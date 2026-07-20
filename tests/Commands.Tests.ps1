@@ -64,6 +64,14 @@ Describe 'Install/Uninstall/Repair' {
         @((Read-GpbConfig).Repos).Count | Should -Be 0
         @(Get-ChildItem (Get-GpbMarkerDir) -Filter '*.json' -ErrorAction SilentlyContinue).Count | Should -Be 0
     }
+    It 'relative-path uninstall removes the absolute registry entry' {
+        Install-ProtonBackup -RepoPath $script:repo
+        Push-Location (Split-Path $script:repo -Parent)
+        try { Uninstall-ProtonBackup -RepoPath ".\$(Split-Path $script:repo -Leaf)" } finally { Pop-Location }
+        git -C $script:repo remote get-url proton *> $null
+        $LASTEXITCODE | Should -Not -Be 0
+        @((Read-GpbConfig).Repos).Count | Should -Be 0
+    }
     It 'repair re-creates a deleted mirror' {
         Install-ProtonBackup -RepoPath $script:repo
         Remove-Item (Get-GpbMirrorPath -RepoPath $script:repo) -Recurse -Force

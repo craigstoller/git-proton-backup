@@ -748,15 +748,19 @@ function Install-ProtonBackup {
 
 function Uninstall-ProtonBackup {
     [CmdletBinding()] param([Parameter(Mandatory)][string]$RepoPath)
+    # Canonicalize once at entry (same contract as Install/Repair): an existing repo uninstalled
+    # via a relative path must match the absolute path Install registered. A deleted repo
+    # (unresolvable) falls back to the raw value — Remove-GpbMirror/Remove-PushPendingMarker still
+    # need something to key off even when the working tree is gone.
+    $resolved = (Resolve-Path -LiteralPath $RepoPath -ErrorAction SilentlyContinue)?.Path
+    if ($resolved) { $RepoPath = $resolved }
     $lock = Wait-GpbLock -TimeoutSeconds 15
     if (-not $lock) { throw 'Another GitProtonBackup operation holds the lock — retry shortly.' }
     try {
         Remove-GpbMirror -RepoPath $RepoPath
         Remove-PushPendingMarker -RepoPath $RepoPath
-        $full = (Resolve-Path -LiteralPath $RepoPath -ErrorAction SilentlyContinue)?.Path
-        if (-not $full) { $full = $RepoPath }
         $cfg = Read-GpbConfig
-        $cfg.Repos = @(@($cfg.Repos) | Where-Object { $_ -ne $full })
+        $cfg.Repos = @(@($cfg.Repos) | Where-Object { $_ -ne $RepoPath })
         Write-GpbConfig -Config $cfg
     } finally { $lock.Close(); Remove-Item (Get-GpbLockPath) -Force -ErrorAction SilentlyContinue }
     Write-Host 'Unwired. Existing bundles on Proton Drive were left in place.'
