@@ -46,8 +46,17 @@ function Get-GpbSlug {
     [CmdletBinding()] param([Parameter(Mandatory)][string]$RepoPath)
     # Canonicalize first: '.', relative paths, and aliases must slug identically to the
     # absolute path the hook stores in gpb.workrepo (public commands also Resolve-Path at entry).
+    # A path that no longer exists on disk (e.g. Uninstall of an already-deleted repo) can't be
+    # Resolve-Path'd — GetUnresolvedProviderPathFromPSPath still normalizes it (relative segments
+    # resolved against PowerShell's actual current location, separators/'.'/'..' collapsed)
+    # WITHOUT requiring the target to exist, so a deleted repo slugs identically to how it slugged
+    # while it still existed. Falling back to the raw string here was the root cause of
+    # deleted-repo mirrors becoming unreachable by slug. NOTE: [System.IO.Path]::GetFullPath is
+    # NOT safe for this — it resolves against [Environment]::CurrentDirectory, which does not
+    # track PowerShell's Push-Location/$PWD in this host, so a relative-path deleted-repo
+    # Uninstall would silently normalize against the wrong directory.
     $resolved = (Resolve-Path -LiteralPath $RepoPath -ErrorAction SilentlyContinue)?.Path
-    if ($resolved) { $RepoPath = $resolved }
+    $RepoPath = if ($resolved) { $resolved } else { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($RepoPath) }
     $full = $RepoPath.TrimEnd('\','/').ToLowerInvariant()
     $sha = [System.Security.Cryptography.SHA256]::Create()
     $hex = -join ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($full)) | ForEach-Object { $_.ToString('x2') })
@@ -558,10 +567,16 @@ function Remove-GpbMirror {
     $workrepo = git -C $mirror config gpb.workrepo 2>$null
     if ($LASTEXITCODE -ne 0) { $workrepo = $null }
     $ownsIt = $false
-    if ($isBare -and $workrepo -and (Test-Path -LiteralPath $workrepo)) {
-        $a = (Resolve-Path -LiteralPath $workrepo).Path.TrimEnd('\','/')
-        $b = (Resolve-Path -LiteralPath $RepoPath).Path.TrimEnd('\','/')
-        $ownsIt = [string]::Equals($a, $b, [System.StringComparison]::OrdinalIgnoreCase)
+    if ($isBare -and $workrepo) {
+        # Normalize BOTH sides the same way: Resolve-Path when the path still exists (canonical
+        # casing/symlinks), else GetUnresolvedProviderPathFromPSPath (honors PowerShell's actual
+        # $PWD — see Get-GpbSlug's note on why [System.IO.Path]::GetFullPath is unsafe here).
+        # Gating this on Test-Path $workrepo (as before) made a DELETED repo's own mirror
+        # permanently "unowned" and un-removable — exactly backwards from what Uninstall/Repair on
+        # a deleted repo need to do.
+        $a = if (Test-Path -LiteralPath $workrepo) { (Resolve-Path -LiteralPath $workrepo).Path } else { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($workrepo) }
+        $b = if (Test-Path -LiteralPath $RepoPath) { (Resolve-Path -LiteralPath $RepoPath).Path } else { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($RepoPath) }
+        $ownsIt = [string]::Equals($a.TrimEnd('\','/'), $b.TrimEnd('\','/'), [System.StringComparison]::OrdinalIgnoreCase)
     }
     if ($ownsIt) { Remove-Item -LiteralPath $mirror -Recurse -Force }
     else { Write-Warning "proton remote pointed at '$mirror', which is not verifiably owned by this repo — left in place (remote removed)." }
@@ -750,20 +765,37 @@ function Uninstall-ProtonBackup {
     [CmdletBinding()] param([Parameter(Mandatory)][string]$RepoPath)
     # Canonicalize once at entry (same contract as Install/Repair): an existing repo uninstalled
     # via a relative path must match the absolute path Install registered. A deleted repo
-    # (unresolvable) falls back to the raw value — Remove-GpbMirror/Remove-PushPendingMarker still
-    # need something to key off even when the working tree is gone.
+    # (unresolvable via Resolve-Path) still normalizes to the SAME absolute form via
+    # GetUnresolvedProviderPathFromPSPath (honors PowerShell's actual $PWD, unlike
+    # [System.IO.Path]::GetFullPath — see Get-GpbSlug) — Remove-GpbMirror/Remove-PushPendingMarker/
+    # the registry filter all need the identical canonical identity Install stored, even when the
+    # working tree is gone (this is the whole point of Uninstall on an already-deleted repo: Verify
+    # tells users to do exactly this).
     $resolved = (Resolve-Path -LiteralPath $RepoPath -ErrorAction SilentlyContinue)?.Path
-    if ($resolved) { $RepoPath = $resolved }
+    $RepoPath = if ($resolved) { $resolved } else { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($RepoPath) }
     $lock = Wait-GpbLock -TimeoutSeconds 15
     if (-not $lock) { throw 'Another GitProtonBackup operation holds the lock — retry shortly.' }
     try {
+        $mirror = Get-GpbMirrorPath -RepoPath $RepoPath
+        $hadRemote = $false
+        git -C $RepoPath remote get-url proton *> $null
+        if ($LASTEXITCODE -eq 0) { $hadRemote = $true }
+        $mirrorExisted = Test-Path -LiteralPath $mirror
+
         Remove-GpbMirror -RepoPath $RepoPath
+        $mirrorRemoved = $mirrorExisted -and -not (Test-Path -LiteralPath $mirror)
+
         Remove-PushPendingMarker -RepoPath $RepoPath
+
         $cfg = Read-GpbConfig
+        $hadRegistryEntry = @($cfg.Repos) -contains $RepoPath
         $cfg.Repos = @(@($cfg.Repos) | Where-Object { $_ -ne $RepoPath })
         Write-GpbConfig -Config $cfg
+
+        $didSomething = $hadRemote -or $mirrorRemoved -or $hadRegistryEntry
     } finally { $lock.Close(); Remove-Item (Get-GpbLockPath) -Force -ErrorAction SilentlyContinue }
-    Write-Host 'Unwired. Existing bundles on Proton Drive were left in place.'
+    if ($didSomething) { Write-Host 'Unwired. Existing bundles on Proton Drive were left in place.' }
+    else { Write-Warning "nothing to uninstall for $RepoPath (not wired and not registered)" }
 }
 
 function Repair-ProtonBackup {

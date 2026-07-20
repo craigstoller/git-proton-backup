@@ -64,12 +64,30 @@ Describe 'Install/Uninstall/Repair' {
         @((Read-GpbConfig).Repos).Count | Should -Be 0
         @(Get-ChildItem (Get-GpbMarkerDir) -Filter '*.json' -ErrorAction SilentlyContinue).Count | Should -Be 0
     }
-    It 'relative-path uninstall removes the absolute registry entry' {
+    It 'relative-path uninstall of an existing repo removes the absolute registry entry (consistency)' {
         Install-ProtonBackup -RepoPath $script:repo
         Push-Location (Split-Path $script:repo -Parent)
         try { Uninstall-ProtonBackup -RepoPath ".\$(Split-Path $script:repo -Leaf)" } finally { Pop-Location }
         git -C $script:repo remote get-url proton *> $null
         $LASTEXITCODE | Should -Not -Be 0
+        @((Read-GpbConfig).Repos).Count | Should -Be 0
+    }
+    It 'deleted-repo uninstall (absolute path) removes mirror + registry entry' {
+        Install-ProtonBackup -RepoPath $script:repo
+        $mirror = Get-GpbMirrorPath -RepoPath $script:repo
+        Remove-Item $script:repo -Recurse -Force
+        Uninstall-ProtonBackup -RepoPath $script:repo
+        Test-Path $mirror | Should -BeFalse
+        @((Read-GpbConfig).Repos).Count | Should -Be 0
+    }
+    It 'deleted-repo uninstall via RELATIVE path also works' {
+        Install-ProtonBackup -RepoPath $script:repo
+        $mirror = Get-GpbMirrorPath -RepoPath $script:repo
+        $leaf = Split-Path $script:repo -Leaf
+        Remove-Item $script:repo -Recurse -Force
+        Push-Location $TestDrive
+        try { Uninstall-ProtonBackup -RepoPath ".\$leaf" } finally { Pop-Location }
+        Test-Path $mirror | Should -BeFalse
         @((Read-GpbConfig).Repos).Count | Should -Be 0
     }
     It 'repair re-creates a deleted mirror' {
