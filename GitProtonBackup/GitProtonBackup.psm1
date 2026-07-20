@@ -1211,3 +1211,133 @@ function Set-ProtonBackupConfig {
         Write-GpbConfig -Config $cfg
     } finally { $lock.Close(); Remove-Item -LiteralPath (Get-GpbLockPath) -Force -ErrorAction SilentlyContinue }
 }
+
+# --- Public commands: Status + scheduled-task installer ----------------------
+
+function Get-ProtonBackupStatus {
+    # Read-only snapshot per registered repo. NEVER calls the Proton CLI, and never bundles —
+    # that's Invoke-ProtonBackupVerify's job. CurrentBundled replicates Invoke-RepoBundleBackup's
+    # own cache-hit comparison (stamped .lastdigest == current digest AND the newest bundle
+    # filename carries the current digest8) purely by reading state already on disk — LOCAL
+    # coverage only. ConfirmedAtLastVerify and the LastVerify* fields come from last-verify.json,
+    # the durable report Invoke-ProtonBackupVerify writes on every run (including its own
+    # failure paths) — never freshly probed here.
+    [CmdletBinding()]
+    param([switch]$Json)
+
+    $cfg = Read-GpbConfig
+
+    $verifyPath = Join-Path (Get-GpbRoot) 'last-verify.json'
+    $lastVerify = $null
+    if (Test-Path -LiteralPath $verifyPath) {
+        try { $lastVerify = Get-Content -LiteralPath $verifyPath -Raw | ConvertFrom-Json -ErrorAction Stop }
+        catch { $lastVerify = $null }
+    }
+    $lastVerifyExitCode = if ($lastVerify -and $lastVerify.PSObject.Properties['ExitCode']) { $lastVerify.ExitCode } else { $null }
+    $lastVerifyAgeHours = $null
+    if ($lastVerify -and $lastVerify.PSObject.Properties['Timestamp'] -and $lastVerify.Timestamp) {
+        try {
+            $ts = [datetime]$lastVerify.Timestamp
+            $lastVerifyAgeHours = ((Get-Date).ToUniversalTime() - $ts.ToUniversalTime()).TotalHours
+        } catch { $lastVerifyAgeHours = $null }
+    }
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    foreach ($repo in @($cfg.Repos)) {
+        $wiring = Test-GpbMirror -RepoPath $repo
+        $wiringOk = [bool]($wiring.HasRemote -and $wiring.MirrorExists -and $wiring.HookExists -and $wiring.WorkRepoOk)
+
+        # Same cache-hit comparison as Invoke-RepoBundleBackup (digest8, newest-bundle-carries-it) —
+        # read-only here: no bundling, no cloud probe.
+        $baseName  = Split-Path $repo -Leaf
+        $bundleDir = Get-GpbBundleDir -Config $cfg -RepoPath $repo
+        $digest    = Get-RepoRefDigest -RepoPath $repo
+        $stateFile = Join-Path $bundleDir ".$baseName.lastdigest"
+        $lastDigest = if (Test-Path -LiteralPath $stateFile) { (Get-Content -LiteralPath $stateFile -Raw).Trim() } else { '' }
+        $digest8 = if ($digest.Length -ge 8) { $digest.Substring(0, 8).ToLowerInvariant() } else { $digest.ToLowerInvariant() }
+        $newest = (Get-ChildItem -LiteralPath $bundleDir -Filter "$baseName-*.bundle" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime | Select-Object -Last 1)
+        $newestIsCurrent = [bool]($newest -and $newest.Name -match "-$([regex]::Escape($digest8))\.bundle$")
+        $currentBundled = [bool](($digest -eq $lastDigest) -and $newestIsCurrent)
+
+        $confirmedAtLastVerify = 'never-verified'
+        if ($lastVerify -and $lastVerify.PSObject.Properties['Repos']) {
+            $entry = @($lastVerify.Repos) | Where-Object { $_.RepoPath -eq $repo } | Select-Object -First 1
+            if ($entry) { $confirmedAtLastVerify = $entry.State }
+        }
+
+        $dirtyCount = @(git -C $repo status --porcelain=v1 2>$null).Count
+
+        $pendingMarker = ''
+        $pendingMarkerAgeHours = $null
+        $markerFile = Join-Path (Get-GpbMarkerDir) "$(Get-GpbSlug -RepoPath $repo).json"
+        $markerItem = Get-Item -LiteralPath $markerFile -ErrorAction SilentlyContinue
+        if ($markerItem) {
+            $mk = Read-GpbMarker -File $markerItem
+            if ($mk) {
+                $pendingMarker = $mk.Reason
+                $pendingMarkerAgeHours = ((Get-Date).ToUniversalTime() - $markerItem.LastWriteTimeUtc).TotalHours
+            }
+        }
+
+        $results.Add([pscustomobject]@{
+            RepoPath              = $repo
+            WiringOk              = $wiringOk
+            CurrentBundled        = $currentBundled
+            ConfirmedAtLastVerify = $confirmedAtLastVerify
+            DirtyCount            = $dirtyCount
+            PendingMarker         = $pendingMarker
+            PendingMarkerAgeHours = $pendingMarkerAgeHours
+            NewestBundle          = if ($newest) { $newest.Name } else { '' }
+            LastVerifyAgeHours    = $lastVerifyAgeHours
+            LastVerifyExitCode    = $lastVerifyExitCode
+        })
+    }
+
+    if ($Json) { return ($results.ToArray() | ConvertTo-Json -Depth 6 -AsArray) }
+    $results.ToArray()
+}
+
+function Install-ProtonBackupTask {
+    # Builds a PLAIN data hashtable first (no CIM/ScheduledTask objects constructed on the path
+    # tests exercise — the Task Scheduler provider can be unavailable in sandboxed/CI contexts,
+    # and tests must never depend on it). The default -Register seam is where real
+    # New-ScheduledTask* objects get built, strictly AFTER the plain data is assembled — swap it
+    # out via -Register/-Unregister for testing.
+    [CmdletBinding()]
+    param(
+        [string]$At = '12:30',
+        [switch]$Uninstall,
+        [scriptblock]$Register,
+        [scriptblock]$Unregister
+    )
+    $taskName = 'GitProtonBackup Verify'
+
+    if ($Uninstall) {
+        $unreg = if ($Unregister) { $Unregister } else { { param($n) Unregister-ScheduledTask -TaskName $n -Confirm:$false } }
+        & $unreg $taskName
+        return
+    }
+
+    $data = @{
+        TaskName           = $taskName
+        At                 = $At
+        LogonType          = 'Interactive'
+        Execute            = 'pwsh'
+        Arguments          = '-NoProfile -WindowStyle Hidden -Command "Import-Module GitProtonBackup; exit (Invoke-ProtonBackupVerify).ExitCode"'
+        StartWhenAvailable = $true
+    }
+
+    $reg = if ($Register) { $Register } else {
+        {
+            param($p)
+            # Missed runs (machine off at 12:30) fire after the next logon — StartWhenAvailable.
+            $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
+            $trigger   = New-ScheduledTaskTrigger -Daily -At $p.At
+            $action    = New-ScheduledTaskAction -Execute $p.Execute -Argument $p.Arguments
+            $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable
+            Register-ScheduledTask -TaskName $p.TaskName -Principal $principal -Trigger $trigger -Action $action -Settings $settings -Force | Out-Null
+        }
+    }
+    & $reg $data
+}

@@ -318,3 +318,43 @@ Describe 'Invoke-ProtonBackupVerify (reconciliation)' {
         } finally { $holder.Close() }
     }
 }
+
+Describe 'Status + scheduled task' {
+    BeforeEach { $script:drive = New-Sandbox; $script:repo = New-TestRepo; Install-ProtonBackup -RepoPath $script:repo }
+    AfterEach  { Clear-Sandbox }
+
+    It 'status reports wiring, local coverage, confirmation, dirt, and last-verify age' {
+        Set-Content "$script:repo/b.txt" 'dirty'
+        Invoke-ProtonBackupVerify -SyncCheck { param($p) $true } -CliReadyRunner { $false } | Out-Null
+        $s = Get-ProtonBackupStatus -Json | ConvertFrom-Json
+        @($s).Count | Should -Be 1
+        $s[0].WiringOk | Should -BeTrue
+        $s[0].CurrentBundled | Should -BeTrue
+        $s[0].ConfirmedAtLastVerify | Should -Be 'ok'
+        $s[0].DirtyCount | Should -Be 1
+        $s[0].LastVerifyAgeHours | Should -BeLessThan 1
+        $s[0].LastVerifyExitCode | Should -Be 0
+    }
+    It 'CurrentBundled is local-only: an unconfirmed spool still shows bundled but NOT confirmed' {
+        Invoke-ProtonBackupVerify -SyncCheck { param($p) $false } -CliReadyRunner { $false } | Out-Null
+        $s = (Get-ProtonBackupStatus -Json | ConvertFrom-Json)[0]
+        $s.CurrentBundled | Should -BeTrue
+        $s.ConfirmedAtLastVerify | Should -Be 'attention'
+    }
+    It 'status flags staleness after a new commit' {
+        Invoke-ProtonBackupVerify -SyncCheck { param($p) $true } -CliReadyRunner { $false } | Out-Null
+        Set-Content "$script:repo/a.txt" 'two'; git -C $script:repo add .; git -C $script:repo commit -qm c2
+        ((Get-ProtonBackupStatus -Json | ConvertFrom-Json))[0].CurrentBundled | Should -BeFalse
+    }
+    It 'task install passes plain data: interactive logon, StartWhenAvailable, daily; -Uninstall unregisters' {
+        $script:reg = $null; $script:unreg = $null
+        Install-ProtonBackupTask -Register { param($p) $script:reg = $p } -Unregister { param($n) $script:unreg = $n }
+        $script:reg.TaskName | Should -Be 'GitProtonBackup Verify'
+        $script:reg.LogonType | Should -Be 'Interactive'
+        $script:reg.StartWhenAvailable | Should -BeTrue
+        $script:reg.Execute | Should -Be 'pwsh'
+        $script:reg.Arguments | Should -Match 'Invoke-ProtonBackupVerify'
+        Install-ProtonBackupTask -Uninstall -Register { param($p) } -Unregister { param($n) $script:unreg = $n }
+        $script:unreg | Should -Be 'GitProtonBackup Verify'
+    }
+}
