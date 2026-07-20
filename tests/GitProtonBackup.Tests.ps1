@@ -200,3 +200,88 @@ Describe 'Invoke-RepoBundleBackup fail-closed publication' {
         @(Get-ChildItem $script:bd -Filter 'r-*.bundle').Count | Should -BeLessOrEqual 3   # keep-2 + monthly checkpoint
     }
 }
+
+Describe 'Get-CloudBundlePath' {
+    BeforeAll {
+        $script:driveRoot = Join-Path $TestDrive 'MyFiles'
+        New-Item -ItemType Directory -Path $script:driveRoot -Force | Out-Null
+    }
+    It 'maps a local bundle path under DriveLocalRoot to a cloud path' {
+        $local = Join-Path $script:driveRoot 'Project Repo Bundles\CrowdFlow\X.bundle'
+        $cloud = Get-CloudBundlePath -LocalPath $local -DriveLocalRoot $script:driveRoot
+        $cloud | Should -Be '/my-files/Project Repo Bundles/CrowdFlow/X.bundle'
+    }
+    It 'uses a custom DriveCloudRoot when provided' {
+        $local = Join-Path $script:driveRoot 'Folder\file.bundle'
+        $cloud = Get-CloudBundlePath -LocalPath $local -DriveLocalRoot $script:driveRoot -DriveCloudRoot '/custom-root'
+        $cloud | Should -Be '/custom-root/Folder/file.bundle'
+    }
+    It 'handles a path that does not exist on disk (no Resolve-Path error)' {
+        $local = Join-Path $script:driveRoot 'Does\Not\Exist.bundle'
+        # Should not throw — file may not exist yet
+        { Get-CloudBundlePath -LocalPath $local -DriveLocalRoot $script:driveRoot } | Should -Not -Throw
+    }
+    It 'converts backslashes to forward slashes in the relative segment' {
+        $local = Join-Path $script:driveRoot 'A\B\C\repo.bundle'
+        $cloud = Get-CloudBundlePath -LocalPath $local -DriveLocalRoot $script:driveRoot
+        $cloud | Should -Not -Match '\\'
+    }
+}
+
+# Option A — Confirm-BundleUploaded
+Describe 'Confirm-BundleUploaded -CliPath' {
+    It 'passes the explicit CLI path to the runner (not module state)' {
+        $script:seenCli = $null
+        $r = Confirm-BundleUploaded -CloudPath '/my-files/x.bundle' -CliPath 'C:\custom\proton-drive.exe' -InfoRunner {
+            param($cp, $cli)
+            $script:seenCli = $cli
+            [pscustomobject]@{ ExitCode = 0; Output = "state: 'active'" }
+        }
+        $r.Confirmed | Should -BeTrue
+        $script:seenCli | Should -Be 'C:\custom\proton-drive.exe'
+    }
+}
+
+Describe 'Push pending markers' {
+    BeforeEach {
+        $env:GPB_CONFIG_DIR = Join-Path $TestDrive "gpb-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        $script:mrepo = 'C:\P\marker-repo'
+        $script:mbd   = Join-Path $TestDrive "marker-bundles-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+    }
+    AfterEach { Remove-Item Env:GPB_CONFIG_DIR -ErrorAction SilentlyContinue }
+
+    It 'a newer write overwrites the previous marker for the same repo' {
+        Write-PushPendingMarker -RepoPath $script:mrepo -Reason cli_unready -BundleDir $script:mbd -BundleBaseName 'r'
+        Write-PushPendingMarker -RepoPath $script:mrepo -Reason verify_timeout -BundleDir $script:mbd -BundleBaseName 'r'
+        @(Get-ChildItem (Get-GpbMarkerDir) -Filter '*.json').Count | Should -Be 1
+        ((Get-Content (Get-ChildItem (Get-GpbMarkerDir) -Filter '*.json').FullName -Raw | ConvertFrom-Json).Reason) | Should -Be 'verify_timeout'
+    }
+}
+
+Describe 'Marker atomicity + quarantine' {
+    BeforeEach { $env:GPB_CONFIG_DIR = Join-Path $TestDrive "mk-$([guid]::NewGuid().ToString('N').Substring(0,8))" }
+    AfterEach  { Remove-Item Env:GPB_CONFIG_DIR -ErrorAction SilentlyContinue }
+    It 'writes atomically (no .tmp residue) and round-trips' {
+        Write-PushPendingMarker -RepoPath 'C:\P\x' -Reason verify_timeout -BundleDir 'C:\B' -BundleBaseName 'x'
+        $f = Get-ChildItem (Get-GpbMarkerDir) -Filter '*.json'
+        @($f).Count | Should -Be 1
+        (Read-GpbMarker -File $f).Reason | Should -Be 'verify_timeout'
+        @(Get-ChildItem (Get-GpbMarkerDir) -Filter '.tmp-*').Count | Should -Be 0
+    }
+    It 'quarantines malformed markers as .bad instead of deleting' {
+        New-Item -ItemType Directory (Get-GpbMarkerDir) -Force | Out-Null
+        Set-Content (Join-Path (Get-GpbMarkerDir) 'broken.json') '{not json'
+        $f = Get-ChildItem (Get-GpbMarkerDir) -Filter 'broken.json'
+        Read-GpbMarker -File $f | Should -BeNullOrEmpty
+        # Quarantine name is unique (guid-suffixed) per Read-GpbMarker's contract — repeated
+        # corruptions must not overwrite earlier evidence — so match via glob, not an exact name.
+        @(Get-ChildItem (Get-GpbMarkerDir) -Filter 'broken.json.*.bad').Count | Should -Be 1
+    }
+    It 'Test-ProtonCliReady resolves a bare command name via Get-Command' {
+        Test-ProtonCliReady -CliPath 'this-command-does-not-exist-anywhere' | Should -BeFalse
+        Test-ProtonCliReady -CliPath 'git' -Runner { param($cli) 0 } | Should -BeTrue   # resolvable name + injected runner
+    }
+    It 'Get-CloudBundlePath refuses paths outside the drive root' {
+        { Get-CloudBundlePath -LocalPath 'C:\elsewhere\x.bundle' -DriveLocalRoot 'C:\Drive' } | Should -Throw '*not under*'
+    }
+}

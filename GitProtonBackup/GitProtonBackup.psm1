@@ -346,3 +346,112 @@ function Invoke-RepoBundleBackup {
 
     [pscustomobject]@{ RepoPath=$RepoPath; State=$state; BundlePath=$bundlePath; Findings=$findings.ToArray() }
 }
+
+# --- Option A: Proton Drive CLI verification ---------------------------------
+
+function Get-CloudBundlePath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$LocalPath,
+        [Parameter(Mandatory)][string]$DriveLocalRoot,
+        [string]$DriveCloudRoot = '/my-files'
+    )
+    $full = (Resolve-Path -LiteralPath $LocalPath -ErrorAction SilentlyContinue)?.Path
+    if (-not $full) { $full = [System.IO.Path]::GetFullPath($LocalPath) }   # file may not exist yet in tests
+    $rootFull = (Resolve-Path -LiteralPath $DriveLocalRoot -ErrorAction SilentlyContinue)?.Path
+    if (-not $rootFull) { $rootFull = [System.IO.Path]::GetFullPath($DriveLocalRoot) }
+    $root = $rootFull.TrimEnd('\','/')
+    # Canonical containment check — a blind Substring would silently produce a garbage
+    # relative path (or throw an unhelpful index error) for anything outside the root.
+    $under = $full.Equals($root, [System.StringComparison]::OrdinalIgnoreCase) -or
+             $full.StartsWith("$root\", [System.StringComparison]::OrdinalIgnoreCase) -or
+             $full.StartsWith("$root/", [System.StringComparison]::OrdinalIgnoreCase)
+    if (-not $under) { throw "Get-CloudBundlePath: '$LocalPath' is not under DriveLocalRoot '$DriveLocalRoot'" }
+    $rel = $full.Substring($root.Length).TrimStart('\','/').Replace('\','/')
+    "$DriveCloudRoot/$rel"
+}
+
+function Confirm-BundleUploaded {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$CloudPath,
+        [Parameter(Mandatory)][string]$CliPath,
+        # InfoRunner returns @{ ExitCode=<int>; Output=<string> }; default invokes the real CLI
+        [scriptblock]$InfoRunner
+    )
+    if (-not $InfoRunner) {
+        $InfoRunner = {
+            param($cp, $cli)
+            $out = & $cli filesystem info $cp 2>&1 | Out-String
+            [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $out }
+        }
+    }
+    $r = & $InfoRunner $CloudPath $CliPath
+    if ($r.ExitCode -eq 0 -and $r.Output -match "state:\s*'active'") {
+        return [pscustomobject]@{ Confirmed=$true;  Reason='cli_confirmed' }
+    }
+    if ($r.Output -match 'Node not found') {
+        return [pscustomobject]@{ Confirmed=$false; Reason='not_in_cloud' }
+    }
+    if ($r.Output -match 'auth|login|unauthor|session') {
+        return [pscustomobject]@{ Confirmed=$false; Reason='auth_error' }
+    }
+    [pscustomobject]@{ Confirmed=$false; Reason='unverified' }
+}
+
+function Test-ProtonCliReady {
+    [CmdletBinding()]
+    param([string]$CliPath, [scriptblock]$Runner)
+    if (-not $CliPath) { return $false }
+    if (-not [System.IO.Path]::IsPathRooted($CliPath)) {
+        # A bare command name (e.g. 'proton-drive') must resolve via PATH before the
+        # Test-Path existence check below, which only understands literal filesystem paths.
+        $cmd = Get-Command -Name $CliPath -ErrorAction SilentlyContinue
+        if ($cmd) { $CliPath = $cmd.Source }
+    }
+    if (-not (Test-Path -LiteralPath $CliPath)) { return $false }
+    if (-not $Runner) { $Runner = { param($cli) & $cli filesystem list '/my-files' 2>&1 | Out-Null; $LASTEXITCODE } }
+    (& $Runner $CliPath) -eq 0
+}
+
+# --- Push pending markers (pessimistic backstop for git-push backups) --------
+
+function Write-PushPendingMarker {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RepoPath,
+        [Parameter(Mandatory)][ValidateSet('in_progress','deferred_lock','no_bundle','verify_timeout','auth_error','cli_unready')][string]$Reason,
+        [Parameter(Mandatory)][string]$BundleDir,
+        [Parameter(Mandatory)][string]$BundleBaseName,
+        [string]$BundlePath,
+        [string]$Stamp = ((Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ'))
+    )
+    $path = Join-Path (Get-GpbMarkerDir) "$(Get-GpbSlug -RepoPath $RepoPath).json"
+    Write-GpbJsonAtomic -Path $path -Object ([pscustomobject]@{
+        RepoPath = $RepoPath; Reason = $Reason; BundleDir = $BundleDir
+        BundleBaseName = $BundleBaseName; BundlePath = $BundlePath; Stamp = $Stamp
+    })
+}
+
+function Remove-PushPendingMarker {
+    [CmdletBinding()] param([Parameter(Mandatory)][string]$RepoPath)
+    Remove-Item -LiteralPath (Join-Path (Get-GpbMarkerDir) "$(Get-GpbSlug -RepoPath $RepoPath).json") -Force -ErrorAction SilentlyContinue
+}
+
+function Read-GpbMarker {
+    # Returns the parsed marker or $null. Never deletes: unreadable/incomplete markers are
+    # quarantined (renamed .bad) so evidence survives for inspection.
+    [CmdletBinding()] param([Parameter(Mandatory)][object]$File)
+    try {
+        $m = Get-Content -LiteralPath $File.FullName -Raw | ConvertFrom-Json -ErrorAction Stop
+        foreach ($k in 'RepoPath','Reason','BundleDir','BundleBaseName') {
+            if (-not $m.PSObject.Properties[$k] -or -not $m.$k) { throw "missing $k" }
+        }
+        $m
+    } catch {
+        # Unique quarantine name: repeated corruptions must not overwrite earlier evidence.
+        $dest = "$($File.FullName).$([guid]::NewGuid().ToString('N').Substring(0,6)).bad"
+        Move-Item -LiteralPath $File.FullName -Destination $dest -Force -ErrorAction SilentlyContinue
+        $null
+    }
+}
