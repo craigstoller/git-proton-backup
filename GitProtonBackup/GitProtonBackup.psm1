@@ -455,3 +455,139 @@ function Read-GpbMarker {
         $null
     }
 }
+
+# --- Push mirror lifecycle (install/remove/health) --------------------------
+
+function Install-GpbMirror {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RepoPath,
+        [switch]$Force,
+        [switch]$SetUpstream
+    )
+    git -C $RepoPath rev-parse --git-dir *> $null
+    if ($LASTEXITCODE -ne 0) { throw "Install-GpbMirror: '$RepoPath' is not a git repository — run 'git init' first." }
+
+    $mirror = Get-GpbMirrorPath -RepoPath $RepoPath
+
+    # Ownership by LOCATION, not by config, so Repair genuinely repairs: a deleted mirror has no
+    # gpb.workrepo to check, and a moved repo's remote points at the OLD slug path — both are ours
+    # as long as the url lives under our mirrors root. Anything else is a foreign remote and is
+    # refused unless -Force (which repoints it — the foreign remote's target is never touched).
+    $existingUrl = git -C $RepoPath remote get-url proton 2>$null
+    if ($LASTEXITCODE -ne 0) { $existingUrl = $null }
+    $oursRoot = (Join-Path (Get-GpbRoot) 'mirrors')
+    if ($existingUrl -and -not $Force) {
+        $isOurs = $existingUrl.StartsWith($oursRoot, [System.StringComparison]::OrdinalIgnoreCase)
+        if (-not $isOurs) { throw "A 'proton' remote already exists and is not owned by GitProtonBackup (url: $existingUrl) — remove/rename it, or re-run with -Force to replace the wiring (the foreign remote's target is never touched)." }
+        if ($existingUrl -ne $mirror) {
+            # Moved repo: old-slug mirror. Repoint, and delete the old mirror only under the
+            # standard delete-safe rule (bare + carries a gpb.workrepo).
+            if ((Test-Path -LiteralPath $existingUrl) -and ((git -C $existingUrl rev-parse --is-bare-repository 2>$null) -eq 'true') -and (git -C $existingUrl config gpb.workrepo 2>$null)) {
+                Remove-Item -LiteralPath $existingUrl -Recurse -Force
+            }
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath (Join-Path $mirror 'HEAD'))) {
+        New-Item -ItemType Directory -Path $mirror -Force | Out-Null
+        git init --bare -q $mirror
+        if ($LASTEXITCODE -ne 0) { throw "git init --bare failed for $mirror" }
+    }
+    git -C $mirror config gpb.workrepo $RepoPath
+
+    # Quoting-safe, version-independent shim: the work-repo path travels via an environment
+    # variable (GPB_WORKREPO) — NEVER inline in the -Command string. A path containing an
+    # apostrophe (e.g. C:\Craig's Code) would break any sh-side quote embedding. `\$env:` is
+    # escaped so sh does NOT expand it, leaving the literal `$env:GPB_WORKREPO` for pwsh to read
+    # as its own environment-variable syntax; `$vs` is unescaped so sh substitutes the (int)
+    # verifyseconds value inline before pwsh ever sees it. LF-only; unconditional exit 0 (no
+    # exec) so the hook never reports failure even if pwsh fails to start, Import-Module fails,
+    # or the target function doesn't exist yet. Post-receive stdin is intentionally NOT
+    # forwarded (see Task 6's upstream-healing delta).
+    $shim = @(
+        '#!/bin/sh',
+        'GPB_WORKREPO=$(git config gpb.workrepo); export GPB_WORKREPO',
+        'vs=$(git config --int gpb.verifyseconds); [ -n "$vs" ] || vs=60',
+        'pwsh -NoProfile -Command "Import-Module GitProtonBackup; Invoke-ProtonBackupHook -WorkRepo \$env:GPB_WORKREPO -VerifySeconds $vs"',
+        'exit 0'
+    ) -join "`n"
+    $hooksDir = Join-Path $mirror 'hooks'
+    if (-not (Test-Path -LiteralPath $hooksDir)) { New-Item -ItemType Directory -Path $hooksDir -Force | Out-Null }
+    [System.IO.File]::WriteAllText((Join-Path $hooksDir 'post-receive'), $shim + "`n")
+
+    git -C $RepoPath remote get-url proton *> $null
+    if ($LASTEXITCODE -ne 0) { git -C $RepoPath remote add proton $mirror }
+    else { git -C $RepoPath remote set-url proton $mirror }
+    $existingPush = @(git -C $RepoPath config --get-all remote.proton.push 2>$null)
+    if ($existingPush -notcontains '+refs/heads/*:refs/heads/*') { git -C $RepoPath config --add remote.proton.push '+refs/heads/*:refs/heads/*' }
+    if ($existingPush -notcontains '+refs/tags/*:refs/tags/*')   { git -C $RepoPath config --add remote.proton.push '+refs/tags/*:refs/tags/*' }
+
+    # Initial push + upstream — only when the repo has a born HEAD. A failed push must fail the
+    # install (side-effects-first: the module manifest is written only after this succeeds).
+    git -C $RepoPath rev-parse -q --verify HEAD *> $null
+    if ($LASTEXITCODE -eq 0) {
+        git -C $RepoPath push -q proton 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "initial 'git push proton' failed for $RepoPath (mirror: $mirror)" }
+        $cur = git -C $RepoPath branch --show-current
+        if ($cur) {
+            # Upstream policy: never clobber an existing upstream unless -SetUpstream was passed.
+            $hasUpstream = [bool](git -C $RepoPath config "branch.$cur.remote" 2>$null)
+            if ($SetUpstream -or -not $hasUpstream) {
+                git -C $RepoPath config "branch.$cur.remote" proton
+                git -C $RepoPath config "branch.$cur.merge" "refs/heads/$cur"
+            }
+        }
+    }
+    [pscustomobject]@{ MirrorPath = $mirror }
+}
+
+function Remove-GpbMirror {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$RepoPath)
+    $mirror = git -C $RepoPath remote get-url proton 2>$null
+    if ($LASTEXITCODE -ne 0) { $mirror = $null }
+    if (-not $mirror) { $mirror = Get-GpbMirrorPath -RepoPath $RepoPath }
+    git -C $RepoPath remote remove proton 2>&1 | Out-Null
+    if (-not $mirror -or -not (Test-Path -LiteralPath $mirror)) { return }
+    # Safety: only delete a directory that is verifiably OUR mirror for THIS repo — a bare repo
+    # whose gpb.workrepo canonically equals $RepoPath (Resolve-Path both sides, case-insensitive).
+    # Never Remove-Item -Recurse a path inferred from config otherwise.
+    $isBare = (git -C $mirror rev-parse --is-bare-repository 2>$null) -eq 'true'
+    $workrepo = git -C $mirror config gpb.workrepo 2>$null
+    if ($LASTEXITCODE -ne 0) { $workrepo = $null }
+    $ownsIt = $false
+    if ($isBare -and $workrepo -and (Test-Path -LiteralPath $workrepo)) {
+        $a = (Resolve-Path -LiteralPath $workrepo).Path.TrimEnd('\','/')
+        $b = (Resolve-Path -LiteralPath $RepoPath).Path.TrimEnd('\','/')
+        $ownsIt = [string]::Equals($a, $b, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+    if ($ownsIt) { Remove-Item -LiteralPath $mirror -Recurse -Force }
+    else { Write-Warning "proton remote pointed at '$mirror', which is not verifiably owned by this repo — left in place (remote removed)." }
+}
+
+function Test-GpbMirror {
+    [CmdletBinding()] param([Parameter(Mandatory)][string]$RepoPath)
+    $mirror = git -C $RepoPath remote get-url proton 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $mirror) {
+        return [pscustomobject]@{ HasRemote=$false; MirrorPath=$null; MirrorExists=$false; HookExists=$false; WorkRepoOk=$false }
+    }
+    $mirrorExists = Test-Path -LiteralPath (Join-Path $mirror 'HEAD')
+    $hookExists   = $mirrorExists -and (Test-Path -LiteralPath (Join-Path $mirror 'hooks/post-receive'))
+    $workrepo = if ($mirrorExists) { git -C $mirror config gpb.workrepo 2>$null } else { $null }
+    # WorkRepoOk: gpb.workrepo must canonically resolve to THIS repo — a mirror wired elsewhere
+    # (or pointed at a path that no longer exists) must not pass.
+    $workRepoOk = $false
+    if ($workrepo -and (Test-Path -LiteralPath $workrepo)) {
+        $a = (Resolve-Path -LiteralPath $workrepo).Path.TrimEnd('\','/')
+        $b = (Resolve-Path -LiteralPath $RepoPath).Path.TrimEnd('\','/')
+        $workRepoOk = [string]::Equals($a, $b, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+    [pscustomobject]@{
+        HasRemote    = $true
+        MirrorPath   = $mirror
+        MirrorExists = [bool]$mirrorExists
+        HookExists   = [bool]$hookExists
+        WorkRepoOk   = $workRepoOk
+    }
+}

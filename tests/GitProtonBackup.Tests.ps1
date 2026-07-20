@@ -285,3 +285,109 @@ Describe 'Marker atomicity + quarantine' {
         { Get-CloudBundlePath -LocalPath 'C:\elsewhere\x.bundle' -DriveLocalRoot 'C:\Drive' } | Should -Throw '*not under*'
     }
 }
+
+Describe 'GpbMirror lifecycle' {
+    BeforeEach {
+        $env:GPB_CONFIG_DIR = Join-Path $TestDrive "gpb-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        $env:GPB_HOOK_DISABLED = '1'
+        $script:proot = Join-Path $TestDrive "pr-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        $script:prepo = Join-Path $script:proot 'hub'
+        New-Item -ItemType Directory -Path $script:prepo -Force | Out-Null
+        git -C $script:prepo init -qb main
+        git -C $script:prepo config user.email 't@t'; git -C $script:prepo config user.name 't'
+        Set-Content "$script:prepo/a.txt" 'one'; git -C $script:prepo add .; git -C $script:prepo commit -qm 'c1'
+    }
+    AfterEach { Remove-Item Env:GPB_CONFIG_DIR, Env:GPB_HOOK_DISABLED -ErrorAction SilentlyContinue }
+
+    It 'install wires mirror, remote, refspecs, shim, config, initial push, upstream' {
+        $r = Install-GpbMirror -RepoPath $script:prepo
+        Test-Path (Join-Path $r.MirrorPath 'HEAD') | Should -BeTrue
+        (git -C $script:prepo remote get-url proton) | Should -Be $r.MirrorPath
+        @(git -C $script:prepo config --get-all remote.proton.push) | Should -Contain '+refs/heads/*:refs/heads/*'
+        @(git -C $script:prepo config --get-all remote.proton.push) | Should -Contain '+refs/tags/*:refs/tags/*'
+        (git -C $r.MirrorPath config gpb.workrepo) | Should -Be $script:prepo
+        $shim = Get-Content (Join-Path $r.MirrorPath 'hooks/post-receive') -Raw
+        $shim | Should -Match '^#!/bin/sh'
+        $shim | Should -Not -Match "`r"                        # LF-only
+        $shim | Should -Match 'Import-Module GitProtonBackup'
+        $shim | Should -Match '(?m)^exit 0\s*$'                 # unconditional exit 0
+        $shim | Should -Not -Match 'exec'                       # no exec
+        (git -C $r.MirrorPath rev-parse refs/heads/main) | Should -Be (git -C $script:prepo rev-parse main)
+        (git -C $script:prepo config branch.main.remote) | Should -Be 'proton'
+        $h = Test-GpbMirror -RepoPath $script:prepo
+        $h.HasRemote | Should -BeTrue; $h.MirrorExists | Should -BeTrue
+        $h.HookExists | Should -BeTrue; $h.WorkRepoOk | Should -BeTrue
+    }
+    It 'install throws on a non-git RepoPath (side-effects-first: hub untouched)' {
+        $plain = Join-Path $script:proot 'plain'
+        New-Item -ItemType Directory -Path $plain -Force | Out-Null
+        { Install-GpbMirror -RepoPath $plain } | Should -Throw '*not a git repository*'
+    }
+    It 'install is idempotent and repairs a deleted mirror' {
+        $r1 = Install-GpbMirror -RepoPath $script:prepo
+        Remove-Item -LiteralPath $r1.MirrorPath -Recurse -Force
+        $r2 = Install-GpbMirror -RepoPath $script:prepo
+        $r2.MirrorPath | Should -Be $r1.MirrorPath
+        Test-Path (Join-Path $r2.MirrorPath 'HEAD') | Should -BeTrue
+        @(git -C $script:prepo config --get-all remote.proton.push).Count | Should -Be 2
+    }
+    It 'install on a repo with no commits skips push/upstream but wires everything else' {
+        $bare = Join-Path $script:proot 'empty-hub'
+        New-Item -ItemType Directory -Path $bare -Force | Out-Null
+        git -C $bare init -qb main
+        $r = Install-GpbMirror -RepoPath $bare
+        Test-Path (Join-Path $r.MirrorPath 'HEAD') | Should -BeTrue
+        (git -C $bare remote get-url proton) | Should -Be $r.MirrorPath
+    }
+    It 'remove drops remote and mirror; health reports absent' {
+        $r = Install-GpbMirror -RepoPath $script:prepo
+        Remove-GpbMirror -RepoPath $script:prepo
+        git -C $script:prepo remote get-url proton *> $null
+        $LASTEXITCODE | Should -Not -Be 0
+        Test-Path $r.MirrorPath | Should -BeFalse
+        (Test-GpbMirror -RepoPath $script:prepo).HasRemote | Should -BeFalse
+    }
+    It 'remove refuses to delete a directory that is not our mirror' {
+        $victim = Join-Path $TestDrive 'victim'
+        New-Item -ItemType Directory -Path $victim -Force | Out-Null
+        Set-Content (Join-Path $victim 'precious.txt') 'data'
+        git -C $script:prepo remote add proton $victim
+        Remove-GpbMirror -RepoPath $script:prepo -WarningAction SilentlyContinue
+        Test-Path (Join-Path $victim 'precious.txt') | Should -BeTrue   # untouched
+        git -C $script:prepo remote get-url proton *> $null
+        $LASTEXITCODE | Should -Not -Be 0                                # remote still removed
+    }
+    It 'health flags a mirror wired to a DIFFERENT repo' {
+        $r = Install-GpbMirror -RepoPath $script:prepo
+        git -C $r.MirrorPath config gpb.workrepo (Join-Path $TestDrive 'somewhere-else')
+        (Test-GpbMirror -RepoPath $script:prepo).WorkRepoOk | Should -BeFalse
+    }
+
+    # --- Task 5 deltas: foreign-remote refusal, upstream policy, ownership-equality removal ---
+
+    It 'refuses a foreign proton remote' {
+        git -C $script:prepo remote add proton (Join-Path $TestDrive 'foreign.git')
+        { Install-GpbMirror -RepoPath $script:prepo } | Should -Throw '*not owned by GitProtonBackup*'
+    }
+    It 'never overwrites an existing upstream unless -SetUpstream' {
+        git -C $script:prepo remote add origin (Join-Path $TestDrive 'origin.git')
+        git -C $script:prepo config branch.main.remote origin
+        git -C $script:prepo config branch.main.merge refs/heads/main
+        Install-GpbMirror -RepoPath $script:prepo | Out-Null
+        (git -C $script:prepo config branch.main.remote) | Should -Be 'origin'
+        Install-GpbMirror -RepoPath $script:prepo -SetUpstream | Out-Null
+        (git -C $script:prepo config branch.main.remote) | Should -Be 'proton'
+    }
+    It 'sets upstream when the branch has none' {
+        Install-GpbMirror -RepoPath $script:prepo | Out-Null
+        (git -C $script:prepo config branch.main.remote) | Should -Be 'proton'
+    }
+    It 'removal requires canonical ownership equality' {
+        $r = Install-GpbMirror -RepoPath $script:prepo
+        git -C $r.MirrorPath config gpb.workrepo 'C:\somewhere\else'
+        Remove-GpbMirror -RepoPath $script:prepo -WarningAction SilentlyContinue
+        Test-Path $r.MirrorPath | Should -BeTrue      # left in place
+        git -C $script:prepo remote get-url proton *> $null
+        $LASTEXITCODE | Should -Not -Be 0             # remote still removed
+    }
+}
