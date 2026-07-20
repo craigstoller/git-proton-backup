@@ -865,7 +865,8 @@ function Initialize-ProtonBackup {
         [string]$ProtonDriveRoot,
         [string]$ProtonCli,
         [scriptblock]$AuthProbe,
-        [scriptblock]$WriteProbe
+        [scriptblock]$WriteProbe,
+        [scriptblock]$InfoProbe
     )
 
     if (-not $ProtonDriveRoot) {
@@ -922,12 +923,15 @@ function Initialize-ProtonBackup {
     }
 
     # --- Cloud info probe: only when the CLI is ready, and never fatal either way — the sync
-    #     app simply may not have uploaded the freshly-created folder yet. ---
+    #     app simply may not have uploaded the freshly-created folder yet. -InfoProbe is a test
+    #     seam (receives the mapped cloud path, then the resolved CLI path); default invokes the
+    #     real CLI's `filesystem info` and treats a nonzero/absent exit code as the same warning.
     if ($cliReady) {
+        $cloudPath = Get-CloudBundlePath -LocalPath $backupDir -DriveLocalRoot $ProtonDriveRoot
         try {
-            $cloudPath = Get-CloudBundlePath -LocalPath $backupDir -DriveLocalRoot $ProtonDriveRoot
-            & $cliPath filesystem info $cloudPath 2>&1 | Out-Null
-            if ($LASTEXITCODE -ne 0) {
+            $infoProbeSb = if ($PSBoundParameters.ContainsKey('InfoProbe')) { $InfoProbe } else { { param($cp, $cli) & $cli filesystem info $cp 2>&1 | Out-Null; $LASTEXITCODE } }
+            $infoResult = & $infoProbeSb $cloudPath $cliPath
+            if ($infoResult -ne 0) {
                 Write-Warning 'cloud path not yet visible — the sync app may not have uploaded it yet'
             }
         } catch {

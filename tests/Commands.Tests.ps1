@@ -142,15 +142,15 @@ Describe 'Initialize + Config' {
     AfterEach { Remove-Item Env:GPB_CONFIG_DIR, Env:GPB_LOCK_PATH -ErrorAction SilentlyContinue }
 
     It 'initialize writes a valid config and creates the backup subdir' {
-        $out = Initialize-ProtonBackup -ProtonDriveRoot $script:drive -AuthProbe { 0 } 6>&1
+        $out = Initialize-ProtonBackup -ProtonDriveRoot $script:drive -AuthProbe { 0 } -InfoProbe { 0 } 6>&1
         ($out -join "`n") | Should -Match 'COMMITTED work only'
         (Read-GpbConfig).ProtonDriveRoot | Should -Be $script:drive
         Test-Path (Join-Path $script:drive 'GitBackups') | Should -BeTrue
     }
     It 'initialize preserves the registry on re-run' {
-        Initialize-ProtonBackup -ProtonDriveRoot $script:drive -AuthProbe { 0 } | Out-Null
+        Initialize-ProtonBackup -ProtonDriveRoot $script:drive -AuthProbe { 0 } -InfoProbe { 0 } | Out-Null
         $cfg = Read-GpbConfig; $cfg.Repos = @('C:\P\x'); Write-GpbConfig -Config $cfg
-        Initialize-ProtonBackup -ProtonDriveRoot $script:drive -AuthProbe { 0 } | Out-Null
+        Initialize-ProtonBackup -ProtonDriveRoot $script:drive -AuthProbe { 0 } -InfoProbe { 0 } | Out-Null
         @((Read-GpbConfig).Repos) | Should -Contain 'C:\P\x'
     }
     It 'initialize warns (not throws) when the CLI is absent or unauthenticated' {
@@ -170,19 +170,35 @@ Describe 'Initialize + Config' {
         }
     }
     It 'Set-ProtonBackupConfig validates values' {
-        Initialize-ProtonBackup -ProtonDriveRoot $script:drive -AuthProbe { 0 } | Out-Null
+        Initialize-ProtonBackup -ProtonDriveRoot $script:drive -AuthProbe { 0 } -InfoProbe { 0 } | Out-Null
         { Set-ProtonBackupConfig -Key ProtonDriveRoot -Value 'C:\no\such' } | Should -Throw
         { Set-ProtonBackupConfig -Key VerifySeconds -Value -5 } | Should -Throw
         Set-ProtonBackupConfig -Key HeartbeatUrl -Value 'https://hc-ping.com/abc'
         (Get-ProtonBackupConfig).HeartbeatUrl | Should -Be 'https://hc-ping.com/abc'
     }
     It 'BackupSubdir containment: a ..\ escape is rejected' {
-        Initialize-ProtonBackup -ProtonDriveRoot $script:drive -AuthProbe { 0 } | Out-Null
+        Initialize-ProtonBackup -ProtonDriveRoot $script:drive -AuthProbe { 0 } -InfoProbe { 0 } | Out-Null
         { Set-ProtonBackupConfig -Key BackupSubdir -Value '..\outside' } | Should -Throw '*under*'
     }
     It 'initialize write-probe fails loud on an unwritable sync folder' {
         $ro = Join-Path $TestDrive 'ro-drive'; New-Item -ItemType Directory $ro -Force | Out-Null
         # Simulate unwritability via an injected probe failure rather than real ACLs (CI-safe):
         { Initialize-ProtonBackup -ProtonDriveRoot $ro -AuthProbe { 0 } -WriteProbe { throw 'denied' } } | Should -Throw '*denied*'
+    }
+    It 'discovery: a one-level subdir with My files wins, and ProtonDriveRoot is set to that folder' {
+        # Pins the inferred discovery semantics: ProtonDriveRoot ends up as the 'My files' folder
+        # ITSELF (not its parent) — that's what Get-CloudBundlePath/BackupSubdir need, since Proton
+        # Drive's desktop client syncs "Proton Drive\<account>\My files" 1:1 with cloud '/my-files'.
+        $up = Join-Path $TestDrive 'up'
+        $acctMyFiles = Join-Path $up 'Proton Drive\acct123\My files'
+        New-Item -ItemType Directory $acctMyFiles -Force | Out-Null
+        $priorUserProfile = $env:USERPROFILE
+        $env:USERPROFILE = $up
+        try {
+            Initialize-ProtonBackup -AuthProbe { 0 } -InfoProbe { 0 } | Out-Null
+        } finally {
+            $env:USERPROFILE = $priorUserProfile
+        }
+        (Read-GpbConfig).ProtonDriveRoot | Should -Match ([regex]::Escape('\My files') + '$')
     }
 }
