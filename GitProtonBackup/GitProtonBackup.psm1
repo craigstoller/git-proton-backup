@@ -60,14 +60,15 @@ function Get-GpbBundleDir { [CmdletBinding()] param([Parameter(Mandatory)][objec
     Join-Path $Config.ProtonDriveRoot "$($Config.BackupSubdir)\$(Get-GpbSlug -RepoPath $RepoPath)" }
 
 function Get-GpbLockPath {
-    # GPB_LOCK_PATH override exists for test isolation (never collide with a real scheduled sweep).
+    # GPB_LOCK_PATH override exists for test isolation (never collide with a real scheduled task run).
     if ($env:GPB_LOCK_PATH) { return $env:GPB_LOCK_PATH }
     Join-Path (Get-GpbRoot) 'gpb.lock'
 }
 
 function Wait-GpbLock {
-    # Bounded, poll-based acquisition of the single backup lock shared by the sweep and the
-    # push hook. Returns the open FileStream (caller closes) or $null on timeout. Never throws.
+    # Bounded, poll-based acquisition of the single backup lock shared by Invoke-ProtonBackupVerify
+    # (or the scheduled task) and the push hook. Returns the open FileStream (caller closes) or
+    # $null on timeout. Never throws.
     # On timeout, a NON-contention failure (bad lock path, ACLs) emits a warning — otherwise the
     # caller's "another run holds the lock" message would misdiagnose a config problem as
     # contention, day after day, with no toast.
@@ -589,5 +590,128 @@ function Test-GpbMirror {
         MirrorExists = [bool]$mirrorExists
         HookExists   = [bool]$hookExists
         WorkRepoOk   = $workRepoOk
+    }
+}
+
+# --- Push flow + hook entry point --------------------------------------------
+
+function Invoke-PushBackupFlow {
+    # post-receive flow (spec: docs/design.md — hook flow + verification table).
+    # A normal function: no `exit`, messages via Write-Host (git relays them as remote: lines).
+    # Throws only on unexpected errors; Invoke-ProtonBackupHook catches and still returns.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$WorkRepo,
+        [object]$OutConfig,
+        [int]$VerifySeconds,
+        [int]$PollSeconds = 5,
+        [int]$LockTimeoutSeconds = 15,
+        # Test seams — production leaves these unset.
+        [scriptblock]$SyncCheck, [scriptblock]$InfoRunner, [scriptblock]$CliReadyRunner
+    )
+    $cfg = if ($OutConfig) { $OutConfig } else { Read-GpbConfig }
+    if (-not $PSBoundParameters.ContainsKey('VerifySeconds')) { $VerifySeconds = $cfg.VerifySeconds }
+
+    $bundleDir = Get-GpbBundleDir -Config $cfg -RepoPath $WorkRepo
+    $baseName  = Split-Path $WorkRepo -Leaf
+
+    # 1. Pessimistic marker BEFORE any long-running work (Ctrl+C / crash safe).
+    Write-PushPendingMarker -RepoPath $WorkRepo -Reason in_progress -BundleDir $bundleDir -BundleBaseName $baseName
+
+    # 2. Lock for the bundle step only (bounded).
+    $lock = Wait-GpbLock -TimeoutSeconds $LockTimeoutSeconds
+    if (-not $lock) {
+        Write-PushPendingMarker -RepoPath $WorkRepo -Reason deferred_lock -BundleDir $bundleDir -BundleBaseName $baseName
+        Write-Host 'backup deferred — another backup operation is active; run Invoke-ProtonBackupVerify (or the scheduled task) to confirm'
+        return
+    }
+
+    # 3. Bundle (never auto-commit on a deliberate push); release the lock immediately after.
+    try {
+        $res = Invoke-RepoBundleBackup -RepoPath $WorkRepo -BundleDir $bundleDir -BundleBaseName $baseName `
+            -SyncCheck { param($p) $false } -RetentionKeep $cfg.RetentionKeep -RetentionCheckpoints $cfg.RetentionCheckpoints
+    } finally {
+        $lock.Close()
+        Remove-Item -LiteralPath (Get-GpbLockPath) -Force -ErrorAction SilentlyContinue
+    }
+    if (-not $res.PSObject.Properties['BundlePath'] -or -not $res.BundlePath) {
+        Write-PushPendingMarker -RepoPath $WorkRepo -Reason no_bundle -BundleDir $bundleDir -BundleBaseName $baseName
+        $why = (@($res.Findings) | Select-Object -First 1)?.Detail
+        Write-Host "no bundle produced ($why) — run Invoke-ProtonBackupVerify (or the scheduled task) to confirm"
+        return
+    }
+
+    # 4. Dirty-tree note: uncommitted changes are never included in a bundle (HEAD-only content).
+    $dirty = @(git -C $WorkRepo status --porcelain=v1 2>$null).Count
+    if ($dirty -gt 0) { Write-Host "note: $dirty uncommitted change(s) not included — commit to back them up" }
+
+    # 5. Upstream healing for the CURRENT branch only, only when it lacks one (existing upstreams
+    #    untouched). Enumerating all local branches would set upstreams on dormant branches the
+    #    user never pushed — too intrusive for a public tool; the current branch is what a push
+    #    almost always means. Enumeration/config failure skips healing with a warning — it must
+    #    never fail the hook.
+    try {
+        $cur = git -C $WorkRepo branch --show-current
+        if ($LASTEXITCODE -eq 0 -and $cur -and -not (git -C $WorkRepo config "branch.$cur.remote" 2>$null)) {
+            git -C $WorkRepo config "branch.$cur.remote" proton
+            git -C $WorkRepo config "branch.$cur.merge" "refs/heads/$cur"
+            Write-Host "tracking set: $cur -> proton/$cur"
+        }
+    } catch {
+        Write-Warning "upstream healing skipped: $($_.Exception.Message)"
+    }
+
+    # 6. Bounded verify, lock-free. Wording table lives in the spec; "confirmed on Proton" is
+    #    reserved for CLI confirmation.
+    $cliPath = if ($cfg.ProtonCli) { $cfg.ProtonCli } else { 'proton-drive' }
+    if (-not $CliReadyRunner) { $CliReadyRunner = { Test-ProtonCliReady -CliPath $cliPath } }
+    if (-not $SyncCheck)      { $SyncCheck      = { param($p) (Get-CloudFileSyncState -Path $p).InSync } }
+    $cloudPath = Get-CloudBundlePath -LocalPath $res.BundlePath -DriveLocalRoot $cfg.ProtonDriveRoot
+
+    if (& $CliReadyRunner) {
+        $deadline = (Get-Date).AddSeconds($VerifySeconds)
+        do {
+            $c = if ($InfoRunner) { Confirm-BundleUploaded -CloudPath $cloudPath -CliPath $cliPath -InfoRunner $InfoRunner }
+                 else             { Confirm-BundleUploaded -CloudPath $cloudPath -CliPath $cliPath }
+            if ($c.Confirmed) {
+                Remove-PushPendingMarker -RepoPath $WorkRepo
+                Write-Host 'confirmed on Proton'
+                return
+            }
+            if ($c.Reason -eq 'auth_error') {
+                Write-PushPendingMarker -RepoPath $WorkRepo -Reason auth_error -BundleDir $bundleDir -BundleBaseName $baseName -BundlePath $res.BundlePath
+                Write-Host 'staged, not yet confirmed — Proton CLI session expired; run Invoke-ProtonBackupVerify (or the scheduled task) to confirm'
+                return
+            }
+            if ((Get-Date) -lt $deadline) { Start-Sleep -Seconds $PollSeconds }
+        } while ((Get-Date) -lt $deadline)
+        Write-PushPendingMarker -RepoPath $WorkRepo -Reason verify_timeout -BundleDir $bundleDir -BundleBaseName $baseName -BundlePath $res.BundlePath
+        Write-Host 'staged, not yet confirmed — run Invoke-ProtonBackupVerify (or the scheduled task) to confirm'
+        return
+    }
+
+    # CLI unavailable: IN_SYNC is the degraded verifier (never claims "confirmed on Proton").
+    if (& $SyncCheck $res.BundlePath) {
+        Remove-PushPendingMarker -RepoPath $WorkRepo
+        Write-Host 'staged; in-sync per Cloud Files (CLI verification unavailable)'
+    } else {
+        Write-PushPendingMarker -RepoPath $WorkRepo -Reason cli_unready -BundleDir $bundleDir -BundleBaseName $baseName -BundlePath $res.BundlePath
+        Write-Host 'staged, not yet confirmed — Proton CLI unavailable; run Invoke-ProtonBackupVerify (or the scheduled task) to confirm'
+    }
+}
+
+function Invoke-ProtonBackupHook {
+    # post-receive entry point. Always returns; never throws — a push must never appear to fail
+    # on backup bookkeeping. Invoked by the mirror shim via Import-Module (version-independent).
+    [CmdletBinding()] param([Parameter(Mandatory)][string]$WorkRepo, [int]$VerifySeconds = 0)
+    try {
+        if ($env:GPB_HOOK_DISABLED -eq '1') { return }
+        foreach ($v in 'GIT_DIR','GIT_WORK_TREE','GIT_INDEX_FILE','GIT_OBJECT_DIRECTORY','GIT_ALTERNATE_OBJECT_DIRECTORIES','GIT_QUARANTINE_PATH') {
+            Remove-Item "Env:$v" -ErrorAction SilentlyContinue
+        }
+        if ($VerifySeconds -gt 0) { Invoke-PushBackupFlow -WorkRepo $WorkRepo -VerifySeconds $VerifySeconds }
+        else { Invoke-PushBackupFlow -WorkRepo $WorkRepo }
+    } catch {
+        Write-Host "backup hook error: $($_.Exception.Message) — run Invoke-ProtonBackupVerify (or the scheduled task) to confirm"
     }
 }
