@@ -59,3 +59,144 @@ Describe 'State foundation' {
         Get-GpbBundleDir -Config $cfg -RepoPath $repo | Should -Be (Join-Path $root "GitBackups\$slug")
     }
 }
+
+Describe 'Get-RepoRefDigest' {
+    BeforeAll {
+        $env:GPB_CONFIG_DIR = Join-Path $TestDrive "gpb-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        $env:GPB_LOCK_PATH  = Join-Path $TestDrive "lk-$([guid]::NewGuid().ToString('N').Substring(0,8)).lock"
+        $repo = Join-Path $TestDrive 'digestrepo'
+        New-Item -ItemType Directory -Path $repo -Force | Out-Null
+        git -C $repo init -q
+        git -C $repo config user.email 't@t'; git -C $repo config user.name 't'
+        Set-Content "$repo/a.txt" 'one'; git -C $repo add .; git -C $repo commit -qm 'c1'
+    }
+    AfterAll { Remove-Item Env:GPB_CONFIG_DIR, Env:GPB_LOCK_PATH -ErrorAction SilentlyContinue }
+
+    It 'changes when a new commit is added' {
+        $d1 = Get-RepoRefDigest -RepoPath $repo
+        Set-Content "$repo/a.txt" 'two'; git -C $repo add .; git -C $repo commit -qm 'c2'
+        $d2 = Get-RepoRefDigest -RepoPath $repo
+        $d2 | Should -Not -Be $d1
+    }
+    It 'changes when a tag is added (not just HEAD)' {
+        $d1 = Get-RepoRefDigest -RepoPath $repo
+        git -C $repo tag v1
+        (Get-RepoRefDigest -RepoPath $repo) | Should -Not -Be $d1
+    }
+    It 'ignores remote-tracking refs (proton bookkeeping)' {
+        $d1 = Get-RepoRefDigest -RepoPath $repo
+        git -C $repo update-ref refs/remotes/proton/main HEAD
+        (Get-RepoRefDigest -RepoPath $repo) | Should -Be $d1
+        git -C $repo update-ref -d refs/remotes/proton/main
+    }
+}
+
+Describe 'Invoke-RepoBundleBackup canonical ref set' {
+    BeforeAll {
+        $env:GPB_CONFIG_DIR = Join-Path $TestDrive "gpb-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        $env:GPB_LOCK_PATH  = Join-Path $TestDrive "lk-$([guid]::NewGuid().ToString('N').Substring(0,8)).lock"
+    }
+    AfterAll { Remove-Item Env:GPB_CONFIG_DIR, Env:GPB_LOCK_PATH -ErrorAction SilentlyContinue }
+
+    It 'bundles only HEAD, heads, and tags — never remote-tracking refs' {
+        $repo = Join-Path $TestDrive 'refset-repo'
+        New-Item -ItemType Directory -Path $repo -Force | Out-Null
+        git -C $repo init -qb main
+        git -C $repo config user.email 't@t'; git -C $repo config user.name 't'
+        Set-Content "$repo/a.txt" 'one'; git -C $repo add .; git -C $repo commit -qm 'c1'
+        git -C $repo tag v1
+        git -C $repo update-ref refs/remotes/proton/main HEAD
+        $bd = Join-Path $TestDrive 'refset-bundles'
+        $res = Invoke-RepoBundleBackup -RepoPath $repo -BundleDir $bd -BundleBaseName 'refset-repo' -SyncCheck { param($p) $true }
+        $res.BundlePath | Should -Not -BeNullOrEmpty
+        $heads = git bundle list-heads $res.BundlePath
+        ($heads | Where-Object { $_ -match 'refs/remotes/' }) | Should -BeNullOrEmpty
+        ($heads | Where-Object { $_ -match 'refs/heads/' })   | Should -Not -BeNullOrEmpty
+        ($heads | Where-Object { $_ -match 'refs/tags/v1' })  | Should -Not -BeNullOrEmpty
+    }
+}
+
+Describe 'Invoke-RepoBundleBackup fail-closed publication' {
+    BeforeEach {
+        $env:GPB_CONFIG_DIR = Join-Path $TestDrive "gpb-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        $env:GPB_LOCK_PATH  = Join-Path $TestDrive "lk-$([guid]::NewGuid().ToString('N').Substring(0,8)).lock"
+        $script:repo = Join-Path $TestDrive "fc-repo-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        New-Item -ItemType Directory -Path $script:repo -Force | Out-Null
+        git -C $script:repo init -qb main
+        git -C $script:repo config user.email 't@t'; git -C $script:repo config user.name 't'
+        Set-Content "$script:repo/a.txt" 'one'; git -C $script:repo add .; git -C $script:repo commit -qm 'c1'
+        $script:bd = Join-Path $TestDrive "fc-bundles-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+    }
+    AfterEach { Remove-Item Env:GPB_CONFIG_DIR, Env:GPB_LOCK_PATH -ErrorAction SilentlyContinue }
+
+    It 'stamps the digest only after a successful publish' {
+        $res = Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' -SyncCheck { param($p) $true }
+        $res.State | Should -Be 'backed_up'
+        Test-Path (Join-Path $script:bd '.r.lastdigest') | Should -BeTrue
+    }
+    It 'an empty repo yields bundle_failed and no digest stamp (fail-visible)' {
+        $empty = Join-Path $TestDrive 'fc-empty'
+        New-Item -ItemType Directory -Path $empty -Force | Out-Null
+        git -C $empty init -qb main
+        git -C $empty config user.email 't@t'; git -C $empty config user.name 't'
+        $res = Invoke-RepoBundleBackup -RepoPath $empty -BundleDir $script:bd -BundleBaseName 'e' -SyncCheck { param($p) $true }
+        $res.State | Should -Be 'detected_not_backed_up'
+        @($res.Findings | Where-Object { $_.Kind -eq 'bundle_failed' }).Count | Should -BeGreaterThan 0
+        Test-Path (Join-Path $script:bd '.e.lastdigest') | Should -BeFalse
+    }
+    It 'a publish failure (target blocked) yields bundle_failed, no digest stamp, no partials left' {
+        $digest = Get-RepoRefDigest -RepoPath $script:repo
+        $d8 = $digest.Substring(0,8).ToLowerInvariant()
+        $target = Join-Path $script:bd "r-20260719T000000Z-$d8.bundle"
+        New-Item -ItemType Directory -Path $target -Force | Out-Null   # a DIRECTORY at the target path blocks Move-Item
+        $res = Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' -SyncCheck { param($p) $true } -Stamp '20260719T000000Z'
+        $res.State | Should -Be 'detected_not_backed_up'
+        @($res.Findings | Where-Object { $_.Kind -eq 'bundle_failed' -and $_.Detail -match 'publish' }).Count | Should -Be 1
+        Test-Path (Join-Path $script:bd '.r.lastdigest') | Should -BeFalse
+        @(Get-ChildItem $script:bd -Filter '*.partial').Count | Should -Be 0
+    }
+    It 'bundle filename carries the digest fragment (unique across same-second publishes)' {
+        $res = Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' -SyncCheck { param($p) $true } -Stamp '20260719T000000Z'
+        Set-Content "$script:repo/a.txt" 'two'; git -C $script:repo add .; git -C $script:repo commit -qm 'c2'
+        $res2 = Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' -SyncCheck { param($p) $true } -Stamp '20260719T000000Z'
+        $res2.BundlePath | Should -Not -Be $res.BundlePath
+        (Split-Path $res.BundlePath -Leaf) | Should -Match '^r-20260719T000000Z-[0-9a-f]{8}\.bundle$'
+    }
+    It 'cache hit requires the CURRENT digest bundle — an older retained bundle does not satisfy it' {
+        $res1 = Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' -SyncCheck { param($p) $true } -Stamp '20260719T000001Z'
+        Set-Content "$script:repo/a.txt" 'two'; git -C $script:repo add .; git -C $script:repo commit -qm 'c2'
+        $res2 = Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' -SyncCheck { param($p) $true } -Stamp '20260719T000002Z'
+        Remove-Item -LiteralPath $res2.BundlePath -Force        # current bundle gone; older $res1 bundle remains
+        $res3 = Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' -SyncCheck { param($p) $true } -Stamp '20260719T000003Z'
+        $res3.BundlePath | Should -Not -Be $res1.BundlePath      # re-created, not the stale one
+        (Split-Path $res3.BundlePath -Leaf) | Should -Match "-$((Get-RepoRefDigest -RepoPath $script:repo).Substring(0,8).ToLowerInvariant())\.bundle$"
+        $res3.State | Should -Be 'backed_up'
+    }
+    It 'prunes on a later call once the newest bundle confirms (delayed confirmation)' {
+        for ($i = 1; $i -le 7; $i++) {
+            Set-Content "$script:repo/a.txt" "v$i"; git -C $script:repo add .; git -C $script:repo commit -qm "c$i"
+            Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' `
+                -SyncCheck { param($p) $false } -Stamp ('20260719T00000' + $i + 'Z') | Out-Null
+        }
+        @(Get-ChildItem $script:bd -Filter 'r-*.bundle').Count | Should -Be 7
+        # No new commit: digest matches, nothing created — but now everything confirms → retention must fire
+        Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' `
+            -SyncCheck { param($p) $true } | Out-Null
+        @(Get-ChildItem $script:bd -Filter 'r-*.bundle').Count | Should -BeLessOrEqual 6   # keep-5 + possible monthly checkpoint
+    }
+    It 'detached HEAD defers with a visible finding (never silent)' {
+        git -C $script:repo checkout -q --detach
+        Set-Content "$script:repo/orphan.txt" 'x'; git -C $script:repo add .; git -C $script:repo commit -qm orphan
+        $res = Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' -SyncCheck { param($p) $true }
+        $res.State | Should -Be 'detected_not_backed_up'
+        (@($res.Findings) | ForEach-Object Detail) -join ' ' | Should -Match '(?i)detached'
+    }
+    It 'RetentionKeep is threaded: keep 2 prunes below the default gate' {
+        for ($i = 1; $i -le 4; $i++) {
+            Set-Content "$script:repo/a.txt" "v$i"; git -C $script:repo add .; git -C $script:repo commit -qm "c$i"
+            Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' `
+                -SyncCheck { param($p) $true } -Stamp ('20260720T00000' + $i + 'Z') -RetentionKeep 2 | Out-Null
+        }
+        @(Get-ChildItem $script:bd -Filter 'r-*.bundle').Count | Should -BeLessOrEqual 3   # keep-2 + monthly checkpoint
+    }
+}
