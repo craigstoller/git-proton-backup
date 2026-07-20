@@ -1295,7 +1295,11 @@ function Get-ProtonBackupStatus {
     }
 
     if ($Json) { return ($results.ToArray() | ConvertTo-Json -Depth 6 -AsArray) }
-    $results.ToArray()
+    # Table default: a curated, human-width column set — PowerShell's default formatter falls
+    # back to a vertical list view once an object has more than ~4 properties, which would defeat
+    # the "table by default" contract for this 10-field object. The omitted fields
+    # (PendingMarkerAgeHours, NewestBundle, LastVerifyExitCode) remain fully available via -Json.
+    $results.ToArray() | Format-Table -AutoSize RepoPath, WiringOk, CurrentBundled, ConfirmedAtLastVerify, DirtyCount, PendingMarker, LastVerifyAgeHours
 }
 
 function Install-ProtonBackupTask {
@@ -1335,7 +1339,7 @@ function Install-ProtonBackupTask {
             $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
             $trigger   = New-ScheduledTaskTrigger -Daily -At $p.At
             $action    = New-ScheduledTaskAction -Execute $p.Execute -Argument $p.Arguments
-            $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable
+            $settings  = if ($p.StartWhenAvailable) { New-ScheduledTaskSettingsSet -StartWhenAvailable } else { New-ScheduledTaskSettingsSet }
             Register-ScheduledTask -TaskName $p.TaskName -Principal $principal -Trigger $trigger -Action $action -Settings $settings -Force | Out-Null
         }
     }

@@ -346,6 +346,35 @@ Describe 'Status + scheduled task' {
         Set-Content "$script:repo/a.txt" 'two'; git -C $script:repo add .; git -C $script:repo commit -qm c2
         ((Get-ProtonBackupStatus -Json | ConvertFrom-Json))[0].CurrentBundled | Should -BeFalse
     }
+    It 'CurrentBundled: the NEWEST bundle governs, not any bundle carrying the current digest8' {
+        # Fabricate two bundles in the bundle dir directly (no real Invoke-RepoBundleBackup call):
+        # an OLDER one whose filename carries the CURRENT digest8, and a NEWER one carrying a
+        # stale digest8. The .lastdigest stamp is set to the current digest so the digest-equality
+        # half of the check passes — only the newest-bundle-carries-it half can fail here.
+        $cfg = Read-GpbConfig
+        $bd = Get-GpbBundleDir -Config $cfg -RepoPath $script:repo
+        New-Item -ItemType Directory -Path $bd -Force | Out-Null
+        $baseName = Split-Path $script:repo -Leaf
+        $digest = Get-RepoRefDigest -RepoPath $script:repo
+        $digest8 = $digest.Substring(0, 8).ToLowerInvariant()
+        $staleDigest8 = 'deadbeef'
+        Set-Content -LiteralPath (Join-Path $bd ".$baseName.lastdigest") -Value $digest -NoNewline
+
+        $older = Join-Path $bd "$baseName-20260101T000000Z-$digest8.bundle"
+        Set-Content -LiteralPath $older -Value 'x' -NoNewline
+        (Get-Item -LiteralPath $older).LastWriteTime = (Get-Date).AddDays(-2)
+
+        $newer = Join-Path $bd "$baseName-20260102T000000Z-$staleDigest8.bundle"
+        Set-Content -LiteralPath $newer -Value 'y' -NoNewline
+        (Get-Item -LiteralPath $newer).LastWriteTime = (Get-Date)
+
+        (Get-ProtonBackupStatus -Json | ConvertFrom-Json)[0].CurrentBundled | Should -BeFalse
+    }
+    It 'default output (no -Json) renders as a table, not a vertical property list' {
+        Invoke-ProtonBackupVerify -SyncCheck { param($p) $true } -CliReadyRunner { $false } | Out-Null
+        $out = Get-ProtonBackupStatus | Out-String
+        $out | Should -Match '(?m)^\s*RepoPath\s+WiringOk'
+    }
     It 'task install passes plain data: interactive logon, StartWhenAvailable, daily; -Uninstall unregisters' {
         $script:reg = $null; $script:unreg = $null
         Install-ProtonBackupTask -Register { param($p) $script:reg = $p } -Unregister { param($n) $script:unreg = $n }
