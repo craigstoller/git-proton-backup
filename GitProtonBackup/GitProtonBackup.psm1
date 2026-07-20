@@ -816,7 +816,17 @@ function Read-GpbConfigOrDefault {
     $default = Get-GpbDefaultConfig
     if (-not (Test-Path -LiteralPath $p)) { return $default }
     try { $cfg = Get-Content -LiteralPath $p -Raw | ConvertFrom-Json -ErrorAction Stop }
-    catch { return $default }
+    catch {
+        # Fail-visible, not fail-silent: an existing-but-unparseable config.json must never be
+        # silently discarded — Initialize's later locked write would otherwise overwrite it with
+        # fresh defaults, quietly losing the Repos registry. Quarantine (same pattern as
+        # Read-GpbMarker's marker quarantine) preserves the evidence and the old Repos list for
+        # manual recovery; the original is left in place (Initialize's own write replaces it).
+        Write-Warning "config.json is unreadable — quarantining it and starting fresh (your repo registry may need re-registering)"
+        $quarantine = "$p.$([guid]::NewGuid().ToString('N').Substring(0,6)).bad"
+        Copy-Item -LiteralPath $p -Destination $quarantine -Force -ErrorAction SilentlyContinue
+        return $default
+    }
     foreach ($k in $default.PSObject.Properties.Name) {
         if (-not $cfg.PSObject.Properties[$k]) { $cfg | Add-Member -NotePropertyName $k -NotePropertyValue $default.$k -Force }
     }
@@ -907,10 +917,11 @@ function Initialize-ProtonBackup {
     }
 
     # --- Backup subdir + write probe (fatal — the sync folder must be genuinely writable) ---
-    # Peeked (not locked) purely to learn the subdir NAME for a re-run; the authoritative
-    # read-modify-write of the config happens under the lock further down.
-    $peeked = Read-GpbConfigOrDefault
-    $backupSubdir = if ($peeked.BackupSubdir) { $peeked.BackupSubdir } else { (Get-GpbDefaultConfig).BackupSubdir }
+    # Single tolerant read for the whole call: reused below (under the lock) for the modify-write,
+    # rather than re-read a second time — Read-GpbConfigOrDefault quarantines an unparseable
+    # config.json as a side effect, and reading twice would quarantine it twice.
+    $cfg = Read-GpbConfigOrDefault
+    $backupSubdir = if ($cfg.BackupSubdir) { $cfg.BackupSubdir } else { (Get-GpbDefaultConfig).BackupSubdir }
     $backupDir = Join-Path $ProtonDriveRoot $backupSubdir
     if (-not (Test-Path -LiteralPath $backupDir)) { New-Item -ItemType Directory -Path $backupDir -Force | Out-Null }
 
@@ -939,12 +950,12 @@ function Initialize-ProtonBackup {
         }
     }
 
-    # --- Config: read-modify-write UNDER the lock; preserves everything not touched here
+    # --- Config: modify-write UNDER the lock (the read above is reused, not repeated, to avoid
+    #     double-quarantining an unparseable config.json); preserves everything not touched here
     #     (Repos, retention/verify settings, an existing ProtonCli the user set via Set-...). ---
     $lock = Wait-GpbLock -TimeoutSeconds 15
     if (-not $lock) { throw 'Another GitProtonBackup operation holds the lock — retry shortly.' }
     try {
-        $cfg = Read-GpbConfigOrDefault
         $cfg.ProtonDriveRoot = $ProtonDriveRoot
         $cfg.BackupSubdir    = $backupSubdir
         if ($PSBoundParameters.ContainsKey('ProtonCli')) { $cfg.ProtonCli = $ProtonCli }

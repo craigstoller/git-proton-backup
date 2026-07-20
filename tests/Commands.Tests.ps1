@@ -201,4 +201,11 @@ Describe 'Initialize + Config' {
         }
         (Read-GpbConfig).ProtonDriveRoot | Should -Match ([regex]::Escape('\My files') + '$')
     }
+    It 'corrupt config is quarantined, warned about, and re-initialized' {
+        Set-Content -LiteralPath (Get-GpbConfigPath) -Value '{broken' -NoNewline
+        Initialize-ProtonBackup -ProtonDriveRoot $script:drive -AuthProbe { 0 } -InfoProbe { 0 } -WarningVariable wv -WarningAction SilentlyContinue | Out-Null
+        (@($wv) -join "`n") | Should -Match '(?i)quarantin'
+        @(Get-ChildItem -LiteralPath (Split-Path (Get-GpbConfigPath) -Parent) -Filter 'config.json.*.bad').Count | Should -Be 1
+        (Read-GpbConfig).ProtonDriveRoot | Should -Be $script:drive
+    }
 }
