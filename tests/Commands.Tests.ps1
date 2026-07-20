@@ -208,4 +208,22 @@ Describe 'Initialize + Config' {
         @(Get-ChildItem -LiteralPath (Split-Path (Get-GpbConfigPath) -Parent) -Filter 'config.json.*.bad').Count | Should -Be 1
         (Read-GpbConfig).ProtonDriveRoot | Should -Be $script:drive
     }
+    It 're-init preserves a customized BackupSubdir and probes it' {
+        $script:writeProbeCalls = 0
+        $wp = {
+            param($dir)
+            $script:writeProbeCalls++
+            $f = Join-Path $dir '.gpb-probe'
+            Set-Content -LiteralPath $f -Value 'x' -NoNewline -ErrorAction Stop
+            Remove-Item -LiteralPath $f -Force -ErrorAction Stop
+        }
+        Initialize-ProtonBackup -ProtonDriveRoot $script:drive -AuthProbe { 0 } -InfoProbe { 0 } -WriteProbe $wp | Out-Null
+        Set-ProtonBackupConfig -Key BackupSubdir -Value 'MyBundles'
+        Initialize-ProtonBackup -ProtonDriveRoot $script:drive -AuthProbe { 0 } -InfoProbe { 0 } -WriteProbe $wp | Out-Null
+        (Read-GpbConfig).BackupSubdir | Should -Be 'MyBundles'
+        Test-Path (Join-Path $script:drive 'MyBundles') | Should -BeTrue
+        # 1st Initialize (default dir) + 2nd Initialize's pre-lock default-dir probe + 2nd
+        # Initialize's under-lock re-probe of the preserved custom subdir = 3 invocations.
+        $script:writeProbeCalls | Should -Be 3
+    }
 }

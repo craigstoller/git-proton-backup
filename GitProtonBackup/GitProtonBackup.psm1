@@ -933,8 +933,9 @@ function Initialize-ProtonBackup {
 
     # --- Backup subdir + write probe (fatal — the sync folder must be genuinely writable) ---
     # No config read here (see the function-level design note) — uses the DEFAULT subdir name.
-    # The name probed here is exactly what gets recorded in config below, so what was validated
-    # writable is always what future push flows actually use.
+    # This is what gets recorded when there's no pre-existing customization; if a customized
+    # BackupSubdir is preserved below (under the lock), that folder gets its OWN re-probe there —
+    # so either way, whatever ends up recorded in config was actually validated writable.
     $backupSubdir = (Get-GpbDefaultConfig).BackupSubdir
     $backupDir = Join-Path $ProtonDriveRoot $backupSubdir
     if (-not (Test-Path -LiteralPath $backupDir)) { New-Item -ItemType Directory -Path $backupDir -Force | Out-Null }
@@ -966,13 +967,31 @@ function Initialize-ProtonBackup {
 
     # --- Config: single tolerant read-modify-write, ALL under the lock — the only config access
     #     in this whole function. Preserves everything not touched here (Repos, retention/verify
-    #     settings, an existing ProtonCli the user set via Set-...). ---
+    #     settings, an existing ProtonCli the user set via Set-...) — INCLUDING a previously
+    #     customized BackupSubdir: silently resetting it back to the default would silently move
+    #     where future bundles land, which this project treats as an unacceptable silent behavior
+    #     change. When the preserved value differs from the default folder already probed above,
+    #     re-probe THAT folder here instead (filesystem-only — mkdir + write/delete a probe file —
+    #     so it's fine to do under the lock; the CLI info probe is NOT re-run for it, since it's
+    #     warning-only and the default path already exercised it above). ---
     $lock = Wait-GpbLock -TimeoutSeconds 15
     if (-not $lock) { throw 'Another GitProtonBackup operation holds the lock — retry shortly.' }
     try {
         $cfg = Read-GpbConfigOrDefault
         $cfg.ProtonDriveRoot = $ProtonDriveRoot
-        $cfg.BackupSubdir    = $backupSubdir
+        if ($cfg.BackupSubdir -and $cfg.BackupSubdir -ne $backupSubdir) {
+            $customDir = Join-Path $ProtonDriveRoot $cfg.BackupSubdir
+            if (-not (Test-Path -LiteralPath $customDir)) { New-Item -ItemType Directory -Path $customDir -Force | Out-Null }
+            if ($WriteProbe) {
+                & $WriteProbe $customDir
+            } else {
+                $probeFile2 = Join-Path $customDir '.gpb-probe'
+                Set-Content -LiteralPath $probeFile2 -Value 'gpb-write-probe' -NoNewline -ErrorAction Stop
+                Remove-Item -LiteralPath $probeFile2 -Force -ErrorAction Stop
+            }
+        } else {
+            $cfg.BackupSubdir = $backupSubdir
+        }
         if ($PSBoundParameters.ContainsKey('ProtonCli')) { $cfg.ProtonCli = $ProtonCli }
         Write-GpbConfig -Config $cfg
     } finally { $lock.Close(); Remove-Item -LiteralPath (Get-GpbLockPath) -Force -ErrorAction SilentlyContinue }
