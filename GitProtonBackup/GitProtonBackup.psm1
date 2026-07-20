@@ -802,3 +802,220 @@ function Repair-ProtonBackup {
     [CmdletBinding()] param([Parameter(Mandatory)][string]$RepoPath)
     Install-ProtonBackup -RepoPath $RepoPath
 }
+
+# --- Public commands: Initialize + config get/set ----------------------------
+
+function Read-GpbConfigOrDefault {
+    # Tolerant variant of Read-GpbConfig for Initialize: unlike Read-GpbConfig, this must succeed
+    # even when no config exists yet, AND even when an existing config's ProtonDriveRoot no longer
+    # exists on disk (re-running Initialize to point at a NEW location — e.g. a moved Proton Drive
+    # folder or a fresh machine — is exactly the scenario this guards). Never throws; missing
+    # fields fall back to Get-GpbDefaultConfig's values (same field-completion Read-GpbConfig does).
+    [CmdletBinding()] param()
+    $p = Get-GpbConfigPath
+    $default = Get-GpbDefaultConfig
+    if (-not (Test-Path -LiteralPath $p)) { return $default }
+    try { $cfg = Get-Content -LiteralPath $p -Raw | ConvertFrom-Json -ErrorAction Stop }
+    catch { return $default }
+    foreach ($k in $default.PSObject.Properties.Name) {
+        if (-not $cfg.PSObject.Properties[$k]) { $cfg | Add-Member -NotePropertyName $k -NotePropertyValue $default.$k -Force }
+    }
+    $cfg
+}
+
+function Find-GpbSyncRoot {
+    # Discovery per spec: $env:USERPROFILE\Proton Drive, plus its one-level subdirectories,
+    # searched for a 'My files' child — that's the actual local folder that mirrors cloud
+    # '/my-files' (Proton Drive's desktop client lays out sync roots as
+    # "Proton Drive\<account>\My files"), so IT (not its parent) is what ProtonDriveRoot must be
+    # for Get-CloudBundlePath's mapping and for BackupSubdir to actually land inside the synced
+    # tree. The deepest hit wins (a subdirectory's 'My files' beats the top level's, on the rare
+    # chance both exist). When the base folder exists but no 'My files' is found anywhere, degrade
+    # to the base folder itself — caller warns that cloud-path verification may be degraded.
+    # Returns $null when nothing is discoverable at all.
+    [CmdletBinding()] param()
+    $base = Join-Path $env:USERPROFILE 'Proton Drive'
+    if (-not (Test-Path -LiteralPath $base -PathType Container)) { return $null }
+
+    $hits = New-Object System.Collections.Generic.List[object]
+    $topMyFiles = Join-Path $base 'My files'
+    if (Test-Path -LiteralPath $topMyFiles -PathType Container) {
+        $hits.Add([pscustomobject]@{ Path = $topMyFiles; Depth = 0 })
+    }
+    foreach ($d in @(Get-ChildItem -LiteralPath $base -Directory -ErrorAction SilentlyContinue)) {
+        $sub = Join-Path $d.FullName 'My files'
+        if (Test-Path -LiteralPath $sub -PathType Container) {
+            $hits.Add([pscustomobject]@{ Path = $sub; Depth = 1 })
+        }
+    }
+    if ($hits.Count -gt 0) {
+        $deepest = ($hits | Sort-Object Depth -Descending | Select-Object -First 1).Path
+        return [pscustomobject]@{ Root = $deepest; Degraded = $false }
+    }
+    [pscustomobject]@{ Root = $base; Degraded = $true }
+}
+
+function Initialize-ProtonBackup {
+    # Guided first-run: discover/accept the Proton Drive sync folder, resolve the CLI (never
+    # fatal if it's missing or unauthenticated — that's a degraded mode, not a blocker), prove the
+    # sync folder is actually writable (fatal — without that, nothing this tool does will work),
+    # and write config while preserving anything already registered (Repos, prior customizations).
+    [CmdletBinding()]
+    param(
+        [string]$ProtonDriveRoot,
+        [string]$ProtonCli,
+        [scriptblock]$AuthProbe,
+        [scriptblock]$WriteProbe
+    )
+
+    if (-not $ProtonDriveRoot) {
+        $found = Find-GpbSyncRoot
+        if (-not $found) {
+            throw "No Proton Drive sync folder found under '$(Join-Path $env:USERPROFILE 'Proton Drive')' — pass -ProtonDriveRoot explicitly."
+        }
+        $ProtonDriveRoot = $found.Root
+        if ($found.Degraded) {
+            Write-Warning "Proton Drive folder found, but no 'My files' subfolder was located under it — cloud-path verification may be degraded until the sync app finishes its first sync."
+        }
+    }
+    if (-not (Test-Path -LiteralPath $ProtonDriveRoot -PathType Container)) {
+        throw "ProtonDriveRoot '$ProtonDriveRoot' does not exist."
+    }
+    $ProtonDriveRoot = (Resolve-Path -LiteralPath $ProtonDriveRoot).Path
+
+    # --- CLI resolution: absent is a warning, never fatal ---
+    $cliArg  = if ($PSBoundParameters.ContainsKey('ProtonCli')) { $ProtonCli } else { 'proton-drive' }
+    $cliPath = $cliArg
+    if ($cliPath -and -not [System.IO.Path]::IsPathRooted($cliPath)) {
+        $cmd = Get-Command -Name $cliPath -ErrorAction SilentlyContinue
+        if ($cmd) { $cliPath = $cmd.Source }
+    }
+    $cliResolved = [bool]$cliPath -and (Test-Path -LiteralPath $cliPath -ErrorAction SilentlyContinue)
+    $cliReady = $false
+
+    if (-not $cliResolved) {
+        Write-Warning "Proton Drive CLI not found (looked for '$cliArg') — sign-in and cloud-upload verification will be skipped until it's installed and on PATH."
+    } else {
+        $probe = if ($PSBoundParameters.ContainsKey('AuthProbe')) { $AuthProbe } else { { param($cli) & $cli filesystem list '/my-files' 2>&1 | Out-Null; $LASTEXITCODE } }
+        $authResult = & $probe $cliPath
+        if ($authResult -ne 0) {
+            Write-Warning 'CLI present but not signed in'
+        } else {
+            $cliReady = $true
+        }
+    }
+
+    # --- Backup subdir + write probe (fatal — the sync folder must be genuinely writable) ---
+    # Peeked (not locked) purely to learn the subdir NAME for a re-run; the authoritative
+    # read-modify-write of the config happens under the lock further down.
+    $peeked = Read-GpbConfigOrDefault
+    $backupSubdir = if ($peeked.BackupSubdir) { $peeked.BackupSubdir } else { (Get-GpbDefaultConfig).BackupSubdir }
+    $backupDir = Join-Path $ProtonDriveRoot $backupSubdir
+    if (-not (Test-Path -LiteralPath $backupDir)) { New-Item -ItemType Directory -Path $backupDir -Force | Out-Null }
+
+    if ($WriteProbe) {
+        & $WriteProbe $backupDir
+    } else {
+        $probeFile = Join-Path $backupDir '.gpb-probe'
+        Set-Content -LiteralPath $probeFile -Value 'gpb-write-probe' -NoNewline -ErrorAction Stop
+        Remove-Item -LiteralPath $probeFile -Force -ErrorAction Stop
+    }
+
+    # --- Cloud info probe: only when the CLI is ready, and never fatal either way — the sync
+    #     app simply may not have uploaded the freshly-created folder yet. ---
+    if ($cliReady) {
+        try {
+            $cloudPath = Get-CloudBundlePath -LocalPath $backupDir -DriveLocalRoot $ProtonDriveRoot
+            & $cliPath filesystem info $cloudPath 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning 'cloud path not yet visible — the sync app may not have uploaded it yet'
+            }
+        } catch {
+            Write-Warning 'cloud path not yet visible — the sync app may not have uploaded it yet'
+        }
+    }
+
+    # --- Config: read-modify-write UNDER the lock; preserves everything not touched here
+    #     (Repos, retention/verify settings, an existing ProtonCli the user set via Set-...). ---
+    $lock = Wait-GpbLock -TimeoutSeconds 15
+    if (-not $lock) { throw 'Another GitProtonBackup operation holds the lock — retry shortly.' }
+    try {
+        $cfg = Read-GpbConfigOrDefault
+        $cfg.ProtonDriveRoot = $ProtonDriveRoot
+        $cfg.BackupSubdir    = $backupSubdir
+        if ($PSBoundParameters.ContainsKey('ProtonCli')) { $cfg.ProtonCli = $ProtonCli }
+        Write-GpbConfig -Config $cfg
+    } finally { $lock.Close(); Remove-Item -LiteralPath (Get-GpbLockPath) -Force -ErrorAction SilentlyContinue }
+
+    Write-Host 'Note: git push proton backs up COMMITTED work only — uncommitted changes are never included.'
+}
+
+function Get-ProtonBackupConfig {
+    [CmdletBinding()] param()
+    Read-GpbConfig
+}
+
+function Set-ProtonBackupConfig {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Key,
+        [Parameter(Mandatory)][object]$Value
+    )
+    $default = Get-GpbDefaultConfig
+    if ($default.PSObject.Properties.Name -notcontains $Key) {
+        throw "Set-ProtonBackupConfig: unknown config key '$Key'."
+    }
+
+    switch ($Key) {
+        'ProtonDriveRoot' {
+            if (-not (Test-Path -LiteralPath $Value -PathType Container)) {
+                throw "Set-ProtonBackupConfig: ProtonDriveRoot '$Value' does not exist."
+            }
+        }
+        'BackupSubdir' {
+            # Containment: the resolved join must remain UNDER the CURRENT ProtonDriveRoot —
+            # rejects '..\' escapes that would write backups outside the Proton Drive sync tree.
+            $cfgNow  = Read-GpbConfig
+            $root    = ([System.IO.Path]::GetFullPath($cfgNow.ProtonDriveRoot)).TrimEnd('\', '/')
+            $full    = [System.IO.Path]::GetFullPath((Join-Path $cfgNow.ProtonDriveRoot $Value))
+            $isUnder = $full.Equals($root, [System.StringComparison]::OrdinalIgnoreCase) -or
+                       $full.StartsWith("$root\", [System.StringComparison]::OrdinalIgnoreCase) -or
+                       $full.StartsWith("$root/", [System.StringComparison]::OrdinalIgnoreCase)
+            if (-not $isUnder) {
+                throw "Set-ProtonBackupConfig: BackupSubdir '$Value' must resolve to a path under ProtonDriveRoot ('$($cfgNow.ProtonDriveRoot)')."
+            }
+        }
+        'ProtonCli' {
+            if ($Value) {
+                $resolved = [string]$Value
+                if (-not [System.IO.Path]::IsPathRooted($resolved)) {
+                    $cmd = Get-Command -Name $resolved -ErrorAction SilentlyContinue
+                    if ($cmd) { $resolved = $cmd.Source }
+                }
+                if (-not (Test-Path -LiteralPath $resolved)) {
+                    throw "Set-ProtonBackupConfig: ProtonCli '$Value' does not resolve to an executable."
+                }
+            }
+        }
+        { $_ -in 'VerifySeconds', 'RetentionKeep', 'RetentionCheckpoints', 'MaxUnconfirmedAgeDays' } {
+            $n = 0
+            if (-not [int]::TryParse([string]$Value, [ref]$n) -or $n -le 0) {
+                throw "Set-ProtonBackupConfig: $Key must be a positive integer."
+            }
+            $Value = $n
+        }
+        'HeartbeatUrl' {
+            if ($Value -ne '' -and -not ([string]$Value).StartsWith('http')) {
+                throw "Set-ProtonBackupConfig: HeartbeatUrl must be '' or start with 'http'."
+            }
+        }
+    }
+
+    $lock = Wait-GpbLock -TimeoutSeconds 15
+    if (-not $lock) { throw 'Another GitProtonBackup operation holds the lock — retry shortly.' }
+    try {
+        $cfg = Read-GpbConfig
+        $cfg.$Key = $Value
+        Write-GpbConfig -Config $cfg
+    } finally { $lock.Close(); Remove-Item -LiteralPath (Get-GpbLockPath) -Force -ErrorAction SilentlyContinue }
+}

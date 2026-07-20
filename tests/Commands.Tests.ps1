@@ -131,3 +131,58 @@ Describe 'Install/Uninstall/Repair' {
             Where-Object { (Read-GpbMarker -File $_)?.Reason -eq 'deferred_lock' }).Count | Should -Be 0
     }
 }
+
+Describe 'Initialize + Config' {
+    BeforeEach {
+        $env:GPB_CONFIG_DIR = Join-Path $TestDrive "init-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        $env:GPB_LOCK_PATH  = Join-Path $TestDrive "init-lk-$([guid]::NewGuid().ToString('N').Substring(0,8)).lock"
+        $script:drive = Join-Path $TestDrive "pd-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        New-Item -ItemType Directory $script:drive -Force | Out-Null
+    }
+    AfterEach { Remove-Item Env:GPB_CONFIG_DIR, Env:GPB_LOCK_PATH -ErrorAction SilentlyContinue }
+
+    It 'initialize writes a valid config and creates the backup subdir' {
+        $out = Initialize-ProtonBackup -ProtonDriveRoot $script:drive -AuthProbe { 0 } 6>&1
+        ($out -join "`n") | Should -Match 'COMMITTED work only'
+        (Read-GpbConfig).ProtonDriveRoot | Should -Be $script:drive
+        Test-Path (Join-Path $script:drive 'GitBackups') | Should -BeTrue
+    }
+    It 'initialize preserves the registry on re-run' {
+        Initialize-ProtonBackup -ProtonDriveRoot $script:drive -AuthProbe { 0 } | Out-Null
+        $cfg = Read-GpbConfig; $cfg.Repos = @('C:\P\x'); Write-GpbConfig -Config $cfg
+        Initialize-ProtonBackup -ProtonDriveRoot $script:drive -AuthProbe { 0 } | Out-Null
+        @((Read-GpbConfig).Repos) | Should -Contain 'C:\P\x'
+    }
+    It 'initialize warns (not throws) when the CLI is absent or unauthenticated' {
+        $out = Initialize-ProtonBackup -ProtonDriveRoot $script:drive -ProtonCli 'no-such-cli-anywhere' -WarningVariable wv -WarningAction SilentlyContinue
+        (@($wv) -join "`n") | Should -Match '(?i)cli'
+        (Read-GpbConfig).ProtonDriveRoot | Should -Be $script:drive
+    }
+    It 'initialize without a discoverable root throws asking for the parameter' {
+        # The real %USERPROFILE%\Proton Drive exists on the dev machine (it does not on CI
+        # runners) — point discovery at an empty $TestDrive for the scope of this test only.
+        $priorUserProfile = $env:USERPROFILE
+        $env:USERPROFILE = $TestDrive
+        try {
+            { Initialize-ProtonBackup } | Should -Throw '*-ProtonDriveRoot*'
+        } finally {
+            $env:USERPROFILE = $priorUserProfile
+        }
+    }
+    It 'Set-ProtonBackupConfig validates values' {
+        Initialize-ProtonBackup -ProtonDriveRoot $script:drive -AuthProbe { 0 } | Out-Null
+        { Set-ProtonBackupConfig -Key ProtonDriveRoot -Value 'C:\no\such' } | Should -Throw
+        { Set-ProtonBackupConfig -Key VerifySeconds -Value -5 } | Should -Throw
+        Set-ProtonBackupConfig -Key HeartbeatUrl -Value 'https://hc-ping.com/abc'
+        (Get-ProtonBackupConfig).HeartbeatUrl | Should -Be 'https://hc-ping.com/abc'
+    }
+    It 'BackupSubdir containment: a ..\ escape is rejected' {
+        Initialize-ProtonBackup -ProtonDriveRoot $script:drive -AuthProbe { 0 } | Out-Null
+        { Set-ProtonBackupConfig -Key BackupSubdir -Value '..\outside' } | Should -Throw '*under*'
+    }
+    It 'initialize write-probe fails loud on an unwritable sync folder' {
+        $ro = Join-Path $TestDrive 'ro-drive'; New-Item -ItemType Directory $ro -Force | Out-Null
+        # Simulate unwritability via an injected probe failure rather than real ACLs (CI-safe):
+        { Initialize-ProtonBackup -ProtonDriveRoot $ro -AuthProbe { 0 } -WriteProbe { throw 'denied' } } | Should -Throw '*denied*'
+    }
+}
