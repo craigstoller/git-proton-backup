@@ -715,3 +715,54 @@ function Invoke-ProtonBackupHook {
         Write-Host "backup hook error: $($_.Exception.Message) — run Invoke-ProtonBackupVerify (or the scheduled task) to confirm"
     }
 }
+
+# --- Public commands: Install / Uninstall / Repair ---------------------------
+
+function Install-ProtonBackup {
+    [CmdletBinding()] param([Parameter(Mandatory)][string]$RepoPath, [switch]$SetUpstream, [switch]$Force)
+    $cfg = Read-GpbConfig
+    $RepoPath = (Resolve-Path -LiteralPath $RepoPath -ErrorAction Stop).Path   # canonical identity everywhere
+    git -C $RepoPath rev-parse --git-dir *> $null
+    if ($LASTEXITCODE -ne 0) { throw "'$RepoPath' is not a git repository." }
+    $shallow = git -C $RepoPath rev-parse --is-shallow-repository
+    if ($LASTEXITCODE -ne 0) { throw "'$RepoPath': git failed while probing repository shape." }
+    if ($shallow -eq 'true') {
+        throw "'$RepoPath' is a shallow clone — git bundles from shallow repos are unreliable. Unshallow it first (git fetch --unshallow)."
+    }
+    foreach ($h in @(Test-RepoHazard -RepoPath $RepoPath)) {
+        Write-Warning ("restore-coverage hazard '{0}': bundles won't include {1} — see the Limits section of the docs." -f $h,
+            $(switch ($h) { 'git-lfs' { 'LFS objects (pointer files only)' } 'submodules' { 'submodule repos (wire each separately)' } default { 'externally-stored state' } }))
+    }
+    # Mirror wiring runs OUTSIDE the global lock: the initial push fires the hook, whose flow
+    # takes the same lock for its bundle step — holding it here would self-contend (15s stall +
+    # a spurious deferred_lock marker on every real install; review finding).
+    Install-GpbMirror -RepoPath $RepoPath -SetUpstream:$SetUpstream -Force:$Force | Out-Null
+    $lock = Wait-GpbLock -TimeoutSeconds 15
+    if (-not $lock) { throw 'Another GitProtonBackup operation holds the lock — the mirror is wired; re-run to finish registering.' }
+    try {
+        $cfg = Read-GpbConfig
+        if (@($cfg.Repos) -notcontains $RepoPath) { $cfg.Repos = @($cfg.Repos) + $RepoPath; Write-GpbConfig -Config $cfg }
+    } finally { $lock.Close(); Remove-Item (Get-GpbLockPath) -Force -ErrorAction SilentlyContinue }
+    Write-Host "Wired. Back up with: git push proton   (status: Get-ProtonBackupStatus)"
+}
+
+function Uninstall-ProtonBackup {
+    [CmdletBinding()] param([Parameter(Mandatory)][string]$RepoPath)
+    $lock = Wait-GpbLock -TimeoutSeconds 15
+    if (-not $lock) { throw 'Another GitProtonBackup operation holds the lock — retry shortly.' }
+    try {
+        Remove-GpbMirror -RepoPath $RepoPath
+        Remove-PushPendingMarker -RepoPath $RepoPath
+        $full = (Resolve-Path -LiteralPath $RepoPath -ErrorAction SilentlyContinue)?.Path
+        if (-not $full) { $full = $RepoPath }
+        $cfg = Read-GpbConfig
+        $cfg.Repos = @(@($cfg.Repos) | Where-Object { $_ -ne $full })
+        Write-GpbConfig -Config $cfg
+    } finally { $lock.Close(); Remove-Item (Get-GpbLockPath) -Force -ErrorAction SilentlyContinue }
+    Write-Host 'Unwired. Existing bundles on Proton Drive were left in place.'
+}
+
+function Repair-ProtonBackup {
+    [CmdletBinding()] param([Parameter(Mandatory)][string]$RepoPath)
+    Install-ProtonBackup -RepoPath $RepoPath
+}
