@@ -227,3 +227,82 @@ Describe 'Initialize + Config' {
         $script:writeProbeCalls | Should -Be 3
     }
 }
+
+Describe 'Invoke-ProtonBackupVerify (reconciliation)' {
+    BeforeEach { $script:drive = New-Sandbox; $script:repo = New-TestRepo; Install-ProtonBackup -RepoPath $script:repo }
+    AfterEach  { Clear-Sandbox }
+
+    It 'broken-hook case: stale coverage is re-cut with NO marker present' {
+        # New commit; hook disabled (sandbox), so no bundle covers c2 and no marker exists.
+        Set-Content "$script:repo/a.txt" 'two'; git -C $script:repo add .; git -C $script:repo commit -qm c2
+        $r = Invoke-ProtonBackupVerify -SyncCheck { param($p) $true } -CliReadyRunner { $false }
+        $r.ExitCode | Should -Be 0
+        $bd = Get-GpbBundleDir -Config (Read-GpbConfig) -RepoPath $script:repo
+        # The CURRENT digest must be covered — a bundle merely existing is not enough
+        # (review finding: an install-time bundle would false-pass a weaker assertion).
+        $digest8 = (Get-RepoRefDigest -RepoPath $script:repo).Substring(0,8).ToLowerInvariant()
+        $newest = Get-ChildItem $bd -Filter '*.bundle' | Sort-Object LastWriteTime | Select-Object -Last 1
+        $newest.Name | Should -Match "-$digest8\.bundle$"
+        (Get-Content (Join-Path (Get-GpbRoot) 'last-verify.json') -Raw | ConvertFrom-Json).ExitCode | Should -Be 0
+    }
+    It 'config failure (exit 2) still writes the report and pings /fail' {
+        Set-ProtonBackupConfig -Key HeartbeatUrl -Value 'https://hc.example/uuid'
+        $cfgRaw = Get-Content (Get-GpbConfigPath) -Raw | ConvertFrom-Json
+        $cfgRaw.ProtonDriveRoot = 'C:\no\such\dir'
+        Write-GpbJsonAtomic -Path (Get-GpbConfigPath) -Object $cfgRaw   # invalid root, parseable JSON
+        $script:pinged = @()
+        $r = Invoke-ProtonBackupVerify -WebRunner { param($u) $script:pinged += $u } -WarningAction SilentlyContinue
+        $r.ExitCode | Should -Be 2
+        (Get-Content (Join-Path (Get-GpbRoot) 'last-verify.json') -Raw | ConvertFrom-Json).ExitCode | Should -Be 2
+        $script:pinged[-1] | Should -Be 'https://hc.example/uuid/fail'
+    }
+    It 'unconfirmed newest bundle → exit 1 + finding; marker kept' {
+        Write-PushPendingMarker -RepoPath $script:repo -Reason verify_timeout `
+            -BundleDir (Get-GpbBundleDir -Config (Read-GpbConfig) -RepoPath $script:repo) -BundleBaseName (Split-Path $script:repo -Leaf)
+        $r = Invoke-ProtonBackupVerify -SyncCheck { param($p) $false } -CliReadyRunner { $false }
+        $r.ExitCode | Should -Be 1
+        @(Get-ChildItem (Get-GpbMarkerDir) -Filter '*.json').Count | Should -Be 1
+    }
+    It 'confirmed + digest-current clears the marker' {
+        git -C $script:repo push proton 2>&1 | Out-Null   # hook disabled: refs move, no bundle
+        Invoke-ProtonBackupVerify -SyncCheck { param($p) $true } -CliReadyRunner { $false } | Out-Null   # reconciles + confirms
+        Write-PushPendingMarker -RepoPath $script:repo -Reason verify_timeout `
+            -BundleDir (Get-GpbBundleDir -Config (Read-GpbConfig) -RepoPath $script:repo) -BundleBaseName (Split-Path $script:repo -Leaf)
+        $r = Invoke-ProtonBackupVerify -SyncCheck { param($p) $true } -CliReadyRunner { $false }
+        $r.ExitCode | Should -Be 0
+        @(Get-ChildItem (Get-GpbMarkerDir) -Filter '*.json').Count | Should -Be 0
+    }
+    It 'orphaned marker (repo gone + not registered) is evicted with a finding' {
+        $gone = New-TestRepo
+        Write-PushPendingMarker -RepoPath $gone -Reason cli_unready -BundleDir 'C:\B' -BundleBaseName 'g'
+        Remove-Item $gone -Recurse -Force
+        $r = Invoke-ProtonBackupVerify -SyncCheck { param($p) $true } -CliReadyRunner { $false }
+        ($r.Findings -join "`n") | Should -Match '(?i)evicted|orphan'
+        @(Get-ChildItem (Get-GpbMarkerDir) -Filter '*.json').Count | Should -Be 0
+    }
+    It 'heartbeat: success pings url, attention pings url/fail, network failure never alters exit code' {
+        Set-ProtonBackupConfig -Key HeartbeatUrl -Value 'https://hc.example/uuid'
+        $script:pinged = @()
+        Invoke-ProtonBackupVerify -SyncCheck { param($p) $true } -CliReadyRunner { $false } -WebRunner { param($u) $script:pinged += $u } | Out-Null
+        $script:pinged[-1] | Should -Be 'https://hc.example/uuid'
+        Write-PushPendingMarker -RepoPath $script:repo -Reason auth_error `
+            -BundleDir (Get-GpbBundleDir -Config (Read-GpbConfig) -RepoPath $script:repo) -BundleBaseName (Split-Path $script:repo -Leaf)
+        Set-Content "$script:repo/a.txt" 'x'; git -C $script:repo add .; git -C $script:repo commit -qm cX
+        $r = Invoke-ProtonBackupVerify -SyncCheck { param($p) $false } -CliReadyRunner { $false } -WebRunner { param($u) $script:pinged += $u }
+        $script:pinged[-1] | Should -Be 'https://hc.example/uuid/fail'
+        $r2 = Invoke-ProtonBackupVerify -SyncCheck { param($p) $false } -CliReadyRunner { $false } -WebRunner { param($u) throw 'net down' } -WarningAction SilentlyContinue
+        $r2.ExitCode | Should -Be $r.ExitCode
+    }
+    It 'no heartbeat configured → no web call' {
+        $script:pinged = @()
+        Invoke-ProtonBackupVerify -SyncCheck { param($p) $true } -CliReadyRunner { $false } -WebRunner { param($u) $script:pinged += $u } | Out-Null
+        @($script:pinged).Count | Should -Be 0
+    }
+    It 'spool guard: old unconfirmed bundle raises an age finding' {
+        Invoke-ProtonBackupVerify -SyncCheck { param($p) $false } -CliReadyRunner { $false } | Out-Null
+        $bd = Get-GpbBundleDir -Config (Read-GpbConfig) -RepoPath $script:repo
+        Get-ChildItem $bd -Filter '*.bundle' | ForEach-Object { $_.LastWriteTime = (Get-Date).AddDays(-10) }
+        $r = Invoke-ProtonBackupVerify -SyncCheck { param($p) $false } -CliReadyRunner { $false }
+        ($r.Findings -join "`n") | Should -Match '(?i)unconfirmed for'
+    }
+}

@@ -999,6 +999,128 @@ function Initialize-ProtonBackup {
     Write-Host 'Note: git push proton backs up COMMITTED work only — uncommitted changes are never included.'
 }
 
+function Invoke-ProtonBackupVerify {
+    # The reconciliation backstop (spec: docs/design.md — dead-man's-switch). Runs on a schedule
+    # (or on demand) independent of any push: re-derives the actual digest per registered repo and
+    # re-cuts a bundle whenever coverage is stale — this is what heals a broken/uninstalled hook,
+    # not just what clears a marker. Every exit path (config failure, lock contention, or normal
+    # completion) writes the durable last-verify.json + verify.log AND best-effort pings the
+    # heartbeat URL — the whole point of a dead-man's switch is that it never goes silent.
+    [CmdletBinding()]
+    param([scriptblock]$SyncCheck, [scriptblock]$InfoRunner, [scriptblock]$CliReadyRunner, [scriptblock]$WebRunner)
+    $findings = [System.Collections.Generic.List[string]]@()
+    $repoResults = [System.Collections.Generic.List[object]]@()
+    $exit = 0
+    try { $cfg = Read-GpbConfig } catch {
+        # Hard config failure: STILL write the durable report and best-effort /fail heartbeat
+        # (review finding: silence on exit 2 defeats the dead-man's switch's purpose).
+        Write-Warning $_.Exception.Message
+        $report = [pscustomobject]@{ Timestamp = (Get-Date).ToUniversalTime().ToString('o'); ExitCode = 2; Repos = @(); Error = $_.Exception.Message }
+        Write-GpbJsonAtomic -Path (Join-Path (Get-GpbRoot) 'last-verify.json') -Object $report
+        Add-Content -LiteralPath (Join-Path (Get-GpbRoot) 'verify.log') -Value "$($report.Timestamp) exit=2 config-error"
+        $rawHb = try { (Get-Content (Get-GpbConfigPath) -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop).HeartbeatUrl } catch { $null }
+        if ($rawHb) {
+            $runner = if ($WebRunner) { $WebRunner } else { { param($u) Invoke-RestMethod -Uri $u -Method Get -TimeoutSec 10 | Out-Null } }
+            try { & $runner "$rawHb/fail" } catch { Write-Warning "heartbeat ping failed: $($_.Exception.Message)" }
+        }
+        return [pscustomobject]@{ ExitCode = 2; Findings = @($_.Exception.Message) }
+    }
+
+    $lock = Wait-GpbLock -TimeoutSeconds 30
+    if (-not $lock) {
+        $findings.Add('lock unavailable — another GitProtonBackup operation is running'); $exit = 1
+    } else {
+      try {
+        $cli = if ($cfg.ProtonCli) { $cfg.ProtonCli } else { 'proton-drive' }
+        # Fault-isolated: a throwing -CliReadyRunner (or a misbehaving real probe) must degrade to
+        # "CLI unavailable", not escape past the report/heartbeat writes below — this whole
+        # function exists to never go silent, including on its own internal failures.
+        $cliReady = $false
+        try {
+            $cliReady = if ($CliReadyRunner) { & $CliReadyRunner } else { Test-ProtonCliReady -CliPath $cli }
+        } catch {
+            $findings.Add("CLI readiness probe failed: $($_.Exception.Message) — degraded verification (Cloud Files sync state only)")
+            $exit = [Math]::Max($exit, 1)
+        }
+        if (-not $cliReady) { Write-Warning 'Proton CLI unavailable or not signed in — degraded verification (Cloud Files sync state only).' }
+        $effectiveCheck = {
+            param($p)
+            if ($cliReady) {
+                $c = if ($InfoRunner) { Confirm-BundleUploaded -CloudPath (Get-CloudBundlePath -LocalPath $p -DriveLocalRoot $cfg.ProtonDriveRoot) -CliPath $cli -InfoRunner $InfoRunner }
+                     else             { Confirm-BundleUploaded -CloudPath (Get-CloudBundlePath -LocalPath $p -DriveLocalRoot $cfg.ProtonDriveRoot) -CliPath $cli }
+                $c.Confirmed
+            } elseif ($SyncCheck) { & $SyncCheck $p } else { (Get-CloudFileSyncState -Path $p).InSync }
+        }.GetNewClosure()
+
+        foreach ($repo in @($cfg.Repos)) {
+            $rf = [System.Collections.Generic.List[string]]@(); $state = 'ok'
+            try {
+                if (-not (Test-Path -LiteralPath $repo)) { $rf.Add("registered repo missing on disk: $repo — Uninstall-ProtonBackup to deregister"); $state = 'attention' }
+                else {
+                    $m = Test-GpbMirror -RepoPath $repo
+                    if (-not ($m.HasRemote -and $m.MirrorExists -and $m.HookExists -and $m.WorkRepoOk)) {
+                        $rf.Add("wiring broken for $repo — run Repair-ProtonBackup"); $state = 'attention'
+                    }
+                    # Digest reconciliation: re-cut when coverage is stale, marker or not.
+                    $bd = Get-GpbBundleDir -Config $cfg -RepoPath $repo
+                    $res = Invoke-RepoBundleBackup -RepoPath $repo -BundleDir $bd -BundleBaseName (Split-Path $repo -Leaf) `
+                        -SyncCheck $effectiveCheck -RetentionKeep $cfg.RetentionKeep -RetentionCheckpoints $cfg.RetentionCheckpoints
+                    foreach ($f in @($res.Findings)) { $rf.Add("$($f.Kind): $($f.Detail)"); $state = 'attention' }
+                    if ($res.State -ne 'backed_up') { $rf.Add("newest bundle not confirmed on Proton for $repo"); $state = 'attention' }
+                    elseif ($res.PSObject.Properties['BundlePath'] -and $res.BundlePath) {
+                        # Read BEFORE removing: a malformed marker under this slug must be
+                        # quarantined (Read-GpbMarker renames it .bad), never deleted unseen.
+                        $mkFile = Get-Item -LiteralPath (Join-Path (Get-GpbMarkerDir) "$(Get-GpbSlug -RepoPath $repo).json") -ErrorAction SilentlyContinue
+                        if ($mkFile) {
+                            if (Read-GpbMarker -File $mkFile) { Remove-PushPendingMarker -RepoPath $repo }
+                            else { $rf.Add("unreadable marker quarantined for $repo"); $state = 'attention' }
+                        }
+                    }
+                    # Spool guard.
+                    $allBundles = @(Get-ChildItem -LiteralPath $bd -Filter '*.bundle' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime)
+                    $newest = $allBundles | Select-Object -Last 1
+                    if ($newest -and $res.State -ne 'backed_up' -and $newest.LastWriteTime -lt (Get-Date).AddDays(-[int]$cfg.MaxUnconfirmedAgeDays)) {
+                        $rf.Add("bundle unconfirmed for over $($cfg.MaxUnconfirmedAgeDays) day(s) — is the Proton Drive app running?"); $state = 'attention'
+                    }
+                    if ($res.State -ne 'backed_up' -and $allBundles.Count -gt [int]$cfg.RetentionKeep) {
+                        $rf.Add("$($allBundles.Count) bundles spooling unconfirmed (retention can't prune until one confirms)"); $state = 'attention'
+                    }
+                }
+            } catch { $rf.Add("verify failed for ${repo}: $($_.Exception.Message)"); $state = 'attention' }
+            if ($state -eq 'attention') { $exit = [Math]::Max($exit, 1) }
+            $repoResults.Add([pscustomobject]@{ RepoPath = $repo; State = $state; Findings = $rf.ToArray() })
+            foreach ($x in $rf) { $findings.Add($x) }
+        }
+
+        # Marker pass: anything the repo loop didn't clear.
+        $registered = @($cfg.Repos)
+        foreach ($file in @(Get-ChildItem -LiteralPath (Get-GpbMarkerDir) -Filter '*.json' -ErrorAction SilentlyContinue)) {
+            $mk = Read-GpbMarker -File $file
+            if (-not $mk) { $findings.Add("quarantined unreadable marker: $($file.Name).bad"); $exit = [Math]::Max($exit, 1); continue }
+            if (($registered -notcontains $mk.RepoPath) -and -not (Test-Path -LiteralPath $mk.RepoPath)) {
+                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+                $findings.Add("evicted orphaned marker for $($mk.RepoPath)")
+                continue
+            }
+            $findings.Add("pending backup not confirmed (reason: $($mk.Reason)) for $($mk.RepoPath)")
+            $exit = [Math]::Max($exit, 1)
+        }
+      } finally { $lock.Close(); Remove-Item (Get-GpbLockPath) -Force -ErrorAction SilentlyContinue }
+    }
+
+    $report = [pscustomobject]@{ Timestamp = (Get-Date).ToUniversalTime().ToString('o'); ExitCode = $exit; Repos = $repoResults.ToArray() }
+    Write-GpbJsonAtomic -Path (Join-Path (Get-GpbRoot) 'last-verify.json') -Object $report
+    Add-Content -LiteralPath (Join-Path (Get-GpbRoot) 'verify.log') -Value "$($report.Timestamp) exit=$exit findings=$($findings.Count)"
+
+    if ($cfg.HeartbeatUrl) {
+        $hb = if ($exit -eq 0) { $cfg.HeartbeatUrl } else { "$($cfg.HeartbeatUrl)/fail" }
+        $runner = if ($WebRunner) { $WebRunner } else { { param($u) Invoke-RestMethod -Uri $u -Method Get -TimeoutSec 10 | Out-Null } }
+        try { & $runner $hb } catch { Write-Warning "heartbeat ping failed: $($_.Exception.Message)" }
+    }
+    foreach ($x in $findings) { Write-Host "- $x" }
+    [pscustomobject]@{ ExitCode = $exit; Findings = $findings.ToArray() }
+}
+
 function Get-ProtonBackupConfig {
     [CmdletBinding()] param()
     Read-GpbConfig
