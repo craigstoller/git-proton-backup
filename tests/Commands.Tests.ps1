@@ -305,4 +305,16 @@ Describe 'Invoke-ProtonBackupVerify (reconciliation)' {
         $r = Invoke-ProtonBackupVerify -SyncCheck { param($p) $false } -CliReadyRunner { $false }
         ($r.Findings -join "`n") | Should -Match '(?i)unconfirmed for'
     }
+    It 'lock unavailable → finding + exit 1 + report and /fail heartbeat still fire' {
+        Set-ProtonBackupConfig -Key HeartbeatUrl -Value 'https://hc.example/uuid'
+        $holder = Wait-GpbLock -TimeoutSeconds 1
+        try {
+            $script:pinged = @()
+            $r = Invoke-ProtonBackupVerify -LockTimeoutSeconds 1 -WebRunner { param($u) $script:pinged += $u }
+            $r.ExitCode | Should -Be 1
+            ($r.Findings -join "`n") | Should -Match 'lock unavailable'
+            (Get-Content (Join-Path (Get-GpbRoot) 'last-verify.json') -Raw | ConvertFrom-Json).ExitCode | Should -Be 1
+            $script:pinged[-1] | Should -Match '/fail$'
+        } finally { $holder.Close() }
+    }
 }

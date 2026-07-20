@@ -1007,7 +1007,7 @@ function Invoke-ProtonBackupVerify {
     # completion) writes the durable last-verify.json + verify.log AND best-effort pings the
     # heartbeat URL — the whole point of a dead-man's switch is that it never goes silent.
     [CmdletBinding()]
-    param([scriptblock]$SyncCheck, [scriptblock]$InfoRunner, [scriptblock]$CliReadyRunner, [scriptblock]$WebRunner)
+    param([scriptblock]$SyncCheck, [scriptblock]$InfoRunner, [scriptblock]$CliReadyRunner, [scriptblock]$WebRunner, [int]$LockTimeoutSeconds = 30)
     $findings = [System.Collections.Generic.List[string]]@()
     $repoResults = [System.Collections.Generic.List[object]]@()
     $exit = 0
@@ -1026,7 +1026,7 @@ function Invoke-ProtonBackupVerify {
         return [pscustomobject]@{ ExitCode = 2; Findings = @($_.Exception.Message) }
     }
 
-    $lock = Wait-GpbLock -TimeoutSeconds 30
+    $lock = Wait-GpbLock -TimeoutSeconds $LockTimeoutSeconds
     if (-not $lock) {
         $findings.Add('lock unavailable — another GitProtonBackup operation is running'); $exit = 1
     } else {
@@ -1092,18 +1092,39 @@ function Invoke-ProtonBackupVerify {
             foreach ($x in $rf) { $findings.Add($x) }
         }
 
-        # Marker pass: anything the repo loop didn't clear.
+        # Marker pass: anything the repo loop didn't clear. Fault-isolated the same way as the
+        # CLI-readiness probe above — neither a bad enumeration nor a single bad marker file may
+        # propagate out of the function and skip the report/heartbeat below.
         $registered = @($cfg.Repos)
-        foreach ($file in @(Get-ChildItem -LiteralPath (Get-GpbMarkerDir) -Filter '*.json' -ErrorAction SilentlyContinue)) {
-            $mk = Read-GpbMarker -File $file
-            if (-not $mk) { $findings.Add("quarantined unreadable marker: $($file.Name).bad"); $exit = [Math]::Max($exit, 1); continue }
-            if (($registered -notcontains $mk.RepoPath) -and -not (Test-Path -LiteralPath $mk.RepoPath)) {
-                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
-                $findings.Add("evicted orphaned marker for $($mk.RepoPath)")
-                continue
+        $markerFiles = @()
+        $markerDir = Get-GpbMarkerDir
+        # Get-GpbMarkerDir is created lazily (only when the first marker is written) — its
+        # absence is the ordinary "no pending markers" state, not a fault, and must not be
+        # reported as one. Only an enumeration failure against an EXISTING directory (permissions,
+        # I/O, etc.) is a genuine fault worth a finding.
+        if (Test-Path -LiteralPath $markerDir -PathType Container) {
+            try {
+                $markerFiles = @(Get-ChildItem -LiteralPath $markerDir -Filter '*.json' -ErrorAction Stop)
+            } catch {
+                $findings.Add("marker pass skipped: enumeration failed: $($_.Exception.Message)")
+                $exit = [Math]::Max($exit, 1)
             }
-            $findings.Add("pending backup not confirmed (reason: $($mk.Reason)) for $($mk.RepoPath)")
-            $exit = [Math]::Max($exit, 1)
+        }
+        foreach ($file in $markerFiles) {
+            try {
+                $mk = Read-GpbMarker -File $file
+                if (-not $mk) { $findings.Add("quarantined unreadable marker: $($file.Name).bad"); $exit = [Math]::Max($exit, 1); continue }
+                if (($registered -notcontains $mk.RepoPath) -and -not (Test-Path -LiteralPath $mk.RepoPath)) {
+                    Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+                    $findings.Add("evicted orphaned marker for $($mk.RepoPath)")
+                    continue
+                }
+                $findings.Add("pending backup not confirmed (reason: $($mk.Reason)) for $($mk.RepoPath)")
+                $exit = [Math]::Max($exit, 1)
+            } catch {
+                $findings.Add("marker check failed ($($file.Name)): $($_.Exception.Message)")
+                $exit = [Math]::Max($exit, 1)
+            }
         }
       } finally { $lock.Close(); Remove-Item (Get-GpbLockPath) -Force -ErrorAction SilentlyContinue }
     }
