@@ -80,10 +80,12 @@ Curious how a non-developer shipped this? See [how it was built](docs/how-it-was
 - `Invoke-ProtonBackupVerify` — run it ad hoc, or install `Install-ProtonBackupTask` for a daily
   scheduled check (interactive logon, since both the CLI session and the sync app live in your
   desktop session).
-- **Local toast, no third-party service** — pipe the exit code into a one-liner:
+- **Local toast, no external service** — pipe the exit code into a one-liner. With the
+  [BurntToast](https://github.com/Windos/BurntToast) module (`Install-Module BurntToast`):
+  `if ((Invoke-ProtonBackupVerify).ExitCode -ne 0) { New-BurntToastNotification -Text 'GitProtonBackup', 'attention needed' }`.
+  On Windows Pro/Enterprise, `msg` works with no extra module —
   `if ((Invoke-ProtonBackupVerify).ExitCode -ne 0) { msg $env:USERNAME "GitProtonBackup: attention needed" }`
-  (swap `msg` for `New-BurntToastNotification` if you have the [BurntToast](https://github.com/Windos/BurntToast)
-  module installed, for a real Action Center toast).
+  — but `msg.exe` isn't present on Windows Home, so BurntToast is the option that works everywhere.
 - **Heartbeat** — optional dead-man's-switch: point `HeartbeatUrl` at a healthchecks.io/Cronitor/
   Uptime-Kuma check; the service sees a ping, never your data — though note that whichever provider
   you point it at does see your source IP and the timestamp of every ping, the same as any HTTP

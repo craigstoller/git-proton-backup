@@ -312,6 +312,7 @@ Describe 'GpbMirror lifecycle' {
         $shim | Should -Match 'Import-Module GitProtonBackup'
         $shim | Should -Match '(?m)^exit 0\s*$'                 # unconditional exit 0
         $shim | Should -Not -Match 'exec'                       # no exec
+        $shim | Should -Match ([regex]::Escape('|| vs=0'))      # verifyseconds fallback pin — a vs=60 regression must not slip through
         (git -C $r.MirrorPath rev-parse refs/heads/main) | Should -Be (git -C $script:prepo rev-parse main)
         (git -C $script:prepo config branch.main.remote) | Should -Be 'proton'
         $h = Test-GpbMirror -RepoPath $script:prepo
