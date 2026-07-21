@@ -338,6 +338,12 @@ function Get-CloudBundlePath {
         [Parameter(Mandatory)][string]$DriveLocalRoot,
         [string]$DriveCloudRoot = '/my-files'
     )
+    # Unlike Get-GpbSlug's note on why [System.IO.Path]::GetFullPath is unsafe for a possibly-
+    # relative, possibly-deleted REPO path, both inputs here are always already-rooted (absolute)
+    # by the time any caller reaches this function — $res.BundlePath and $cfg.ProtonDriveRoot are
+    # both produced upstream via Resolve-Path/New-Item on real paths — so GetFullPath below is just
+    # a no-op normalization fallback for a not-yet-created bundle file, never a real relative-path
+    # resolution against the wrong current directory.
     $full = (Resolve-Path -LiteralPath $LocalPath -ErrorAction SilentlyContinue)?.Path
     if (-not $full) { $full = [System.IO.Path]::GetFullPath($LocalPath) }   # file may not exist yet in tests
     $rootFull = (Resolve-Path -LiteralPath $DriveLocalRoot -ErrorAction SilentlyContinue)?.Path
@@ -873,7 +879,7 @@ function Initialize-ProtonBackup {
         }
         $ProtonDriveRoot = $found.Root
         if ($found.Degraded) {
-            Write-Warning "Proton Drive folder found, but no 'My files' subfolder was located under it — cloud-path verification may be degraded until the sync app finishes its first sync."
+            Write-Warning "Proton Drive folder found, but no 'My files' subfolder was located under it — bundles may not upload to Proton Drive AT ALL until this folder is confirmed to actually be synced (not just present). If you know the real synced folder, pass it explicitly with -ProtonDriveRoot instead of relying on this fallback."
         }
     }
     if (-not (Test-Path -LiteralPath $ProtonDriveRoot -PathType Container)) {
@@ -1056,7 +1062,7 @@ function Invoke-ProtonBackupVerify {
                         $mkFile = Get-Item -LiteralPath (Join-Path (Get-GpbMarkerDir) "$(Get-GpbSlug -RepoPath $repo).json") -ErrorAction SilentlyContinue
                         if ($mkFile) {
                             if (Read-GpbMarker -File $mkFile) { Remove-PushPendingMarker -RepoPath $repo }
-                            else { $rf.Add("unreadable marker quarantined for $repo"); $state = 'attention' }
+                            else { $rf.Add("unreadable marker quarantined for $repo (renamed with a .bad suffix)"); $state = 'attention' }
                         }
                     }
                     # Spool guard.
@@ -1096,7 +1102,10 @@ function Invoke-ProtonBackupVerify {
         foreach ($file in $markerFiles) {
             try {
                 $mk = Read-GpbMarker -File $file
-                if (-not $mk) { $findings.Add("quarantined unreadable marker: $($file.Name).bad"); $exit = [Math]::Max($exit, 1); continue }
+                # Read-GpbMarker's quarantine name carries a random suffix ("$($file.Name).<hex>.bad")
+                # so repeated corruptions never overwrite earlier evidence — naming an exact filename
+                # here would name one that doesn't exist, so this only states what happened.
+                if (-not $mk) { $findings.Add("quarantined unreadable marker: $($file.Name) (renamed with a .bad suffix)"); $exit = [Math]::Max($exit, 1); continue }
                 if (($registered -notcontains $mk.RepoPath) -and -not (Test-Path -LiteralPath $mk.RepoPath)) {
                     Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
                     $findings.Add("evicted orphaned marker for $($mk.RepoPath)")
@@ -1142,6 +1151,7 @@ function Set-ProtonBackupConfig {
     }
 
     switch ($Key) {
+        'Repos' { throw "Set-ProtonBackupConfig: Repos is managed by Install-ProtonBackup/Uninstall-ProtonBackup — not settable directly." }
         'ProtonDriveRoot' {
             if (-not (Test-Path -LiteralPath $Value -PathType Container)) {
                 throw "Set-ProtonBackupConfig: ProtonDriveRoot '$Value' does not exist."
@@ -1204,7 +1214,10 @@ function Get-ProtonBackupStatus {
     # filename carries the current digest8) purely by reading state already on disk — LOCAL
     # coverage only. ConfirmedAtLastVerify and the LastVerify* fields come from last-verify.json,
     # the durable report Invoke-ProtonBackupVerify writes on every run (including its own
-    # failure paths) — never freshly probed here.
+    # failure paths) — never freshly probed here. One caveat to "read-only": reading a pending
+    # marker goes through Read-GpbMarker, which quarantines (renames .bad) a marker file it can't
+    # parse as a side effect of being read — so a corrupt marker can still be mutated by a Status
+    # call, even though nothing here writes config, bundles, or the registry.
     [CmdletBinding()]
     param([switch]$Json)
 

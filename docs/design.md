@@ -85,13 +85,17 @@ surface (via that report's age) rather than something that just goes quiet.
 
 ## Locking
 
-There is one lock file, held only for the span of actually cutting and publishing a bundle — never
-across a push in full, and never across the network verification step. The push hook takes it
-non-blocking with a short bounded retry (about 15 seconds) around the bundle step only; on timeout
-it records a `deferred_lock` marker and lets the push finish anyway (the marker guarantees the gap
-still surfaces later). `Invoke-ProtonBackupVerify` takes the same lock for its whole per-repo pass,
-with a longer bound (about 30 seconds), so a hook's brief hold can't make a scheduled verify run
-skip its work outright — it waits the hold out instead of bailing.
+There is one lock file, and the two callers hold it differently. The push hook takes it
+non-blocking, with a short bounded retry (about 15 seconds), around the bundle step only — never
+across the push in full, and never across the network verification/polling step that follows (that
+step is deliberately lock-free, so a slow or hung Proton CLI call can never make it look like
+another backup operation is "active"); on timeout it records a `deferred_lock` marker and lets the
+push finish anyway (the marker guarantees the gap still surfaces later). `Invoke-ProtonBackupVerify`
+is the opposite: it takes the same lock for its *entire* per-repo pass — including the network
+confirmation check against the Proton CLI — with a longer bound (about 30 seconds), so a hook's
+brief hold can't make a scheduled verify run skip its work outright; it waits the hold out instead
+of bailing, and holds it through confirmation because a reconciliation pass that let another run
+start mid-check could double-cut or double-confirm the same bundle.
 
 ## Threat model & limits
 

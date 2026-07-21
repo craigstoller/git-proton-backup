@@ -176,6 +176,10 @@ Describe 'Initialize + Config' {
         Set-ProtonBackupConfig -Key HeartbeatUrl -Value 'https://hc-ping.com/abc'
         (Get-ProtonBackupConfig).HeartbeatUrl | Should -Be 'https://hc-ping.com/abc'
     }
+    It 'Set-ProtonBackupConfig refuses to set Repos directly (owned by Install/Uninstall-ProtonBackup)' {
+        Initialize-ProtonBackup -ProtonDriveRoot $script:drive -AuthProbe { 0 } -InfoProbe { 0 } | Out-Null
+        { Set-ProtonBackupConfig -Key Repos -Value @() } | Should -Throw '*Install-ProtonBackup*'
+    }
     It 'BackupSubdir containment: a ..\ escape is rejected' {
         Initialize-ProtonBackup -ProtonDriveRoot $script:drive -AuthProbe { 0 } -InfoProbe { 0 } | Out-Null
         { Set-ProtonBackupConfig -Key BackupSubdir -Value '..\outside' } | Should -Throw '*under*'

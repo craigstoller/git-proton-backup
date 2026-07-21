@@ -51,6 +51,10 @@ only claims an upstream that's unset); `-Force` replaces conflicting `proton`-re
 ever touching whatever that remote used to point at. `Uninstall-ProtonBackup` removes the remote,
 hook, and mirror for a repo — existing bundles on Proton Drive are left in place.
 
+Repairing a *moved* repo re-wires it at its new path, but its old path stays registered until you
+deregister it — `Invoke-ProtonBackupVerify` will keep reporting that old entry as a repo missing on
+disk, naming `Uninstall-ProtonBackup <old-path>` as the fix, until you run it.
+
 ## How it works
 
 `git push proton` doesn't write into your Proton Drive folder directly — a folder full of loose
@@ -76,8 +80,14 @@ Curious how a non-developer shipped this? See [how it was built](docs/how-it-was
 - `Invoke-ProtonBackupVerify` — run it ad hoc, or install `Install-ProtonBackupTask` for a daily
   scheduled check (interactive logon, since both the CLI session and the sync app live in your
   desktop session).
+- **Local toast, no third-party service** — pipe the exit code into a one-liner:
+  `if ((Invoke-ProtonBackupVerify).ExitCode -ne 0) { msg $env:USERNAME "GitProtonBackup: attention needed" }`
+  (swap `msg` for `New-BurntToastNotification` if you have the [BurntToast](https://github.com/Windos/BurntToast)
+  module installed, for a real Action Center toast).
 - **Heartbeat** — optional dead-man's-switch: point `HeartbeatUrl` at a healthchecks.io/Cronitor/
-  Uptime-Kuma check; the service sees a ping, never your data.
+  Uptime-Kuma check; the service sees a ping, never your data — though note that whichever provider
+  you point it at does see your source IP and the timestamp of every ping, the same as any HTTP
+  request to any web service.
 
 ## Restore
 
@@ -110,6 +120,10 @@ download them; you don't need this tool, or even a Windows machine, to get your 
   surfaces the backlog once it's older than `MaxUnconfirmedAgeDays` (default 7).
 - **One machine per repo:** there's no multi-machine coordination. A second machine pushing the same
   repo is safe but confusing — digest-suffixed filenames prevent corruption, not confusion.
+- **Worktrees:** a bundle carries full ref history — every branch and tag — but not the checked-out
+  working-tree state of any secondary `git worktree` attached to the repo. History is complete;
+  restoring a linked worktree's own working copy afterward is a manual `git worktree add` from that
+  history, not something the bundle reproduces automatically.
 
 > **What this tool does and doesn't encrypt:** git-proton-backup performs no encryption itself.
 > Bundles are ordinary git bundles; anyone with access to your Windows account or your Proton

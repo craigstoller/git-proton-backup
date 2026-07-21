@@ -291,7 +291,7 @@ Describe 'GpbMirror lifecycle' {
         $env:GPB_CONFIG_DIR = Join-Path $TestDrive "gpb-$([guid]::NewGuid().ToString('N').Substring(0,8))"
         $env:GPB_HOOK_DISABLED = '1'
         $script:proot = Join-Path $TestDrive "pr-$([guid]::NewGuid().ToString('N').Substring(0,8))"
-        $script:prepo = Join-Path $script:proot 'hub'
+        $script:prepo = Join-Path $script:proot 'repo'
         New-Item -ItemType Directory -Path $script:prepo -Force | Out-Null
         git -C $script:prepo init -qb main
         git -C $script:prepo config user.email 't@t'; git -C $script:prepo config user.name 't'
@@ -318,7 +318,7 @@ Describe 'GpbMirror lifecycle' {
         $h.HasRemote | Should -BeTrue; $h.MirrorExists | Should -BeTrue
         $h.HookExists | Should -BeTrue; $h.WorkRepoOk | Should -BeTrue
     }
-    It 'install throws on a non-git RepoPath (side-effects-first: hub untouched)' {
+    It 'install throws on a non-git RepoPath (side-effects-first: repo untouched)' {
         $plain = Join-Path $script:proot 'plain'
         New-Item -ItemType Directory -Path $plain -Force | Out-Null
         { Install-GpbMirror -RepoPath $plain } | Should -Throw '*not a git repository*'
@@ -332,7 +332,7 @@ Describe 'GpbMirror lifecycle' {
         @(git -C $script:prepo config --get-all remote.proton.push).Count | Should -Be 2
     }
     It 'install on a repo with no commits skips push/upstream but wires everything else' {
-        $bare = Join-Path $script:proot 'empty-hub'
+        $bare = Join-Path $script:proot 'empty-repo'
         New-Item -ItemType Directory -Path $bare -Force | Out-Null
         git -C $bare init -qb main
         $r = Install-GpbMirror -RepoPath $bare

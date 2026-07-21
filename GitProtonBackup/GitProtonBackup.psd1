@@ -17,6 +17,9 @@
         'Set-ProtonBackupConfig',
         'Invoke-ProtonBackupHook'
     )
+    CmdletsToExport = @()
+    AliasesToExport = @()
+    Copyright   = '(c) 2026 Craig Stoller. MIT.'
     PrivateData = @{
         PSData = @{
             Tags       = @('git','backup','proton','proton-drive','bundle','Windows')
