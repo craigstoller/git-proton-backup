@@ -1,4 +1,4 @@
-BeforeAll { Import-Module "$PSScriptRoot/../GitProtonBackup/GitProtonBackup.psd1" -Force }
+BeforeAll { Import-Module "$PSScriptRoot/../GitProtonBackup/GitProtonBackup.psm1" -Force }
 
 Describe 'State foundation' {
     BeforeEach {

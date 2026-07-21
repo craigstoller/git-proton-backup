@@ -1,0 +1,16 @@
+name: CI
+on:
+  push: { branches: [main] }
+  pull_request:
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pester
+        shell: pwsh
+        run: |
+          Install-Module Pester -MinimumVersion 5.5 -Force -SkipPublisherCheck -Scope CurrentUser -AllowClobber
+          Import-Module Pester -MinimumVersion 5.5
+          git config --global user.email 'ci@ci'; git config --global user.name 'ci'
+          Invoke-Pester -Path tests -CI

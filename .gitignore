@@ -1,4 +1,5 @@
 *.bak
 *.tmp
 TestResults/
+testResults.xml
 .superpowers/

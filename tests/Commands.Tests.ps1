@@ -1,5 +1,5 @@
 BeforeAll {
-    Import-Module "$PSScriptRoot/../GitProtonBackup/GitProtonBackup.psd1" -Force
+    Import-Module "$PSScriptRoot/../GitProtonBackup/GitProtonBackup.psm1" -Force
     function New-Sandbox {
         $env:GPB_CONFIG_DIR = Join-Path $TestDrive "cfg-$([guid]::NewGuid().ToString('N').Substring(0,8))"
         $env:GPB_LOCK_PATH  = Join-Path $TestDrive "lk-$([guid]::NewGuid().ToString('N').Substring(0,8)).lock"

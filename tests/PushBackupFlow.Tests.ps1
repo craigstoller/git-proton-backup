@@ -1,5 +1,5 @@
 BeforeAll {
-    Import-Module "$PSScriptRoot/../GitProtonBackup/GitProtonBackup.psd1" -Force
+    Import-Module "$PSScriptRoot/../GitProtonBackup/GitProtonBackup.psm1" -Force
 
     function New-HookRepo {
         $repo = Join-Path $TestDrive "hr-$([guid]::NewGuid().ToString('N').Substring(0,8))"
