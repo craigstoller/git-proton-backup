@@ -484,3 +484,66 @@ exit $r.ExitCode
         $childExit | Should -Be 0
     }
 }
+
+Describe 'Invoke-ProtonBackupVerify return contract (v0.2.0)' {
+    BeforeEach {
+        $script:dir = Join-Path ([IO.Path]::GetTempPath()) ("gpbv2-" + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $script:dir | Out-Null
+        $env:GPB_CONFIG_DIR = $script:dir
+        $env:GPB_LOCK_PATH  = Join-Path $script:dir 'test.lock'
+    }
+    AfterEach {
+        Remove-Item Env:GPB_CONFIG_DIR -ErrorAction SilentlyContinue
+        Remove-Item Env:GPB_LOCK_PATH -ErrorAction SilentlyContinue
+        # -Force (not the raw [IO.Directory]::Delete the brief's snippet used) so the repo's
+        # .git objects — Windows marks loose objects read-only — don't throw
+        # UnauthorizedAccessException here and fail an otherwise-passing test.
+        Remove-Item -LiteralPath $script:dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'returns Complete=$false, IncompleteReason=config, Repos=@() on missing config (exit 2)' {
+        $r = Invoke-ProtonBackupVerify
+        $r.ExitCode | Should -Be 2
+        $r.Complete | Should -BeFalse
+        $r.IncompleteReason | Should -Be 'config'
+        @($r.Repos).Count | Should -Be 0
+        $lv = Get-Content (Join-Path $script:dir 'last-verify.json') -Raw | ConvertFrom-Json
+        $lv.Complete | Should -BeFalse
+        $lv.IncompleteReason | Should -Be 'config'
+    }
+
+    It 'returns Complete=$false, IncompleteReason=lock on lock contention (exit 1)' {
+        # Valid config so the config read succeeds, then hold the lock exclusively.
+        $drive = Join-Path $script:dir 'drive'; New-Item -ItemType Directory -Force -Path $drive | Out-Null
+        Initialize-ProtonBackup -ProtonDriveRoot $drive -WarningAction SilentlyContinue
+        $fs = [System.IO.File]::Open($env:GPB_LOCK_PATH, 'OpenOrCreate', 'ReadWrite', 'None')
+        try { $r = Invoke-ProtonBackupVerify -LockTimeoutSeconds 1 } finally { $fs.Close() }
+        $r.ExitCode | Should -Be 1
+        $r.Complete | Should -BeFalse
+        $r.IncompleteReason | Should -Be 'lock'
+        $lv = Get-Content (Join-Path $script:dir 'last-verify.json') -Raw | ConvertFrom-Json
+        $lv.Complete | Should -BeFalse
+    }
+
+    It 'returns Complete=$true, IncompleteReason empty, and per-repo Repos on a normal pass' {
+        $drive = Join-Path $script:dir 'drive'; New-Item -ItemType Directory -Force -Path $drive | Out-Null
+        Initialize-ProtonBackup -ProtonDriveRoot $drive -WarningAction SilentlyContinue
+        # Empty registry: still a complete pass.
+        $r = Invoke-ProtonBackupVerify -CliReadyRunner { $false } -WarningAction SilentlyContinue
+        $r.ExitCode | Should -Be 0
+        $r.Complete | Should -BeTrue
+        $r.IncompleteReason | Should -Be ''
+        @($r.Repos).Count | Should -Be 0
+        # Register a real repo; its row must appear in the RETURN value, not only the file.
+        $repo = Join-Path $script:dir 'repo'; New-Item -ItemType Directory -Force -Path $repo | Out-Null
+        git -C $repo init -q; git -C $repo config user.email t@t; git -C $repo config user.name t
+        Set-Content (Join-Path $repo 'a.txt') 'x'; git -C $repo add .; git -C $repo commit -qm init
+        $env:GPB_HOOK_DISABLED = '1'
+        try { Install-ProtonBackup -RepoPath $repo | Out-Null } finally { Remove-Item Env:GPB_HOOK_DISABLED }
+        $r2 = Invoke-ProtonBackupVerify -CliReadyRunner { $false } -SyncCheck { param($p) $true } -WarningAction SilentlyContinue
+        $r2.Complete | Should -BeTrue
+        @($r2.Repos).Count | Should -Be 1
+        $r2.Repos[0].RepoPath | Should -Be (Resolve-Path $repo).Path
+        $r2.Repos[0].State | Should -BeIn @('ok','attention')
+    }
+}

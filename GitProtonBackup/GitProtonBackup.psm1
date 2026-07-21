@@ -989,11 +989,13 @@ function Invoke-ProtonBackupVerify {
     $findings = [System.Collections.Generic.List[string]]@()
     $repoResults = [System.Collections.Generic.List[object]]@()
     $exit = 0
+    $complete = $false
+    $incompleteReason = ''
     try { $cfg = Read-GpbConfig } catch {
         # Hard config failure: STILL write the durable report and best-effort /fail heartbeat
         # (review finding: silence on exit 2 defeats the dead-man's switch's purpose).
         Write-Warning $_.Exception.Message
-        $report = [pscustomobject]@{ Timestamp = (Get-Date).ToUniversalTime().ToString('o'); ExitCode = 2; Repos = @(); Error = $_.Exception.Message }
+        $report = [pscustomobject]@{ Timestamp = (Get-Date).ToUniversalTime().ToString('o'); ExitCode = 2; Complete = $false; IncompleteReason = 'config'; Repos = @(); Error = $_.Exception.Message }
         Write-GpbJsonAtomic -Path (Join-Path (Get-GpbRoot) 'last-verify.json') -Object $report
         Add-Content -LiteralPath (Join-Path (Get-GpbRoot) 'verify.log') -Value "$($report.Timestamp) exit=2 config-error"
         $rawHb = try { (Get-Content (Get-GpbConfigPath) -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop).HeartbeatUrl } catch { $null }
@@ -1001,12 +1003,13 @@ function Invoke-ProtonBackupVerify {
             $runner = if ($WebRunner) { $WebRunner } else { { param($u) Invoke-RestMethod -Uri $u -Method Get -TimeoutSec 10 | Out-Null } }
             try { & $runner "$rawHb/fail" } catch { Write-Warning "heartbeat ping failed: $($_.Exception.Message)" }
         }
-        return [pscustomobject]@{ ExitCode = 2; Findings = @($_.Exception.Message) }
+        return [pscustomobject]@{ ExitCode = 2; Complete = $false; IncompleteReason = 'config'; Findings = @($_.Exception.Message); Repos = @() }
     }
 
     $lock = Wait-GpbLock -TimeoutSeconds $LockTimeoutSeconds
     if (-not $lock) {
         $findings.Add('lock unavailable — another GitProtonBackup operation is running'); $exit = 1
+        $incompleteReason = 'lock'
     } else {
       try {
         $cli = if ($cfg.ProtonCli) { $cfg.ProtonCli } else { 'proton-drive' }
@@ -1118,10 +1121,12 @@ function Invoke-ProtonBackupVerify {
                 $exit = [Math]::Max($exit, 1)
             }
         }
+
+        $complete = $true
       } finally { $lock.Close(); Remove-Item (Get-GpbLockPath) -Force -ErrorAction SilentlyContinue }
     }
 
-    $report = [pscustomobject]@{ Timestamp = (Get-Date).ToUniversalTime().ToString('o'); ExitCode = $exit; Repos = $repoResults.ToArray() }
+    $report = [pscustomobject]@{ Timestamp = (Get-Date).ToUniversalTime().ToString('o'); ExitCode = $exit; Complete = $complete; IncompleteReason = $incompleteReason; Repos = $repoResults.ToArray() }
     Write-GpbJsonAtomic -Path (Join-Path (Get-GpbRoot) 'last-verify.json') -Object $report
     Add-Content -LiteralPath (Join-Path (Get-GpbRoot) 'verify.log') -Value "$($report.Timestamp) exit=$exit findings=$($findings.Count)"
 
@@ -1131,7 +1136,7 @@ function Invoke-ProtonBackupVerify {
         try { & $runner $hb } catch { Write-Warning "heartbeat ping failed: $($_.Exception.Message)" }
     }
     foreach ($x in $findings) { Write-Host "- $x" }
-    [pscustomobject]@{ ExitCode = $exit; Findings = $findings.ToArray() }
+    [pscustomobject]@{ ExitCode = $exit; Complete = $complete; IncompleteReason = $incompleteReason; Findings = $findings.ToArray(); Repos = $repoResults.ToArray() }
 }
 
 function Get-ProtonBackupConfig {

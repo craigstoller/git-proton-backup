@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0 — 2026-07-21
+
+- `Invoke-ProtonBackupVerify` now returns `Repos` (the per-repo results already written to
+  `last-verify.json`), `Complete` (whether the registered-repo pass actually ran), and
+  `IncompleteReason` (`''` | `'lock'` | `'config'`). `last-verify.json` carries the same two
+  new fields. Additive — existing fields and exit codes are unchanged. Lets callers
+  distinguish "verified, one repo needs attention" from "verified nothing" (lock contention /
+  config failure).
+
 ## 0.1.0 — 2026-07-20
 
 - `Initialize-ProtonBackup` — guided first-run setup: discovers the Proton Drive sync folder,

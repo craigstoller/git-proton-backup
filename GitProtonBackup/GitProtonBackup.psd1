@@ -1,6 +1,6 @@
 @{
     RootModule        = 'GitProtonBackup.psm1'
-    ModuleVersion     = '0.1.0'
+    ModuleVersion     = '0.2.0'
     GUID              = 'f3e7e2c7-df15-445e-8957-5e8aad6cfeb4'
     Author            = 'Craig Stoller'
     Description       = 'Git-native backups: git push your repos to Proton Drive.'
