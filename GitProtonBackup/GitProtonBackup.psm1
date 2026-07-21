@@ -1043,13 +1043,24 @@ function Invoke-ProtonBackupVerify {
             $exit = [Math]::Max($exit, 1)
         }
         if (-not $cliReady) { Write-Warning 'Proton CLI unavailable or not signed in — degraded verification (Cloud Files sync state only).' }
+        # GetNewClosure() below detaches the resulting scriptblock's SessionState from this
+        # module — it captures the *variables* it references, but bareword calls to non-exported
+        # module functions (Get-CloudBundlePath, Confirm-BundleUploaded, Get-CloudFileSyncState)
+        # then fail to resolve at invocation time ("... is not recognized ..."), because every
+        # test seams past this real branch with -SyncCheck/-CliReadyRunner and never exercised it
+        # for real. Capture references to those private functions as variables (which DO survive
+        # the closure) and invoke through the references instead of by name.
+        $getCloudBundlePathFn    = ${function:Get-CloudBundlePath}
+        $confirmBundleUploadedFn = ${function:Confirm-BundleUploaded}
+        $getCloudFileSyncStateFn = ${function:Get-CloudFileSyncState}
         $effectiveCheck = {
             param($p)
             if ($cliReady) {
-                $c = if ($InfoRunner) { Confirm-BundleUploaded -CloudPath (Get-CloudBundlePath -LocalPath $p -DriveLocalRoot $cfg.ProtonDriveRoot) -CliPath $cli -InfoRunner $InfoRunner }
-                     else             { Confirm-BundleUploaded -CloudPath (Get-CloudBundlePath -LocalPath $p -DriveLocalRoot $cfg.ProtonDriveRoot) -CliPath $cli }
+                $cloudPath = & $getCloudBundlePathFn -LocalPath $p -DriveLocalRoot $cfg.ProtonDriveRoot
+                $c = if ($InfoRunner) { & $confirmBundleUploadedFn -CloudPath $cloudPath -CliPath $cli -InfoRunner $InfoRunner }
+                     else             { & $confirmBundleUploadedFn -CloudPath $cloudPath -CliPath $cli }
                 $c.Confirmed
-            } elseif ($SyncCheck) { & $SyncCheck $p } else { (Get-CloudFileSyncState -Path $p).InSync }
+            } elseif ($SyncCheck) { & $SyncCheck $p } else { (& $getCloudFileSyncStateFn -Path $p).InSync }
         }.GetNewClosure()
 
         foreach ($repo in @($cfg.Repos)) {

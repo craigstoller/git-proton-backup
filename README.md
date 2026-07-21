@@ -3,6 +3,8 @@
 **Git-native backups — git push your repos to Proton Drive's end-to-end encrypted storage.**
 
 [![CI](https://github.com/craigstoller/git-proton-backup/actions/workflows/ci.yml/badge.svg)](https://github.com/craigstoller/git-proton-backup/actions/workflows/ci.yml)
+(CI runs the unit/contract test suite only — no real Proton account or CLI is available in CI, so
+the real end-to-end path is verified by hand; see [how it was built](docs/how-it-was-built.md).)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## The 30-second demo
@@ -18,7 +20,7 @@ PS> git status
 Your branch is up to date with 'proton/main'.
 ```
 
-<!-- Transcript must match real git/tool output — Task 13's e2e run is the source of truth; update this block if it differs. -->
+<!-- transcript verified against a real run 2026-07-20 -->
 
 ## Install & first run
 
@@ -65,6 +67,7 @@ Because a push can fail quietly — a network hiccup, Proton Drive signed out, t
 `Invoke-ProtonBackupVerify` independently re-derives what *should* be backed up and re-cuts a bundle
 whenever it's stale, whether or not anything flagged a problem along the way. Run it by hand, or
 install it as a daily check. Full rationale for all of this: [docs/design.md](docs/design.md).
+Curious how a non-developer shipped this? See [how it was built](docs/how-it-was-built.md).
 
 ## Monitoring
 
