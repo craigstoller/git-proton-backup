@@ -71,6 +71,19 @@ Describe 'Invoke-PushBackupFlow' {
         ($o -join "`n") | Should -Match 'staged, not yet confirmed'
         (Get-Content (Get-ChildItem $script:mdir -Filter '*.json').FullName -Raw | ConvertFrom-Json).Reason | Should -Be 'verify_timeout'
     }
+    It 'honors cfg.VerifySeconds (1s) when -VerifySeconds is not passed — not a stale 60s default (regression pin)' {
+        # $script:base's -OutConfig has VerifySeconds=1 (New-GpbTestConfig) and -VerifySeconds is
+        # deliberately NOT in $script:base — this pins the fallback path
+        # (`if (-not $PSBoundParameters.ContainsKey('VerifySeconds')) { $VerifySeconds = $cfg.VerifySeconds }`)
+        # that the shim's `vs=0` fix (was `vs=60`) depends on: a mirror with no per-repo
+        # `gpb.verifyseconds` override must defer to config, never spin for a hardcoded 60s.
+        $elapsed = Measure-Command {
+            Invoke-PushBackupFlow @script:base -CliReadyRunner { $true } `
+                -InfoRunner { param($cp,$cli) [pscustomobject]@{ ExitCode=1; Output='Node not found' } } 6>&1 | Out-Null
+        }
+        $elapsed.TotalSeconds | Should -BeLessThan 10
+        (Get-Content (Get-ChildItem $script:mdir -Filter '*.json').FullName -Raw | ConvertFrom-Json).Reason | Should -Be 'verify_timeout'
+    }
     It 'auth-error path: session-expired message + auth_error marker, no further polling' {
         $script:calls = 0
         $p = $script:base.Clone()

@@ -181,32 +181,6 @@ function Get-RepoPreflight {
     [pscustomobject]@{ Safe=$true; Reason='' }
 }
 
-function ConvertFrom-PorcelainLine {
-    [CmdletBinding()] param([Parameter(Mandatory)][string]$Line)
-    if ($Line.Length -lt 4) { return $null }
-    $x = $Line.Substring(0,1); $y = $Line.Substring(1,1)
-    $rest = $Line.Substring(3)
-    $untracked = ($x -eq '?' -and $y -eq '?')
-    # rename/copy: "ORIG -> NEW" — take NEW
-    if (($x -eq 'R' -or $x -eq 'C') -and $rest -match '^(.*?)\s->\s(.*)$') { $rest = $Matches[2] }
-    # unquote C-style quoted path (strip surrounding quotes + basic unescape)
-    if ($rest.StartsWith('"') -and $rest.EndsWith('"')) {
-        $rest = $rest.Substring(1, $rest.Length - 2) -replace '\\"','"' -replace '\\\\','\'
-    }
-    [pscustomobject]@{ X=$x; Y=$y; Path=$rest; Untracked=$untracked }
-}
-
-function Get-RepoStatusEntry {
-    param([string]$RepoPath)
-    foreach ($line in (git -C $RepoPath status --porcelain=v1 2>$null)) {
-        $parsed = ConvertFrom-PorcelainLine -Line $line
-        if (-not $parsed) { continue }
-        $full = Join-Path $RepoPath $parsed.Path
-        $size = if (Test-Path -LiteralPath $full -PathType Leaf) { (Get-Item -LiteralPath $full).Length } else { 0 }
-        [pscustomobject]@{ X=$parsed.X; Y=$parsed.Y; Path=$parsed.Path; Untracked=$parsed.Untracked; SizeBytes=$size }
-    }
-}
-
 function Test-RepoHazard {
     param([string]$RepoPath)
     $h = @()
@@ -298,7 +272,6 @@ function Invoke-RepoBundleBackup {
     $newest = (Get-ChildItem -LiteralPath $BundleDir -Filter "$BundleBaseName-*.bundle" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1)?.FullName
     $newestIsCurrent = [bool]($newest -and $newest -match "-$([regex]::Escape($digest8))\.bundle$")
     $bundlePath = $null
-    $createdNewBundle = $false
     if ($digest -ne $last -or -not $newestIsCurrent) {
         if (-not (Test-Path -LiteralPath $BundleDir)) { New-Item -ItemType Directory -Path $BundleDir -Force | Out-Null }
         $target  = Join-Path $BundleDir "$BundleBaseName-$Stamp-$digest8.bundle"
@@ -333,7 +306,6 @@ function Invoke-RepoBundleBackup {
         try { Set-Content -LiteralPath $stateFile -Value $digest -NoNewline -ErrorAction Stop }
         catch { $findings.Add([pscustomobject]@{ Severity='warn'; Kind='bundle_failed'; Detail="digest stamp failed for $RepoPath (bundle published; next run re-bundles)" }) }
         $bundlePath = $target
-        $createdNewBundle = $true
     } else {
         $bundlePath = $newest
     }
@@ -518,7 +490,7 @@ function Install-GpbMirror {
     $shim = @(
         '#!/bin/sh',
         'GPB_WORKREPO=$(git config gpb.workrepo); export GPB_WORKREPO',
-        'vs=$(git config --int gpb.verifyseconds); [ -n "$vs" ] || vs=60',
+        'vs=$(git config --int gpb.verifyseconds); [ -n "$vs" ] || vs=0',
         'pwsh -NoProfile -Command "Import-Module GitProtonBackup; Invoke-ProtonBackupHook -WorkRepo \$env:GPB_WORKREPO -VerifySeconds $vs"',
         'exit 0'
     ) -join "`n"

@@ -272,6 +272,19 @@ Describe 'Invoke-ProtonBackupVerify (reconciliation)' {
         $r.ExitCode | Should -Be 0
         @(Get-ChildItem (Get-GpbMarkerDir) -Filter '*.json').Count | Should -Be 0
     }
+    It 'CLI-ready path resolves the closure-captured private helpers for real (regression pin: GetNewClosure bareword bug)' {
+        # Deliberately NO -SyncCheck: with -CliReadyRunner returning $true, $effectiveCheck's
+        # cliReady branch must resolve Get-CloudBundlePath/Confirm-BundleUploaded through the
+        # $getCloudBundlePathFn/$confirmBundleUploadedFn variable captures (GetNewClosure detaches
+        # the scriptblock's SessionState, so a bareword call to either function used to fail with
+        # "not recognized" here — every other test seams past this branch via -SyncCheck/
+        # -CliReadyRunner and never actually exercised it).
+        Write-PushPendingMarker -RepoPath $script:repo -Reason verify_timeout `
+            -BundleDir (Get-GpbBundleDir -Config (Read-GpbConfig) -RepoPath $script:repo) -BundleBaseName (Split-Path $script:repo -Leaf)
+        $r = Invoke-ProtonBackupVerify -CliReadyRunner { $true } -InfoRunner { param($cp,$cli) [pscustomobject]@{ ExitCode=0; Output="state: 'active'" } }
+        $r.ExitCode | Should -Be 0
+        @(Get-ChildItem (Get-GpbMarkerDir) -Filter '*.json').Count | Should -Be 0
+    }
     It 'orphaned marker (repo gone + not registered) is evicted with a finding' {
         $gone = New-TestRepo
         Write-PushPendingMarker -RepoPath $gone -Reason cli_unready -BundleDir 'C:\B' -BundleBaseName 'g'

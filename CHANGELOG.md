@@ -18,4 +18,9 @@
 - `Get-ProtonBackupConfig` — reads the current configuration.
 - `Set-ProtonBackupConfig` — validates and writes a single configuration key.
 
+Note: a pre-release fix corrected the push-hook shim's `VerifySeconds` fallback (it was hardcoding
+60s instead of honoring `config.json`'s `VerifySeconds` when no per-mirror `gpb.verifyseconds`
+override is set) — any mirror wired before this fix picks it up by re-running
+`Repair-ProtonBackup`.
+
 Initial public release.
