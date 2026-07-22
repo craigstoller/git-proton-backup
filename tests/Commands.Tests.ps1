@@ -547,3 +547,48 @@ Describe 'Invoke-ProtonBackupVerify return contract (v0.2.0)' {
         $r2.Repos[0].State | Should -BeIn @('ok','attention')
     }
 }
+
+Describe 'Issue #2 hardening (v0.2.1)' {
+    BeforeEach {
+        $script:dir = Join-Path ([IO.Path]::GetTempPath()) ("gpb21-" + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $script:dir | Out-Null
+        $env:GPB_CONFIG_DIR = $script:dir
+        $env:GPB_LOCK_PATH  = Join-Path $script:dir 'test.lock'
+        $script:drive = Join-Path $script:dir 'drive'
+        New-Item -ItemType Directory -Force -Path $script:drive | Out-Null
+        Initialize-ProtonBackup -ProtonDriveRoot $script:drive -WarningAction SilentlyContinue
+    }
+    AfterEach {
+        Remove-Item Env:GPB_CONFIG_DIR -ErrorAction SilentlyContinue
+        Remove-Item Env:GPB_LOCK_PATH -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $script:dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'Verify reports and returns instead of going silent when the pass throws unexpectedly' {
+        # Get-GpbMarkerDir is called in the marker pass OUTSIDE the inner fault isolations —
+        # a stand-in for any unexpected throw escaping those islands.
+        Mock Get-GpbMarkerDir { throw 'boom' } -ModuleName GitProtonBackup
+        $r = Invoke-ProtonBackupVerify -CliReadyRunner { $false } -WarningAction SilentlyContinue
+        $r.ExitCode | Should -Be 1
+        $r.Complete | Should -BeFalse
+        $r.IncompleteReason | Should -Be 'error'
+        (@($r.Findings) -join ' ') | Should -Match 'verify pass failed unexpectedly'
+        # The whole point: the durable report still gets written.
+        $lv = Get-Content (Join-Path $script:dir 'last-verify.json') -Raw | ConvertFrom-Json
+        $lv.Complete | Should -BeFalse
+        $lv.IncompleteReason | Should -Be 'error'
+    }
+
+    It 'Uninstall leaves a foreign proton remote in place (with a warning)' {
+        $repo = Join-Path $script:dir 'repo'; New-Item -ItemType Directory -Force -Path $repo | Out-Null
+        git -C $repo init -q; git -C $repo config user.email t@t; git -C $repo config user.name t
+        Set-Content (Join-Path $repo 'a.txt') 'x'; git -C $repo add .; git -C $repo commit -qm init
+        $foreign = Join-Path $script:dir 'foreign.git'
+        git init --bare -q $foreign
+        git -C $repo remote add proton $foreign
+        Uninstall-ProtonBackup -RepoPath $repo -WarningVariable wv -WarningAction SilentlyContinue
+        (git -C $repo remote get-url proton) | Should -Be $foreign
+        (@($wv) -join ' ') | Should -Match 'not a GitProtonBackup mirror'
+        Test-Path -LiteralPath $foreign | Should -BeTrue
+    }
+}

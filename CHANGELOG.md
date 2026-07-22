@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.1 — 2026-07-21
+
+- `Invoke-ProtonBackupVerify` can no longer go silent on an unexpected throw: the verify pass
+  now has a catch-all that converts an escaping error into an incomplete run
+  (`Complete = $false`, new `IncompleteReason` value `'error'`) and still writes
+  `last-verify.json` and pings the heartbeat. Previously such a throw would skip both —
+  leaving the dead-man's switch silently stale. ([#2])
+- `Uninstall-ProtonBackup` no longer removes a `proton` remote it doesn't own: the remote is
+  removed only when it points into this tool's mirrors root; a foreign remote gets a warning
+  and is left in place (any GitProtonBackup mirror for the repo is still cleaned up).
+  Ownership-symmetric with install, which refuses foreign remotes. ([#2])
+
+[#2]: https://github.com/craigstoller/git-proton-backup/issues/2
+
 ## 0.2.0 — 2026-07-21
 
 - `Invoke-ProtonBackupVerify` now returns `Repos` (the per-repo results already written to

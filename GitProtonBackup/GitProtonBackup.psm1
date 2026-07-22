@@ -533,10 +533,17 @@ function Install-GpbMirror {
 function Remove-GpbMirror {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$RepoPath)
-    $mirror = git -C $RepoPath remote get-url proton 2>$null
-    if ($LASTEXITCODE -ne 0) { $mirror = $null }
-    if (-not $mirror) { $mirror = Get-GpbMirrorPath -RepoPath $RepoPath }
-    git -C $RepoPath remote remove proton 2>&1 | Out-Null
+    # Ownership-symmetric with Install (issue #2): Install refuses a foreign 'proton' remote,
+    # so Uninstall must not strip one either. The remote is removed only when its url points
+    # into OUR mirrors root; a foreign remote is warned about and left in place — while any
+    # GitProtonBackup mirror for this repo is still cleaned up under the delete-safe rule below.
+    $remoteUrl = git -C $RepoPath remote get-url proton 2>$null
+    if ($LASTEXITCODE -ne 0) { $remoteUrl = $null }
+    $oursRoot = Join-Path (Get-GpbRoot) 'mirrors'
+    $remoteIsOurs = [bool]($remoteUrl -and $remoteUrl.StartsWith($oursRoot, [System.StringComparison]::OrdinalIgnoreCase))
+    if ($remoteIsOurs) { git -C $RepoPath remote remove proton 2>&1 | Out-Null }
+    elseif ($remoteUrl) { Write-Warning "the 'proton' remote points at '$remoteUrl', which is not a GitProtonBackup mirror — remote left in place." }
+    $mirror = if ($remoteIsOurs) { $remoteUrl } else { Get-GpbMirrorPath -RepoPath $RepoPath }
     if (-not $mirror -or -not (Test-Path -LiteralPath $mirror)) { return }
     # Safety: only delete a directory that is verifiably OUR mirror for THIS repo — a bare repo
     # whose gpb.workrepo canonically equals $RepoPath (Resolve-Path both sides, case-insensitive).
@@ -557,7 +564,7 @@ function Remove-GpbMirror {
         $ownsIt = [string]::Equals($a.TrimEnd('\','/'), $b.TrimEnd('\','/'), [System.StringComparison]::OrdinalIgnoreCase)
     }
     if ($ownsIt) { Remove-Item -LiteralPath $mirror -Recurse -Force }
-    else { Write-Warning "proton remote pointed at '$mirror', which is not verifiably owned by this repo — left in place (remote removed)." }
+    else { Write-Warning "mirror at '$mirror' is not verifiably owned by this repo — left in place." }
 }
 
 function Test-GpbMirror {
@@ -1123,6 +1130,15 @@ function Invoke-ProtonBackupVerify {
         }
 
         $complete = $true
+      } catch {
+        # Never-go-silent backstop (issue #2): the inner fault isolations cover the expected
+        # failure modes, but a throw OUTSIDE those islands would previously escape this
+        # catchless try/finally — releasing the lock, then skipping the report/heartbeat tail
+        # entirely, leaving last-verify.json silently stale. Convert it to an incomplete run
+        # instead; the tail below still reports and pings.
+        $findings.Add("verify pass failed unexpectedly: $($_.Exception.GetBaseException().Message)")
+        $exit = [Math]::Max($exit, 1)
+        $incompleteReason = 'error'
       } finally { $lock.Close(); Remove-Item (Get-GpbLockPath) -Force -ErrorAction SilentlyContinue }
     }
 

@@ -353,10 +353,12 @@ Describe 'GpbMirror lifecycle' {
         New-Item -ItemType Directory -Path $victim -Force | Out-Null
         Set-Content (Join-Path $victim 'precious.txt') 'data'
         git -C $script:prepo remote add proton $victim
-        Remove-GpbMirror -RepoPath $script:prepo -WarningAction SilentlyContinue
+        Remove-GpbMirror -RepoPath $script:prepo -WarningVariable wv -WarningAction SilentlyContinue
         Test-Path (Join-Path $victim 'precious.txt') | Should -BeTrue   # untouched
-        git -C $script:prepo remote get-url proton *> $null
-        $LASTEXITCODE | Should -Not -Be 0                                # remote still removed
+        # v0.2.1 (issue #2): a FOREIGN remote is now left in place too — ownership-symmetric
+        # with Install, which refuses foreign remotes rather than silently adopting them.
+        (git -C $script:prepo remote get-url proton) | Should -Be $victim
+        (@($wv) -join ' ') | Should -Match 'not a GitProtonBackup mirror'
     }
     It 'health flags a mirror wired to a DIFFERENT repo' {
         $r = Install-GpbMirror -RepoPath $script:prepo
