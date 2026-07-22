@@ -1,0 +1,7 @@
+version: 2
+updates:
+  # The module itself has zero dependencies; GitHub Actions is the only dependency surface.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

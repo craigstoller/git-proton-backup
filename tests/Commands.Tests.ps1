@@ -154,7 +154,7 @@ Describe 'Initialize + Config' {
         @((Read-GpbConfig).Repos) | Should -Contain 'C:\P\x'
     }
     It 'initialize warns (not throws) when the CLI is absent or unauthenticated' {
-        $out = Initialize-ProtonBackup -ProtonDriveRoot $script:drive -ProtonCli 'no-such-cli-anywhere' -WarningVariable wv -WarningAction SilentlyContinue
+        $null = Initialize-ProtonBackup -ProtonDriveRoot $script:drive -ProtonCli 'no-such-cli-anywhere' -WarningVariable wv -WarningAction SilentlyContinue
         (@($wv) -join "`n") | Should -Match '(?i)cli'
         (Read-GpbConfig).ProtonDriveRoot | Should -Be $script:drive
     }

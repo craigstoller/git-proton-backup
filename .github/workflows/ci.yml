@@ -7,6 +7,19 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Lint (PSScriptAnalyzer)
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $findings = Invoke-ScriptAnalyzer -Path . -Recurse -Settings .\PSScriptAnalyzerSettings.psd1
+          if ($findings) {
+            $findings | Format-Table RuleName, Severity, ScriptName, Line, Message -AutoSize | Out-String | Write-Host
+            throw "PSScriptAnalyzer: $($findings.Count) finding(s)"
+          }
+          Write-Host 'PSScriptAnalyzer: clean'
+      - name: Manifest
+        shell: pwsh
+        run: Test-ModuleManifest .\GitProtonBackup\GitProtonBackup.psd1 | Out-Null
       - name: Pester
         shell: pwsh
         run: |
