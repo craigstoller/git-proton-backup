@@ -73,6 +73,23 @@ whenever it's stale, whether or not anything flagged a problem along the way. Ru
 install it as a daily check. Full rationale for all of this: [docs/design.md](docs/design.md).
 Curious how a non-developer shipped this? See [how it was built](docs/how-it-was-built.md).
 
+## Why PowerShell?
+
+Because the domain is Windows, and PowerShell is what Windows already speaks.
+
+- **The transport is the Proton Drive *Windows* sync app** — bundles are published into its sync
+  folder, and upload state is read straight from the Windows Cloud Files API. That API call is a
+  few lines of inline P/Invoke here; it isn't portable, and neither is the transport.
+- **Zero runtime for the audience.** The people this is for — Windows users with git and a Proton
+  account — install nothing to run it: no Python, no packaging manager, no binary to trust.
+  `install.ps1` copies a module; that's the whole footprint.
+- **The job is glue.** Orchestrating git, a vendor CLI, filesystem state, and Task Scheduler is
+  exactly what a shell is for. A compiled language would add build weight to a tool whose honest
+  job is coordination, not computation.
+
+The Windows-specific part is the transport, not the language — see the [Roadmap](#roadmap) for
+what macOS/Linux support would actually take.
+
 ## Monitoring
 
 - `Get-ProtonBackupStatus` (add `-Json` for scripting) — per-repo wiring health, whether the current
