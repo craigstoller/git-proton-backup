@@ -240,6 +240,38 @@ Describe 'Confirm-BundleUploaded -CliPath' {
         $r.Confirmed | Should -BeTrue
         $script:seenCli | Should -Be 'C:\custom\proton-drive.exe'
     }
+    It 'confirms from the --json payload (activeRevision.value.state), not prose' {
+        $r = Confirm-BundleUploaded -CloudPath '/my-files/x.bundle' -CliPath 'cli' -InfoRunner {
+            param($cp, $cli)
+            [pscustomobject]@{ ExitCode = 0; Output = '{"type":"file","activeRevision":{"ok":true,"value":{"uid":"a~b~c","state":"active","storageSize":120350}}}' }
+        }
+        $r.Confirmed | Should -BeTrue
+        $r.Reason | Should -Be 'cli_confirmed'
+    }
+    It 'does NOT confirm when the json payload reports a non-active revision' {
+        $r = Confirm-BundleUploaded -CloudPath '/my-files/x.bundle' -CliPath 'cli' -InfoRunner {
+            param($cp, $cli)
+            [pscustomobject]@{ ExitCode = 0; Output = '{"type":"file","activeRevision":{"ok":true,"value":{"uid":"a~b~c","state":"draft"}}}' }
+        }
+        $r.Confirmed | Should -BeFalse
+        $r.Reason | Should -Be 'unverified'
+    }
+    It 'falls back to the human-readable match when the payload is not json (older CLI)' {
+        $r = Confirm-BundleUploaded -CloudPath '/my-files/x.bundle' -CliPath 'cli' -InfoRunner {
+            param($cp, $cli)
+            [pscustomobject]@{ ExitCode = 0; Output = "uid: 'a~b~c',`n  state: 'active'," }
+        }
+        $r.Confirmed | Should -BeTrue
+        $r.Reason | Should -Be 'cli_confirmed'
+    }
+    It 'keeps not_in_cloud and auth_error detection on the error paths' {
+        (Confirm-BundleUploaded -CloudPath '/x' -CliPath 'cli' -InfoRunner {
+            param($cp, $cli) [pscustomobject]@{ ExitCode = 1; Output = 'Node not found: x.bundle' } }).Reason |
+            Should -Be 'not_in_cloud'
+        (Confirm-BundleUploaded -CloudPath '/x' -CliPath 'cli' -InfoRunner {
+            param($cp, $cli) [pscustomobject]@{ ExitCode = 1; Output = 'You need to login first' } }).Reason |
+            Should -Be 'auth_error'
+    }
 }
 
 Describe 'Push pending markers' {

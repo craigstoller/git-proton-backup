@@ -370,13 +370,30 @@ function Confirm-BundleUploaded {
     if (-not $InfoRunner) {
         $InfoRunner = {
             param($cp, $cli)
-            $out = & $cli filesystem info $cp 2>&1 | Out-String
+            # --json goes AFTER the subcommand. Structured output means confirmation reads a
+            # documented field instead of pattern-matching prose (issue #4).
+            $out = & $cli filesystem info $cp --json 2>&1 | Out-String
             [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $out }
         }
     }
     $r = & $InfoRunner $CloudPath $CliPath
-    if ($r.ExitCode -eq 0 -and $r.Output -match "state:\s*'active'") {
-        return [pscustomobject]@{ Confirmed=$true;  Reason='cli_confirmed' }
+    if ($r.ExitCode -eq 0) {
+        # Preferred: the CLI's --json payload exposes the revision state directly as
+        # activeRevision.value.state. Fall back to matching the human-readable output so an
+        # older CLI (or an injected legacy runner) degrades to the previous behavior rather
+        # than reporting a healthy bundle as unconfirmed.
+        $state = $null
+        try {
+            $json = $r.Output | ConvertFrom-Json -ErrorAction Stop
+            $rev = $json.PSObject.Properties['activeRevision'] ? $json.activeRevision : $null
+            if ($rev -and $rev.PSObject.Properties['ok'] -and $rev.ok -and $rev.PSObject.Properties['value']) {
+                $state = $rev.value.PSObject.Properties['state'] ? $rev.value.state : $null
+            }
+        } catch { $state = $null }
+        if ($state -eq 'active') { return [pscustomobject]@{ Confirmed=$true; Reason='cli_confirmed' } }
+        if (-not $state -and $r.Output -match "state:\s*'active'") {
+            return [pscustomobject]@{ Confirmed=$true; Reason='cli_confirmed' }
+        }
     }
     if ($r.Output -match 'Node not found') {
         return [pscustomobject]@{ Confirmed=$false; Reason='not_in_cloud' }

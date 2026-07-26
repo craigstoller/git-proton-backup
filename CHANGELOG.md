@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.2 — 2026-07-25
+
+- Upload confirmation now reads the CLI's structured output (`filesystem info --json` →
+  `activeRevision.value.state`) instead of pattern-matching the human-readable text for
+  `state: 'active'`. The old match is kept as a fallback, so a CLI whose JSON is absent or
+  unparseable degrades to the previous behavior rather than reporting a healthy bundle as
+  unconfirmed. Closes #4.
+
 ## 0.2.1 — 2026-07-21
 
 - `Invoke-ProtonBackupVerify` can no longer go silent on an unexpected throw: the verify pass
