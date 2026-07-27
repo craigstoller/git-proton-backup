@@ -2,3 +2,9 @@
 *.tmp
 TestResults/
 testResults.xml
+
+# Agent permission allowlists. Tools such as Claude Code record each approved
+# command verbatim, so any secret pasted on a command line -- a token, an API
+# key, a connection string -- is stored in this file in plain text. Treat it
+# like .env and never commit it.
+**/.claude/settings.local.json
