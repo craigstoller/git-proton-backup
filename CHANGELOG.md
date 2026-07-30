@@ -11,7 +11,9 @@
   unavailable, a file whose state could not be determined read as "safely in sync" and could
   have permitted a bundle to be pruned. All negative values now fail closed; unknown positive
   bits are still ignored by the masks, so a future Windows state cannot suppress a real
-  `IN_SYNC`. Six regression tests added, confirmed failing before the fix.
+  `IN_SYNC`. Six tests added around the decoder, which previously had none: the two
+  negative-state cases were confirmed failing against the old code before the fix; the other
+  four pin the valid-state decoding the fix had to preserve.
 
   Found because a commenter on r/PowerShell asked how the DLL's functions were discovered,
   which sent us back to re-read the P/Invoke.
