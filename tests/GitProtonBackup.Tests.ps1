@@ -426,3 +426,48 @@ Describe 'GpbMirror lifecycle' {
         $LASTEXITCODE | Should -Not -Be 0             # remote still removed
     }
 }
+
+Describe 'Cloud Files placeholder state decoding' {
+    # CF_PLACEHOLDER_STATE values per cfapi.h:
+    #   NO_STATES 0x0  PLACEHOLDER 0x1  SYNC_ROOT 0x2  ESSENTIAL_PROP 0x4
+    #   IN_SYNC   0x8  PARTIAL     0x10 PARTIALLY_ON_DISK 0x20  INVALID 0xffffffff
+
+    It 'INVALID (0xffffffff -> -1 through the int P/Invoke) fails CLOSED' {
+        # Regression: masking bits straight off -1 (every bit set) reported BOTH
+        # IsPlaceholder and InSync as true, so a file whose state the API could not parse
+        # read as "safely in sync" — and InSync alone drives backed_up state, marker
+        # clearing, and retention pruning in the verify pass.
+        $s = ConvertFrom-CfPlaceholderState -State ([int]0xffffffff)
+        $s.IsPlaceholder | Should -BeFalse
+        $s.InSync        | Should -BeFalse
+        $s.Raw           | Should -Be -1      # original preserved for diagnosis
+    }
+    It 'any negative state fails closed, not just the documented sentinel' {
+        foreach ($v in -2, -12345, [int]::MinValue) {
+            $s = ConvertFrom-CfPlaceholderState -State $v
+            $s.IsPlaceholder | Should -BeFalse
+            $s.InSync        | Should -BeFalse
+        }
+    }
+    It 'NO_STATES reports neither placeholder nor in-sync' {
+        $s = ConvertFrom-CfPlaceholderState -State 0
+        $s.IsPlaceholder | Should -BeFalse
+        $s.InSync        | Should -BeFalse
+    }
+    It 'PLACEHOLDER without IN_SYNC is a placeholder that is not synced' {
+        $s = ConvertFrom-CfPlaceholderState -State 0x1
+        $s.IsPlaceholder | Should -BeTrue
+        $s.InSync        | Should -BeFalse
+    }
+    It 'PLACEHOLDER + IN_SYNC is the confirmed-locally case' {
+        $s = ConvertFrom-CfPlaceholderState -State (0x1 -bor 0x8)
+        $s.IsPlaceholder | Should -BeTrue
+        $s.InSync        | Should -BeTrue
+    }
+    It 'an undocumented future bit does not suppress a real IN_SYNC (fix must not over-reject)' {
+        # Guards the fix itself: failing closed on negatives must not become
+        # failing closed on any unrecognised positive bit.
+        $s = ConvertFrom-CfPlaceholderState -State (0x1 -bor 0x8 -bor 0x40)
+        $s.InSync | Should -BeTrue
+    }
+}

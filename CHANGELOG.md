@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.3 — 2026-07-29
+
+- **Fail-closed fix in Cloud Files sync-state decoding.** `CF_PLACEHOLDER_STATE_INVALID` is
+  `0xffffffff`, returned when Windows cannot parse a file's attributes and reparse tag. It
+  arrives through the int-returning P/Invoke as `-1` (every bit set), and
+  `ConvertFrom-CfPlaceholderState` was masking bits straight off it — so an unreadable state
+  reported both `IsPlaceholder` and `InSync` as **true**. Because `InSync` alone drives
+  `backed_up` state, push-marker clearing, and retention pruning whenever the Proton CLI is
+  unavailable, a file whose state could not be determined read as "safely in sync" and could
+  have permitted a bundle to be pruned. All negative values now fail closed; unknown positive
+  bits are still ignored by the masks, so a future Windows state cannot suppress a real
+  `IN_SYNC`. Six regression tests added, confirmed failing before the fix.
+
+  Found because a commenter on r/PowerShell asked how the DLL's functions were discovered,
+  which sent us back to re-read the P/Invoke.
+
 ## 0.2.2 — 2026-07-25
 
 - Upload confirmation now reads the CLI's structured output (`filesystem info --json` →

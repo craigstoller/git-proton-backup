@@ -118,6 +118,19 @@ function Get-RepoRefDigest {
 function ConvertFrom-CfPlaceholderState {
     [CmdletBinding()]
     param([Parameter(Mandatory)][int]$State)
+    # CF_PLACEHOLDER_STATE_INVALID is 0xffffffff — returned when the API cannot parse the
+    # file's attributes/reparse tag — and it arrives through the int-returning P/Invoke as
+    # -1, i.e. every bit set. Masking bits straight off that reported IsPlaceholder AND
+    # InSync as TRUE, so a file whose state Windows could not determine read as "safely in
+    # sync". That is the wrong direction for this module: InSync alone drives backed_up
+    # state, marker clearing, and retention pruning in the verify pass, so an unreadable
+    # state could have retired a bundle. Every negative value is outside the documented
+    # enum (max valid is 0x3F), so fail closed on all of them rather than on -1 alone.
+    # Unknown POSITIVE bits stay harmless: the masks below simply ignore them, which keeps
+    # a future Windows adding a state from suppressing a real IN_SYNC.
+    if ($State -lt 0) {
+        return [pscustomobject]@{ IsPlaceholder = $false; InSync = $false; Raw = $State }
+    }
     [pscustomobject]@{
         IsPlaceholder = ($State -band 0x1) -ne 0
         InSync        = ($State -band 0x8) -ne 0
