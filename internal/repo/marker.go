@@ -18,17 +18,17 @@ const (
 func Bootstrap(t transport.Transport, root string) error {
 	marker := root + "/" + MarkerName
 	if _, ok, err := t.Stat(marker); err != nil {
-		return err
+		return fmt.Errorf("stat %s: %w", marker, err)
 	} else if ok {
 		return ensureSubdirs(t, root)
 	}
 
 	if err := t.EnsureDir(root); err != nil {
-		return err
+		return fmt.Errorf("ensure dir %s: %w", root, err)
 	}
 	nodes, err := t.List(root)
 	if err != nil {
-		return err
+		return fmt.Errorf("list %s: %w", root, err)
 	}
 	for _, n := range nodes {
 		// .lock is our own scaffolding, not repo content. Counting it would
@@ -104,11 +104,14 @@ var windowsReserved = map[string]bool{
 }
 
 // checkStageableLeaf rejects leaf names that cannot survive a local staging
-// path. The set is small because git already forbids space, control characters,
-// '?', '*', '[', '~', '^' and ':' in ref names; what remains is brace globbing
-// (probe C13: 0.7.0 still glob-expands '{') and Windows device names. Refusing
-// these is also consistent — such a ref could never be UPDATED on this
-// transport, so accepting the create would promise what the update cannot keep.
+// path. leaf must be a single path component — stagedFile places it directly
+// under a temp dir, so any '/' or '\' is rejected outright as a separator, not
+// interpreted as a subpath. Beyond that, the set is small because git already
+// forbids space, control characters, '?', '*', '[', '~', '^' and ':' in ref
+// names; what remains is brace globbing (probe C13: 0.7.0 still glob-expands
+// '{') and Windows device names. Refusing these is also consistent — such a
+// ref could never be UPDATED on this transport, so accepting the create would
+// promise what the update cannot keep.
 func checkStageableLeaf(leaf string) error {
 	if leaf == "" || leaf == "." || leaf == ".." {
 		return fmt.Errorf("refusing to stage the name %q", leaf)

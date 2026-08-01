@@ -16,6 +16,31 @@ func TestBootstrapEmptyRemote(t *testing.T) {
 	if _, ok := f.Files["/my-files/r/gpb-remote.json"]; !ok {
 		t.Error("marker must be written")
 	}
+	for _, d := range []string{"/my-files/r/refs", "/my-files/r/refs/heads", "/my-files/r/refs/tags", "/my-files/r/packs"} {
+		if !f.Dirs[d] {
+			t.Errorf("subdir %s must exist after first bootstrap", d)
+		}
+	}
+}
+
+// TestBootstrapCompletesPartialInitialisation covers the marker-present fast
+// path in isolation: a folder with a valid marker but no subdirs yet (e.g. an
+// interrupted prior bootstrap) must be completed, not treated as already done.
+// Unlike TestBootstrapIdempotent, no first Bootstrap call runs here, so the
+// subdirs cannot already exist as a side effect of anything else — this is
+// the only test that would fail if the fast path stopped calling
+// ensureSubdirs.
+func TestBootstrapCompletesPartialInitialisation(t *testing.T) {
+	f := transport.NewFake()
+	f.Files["/my-files/r/gpb-remote.json"] = []byte(markerContent)
+	if err := Bootstrap(f, "/my-files/r"); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	for _, d := range []string{"/my-files/r/refs", "/my-files/r/refs/heads", "/my-files/r/refs/tags", "/my-files/r/packs"} {
+		if !f.Dirs[d] {
+			t.Errorf("subdir %s must be created to complete a partial initialisation", d)
+		}
+	}
 }
 
 func TestBootstrapIgnoresLockWhenTestingEmptiness(t *testing.T) {
