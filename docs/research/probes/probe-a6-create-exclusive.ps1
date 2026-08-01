@@ -3,36 +3,39 @@
 A6 - is `filesystem upload -f skip` an atomic create-exclusive usable as a mutex?
 
 .DESCRIPTION
-Raised by peer review of docs/v2-remote-helper-design.md (2026-07-31). The v2 design uses an
-advisory .lock file to enforce one writer per repo. A reviewer objected that writing that lock
-through the CLI is a time-of-check-to-time-of-use race: two machines both list, both see no
-lock, both upload, both proceed - reintroducing exactly the silent-clobber hazard the design
-claims to avoid. If true, the reviewer's conclusion follows: the CLI cannot carry the lock and
-the design needs the SDK.
+Raised by peer review of docs/v2-remote-helper-design.md (2026-07-31). The v2 design needs a
+create-exclusive primitive: a write that succeeds only if the name does not already exist, with
+the refusal DETECTABLE by the loser. If the CLI cannot express that, the lock is decorative.
 
-The counter-hypothesis: the race may not exist, because uniqueness is enforced SERVER-side, not
-by the client's check. The prior-art memo (§3b item 1) records that Proton rejects creating a
-file whose name already exists with code 2500 - "atomic create-exclusive", equivalent to
-Dropbox's WriteMode.add. If the CLI's `skip` conflict strategy surfaces that refusal, then
-"upload my lock, read it back, check whose content is there" is a correct mutual-exclusion
-primitive, and no client-side check is involved at all.
+The counter-hypothesis to "this is a check-then-act race": uniqueness is enforced SERVER-side,
+not by any client check (prior-art memo §3b item 1 - creating a node whose name exists is
+rejected with code 2500). If the CLI's `skip` strategy surfaces that refusal distinguishably,
+then "attempt the write, read the outcome" is a correct mutual-exclusion primitive.
 
-WHAT IS TESTED
-  1. upload lock-A (content identifying writer A)
-  2. upload lock-B - SAME name, different content, -f skip
-  3. read the file back
+## v2 of this probe - why it was rewritten
 
-READING THE RESULT
-  content is still A -> the second write was refused. Create-exclusive works through the CLI,
-                        the loser can detect it by reading back, and the lock is sound.
-  content is now B   -> skip did not protect the file. The reviewer is right: no mutex via CLI.
-  file missing/error -> ERROR, no conclusion.
+The first version reported "CREATE-EXCLUSIVE WORKS" based ONLY on the final file contents. It
+never asserted that writer B actually ran and was actually skipped. Any failure of B - bad
+path, network, auth, malformed arguments - would leave writer A's content in place and produce
+exactly the same "works" verdict. That is the same defect as the false-COLLIDED A5 run this
+project already documented: a probe that cannot distinguish "the remote refused" from "my call
+failed" is not evidence.
 
-NOTE ON WHAT THIS DOES AND DOES NOT PROVE. This is a SEQUENTIAL test: it shows the CLI refuses
-to overwrite an existing name and that the refusal is detectable. It does NOT prove atomicity
-under genuine simultaneous contention - two uploads racing in the same instant. That would need
-two clients firing together, and is the same class of claim as A1-A3. Sequential refusal is
-necessary but not sufficient; it is reported as such.
+This version therefore:
+  - runs BOTH uploads with --json and records the raw summaries
+  - asserts writer A was actually transferred (transferred >= 1)
+  - asserts writer B was actually SKIPPED (skipped >= 1 AND transferred == 0)
+  - asserts no failures were reported for either
+  - verifies the surviving content is A's, by exact bytes
+  - reports the CLI version, so the result is pinned to a build
+
+Any of those failing yields ERROR, never a substantive verdict.
+
+## What this still does NOT prove
+
+This is SEQUENTIAL. It shows the CLI refuses an existing name and that the refusal is
+detectable. It does NOT prove atomicity under two genuinely simultaneous processes - that
+needs a barrier-synchronised concurrent run, and is Stage 1 work in the v2 design.
 
 .NOTES
 Writes only under /my-files/_cas-probe (enforced by probe-lib.ps1, no override).
@@ -44,12 +47,30 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'probe-lib.ps1')
 
-'=== A6 - create-exclusive via the CLI ==='
+'=== A6 - create-exclusive via the CLI (v2: asserts its own preconditions) ==='
 Assert-FleetGreen -SkipSweepGate:$SkipSweepGate
+
+$ver = Invoke-ProbeCli -CliArgs @('--version')
+"CLI version: $($ver.Output.Trim())   (results are pinned to this build)"
+
 [void](Initialize-ProbeRoot)
 
 $ws   = New-ProbeWorkspace
 $name = 'repo.lock'
+
+function Get-TransferCounts {
+    <#  Parse the --json transfer summary. Returns nulls if the shape is not what we expect,
+        so the caller can fail loudly rather than silently reading 0 for everything. #>
+    param([Parameter(Mandatory)][object]$Result)
+    $t = $null; $s = $null; $f = $null; $parsed = $null
+    try { $parsed = $Result.Output | ConvertFrom-Json } catch { }
+    if ($parsed) {
+        foreach ($n in 'transferredItems','transferred','uploadedItems') { if ($null -eq $t -and $parsed.PSObject.Properties[$n]) { $t = [int]$parsed.$n } }
+        foreach ($n in 'skippedItems','skipped')                          { if ($null -eq $s -and $parsed.PSObject.Properties[$n]) { $s = [int]$parsed.$n } }
+        foreach ($n in 'failedItems','failed')                            { if ($null -eq $f -and $parsed.PSObject.Properties[$n]) { $f = [int]$parsed.$n } }
+    }
+    [pscustomobject]@{ Transferred=$t; Skipped=$s; Failed=$f; Parsed=$parsed; Raw=$Result.Output; ExitCode=$Result.ExitCode }
+}
 
 try {
     $sub    = New-ProbeFolder -Parent $script:ProbeRoot -Name 'a6'
@@ -58,34 +79,52 @@ try {
     $dirA = Join-Path $ws 'A'; New-Item -ItemType Directory -Path $dirA -Force | Out-Null
     $dirB = Join-Path $ws 'B'; New-Item -ItemType Directory -Path $dirB -Force | Out-Null
     [System.IO.File]::WriteAllText((Join-Path $dirA $name), 'WRITER-A')
-    [System.IO.File]::WriteAllText((Join-Path $dirB $name), 'WRITER-B-SHOULD-NOT-WIN')
+    [System.IO.File]::WriteAllText((Join-Path $dirB $name), 'WRITER-B-MUST-NOT-WIN')
 
-    $u1 = Invoke-ProbeCli -CliArgs @('filesystem','upload','-f','skip',(Join-Path $dirA $name),$sub) -RemotePaths @($sub)
-    "1. writer A takes the lock -> exit $($u1.ExitCode)"; if ($u1.Output) { "   $($u1.Output)" }
-    [void](Assert-CliOk -Result $u1 -What 'writer A creating the lock')
+    # --- writer A: must genuinely transfer -------------------------------------------
+    $rA = Invoke-ProbeCli -CliArgs @('filesystem','upload','-f','skip','--json',(Join-Path $dirA $name),$sub) -RemotePaths @($sub)
+    $a  = Get-TransferCounts -Result $rA
+    "1. writer A -> exit $($a.ExitCode)  transferred=$($a.Transferred) skipped=$($a.Skipped) failed=$($a.Failed)"
+    "   raw: $($a.Raw)"
 
-    $u2 = Invoke-ProbeCli -CliArgs @('filesystem','upload','-f','skip',(Join-Path $dirB $name),$sub) -RemotePaths @($sub)
-    "2. writer B attempts the same name -> exit $($u2.ExitCode)"; if ($u2.Output) { "   $($u2.Output)" }
+    # --- writer B: must genuinely be SKIPPED ------------------------------------------
+    $rB = Invoke-ProbeCli -CliArgs @('filesystem','upload','-f','skip','--json',(Join-Path $dirB $name),$sub) -RemotePaths @($sub)
+    $b  = Get-TransferCounts -Result $rB
+    "2. writer B -> exit $($b.ExitCode)  transferred=$($b.Transferred) skipped=$($b.Skipped) failed=$($b.Failed)"
+    "   raw: $($b.Raw)"
 
-    # read back: download to a local file and inspect the bytes
+    # --- surviving content -------------------------------------------------------------
     $dl = Join-Path $ws 'readback'; New-Item -ItemType Directory -Path $dl -Force | Out-Null
-    $d = Invoke-ProbeCli -CliArgs @('filesystem','download',$remote,$dl) -RemotePaths @($remote)
-    "3. read back -> exit $($d.ExitCode)"; if ($d.Output) { "   $($d.Output)" }
-
+    $rD = Invoke-ProbeCli -CliArgs @('filesystem','download',$remote,$dl) -RemotePaths @($remote)
     $got = $null
-    $f = Get-ChildItem $dl -File -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($f) { $got = [System.IO.File]::ReadAllText($f.FullName) }
-    "   content on the remote: '$got'"
+    $file = Get-ChildItem $dl -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($file) { $got = [System.IO.File]::ReadAllText($file.FullName) }
+    "3. surviving content: '$got'"
 
-    $verdict =
-        if ($null -eq $got)            { 'ERROR - could not read the lock back; no conclusion' }
-        elseif ($got -eq 'WRITER-A')   { 'CREATE-EXCLUSIVE WORKS (sequential) - the second write was refused and the loser can detect it by reading back' }
-        elseif ($got -like 'WRITER-B*'){ 'NO MUTEX - skip did not protect the existing file; the reviewer is right' }
-        else                           { "ERROR - unexpected content '$got'" }
+    # --- verdict: every precondition must hold, else ERROR -----------------------------
+    $problems = @()
+    if ($null -eq $a.Transferred -or $null -eq $b.Skipped) {
+        $problems += 'could not parse transfer counts from --json (shape changed?) - see raw output above'
+    } else {
+        if ($a.Transferred -lt 1)          { $problems += "writer A did not transfer (transferred=$($a.Transferred)) - setup failed, nothing was tested" }
+        if ($a.Failed -gt 0)               { $problems += "writer A reported failures ($($a.Failed))" }
+        if ($b.Failed -gt 0)               { $problems += "writer B reported failures ($($b.Failed)) - B errored rather than being refused" }
+        if ($b.Transferred -ne 0)          { $problems += "writer B TRANSFERRED ($($b.Transferred)) - the name was NOT protected" }
+        if ($b.Skipped -lt 1)              { $problems += "writer B was not skipped (skipped=$($b.Skipped)) - refusal not observed" }
+    }
+    if ($got -ne 'WRITER-A')               { $problems += "surviving content is '$got', expected 'WRITER-A'" }
 
-    "`nVERDICT: $verdict"
-    "  writer B exit code was $($u2.ExitCode) - note whether a refusal is distinguishable from success by exit code alone"
-    "`nSCOPE: sequential refusal only. This does NOT prove atomicity under simultaneous contention."
+    ''
+    if ($problems.Count) {
+        'VERDICT: ERROR - preconditions not met, NO conclusion drawn:'
+        $problems | ForEach-Object { "  - $_" }
+    } else {
+        'VERDICT: CREATE-EXCLUSIVE CONFIRMED (sequential)'
+        "  writer A transferred=1, writer B skipped=1 transferred=0, content intact."
+        "  Detection MUST read these counts: both invocations exited $($a.ExitCode)/$($b.ExitCode)."
+    }
+    ''
+    'SCOPE: sequential only. Atomicity under two simultaneous processes is NOT established here.'
 }
 finally {
     Remove-Item $ws -Recurse -Force -ErrorAction SilentlyContinue
