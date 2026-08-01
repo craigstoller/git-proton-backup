@@ -1,0 +1,52 @@
+package transport
+
+// Outcome is what a mutation is known to have done. A NON-NIL ERROR ALWAYS
+// DOMINATES THE OUTCOME: every method here returns (Outcome, error), and the
+// Outcome is meaningful only when err == nil. Implementations return Ambiguous
+// alongside an error as the safe accompanying value, never as a claim the
+// caller may act on, so a caller that reads the Outcome without checking the
+// error first is reading a value that was never asserted.
+type Outcome int
+
+const (
+	Committed Outcome = iota // definitely applied
+	Refused                  // name existed; nothing changed
+	Ambiguous                // unknown; MUST be reconciled by reading remote state
+)
+
+func (o Outcome) String() string {
+	switch o {
+	case Committed:
+		return "committed"
+	case Refused:
+		return "refused"
+	default:
+		return "ambiguous"
+	}
+}
+
+type Node struct {
+	Name  string
+	IsDir bool
+	Size  int64
+}
+
+type Transport interface {
+	// EnsureDir is Stat-then-create: create-folder FAILS on an existing folder
+	// (Stage 1 C5), so a bare create would error on every run after the first.
+	EnsureDir(path string) error
+	List(path string) ([]Node, error)
+	Stat(path string) (Node, bool, error) // absence is (_, false, nil), never an error
+	// ReadTo downloads the node at path into the existing local directory
+	// localPath, landing as a file named after path's own remote basename —
+	// this mirrors `filesystem download path... localFolder` exactly.
+	// localPath is a directory, never a destination file path; implementations
+	// do not create it, and a missing or non-directory localPath must surface
+	// as the error it naturally is.
+	ReadTo(path, localPath string) error
+	CreateExclusive(path, localPath string) (Outcome, error)
+	UpdateRevision(path, localPath string) (Outcome, error)
+	// Trash on a MISSING target fails with exit 1 (Stage 1 C4), so implementations
+	// must Stat first and report Committed for an already-absent node.
+	Trash(path string) (Outcome, error)
+}

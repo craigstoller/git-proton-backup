@@ -353,7 +353,10 @@ type Transport interface {
 	EnsureDir(path string) error
 	List(path string) ([]Node, error)
 	Stat(path string) (Node, bool, error) // absence is (_, false, nil), never an error
-	ReadTo(path, localPath string) error
+	// ReadTo downloads the node at path INTO the existing local directory
+	// localDir, as a file named after the node's own remote basename. It is
+	// never a destination FILE path: the CLI's `download` takes a folder.
+	ReadTo(path, localDir string) error
 	CreateExclusive(path, localPath string) (Outcome, error)
 	UpdateRevision(path, localPath string) (Outcome, error)
 	// Trash on a MISSING target fails with exit 1 (Stage 1 C4), so implementations
@@ -371,6 +374,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -419,12 +423,17 @@ func (f *Fake) Stat(p string) (Node, bool, error) {
 	return Node{}, false, nil
 }
 
-func (f *Fake) ReadTo(p, local string) error {
+// ReadTo mirrors the CLI: localDir is an existing DIRECTORY, and the node
+// lands inside it under its own remote basename. Writing straight to localDir
+// as if it were a file path is the bug this fake originally shipped — latent
+// until Task 7's readLock became the first caller. path.Base, not
+// filepath.Base: remote paths are POSIX regardless of host OS.
+func (f *Fake) ReadTo(p, localDir string) error {
 	b, ok := f.Files[p]
 	if !ok {
 		return fmt.Errorf("not found: %s", p)
 	}
-	return os.WriteFile(local, b, 0o644)
+	return os.WriteFile(filepath.Join(localDir, path.Base(p)), b, 0o644)
 }
 
 func (f *Fake) CreateExclusive(p, local string) (Outcome, error) {
@@ -754,6 +763,11 @@ func (c *CLI) upload(strategy, remoteDir, localFile string) (Outcome, error) {
 	return classifyUpload(s.Transferred, s.Skipped, s.Failed), nil
 }
 
+// CreateExclusive and UpdateRevision both pass only dirOf(p) to the CLI,
+// because `filesystem upload` takes a PARENT path and has no --name flag: the
+// remote node is named after localFile's OWN basename (probe C11). CALLER
+// CONTRACT: filepath.Base(localFile) MUST equal the leaf of p, or the write
+// lands under the wrong remote name. repo.stagedFile is what guarantees it.
 func (c *CLI) CreateExclusive(p, localFile string) (Outcome, error) {
 	return c.upload("skip", dirOf(p), localFile)
 }
@@ -859,6 +873,28 @@ func TestBootstrapIdempotent(t *testing.T) {
 		t.Errorf("second bootstrap must be a no-op: %v", err)
 	}
 }
+
+func TestStagedFileUsesTheLeafNameAndRefusesHostileOnes(t *testing.T) {
+	// The CLI names the uploaded node after the LOCAL basename (probe C11),
+	// so the staged file must BE the leaf name, not a neutral one.
+	p, cleanup, err := stagedFile([]byte("x"), "main")
+	if err != nil {
+		t.Fatalf("staging a plain leaf must succeed: %v", err)
+	}
+	defer cleanup()
+	if filepath.Base(p) != "main" {
+		t.Errorf("staged basename must equal the leaf, got %q", filepath.Base(p))
+	}
+	if b, err := os.ReadFile(p); err != nil || string(b) != "x" {
+		t.Errorf("staged content = %q, %v", b, err)
+	}
+
+	for _, bad := range []string{"a{b,c}", "con", "nul.txt", "", "..", "a/b"} {
+		if _, _, err := stagedFile([]byte("x"), bad); err == nil {
+			t.Errorf("%q must be refused with a reason, not mangled", bad)
+		}
+	}
+}
 ```
 
 - [ ] **Step 2: Run to verify failure**
@@ -878,6 +914,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/craigstoller/git-proton-backup/internal/transport"
 )
@@ -911,17 +948,13 @@ func Bootstrap(t transport.Transport, root string) error {
 		}
 	}
 
-	tmp, err := os.CreateTemp("", "gpb-marker-*")
+	staged, cleanup, err := stagedFile([]byte(markerContent), MarkerName)
 	if err != nil {
 		return err
 	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.WriteString(markerContent); err != nil {
-		return err
-	}
-	tmp.Close()
+	defer cleanup()
 
-	switch out, err := t.CreateExclusive(marker, tmp.Name()); {
+	switch out, err := t.CreateExclusive(marker, staged); {
 	case err != nil:
 		return err
 	case out == transport.Refused:
@@ -941,21 +974,66 @@ func ensureSubdirs(t transport.Transport, root string) error {
 	return nil
 }
 
-func stagedFile(content []byte) (string, func(), error) {
-	// Ref names never appear in a LOCAL path: CLI 0.7.0 glob-expands local paths
-	// containing '{', and git accepts refs/heads/a{b,c}. Windows also reserves
-	// names like `con`. Staging through a neutral name sidesteps all of it.
-	f, err := os.CreateTemp("", "gpb-stage-*")
+// stagedFile writes content into a private temp directory under leafName and
+// returns that local path, plus a cleanup func.
+//
+// The local basename MUST equal the target's remote leaf name. `filesystem
+// upload` takes a PARENT path and has no --name flag, so the CLI names the
+// uploaded node after the LOCAL file (probe C11). Neutral staging — which an
+// earlier design revision specified — is therefore not expressible, and
+// upload-then-rename cannot serve UpdateRevision (probe C12).
+//
+// The cost is that a ref name does appear in a local path, so names hostile to
+// one are rejected here with a reason instead of being silently mangled.
+func stagedFile(content []byte, leafName string) (string, func(), error) {
+	noop := func() {}
+	if err := checkStageableLeaf(leafName); err != nil {
+		return "", noop, err
+	}
+	dir, err := os.MkdirTemp("", "gpb-stage-*")
 	if err != nil {
-		return "", func() {}, err
+		return "", noop, err
 	}
-	if _, err := f.Write(content); err != nil {
-		f.Close()
-		os.Remove(f.Name())
-		return "", func() {}, err
+	cleanup := func() { os.RemoveAll(dir) }
+	p := filepath.Join(dir, leafName)
+	if err := os.WriteFile(p, content, 0o600); err != nil {
+		cleanup()
+		return "", noop, err
 	}
-	f.Close()
-	return f.Name(), func() { os.Remove(filepath.Clean(f.Name())) }, nil
+	return p, cleanup, nil
+}
+
+// windowsReserved are DOS device names. Windows refuses them as filenames on
+// every host, and git accepts them as ref names.
+var windowsReserved = map[string]bool{
+	"con": true, "prn": true, "aux": true, "nul": true,
+	"com1": true, "com2": true, "com3": true, "com4": true, "com5": true,
+	"com6": true, "com7": true, "com8": true, "com9": true,
+	"lpt1": true, "lpt2": true, "lpt3": true, "lpt4": true, "lpt5": true,
+	"lpt6": true, "lpt7": true, "lpt8": true, "lpt9": true,
+}
+
+// checkStageableLeaf rejects leaf names that cannot survive a local staging
+// path. The set is small because git already forbids space, control characters,
+// '?', '*', '[', '~', '^' and ':' in ref names; what remains is brace globbing
+// (probe C13: 0.7.0 still glob-expands '{') and Windows device names. Refusing
+// these is also consistent — such a ref could never be UPDATED on this
+// transport, so accepting the create would promise what the update cannot keep.
+func checkStageableLeaf(leaf string) error {
+	if leaf == "" || leaf == "." || leaf == ".." {
+		return fmt.Errorf("refusing to stage the name %q", leaf)
+	}
+	if strings.ContainsAny(leaf, `{}/\`) {
+		return fmt.Errorf("%q cannot be expressed as a local staging path", leaf)
+	}
+	stem := strings.ToLower(leaf)
+	if i := strings.IndexByte(stem, '.'); i >= 0 {
+		stem = stem[:i]
+	}
+	if windowsReserved[stem] {
+		return fmt.Errorf("%q is a reserved device name on Windows", leaf)
+	}
+	return nil
 }
 ```
 
@@ -965,7 +1043,7 @@ func stagedFile(content []byte) (string, func(), error) {
 go test ./internal/repo/
 ```
 
-Expected: PASS (4 tests).
+Expected: PASS (5 tests).
 
 - [ ] **Step 5: Commit**
 
@@ -1074,7 +1152,9 @@ func AcquireLock(t transport.Transport, root string) (*Lock, error) {
 	host, _ := os.Hostname()
 	body, _ := json.Marshal(lockBody{nonce, host, os.Getpid(), time.Now().UTC().Format(time.RFC3339)})
 
-	staged, cleanup, err := stagedFile(body)
+	// Staged under the lock's own leaf name: the CLI names the uploaded node
+	// after the LOCAL basename (probe C11), so it must match.
+	staged, cleanup, err := stagedFile(body, LockName)
 	if err != nil {
 		return nil, err
 	}
@@ -1427,14 +1507,17 @@ func readRef(t transport.Transport, p string) (string, error) {
 	return sha, nil
 }
 
-// WriteRef stages through a neutral temp filename so the ref name never appears
-// in a LOCAL path (CLI globbing, Windows reserved names). It then verifies by
-// read-back, because a byte-identical write is silently skipped.
+// WriteRef stages under the ref's own LEAF NAME, because `filesystem upload`
+// names the uploaded node after the local basename and has no --name flag
+// (probe C11). A leaf hostile to a local path is rejected by stagedFile with a
+// named reason rather than mangled. It then verifies by read-back, because a
+// byte-identical write is silently skipped.
 func WriteRef(t transport.Transport, root, ref, sha string, exists bool) (transport.Outcome, error) {
 	if !shaRe.MatchString(sha) {
 		return transport.Ambiguous, fmt.Errorf("refusing to write non-sha %q to %s", sha, ref)
 	}
-	staged, cleanup, err := stagedFile([]byte(sha + "\n"))
+	leaf := ref[strings.LastIndex(ref, "/")+1:]
+	staged, cleanup, err := stagedFile([]byte(sha+"\n"), leaf)
 	if err != nil {
 		return transport.Ambiguous, err
 	}
@@ -1606,7 +1689,13 @@ func pushOne(t transport.Transport, root, gitDir string,
 		if !gitcmd.HasObject(gitDir, oldSha) {
 			return fail("fetch first")
 		}
-		ok, _ := gitcmd.IsAncestor(gitDir, oldSha, newSha)
+		// IsAncestor distinguishes "not an ancestor" (exit 1) from a tooling
+		// failure. Discarding the error would report a broken git as a
+		// confident non-fast-forward rejection.
+		ok, err := gitcmd.IsAncestor(gitDir, oldSha, newSha)
+		if err != nil {
+			return fail("cannot determine ancestry: " + err.Error())
+		}
 		if !ok {
 			return fail("non-fast-forward")
 		}
@@ -1727,11 +1816,20 @@ import (
 	"github.com/craigstoller/git-proton-backup/internal/transport"
 )
 
-func main() {
+func main() { os.Exit(run()) }
+
+// run returns the process exit code. NOTHING inside the command loop may call
+// os.Exit: it skips deferred functions, so a fatal error after `list for-push`
+// has acquired the lock would leak `.lock` — and with no takeover in v2, a
+// leaked lock wedges the repo until a human clears it by hand with the CLI.
+// Release-on-every-exit-path is normative, which is why it is a defer.
+func run() int {
 	if len(os.Args) < 3 {
 		fmt.Fprintln(os.Stderr, "git-remote-proton: must be run by git as a remote helper")
-		os.Exit(1)
+		return 1
 	}
+	// git invokes the helper with the part AFTER `proton::` as argv[2], so this
+	// is normally a no-op; it costs nothing and covers the other form.
 	root := strings.TrimPrefix(os.Args[2], "proton::")
 	gitDir := os.Getenv("GIT_DIR")
 	if gitDir == "" {
@@ -1769,12 +1867,12 @@ func main() {
 			}
 			l, err := repo.AcquireLock(t, root) // BEFORE advertising
 			if err != nil {
-				die(err)
+				return die(err)
 			}
 			lock = l
 			refs, err := repo.ListRefs(t, root)
 			if err != nil {
-				die(err)
+				return die(err)
 			}
 			for name, sha := range refs {
 				fmt.Fprintf(out, "%s %s\n", sha, name)
@@ -1807,11 +1905,11 @@ func main() {
 			}
 			ups, err := protocol.ParsePushBatch(batch)
 			if err != nil {
-				die(err)
+				return die(err)
 			}
 			remote, err := repo.ListRefs(t, root)
 			if err != nil {
-				die(err)
+				return die(err)
 			}
 			for _, r := range repo.Push(t, root, gitDir, ups, remote) {
 				if r.OK {
@@ -1824,16 +1922,22 @@ func main() {
 			out.Flush()
 
 		case line == "":
-			return
+			return 0
 		default:
-			die(fmt.Errorf("unsupported command: %q", line))
+			return die(fmt.Errorf("unsupported command: %q", line))
 		}
 	}
+	if err := in.Err(); err != nil {
+		return die(fmt.Errorf("reading stdin: %w", err))
+	}
+	return 0
 }
 
-func die(err error) {
+// die reports to stderr and returns the exit code. It must never call os.Exit
+// itself — see run().
+func die(err error) int {
 	fmt.Fprintf(os.Stderr, "git-remote-proton: %v\n", err)
-	os.Exit(1)
+	return 1
 }
 ```
 
@@ -1910,3 +2014,9 @@ git commit -m "feat(v2): wire the helper; git push proton-v2 works end to end"
 **Deliberately deferred to Stage 3+ and NOT in this plan:** fetch, clone, tag transitions beyond create, `refs/notes` and other namespaces, initial `HEAD` derivation, and shallow/partial refusal beyond the poison flag. Stage 2's contract is "a real `git push` works", and each of those needs the fetch half or its own transition rules.
 
 **Known judgment calls for the implementer.** `readRef` and `readLock` both download to a temp directory because the CLI's `download` takes a destination *folder*, not a file path — do not assume a file destination. `filepathBase` is hand-rolled rather than `filepath.Base` because remote paths are always POSIX regardless of host OS, and `filepath.Base` would mishandle them on Windows.
+
+**Revised 2026-08-01 during Task 11 — `os.Exit` skipped the lock release.** Step 1's `die()` called `os.Exit(1)`, which does not run deferred functions. So any fatal error after `list for-push` had acquired the lock would leak `.lock` — and with no takeover in v2, a leaked lock wedges the repo until a human clears it by hand. The design calls release-on-every-exit-path normative and says explicitly that it is a `defer` rather than a happy-path step; this code contradicted that. Restructured as `main() { os.Exit(run()) }` with `run() int`, so nothing inside the command loop calls `os.Exit`. The same edit closes Task 1's deferred minor: the loop now checks `in.Err()`, so a stdin read error fails closed instead of exiting 0. Found by the Task 11 implementer during self-review, not by a reviewer.
+
+**Revised 2026-08-01 during Task 7 — the fake diverged from the CLI a second time.** `Transport.ReadTo` was declared with no comment about its destination. `CLI.ReadTo` runs `filesystem download p localDir`, where the destination is a **folder**; the fake wrote straight to `localPath` as if it were a **file**. Neither contradicted a stated contract, because there wasn't one, and `readLock` was the first caller in the codebase — so it stayed latent through Tasks 3, 4 and 5. The contract is now stated on the interface and the fake is fixed. **This is the second fake/real divergence on this branch**, after the C11 staging bug below, and both were invisible to the deterministic suite. `Trash`, `CreateExclusive` and `UpdateRevision` have never been differentially tested against their CLI counterparts either; that audit belongs in the final review, not in Task 11's live push alone.
+
+**Revised 2026-08-01 during Task 5 (probes C11–C14).** The plan originally staged every ref write through a *neutral* temporary local filename, per design v5. That is not expressible: `filesystem upload` takes a PARENT path and has no `--name` flag, so the CLI names the uploaded node after the LOCAL basename (C11), and upload-then-`rename` cannot serve `UpdateRevision` without first trashing the ref (C12). Staging now happens under the target's own **leaf name**, and leaf names hostile to a local path are rejected with a named reason rather than mangled — the rejected set being brace-globbing names (C13 confirms the hazard is live on 0.7.0) and Windows device names. `docs/v2-remote-helper-design.md` v6 records the same change. Note the in-memory fake would **not** have caught this: it keys on the full target path, so every repo-layer test would have passed while the real transport wrote to the wrong name.

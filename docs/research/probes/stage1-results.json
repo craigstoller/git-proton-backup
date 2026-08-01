@@ -68,6 +68,93 @@
         "visible": true,
         "msFromUploadStart": 7331.0
       }
+    },
+    "C8": {
+      "question": "Does `upload -f merge` create a node that does not yet exist, or fail?",
+      "answer": "UPSERTS - exit 0, transferredItems=1, node present afterwards. UpdateRevision needs no prior existence check for correctness.",
+      "evidence": {
+        "nodeExistsAfter": true,
+        "failed": 0,
+        "exit": 0,
+        "transferred": 1,
+        "raisedBy": "Task 3 review (cannot-verify item)",
+        "skipped": 0
+      }
+    },
+    "C9": {
+      "question": "What are the literal `type` field values, and are they the same in `info --json` and `list --json`? (Node.IsDir is decided by a string compare)",
+      "answer": "EXACTLY \"folder\" and \"file\", identical in both commands. `type == \"folder\"` is a sound IsDir test. Folders carry no activeRevision; files carry it UNWRAPPED on 0.7.0, with claimedSize = real bytes (2) and storageSize = encrypted size (80) — reading claimedSize is correct.",
+      "evidence": {
+        "infoFolderType": "folder",
+        "infoFileType": "file",
+        "listFolderType": "folder",
+        "listFileType": "file",
+        "activeRevisionOnFolder": "absent",
+        "activeRevisionShape": "unwrapped",
+        "claimedSize": 2,
+        "storageSize": 80,
+        "sha1Verified": false,
+        "raisedBy": "Task 4 review (cannot-verify item)"
+      }
+    },
+    "C10": {
+      "question": "What are the exact bytes of an EMPTY folder listing? (C6 established exit 0 + zero elements, but not the raw shape)",
+      "answer": "`[\\r\\n\\r\\n]\\r\\n` - 8 bytes, exit 0. It is NOT empty output: a TrimSpace-is-empty guard never fires. An empty listing is valid JSON and parses to a zero-element array on the normal path. C6's `emptyRawLen: 6` was the same shape measured without the trailing CRLF.",
+      "evidence": {
+        "emptyExit": 0,
+        "emptyRawLen": 8,
+        "emptyRawBytes": [91, 13, 10, 13, 10, 93, 13, 10],
+        "trimSpaceIsEmpty": false,
+        "parsesAsEmptyArray": true,
+        "raisedBy": "Task 4 review (follow-on to the C9 probe)"
+      }
+    },
+    "C11": {
+      "question": "Can `upload` place a file at a CHOSEN remote name, or is the node always named after the LOCAL basename? (the design stages ref writes through a neutral local filename and uploads `to the desired remote name`)",
+      "answer": "ALWAYS NAMED AFTER THE LOCAL BASENAME. `filesystem upload localPath... parentPath` takes a PARENT path, not a target file path, and has no --name flag (only -c/-f/-d/-t). A local file `gpb-stage-neutral123` uploaded to a folder lands as a node named `gpb-stage-neutral123`. The design's neutral-staging mechanism is NOT EXPRESSIBLE with this CLI.",
+      "evidence": {
+        "uploadUsage": "filesystem upload [-c STRATEGY] [-f STRATEGY] [-d STRATEGY] [-t] localPath... parentPath",
+        "nameFlagExists": false,
+        "localBasename": "gpb-stage-neutral123",
+        "remoteNodeName": "gpb-stage-neutral123",
+        "transferred": 1,
+        "raisedBy": "Task 5 review (Important finding: dirOf discards the target basename)"
+      }
+    },
+    "C12": {
+      "question": "Does `filesystem rename` exist, and does it refuse a name that is already taken? (an upload-then-rename workaround for C11 would depend on it)",
+      "answer": "EXISTS and REFUSES. `rename path newName` renames in place (node uid stable, revision preserved), exit 0. Renaming ONTO an existing name exits 1 with `A file or folder with that name already exists` - a server-arbitrated refusal, so it could stand in for CreateExclusive. But it CANNOT serve UpdateRevision: revising an existing ref would require trashing the old node first, which is exactly the destructive `replace` pattern the design rejects for being able to destroy a ref on crash. Upload-then-rename is therefore a dead end for the update path.",
+      "evidence": {
+        "renameUsage": "filesystem rename path newName",
+        "renameToFreeNameExit": 0,
+        "renameOntoExistingExit": 1,
+        "renameOntoExistingRaw": "A file or folder with that name already exists",
+        "movesBetweenFolders": false,
+        "orphanLeftOnCollision": true
+      }
+    },
+    "C13": {
+      "question": "Does CLI 0.7.0 glob-expand a LOCAL path containing brace metacharacters? (the design cites this 0.4.6 behaviour as a reason to never put a ref name in a local path; it was unverified on 0.7.0)",
+      "answer": "YES - STILL BROKEN ON 0.7.0. A local file literally named `a{b,c}` (a ref leaf name git accepts) fails with `No paths matched`, exit 1, counts (0,0,0). The hazard the design cites is real on the pinned build, not just on 0.4.6. Note the (0,0,0) tuple classifies as Ambiguous, which is the correct fail-closed reading.",
+      "evidence": {
+        "localBasename": "a{b,c}",
+        "exit": 1,
+        "raw": "No paths matched: ...\\a{b,c}",
+        "counts": { "t": 0, "s": 0, "f": 0 },
+        "classifiesAs": "Ambiguous"
+      }
+    },
+    "C14": {
+      "question": "Does `upload -f merge` revise the existing node when the LOCAL basename equals the target's remote leaf name?",
+      "answer": "YES - exit 0, transferredItems=1, revised in place. Staging under the target leaf name is the only mechanism that serves BOTH CreateExclusive (server-arbitrated name refusal) and UpdateRevision (in-place merge), given C11 and C12.",
+      "evidence": {
+        "localBasename": "main",
+        "remoteLeaf": "main",
+        "exit": 0,
+        "transferred": 1,
+        "skipped": 0,
+        "failed": 0
+      }
     }
   }
 }
