@@ -185,3 +185,30 @@ func TestCLIUploadStartFailureIsAmbiguous(t *testing.T) {
 		})
 	}
 }
+
+// TestDirOf pins the real behaviour of dirOf, the function the Task 5
+// review round 1 finding (C11) turned on: CreateExclusive/UpdateRevision
+// pass only dirOf(p) to the CLI, so the CLI process's target directory
+// depends entirely on this function being correct. Asserts actual observed
+// behaviour, not an assumed one.
+func TestDirOf(t *testing.T) {
+	cases := []struct {
+		name string
+		p    string
+		want string
+	}{
+		{"nested path", "/a/b/c", "/a/b"},
+		{"parent is root", "/a", "/"},
+		{"root itself", "/", "/"},
+		{"no slash at all", "filename.txt", "/"},
+		{"empty string", "", "/"},
+		{"relative nested path, no leading slash", "refs/heads/master", "refs/heads"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := dirOf(c.p); got != c.want {
+				t.Errorf("dirOf(%q) = %q, want %q", c.p, got, c.want)
+			}
+		})
+	}
+}

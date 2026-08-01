@@ -210,6 +210,11 @@ func (c *CLI) upload(strategy, remoteDir, localFile string) (Outcome, error) {
 	return parseTransferSummary(out)
 }
 
+// CreateExclusive and UpdateRevision both pass only dirOf(p) to the CLI,
+// because `filesystem upload` takes a PARENT path and has no --name flag: the
+// remote node is named after localFile's OWN basename (probe C11). CALLER
+// CONTRACT: filepath.Base(localFile) MUST equal the leaf of p, or the write
+// lands under the wrong remote name. repo.stagedFile is what guarantees it.
 func (c *CLI) CreateExclusive(p, localFile string) (Outcome, error) {
 	return c.upload("skip", dirOf(p), localFile)
 }
@@ -219,6 +224,9 @@ func (c *CLI) CreateExclusive(p, localFile string) (Outcome, error) {
 // that does not yet exist (Stage 1 C8: exit 0, transferred=1), so no prior
 // existence check is needed for correctness. NOT `replace`, which trashes
 // the node before creating the new one and can destroy a ref on a crash.
+// Subject to the same caller contract as CreateExclusive, above: localFile's
+// basename must equal p's leaf (probe C11), or the revision lands under the
+// wrong remote name.
 func (c *CLI) UpdateRevision(p, localFile string) (Outcome, error) {
 	return c.upload("merge", dirOf(p), localFile)
 }
