@@ -80,6 +80,34 @@
         "raisedBy": "Task 3 review (cannot-verify item)",
         "skipped": 0
       }
+    },
+    "C9": {
+      "question": "What are the literal `type` field values, and are they the same in `info --json` and `list --json`? (Node.IsDir is decided by a string compare)",
+      "answer": "EXACTLY \"folder\" and \"file\", identical in both commands. `type == \"folder\"` is a sound IsDir test. Folders carry no activeRevision; files carry it UNWRAPPED on 0.7.0, with claimedSize = real bytes (2) and storageSize = encrypted size (80) — reading claimedSize is correct.",
+      "evidence": {
+        "infoFolderType": "folder",
+        "infoFileType": "file",
+        "listFolderType": "folder",
+        "listFileType": "file",
+        "activeRevisionOnFolder": "absent",
+        "activeRevisionShape": "unwrapped",
+        "claimedSize": 2,
+        "storageSize": 80,
+        "sha1Verified": false,
+        "raisedBy": "Task 4 review (cannot-verify item)"
+      }
+    },
+    "C10": {
+      "question": "What are the exact bytes of an EMPTY folder listing? (C6 established exit 0 + zero elements, but not the raw shape)",
+      "answer": "`[\\r\\n\\r\\n]\\r\\n` - 8 bytes, exit 0. It is NOT empty output: a TrimSpace-is-empty guard never fires. An empty listing is valid JSON and parses to a zero-element array on the normal path. C6's `emptyRawLen: 6` was the same shape measured without the trailing CRLF.",
+      "evidence": {
+        "emptyExit": 0,
+        "emptyRawLen": 8,
+        "emptyRawBytes": [91, 13, 10, 13, 10, 93, 13, 10],
+        "trimSpaceIsEmpty": false,
+        "parsesAsEmptyArray": true,
+        "raisedBy": "Task 4 review (follow-on to the C9 probe)"
+      }
     }
   }
 }
