@@ -88,3 +88,75 @@ func TestStagedFileUsesTheLeafNameAndRefusesHostileOnes(t *testing.T) {
 		}
 	}
 }
+
+func TestLockAcquireAndRelease(t *testing.T) {
+	f := transport.NewFake()
+	l, err := AcquireLock(f, "/my-files/r")
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if _, ok := f.Files["/my-files/r/.lock"]; !ok {
+		t.Fatal("lock file must exist while held")
+	}
+	if err := l.Release(); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if _, ok := f.Files["/my-files/r/.lock"]; ok {
+		t.Error("lock file must be gone after release")
+	}
+}
+
+func TestLockRefusesWhenHeld(t *testing.T) {
+	f := transport.NewFake()
+	if _, err := AcquireLock(f, "/my-files/r"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AcquireLock(f, "/my-files/r"); err == nil {
+		t.Error("second acquire must fail while the first holds it")
+	}
+}
+
+func TestReleaseDoesNotDeleteSomeoneElsesLock(t *testing.T) {
+	f := transport.NewFake()
+	l, _ := AcquireLock(f, "/my-files/r")
+	f.Files["/my-files/r/.lock"] = []byte(`{"nonce":"someone-else"}`)
+	_ = l.Release()
+	if _, ok := f.Files["/my-files/r/.lock"]; !ok {
+		t.Error("must not delete a lock whose nonce does not match ours")
+	}
+}
+
+// ambiguousTrashTransport wraps a Fake but forces Trash to report Ambiguous
+// with a nil error. transport.Fake's FailNext field (see fake.go) is only
+// checked by CreateExclusive, not by Trash, so it cannot drive this case; a
+// small local stub is the only way to exercise it against the real
+// transport.Transport interface.
+type ambiguousTrashTransport struct {
+	*transport.Fake
+}
+
+func (a ambiguousTrashTransport) Trash(p string) (transport.Outcome, error) {
+	return transport.Ambiguous, nil
+}
+
+// TestReleaseFailsClosedOnAmbiguousTrash covers the requirement that Release
+// must not discard Trash's Outcome. Committed from CreateExclusive does not
+// prove a write landed, and symmetrically a non-Committed Trash outcome does
+// not prove the lock is gone: reporting success here would let an operator
+// believe the repo is unlocked while .lock may still be sitting on the
+// remote, and v2 has no takeover to recover from that.
+func TestReleaseFailsClosedOnAmbiguousTrash(t *testing.T) {
+	f := transport.NewFake()
+	l, err := AcquireLock(f, "/my-files/r")
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	l.t = ambiguousTrashTransport{f}
+
+	if err := l.Release(); err == nil {
+		t.Error("Release must return an error when Trash reports a non-Committed outcome")
+	}
+	if _, ok := f.Files["/my-files/r/.lock"]; !ok {
+		t.Error("lock file must still be reported present; Trash never actually removed it")
+	}
+}
