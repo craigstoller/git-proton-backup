@@ -60,11 +60,22 @@ function Get-NodeFacts {
         try {
             $obj = $r.Output | ConvertFrom-Json
             $uid = $obj.uid
-            # The plaintext length is activeRevision.value.claimedSize. NOT ".size" (absent) and
-            # NOT storageSize / totalStorageSize, which include E2EE overhead - an 8-byte file
-            # reports storageSize 86. Confirmed against a live payload 2026-07-31.
-            try { $size = $obj.activeRevision.value.claimedSize } catch { }
-            try { $sha1 = $obj.activeRevision.value.claimedDigests.sha1 } catch { }
+            # The plaintext length is claimedSize. NOT ".size" (absent) and NOT storageSize /
+            # totalStorageSize, which include E2EE overhead - an 8-byte file reports 86.
+            #
+            # The CLI dropped the {ok,value} Result wrapper between 0.4.6 and 0.7.0, so BOTH
+            # shapes must be read. This probe originally handled only the wrapped form and, on
+            # 0.7.0, reported "size unreadable" for a perfectly good result - the same defect
+            # that made the shipped module report every bundle unconfirmed (fixed in 0.2.4).
+            $rev = $null
+            if ($obj -and $obj.PSObject.Properties['activeRevision']) {
+                $ar = $obj.activeRevision
+                $rev = if ($ar.PSObject.Properties['value']) { $ar.value } else { $ar }
+            }
+            if ($rev) {
+                try { $size = $rev.claimedSize } catch { }
+                try { $sha1 = $rev.claimedDigests.sha1 } catch { }
+            }
         } catch { }
     }
     [pscustomobject]@{ Exists = ($r.ExitCode -eq 0); ExitCode = $r.ExitCode; Uid = $uid; Size = $size; Sha1 = $sha1; Raw = $r.Output; Obj = $obj }

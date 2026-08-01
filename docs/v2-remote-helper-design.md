@@ -184,7 +184,41 @@ makes read-back verification more important rather than less. So `UpdateRevision
 
 **Lock contents:** `{"nonce":"<uuid>","host":"…","pid":123,"acquiredAt":"<rfc3339>"}`. The **nonce**, not the hostname, is identity — two processes on one machine are otherwise indistinguishable. A local OS file lock keyed by the **canonical remote address** (not the working copy) serialises clones on the same machine before the remote attempt.
 
-**What is verified.** A6 confirms `CreateExclusive` refuses a second writer sequentially. **A7 (2026-08-01) confirms it under genuine concurrency** — the Stage 1 gate that could have invalidated this design. Four worker processes, barrier-aligned to fire spreads of 0.3–2.8 ms, three rounds, on CLI 0.4.6: every round produced **exactly one `transferred=1` and three `skipped=1`**, zero failures, with the surviving remote content always matching the winner. The **winner rotated between rounds** (W1, W4, W3), which is what distinguishes a genuine race arbitrated by the server from a harness that accidentally serialised its workers.
+> ### ⚠ STAGE 1 BLOCKER — the CLI cannot be invoked concurrently (CLI 0.7.0)
+>
+> Discovered while re-running the probes against 0.7.0 on 2026-08-01. **Two `proton-drive`
+> processes cannot run at the same time on one machine.** The second dies during startup:
+>
+> ```
+> SQLiteError: database is locked   errno: 261   code: "SQLITE_BUSY_RECOVERY"
+>   at new SQLiteCache (src/cache/sqliteCache.ts:12)
+>   at LO (src/init.ts:49)
+> ```
+>
+> This is the CLI's **local encrypted SQLite session cache**, not a Proton response. The loser
+> never issues a network request.
+>
+> **Three consequences, and they are not small:**
+>
+> 1. **A7's 0.7.0 run does not establish server atomicity.** "Exactly one winner" there is an
+>    artifact of local cache locking, not server arbitration. The **0.4.6** A7 run remains
+>    genuine evidence — its losers exited 0 with `skippedItems=1`, meaning they reached the
+>    server and were refused by it.
+> 2. **The v1/v2 coexistence claim in this document is wrong as written.** Using distinct remote
+>    names avoids a *git* collision, but it does not let a v1 sweep and a v2 push run
+>    simultaneously: both shell out to the same CLI and would collide on this cache. Any
+>    concurrent `proton-drive` use on the machine is affected, including a user running the CLI
+>    by hand during a scheduled sweep.
+> 3. **v2 must serialise every CLI invocation machine-wide**, via a local named mutex keyed to
+>    the CLI's cache path rather than to the repo. That is a different lock from the remote
+>    `.lock`, with a different scope, and the design previously had no concept of it.
+>
+> **Open, for Stage 1:** whether this is transient (`SQLITE_BUSY_RECOVERY` may clear on retry) or
+> a hard serialisation limit; whether a shared `--cache-dir`-style option exists to give each
+> process its own cache; and whether 0.4.6's tolerance was deliberate or accidental. Until
+> answered, treat machine-wide CLI serialisation as **required**.
+
+**What is verified.** A6 confirms `CreateExclusive` refuses a second writer sequentially, on both 0.4.6 and 0.7.0. **A7 on CLI 0.4.6 (2026-08-01) confirms it under genuine concurrency** — the Stage 1 gate that could have invalidated this design. The 0.7.0 re-run does *not* corroborate it, for the reason in the blocker above. Four worker processes, barrier-aligned to fire spreads of 0.3–2.8 ms, three rounds, on CLI 0.4.6: every round produced **exactly one `transferred=1` and three `skipped=1`**, zero failures, with the surviving remote content always matching the winner. The **winner rotated between rounds** (W1, W4, W3), which is what distinguishes a genuine race arbitrated by the server from a harness that accidentally serialised its workers.
 
 **What that does and does not establish.** The experiment is asymmetric by construction: observing two winners would have *disproved* atomicity outright, while observing none only *supports* it. Three rounds at four workers is not proof of a race-free server, and this result should be re-run whenever the pinned CLI version changes. But the specific failure that would have sunk the lock — two writers both told they succeeded — did not occur under conditions designed to provoke it.
 
