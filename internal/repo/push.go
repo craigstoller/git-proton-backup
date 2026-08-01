@@ -43,8 +43,14 @@ func pushOne(t transport.Transport, root, gitDir string,
 		if !exists {
 			return Result{Ref: u.Dst, OK: true} // already absent
 		}
-		if out, err := t.Trash(root + "/" + u.Dst); err != nil || out != transport.Committed {
+		out, err := t.Trash(root + "/" + u.Dst)
+		if err != nil {
 			return fail(fmt.Sprintf("delete failed: %v", err))
+		}
+		if out != transport.Committed {
+			// err is nil here, so a bare "%v" would print the useless
+			// "delete failed: <nil>". Report the outcome itself instead.
+			return fail(fmt.Sprintf("delete failed: outcome %s", out))
 		}
 		return Result{Ref: u.Dst, OK: true}
 	}
@@ -121,8 +127,19 @@ func pushOne(t transport.Transport, root, gitDir string,
 	}
 
 	// --- publish ------------------------------------------------------------
-	if out, err := WriteRef(t, root, u.Dst, newSha, exists); err != nil || out == transport.Ambiguous {
+	out, err := WriteRef(t, root, u.Dst, newSha, exists)
+	if err != nil || out == transport.Ambiguous {
 		return fail(fmt.Sprintf("ref publish failed: %v", err))
+	}
+	if out == transport.Refused {
+		// WriteRef (refs.go) returns (Refused, nil) — no error — specifically
+		// when this is a create (exists == false) and a concurrent creator
+		// won the race; it deliberately did not overwrite. That is not the
+		// same as success: our newSha was never published, so reporting
+		// OK: true here would make git update its remote-tracking ref to a
+		// sha that disagrees with what is actually on the remote, with
+		// nothing to signal the mismatch. It must be reported as a failure.
+		return fail("ref changed concurrently; refusing to overwrite")
 	}
 	return Result{Ref: u.Dst, OK: true}
 }

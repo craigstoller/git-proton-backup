@@ -530,3 +530,56 @@ func TestPushForceSkipsAncestryCheck(t *testing.T) {
 		t.Errorf("forced push must still upload a pack/idx pair, got pack=%d idx=%d", packs, idxs)
 	}
 }
+
+// refusedRefCreateTransport wraps a Fake but forces CreateExclusive to
+// report (Refused, nil) — no error — for a first-time ref create under
+// refs/heads/, mimicking a concurrent creator winning the race. refs.go's
+// WriteRef turns exactly this shape into (transport.Refused, nil) when
+// exists is false (WriteRef never returns Refused on an update, since a
+// byte-identical UpdateRevision falls through to a matching read-back and
+// reports Committed instead). It must NOT intercept CreateExclusive calls
+// under packs/, or this would exercise the ambiguous-pack path instead of
+// the ref-publish path under test — the same care
+// ambiguousPackUploadTransport above takes in the other direction.
+type refusedRefCreateTransport struct {
+	*transport.Fake
+}
+
+func (r refusedRefCreateTransport) CreateExclusive(p, local string) (transport.Outcome, error) {
+	if strings.HasPrefix(p, "/r/refs/heads/") {
+		return transport.Refused, nil
+	}
+	return r.Fake.CreateExclusive(p, local)
+}
+
+// TestPushReportsFailureWhenRefCreateLosesConcurrentRace covers a review
+// finding: WriteRef legitimately returns (transport.Refused, nil) — no error
+// — when a create races a concurrent creator and declines to overwrite
+// (refs.go's "concurrent creator" branch). That is neither an error nor
+// Ambiguous, so a publish check that only tests `err != nil || out ==
+// transport.Ambiguous` lets it fall through and report the push as OK: true.
+// That is worse than a plain failure: our newSha was never actually
+// published, so git would update its remote-tracking ref to a sha that
+// disagrees with what is really on the remote, with nothing to signal the
+// mismatch. This drives CreateExclusive to Refused for the ref path only
+// (pack/idx uploads still succeed normally through the same Fake) and
+// asserts the push is reported as a failure naming the conflict, and that
+// our sha was never written to the ref path.
+func TestPushReportsFailureWhenRefCreateLosesConcurrentRace(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	stub := refusedRefCreateTransport{f}
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/main"}}
+	res := Push(stub, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("want a failed result when ref create loses a concurrent race, got %+v", res)
+	}
+	if !strings.Contains(res[0].Err, "concurrent") {
+		t.Errorf("failure message must name the conflict, got %q", res[0].Err)
+	}
+	if _, ok := f.Files["/r/refs/heads/main"]; ok {
+		t.Error("our sha must not be treated as published when we lost the create race")
+	}
+}
