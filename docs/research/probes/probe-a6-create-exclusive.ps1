@@ -58,19 +58,10 @@ $ver = Invoke-ProbeCli -CliArgs @('--version')
 $ws   = New-ProbeWorkspace
 $name = 'repo.lock'
 
-function Get-TransferCounts {
-    <#  Parse the --json transfer summary. Returns nulls if the shape is not what we expect,
-        so the caller can fail loudly rather than silently reading 0 for everything. #>
-    param([Parameter(Mandatory)][object]$Result)
-    $t = $null; $s = $null; $f = $null; $parsed = $null
-    try { $parsed = $Result.Output | ConvertFrom-Json } catch { }
-    if ($parsed) {
-        foreach ($n in 'transferredItems','transferred','uploadedItems') { if ($null -eq $t -and $parsed.PSObject.Properties[$n]) { $t = [int]$parsed.$n } }
-        foreach ($n in 'skippedItems','skipped')                          { if ($null -eq $s -and $parsed.PSObject.Properties[$n]) { $s = [int]$parsed.$n } }
-        foreach ($n in 'failedItems','failed')                            { if ($null -eq $f -and $parsed.PSObject.Properties[$n]) { $f = [int]$parsed.$n } }
-    }
-    [pscustomobject]@{ Transferred=$t; Skipped=$s; Failed=$f; Parsed=$parsed; Raw=$Result.Output; ExitCode=$Result.ExitCode }
-}
+# Count parsing lives in probe-lib.ps1 (Get-UploadCounts) so A5 and A6 assert identically.
+# Round-3 review catch: the earlier local copy accepted field-name ALIASES, which meant a
+# renamed field in a future CLI would silently match a fallback instead of failing the
+# assertion. The shared version requires the exact names and returns $null when absent.
 
 try {
     $sub    = New-ProbeFolder -Parent $script:ProbeRoot -Name 'a6'
@@ -83,13 +74,13 @@ try {
 
     # --- writer A: must genuinely transfer -------------------------------------------
     $rA = Invoke-ProbeCli -CliArgs @('filesystem','upload','-f','skip','--json',(Join-Path $dirA $name),$sub) -RemotePaths @($sub)
-    $a  = Get-TransferCounts -Result $rA
+    $a  = Get-UploadCounts -Result $rA
     "1. writer A -> exit $($a.ExitCode)  transferred=$($a.Transferred) skipped=$($a.Skipped) failed=$($a.Failed)"
     "   raw: $($a.Raw)"
 
     # --- writer B: must genuinely be SKIPPED ------------------------------------------
     $rB = Invoke-ProbeCli -CliArgs @('filesystem','upload','-f','skip','--json',(Join-Path $dirB $name),$sub) -RemotePaths @($sub)
-    $b  = Get-TransferCounts -Result $rB
+    $b  = Get-UploadCounts -Result $rB
     "2. writer B -> exit $($b.ExitCode)  transferred=$($b.Transferred) skipped=$($b.Skipped) failed=$($b.Failed)"
     "   raw: $($b.Raw)"
 

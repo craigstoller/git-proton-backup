@@ -76,6 +76,34 @@ function Assert-CliOk {
     $Result
 }
 
+function Get-UploadCounts {
+    <#  Parse a `filesystem upload --json` transfer summary into asserted counts.
+
+        Shape observed on cli-drive@0.4.6 (probe A6, 2026-07-31):
+          {"transferredItems":1,"transferredBytes":8,"skippedItems":0,"failedItems":0,"failures":[]}
+
+        Returns $null for a count that is ABSENT rather than defaulting it to 0 - a missing
+        field must fail an assertion, not silently read as "nothing happened". Exit code is
+        deliberately not interpreted here: A6 established that success and refusal both exit 0.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Result)
+    $parsed = $null
+    try { $parsed = $Result.Output | ConvertFrom-Json } catch { }
+    $get = {
+        param($obj, $name)
+        if ($obj -and $obj.PSObject.Properties[$name]) { [int]$obj.$name } else { $null }
+    }
+    [pscustomobject]@{
+        Transferred = & $get $parsed 'transferredItems'
+        Skipped     = & $get $parsed 'skippedItems'
+        Failed      = & $get $parsed 'failedItems'
+        Parsed      = $parsed
+        Raw         = $Result.Output
+        ExitCode    = $Result.ExitCode
+    }
+}
+
 function Test-FleetGreen {
     [CmdletBinding()]
     param()

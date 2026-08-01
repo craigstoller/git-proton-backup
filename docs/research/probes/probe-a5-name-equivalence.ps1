@@ -65,15 +65,37 @@ function Invoke-NamePair {
 
     $sub = New-ProbeFolder -Parent $script:ProbeRoot -Name "a5-$Label"
 
-    # First upload MUST succeed or the experiment is meaningless.
-    $u1 = Invoke-ProbeCli -CliArgs @('filesystem','upload','-f','skip',(Join-Path $dirA $NameA),$sub) -RemotePaths @($sub)
-    "  upload A -> exit $($u1.ExitCode)"; if ($u1.Output) { "    $($u1.Output)" }
-    [void](Assert-CliOk -Result $u1 -What "uploading the first name ($NameA)")
+    # Both uploads run with --json so their outcomes are DATA, not guesses.
+    # (Round-3 review catch: an earlier version validated only A. If B failed for any reason -
+    #  network, auth, bad path - the folder would hold one node and the probe would report
+    #  COLLIDED, a design-sinking result, from a call that never reached the server. Same
+    #  defect as the original A6. B's counts are now asserted.)
+    $u1 = Invoke-ProbeCli -CliArgs @('filesystem','upload','-f','skip','--json',(Join-Path $dirA $NameA),$sub) -RemotePaths @($sub)
+    $c1 = Get-UploadCounts -Result $u1
+    "  upload A -> exit $($u1.ExitCode) transferred=$($c1.Transferred) skipped=$($c1.Skipped) failed=$($c1.Failed)"
 
-    # Second upload may legitimately be skipped on collision, so its exit code is DATA,
-    # not a preconditionwe interpret it alongside the listing.
-    $u2 = Invoke-ProbeCli -CliArgs @('filesystem','upload','-f','skip',(Join-Path $dirB $NameB),$sub) -RemotePaths @($sub)
-    "  upload B -> exit $($u2.ExitCode)"; if ($u2.Output) { "    $($u2.Output)" }
+    $u2 = Invoke-ProbeCli -CliArgs @('filesystem','upload','-f','skip','--json',(Join-Path $dirB $NameB),$sub) -RemotePaths @($sub)
+    $c2 = Get-UploadCounts -Result $u2
+    "  upload B -> exit $($u2.ExitCode) transferred=$($c2.Transferred) skipped=$($c2.Skipped) failed=$($c2.Failed)"
+
+    # Preconditions: A must have landed, and B must have either landed (distinct names) or
+    # been skipped (collision). B FAILING means the experiment did not run.
+    $bad = @()
+    if ($null -eq $c1.Transferred -or $null -eq $c2.Transferred) { $bad += 'could not parse --json counts' }
+    else {
+        if ($c1.Transferred -lt 1) { $bad += "upload A did not transfer (transferred=$($c1.Transferred))" }
+        if ($c1.Failed -gt 0)      { $bad += "upload A reported $($c1.Failed) failure(s)" }
+        if ($c2.Failed -gt 0)      { $bad += "upload B reported $($c2.Failed) failure(s) - B errored rather than landing or being skipped" }
+        if ($c2.Transferred -lt 1 -and $c2.Skipped -lt 1) { $bad += 'upload B neither transferred nor was skipped - outcome unknown' }
+    }
+    if ($bad.Count) {
+        "  VERDICT: ERROR - preconditions not met, NO conclusion drawn:"
+        $bad | ForEach-Object { "    - $_" }
+        $results.Add([pscustomobject]@{ Case=$Label; NameA=$NameA; NameB=$NameB
+            UploadAExit=$u1.ExitCode; UploadBExit=$u2.ExitCode; Nodes=$null
+            NamesSeen=''; Verdict='ERROR - preconditions not met' })
+        return
+    }
 
     $nodes = Get-ProbeNodes -Path $sub
     $names = @($nodes | ForEach-Object { $_.name.value })

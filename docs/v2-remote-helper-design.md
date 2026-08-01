@@ -1,9 +1,14 @@
 # git-remote-proton — v2 design
 
-**Status:** design v3, revised 2026-07-31 after two rounds of Codex + Gemini peer review. Not implemented.
+**Status:** design v4, revised 2026-07-31 after three rounds of Codex + Gemini peer review. Not implemented.
 **Relates to:** [issue #3](https://github.com/craigstoller/git-proton-backup/issues/3).
 **Depends on:** [`docs/research/remote-helper-prior-art.md`](research/remote-helper-prior-art.md) — read first; assumed, not repeated.
-**Pinned to:** Proton Drive CLI `cli-drive@0.4.6` (SDK `js@0.17.3`). Behaviour below was observed on that build; other builds are unverified.
+**Pinned to:** Proton Drive CLI `cli-drive@0.4.6` (SDK `js@0.17.3`) - the build the probes ran
+against. **Proton's current published CLI is 0.7.0**, so these results are from a stale build and
+Stage 1 must re-certify against whatever version the tool actually ships against. Support is an
+**exact-version allowlist**, not a minimum: a floor would silently admit a future build whose
+`--json` shape or auto-skip behaviour differs, which is the whole thing the pinning exists to
+prevent.
 
 ---
 
@@ -65,9 +70,16 @@ Scoping v2 to a single writer removes the need for the SDK, for vendoring its in
 
 **Pack naming:** `<sha256>` is the SHA-256 of the pack file's bytes, deliberately distinct from git's object hash so the two are never confused.
 
-**Generations.** Pack filenames carry no ordering. A future compaction milestone needs one, so the cache records a `generation` integer per pack alongside its hash, sourced from the marker file's monotonically incremented counter. **Reserved now, unused in v2** — retrofitting a generation onto an existing layout is the expensive kind of change.
+**No generation field in v2.** An earlier draft reserved one for future compaction while also
+calling it unused, then referenced it from the fetch cache and the error table - reserved and
+relied upon at once. Removed. The marker's `version` field is the forward-compatibility seam:
+compaction will bump it and define its own ordering scheme at that point. The v2 fetch cache is
+keyed on pack name plus existence only.
 
-**Path canonicalisation:** the address is normalised before use — duplicate and trailing slashes collapsed, `.` and `..` rejected outright rather than resolved, empty path rejected, and the root must lie under an allowed Proton prefix (`/my-files/…`). The canonical form is the cache and lock identity.
+**Path canonicalisation:** the address is normalised before use — duplicate and trailing slashes collapsed, `.` and `..` rejected outright rather than resolved, empty path rejected, and the root must lie under `/my-files` or `/devices`. The CLI also permits creation under
+`/shared-with-me`, which v2 **refuses**: a repo in a folder another person can write to is
+precisely the concurrent-writer case this design has no defence against, so allowing it would
+invite the one failure mode single-writer cannot survive. The canonical form is the cache and lock identity.
 
 ## Architecture
 
@@ -97,9 +109,13 @@ type Transport interface {
     ReadTo(path string, localPath string) error        // streams to disk
     CreateExclusive(path, localPath string) (Outcome, error)
     UpdateRevision(path, localPath string) (Outcome, error)
-    Trash(path string) error
+    Trash(path string) (Outcome, error)                // idempotent: absent target is Committed
 }
 ```
+
+**`Trash` on a missing target is `Committed`, not an error.** The desired end state is "not there", and treating absence as failure would break concurrent branch deletion and lock cleanup — both of which can legitimately race with something that already removed the node.
+
+**Every non-idempotent mutation returns `Outcome`**, including `Trash`. A plain `error` cannot distinguish a delete that failed from one that committed before the response was lost, and the error table requires that distinction.
 
 **`CreateExclusive` maps to `upload -f skip --json`.** The outcome is read from the transfer summary, whose shape is pinned by probe A6 on CLI 0.4.6:
 
@@ -107,7 +123,16 @@ type Transport interface {
 {"transferredItems":1,"transferredBytes":8,"skippedItems":0,"failedItems":0,"failures":[]}
 ```
 
-`transferredItems >= 1` is `Committed`; `skippedItems >= 1` with `transferredItems == 0` is `Refused`; `failedItems > 0` is an error **even though the exit code may be 0**. Anything else — unparseable JSON, unexpected counts — is `Ambiguous`.
+**Count tuples are exact and mutually exclusive** for a single-file operation. `>= 1` is too permissive — a `transferred=1, skipped=1` response is contradictory for one file and must not read as success:
+
+| `transferred` | `skipped` | `failed` | Outcome |
+|---|---|---|---|
+| 1 | 0 | 0 | `Committed` |
+| 0 | 1 | 0 | `Refused` |
+| 0 | 0 | ≥1 | error (**exit code may still be 0**) |
+| anything else, or unparseable JSON, or a missing field | | | `Ambiguous` |
+
+A missing count field is `Ambiguous`, never defaulted to zero — a renamed field in a future CLI must fail loudly rather than silently read as "nothing happened."
 
 **Exit codes cannot distinguish these.** A6 confirms both success and refusal exit 0. Any implementation branching on exit status is wrong.
 
@@ -133,13 +158,25 @@ type Transport interface {
 
 **What is not protected at all:** ref *updates* are last-write-wins. Without a conditional write there is no defence if two writers do run concurrently. New refs are safer, since `CreateExclusive` genuinely refuses. **The lock lowers the chance of an accident; it does not make concurrent use safe.**
 
-**Takeover:** no fencing token exists, so an override can delete A's lock while A is merely slow, after which A may publish behind B. Default is never auto-steal: report holder nonce and age, require an explicit flag, and document that it is safe only once the holder is known dead.
+**Release cannot be conditional, so v2 has no takeover at all.** An earlier draft promised release would "not delete a replacement lock." That guarantee is impossible with this transport: verifying the nonce and then calling `Trash` is check-then-act, and no conditional delete exists. If A verifies its nonce, B takes over, and A then trashes by path, A deletes B's lock.
+
+Rather than ship an impossible promise, **v2 removes takeover**. A stale lock is reported — holder nonce, host, age — with instructions to remove it manually via the CLI once the operator has established the holder is dead. There is no override flag. This is less convenient and it is honest; a fencing token or conditional delete would be required to do better, and neither exists without the SDK.
 
 **Weaker than v1's lock.** v1 holds an OS file handle with exclusive sharing — a kernel mutex. A file on cloud storage is a convention.
 
 ## Push
 
-**Options.** `--atomic` must be **rejected**, not silently accepted, since this design cannot honour it. `--force-with-lease` must be rejected as unsupported rather than treated as plain force — silently discarding a safety property the user asked for is worse than refusing. Both are reported through the helper's option mechanism.
+### Unsupported-option state machine (safety-critical)
+
+**Git does not honour the helper's rejection of every option, so "reply `unsupported`" is not a defence.** This is the single most dangerous subtlety in the protocol.
+
+- **`--atomic`** → git sends `option atomic true`, **checks the response, and aborts** on rejection. Replying `unsupported` is sufficient and correct.
+- **`--force-with-lease`** → git sends `option cas <ref>:<expected>`, **ignores the response, and sends the forced push batch anyway** (`transport-helper.c:1029-1046`). Replying `unsupported` accomplishes nothing: the push proceeds as a plain force, silently discarding the exact safety property the user asked for.
+- **Shallow and partial** → git likewise ignores responses to `depth`, `deepen-since`, `deepen-not`, `deepen-relative`, `update-shallow`, `filter`, `from-promisor`, and `no-dependents` (`transport-helper.c:709-724`). A fresh `git clone --depth` sends `depth`, not `update-shallow`, so watching for the latter alone misses the common case.
+
+**Therefore the helper maintains session state, not per-option replies.** Any unsupported safety option seen during the option phase sets a poison flag naming it. The flag is checked at the **start of the next `push` or `fetch` batch**, and the batch is failed with a message naming the option — **before any pack is uploaded, any ref is written, or any object is installed.** Replying `unsupported` to the option itself is still done, but it is treated as advisory, never as protection.
+
+This conformance is **Stage 2/3 work**, not Stage 4 — it is a correctness property of the first working push, not a polish item.
 
 **Ref transitions** — enumerated, because one ancestry rule applied to every ref repeats a flaw the memo found in git-remote-dropbox:
 
@@ -154,9 +191,18 @@ type Transport interface {
 | Delete (`push :dst`) | `Trash`; refuse to delete the branch `HEAD` points at |
 | Tag create | `CreateExclusive` |
 | Tag update | Requires force, matching git's rule; no ancestry check |
-| `refs/notes/*`, `refs/replace/*`, other valid namespaces | Create-exclusive on create; forced update required to move; no branch ancestry rule |
+| `refs/notes/*`, `refs/replace/*`, other valid namespaces | Create-exclusive on create; **force required to move** — an intentional conservative deviation, see below |
 | Pseudorefs and unsupported destinations | Explicit rejection with a named reason |
-| First push to empty remote | Write the format marker, then `HEAD` derived from the pushed branch — otherwise later clones fetch objects and check out nothing |
+| First push to empty remote | Write the marker, then `HEAD` per the deterministic rules below |
+
+**The other-namespace rule is deliberately stricter than git.** Git's push rules are object-type aware outside `refs/heads/*` and `refs/tags/*`: some commit and tag fast-forwards are permitted without force, while tree and blob updates are refused. v2 requires force for any move in those namespaces. That is a **knowing deviation from the "proper git semantics" goal**, taken because the conservative rule cannot silently lose data and the permissive one needs object-type inspection this design has not specified. It is listed as future work rather than presented as equivalent to git.
+
+**Initial `HEAD` is deterministic**, because it decides what a later clone checks out:
+
+- Single branch in the first push → `HEAD` points at it.
+- Multiple branches in one first push → the branch matching the client's own `HEAD` if it is among them; otherwise the lexicographically first, so the result never depends on batch ordering.
+- Tag-only or non-branch first push → **no `HEAD` is written**, and the repo is left headless. A later branch push writes it. A clone before then fetches objects and reports that no default branch exists, rather than silently checking out nothing.
+- `HEAD` is never rewritten implicitly afterwards. Changing the default branch is an explicit operation, out of scope for v2.
 
 **Object transfer per batch:** compute `git rev-list --objects <new> ^<remote-tip>…`, excluding only advertised tips that also exist locally (unknown tips are simply not excluded — larger pack, never wrong); build **one non-thin pack** (`--no-thin`); `CreateExclusive` the pack, then the `.idx`; **`Stat` both to confirm presence before any ref is written**. A ref whose index is missing is not fetch-discoverable.
 
@@ -173,15 +219,17 @@ The helper owns the closure. Git's `fetch` capability is defined as transferring
 1. Advertise refs plus `@refs/heads/<branch> HEAD`.
 2. Download `.idx` sidecars not already cached; build an object-to-pack map.
 3. Download packs containing wanted objects into a temp area.
-4. Traverse the objects now readable, collect missing parents/trees/blobs/tags, look them up in the map, repeat.
-5. **Consolidate the whole closure into ONE pack and install that.** Git's `transport-helper.c` records only the **first** `lock <path>` response and merely warns about later ones, so a multi-pack install cannot be protected by multiple `.keep` files. One pack, one `lock`, one keep.
+4. **Traverse.** An `.idx` maps object IDs to byte offsets and carries no connectivity data, so parents and trees can only be discovered by reading the objects themselves. The mechanism is normative: index each downloaded pack into a **temporary object directory**, expose it via `GIT_ALTERNATE_OBJECT_DIRECTORIES`, and read objects with `git cat-file --batch`. That keeps unverified remote objects out of the real object database until the closure is proven, and avoids writing a git object parser in Go. Collect missing parents/trees/blobs/tags, look them up in the map, repeat.
+5. **Install the verified packs directly, with helper-managed `.keep` files.** Git's `transport-helper.c` retains only the **first** `lock <path>` response and merely warns about later ones, so a multi-pack install cannot be protected by multiple protocol-level locks. Rather than build a repacking pipeline to consolidate the closure into one pack, the helper writes each pack into `.git/objects/pack/`, creates its **own** `.keep` beside it, and **omits the `lock` response entirely** — that response only asks git to clean up a lockfile on the helper's behalf, which is unnecessary when the helper owns the lifecycle. Keeps are named identifiably (`git-remote-proton-<sha256>.keep`) and swept at the start of the next fetch, so a crash leaks at worst some unreaped objects rather than corrupting anything.
+
+   *(Consolidating into a single pack is also correct and was independently validated; it was rejected as the more complex path, since it requires local repacking plumbing for no additional safety.)*
 6. **Verify connectivity against the exact requested wants**, after all imports and before reporting success — an explicit missing-object-fatal traversal rooted at the wants, not a generic `fsck`, since the wants are not yet referenced by any ref.
 
 **Termination is explicit.** The loop maintains a set of already-downloaded packs and a set of still-missing OIDs. Each round must either download a pack not previously downloaded, or resolve at least one missing OID. **A round that does neither is fatal** — that is the signature of a stale or corrupt index mapping a missing OID into a pack already held, and without this check the loop runs forever.
 
 **Resume-safety:** prune the walk at objects already present locally *with complete history*, so an interrupted fetch resumes.
 
-**Caching** is valid only while a pack exists; compaction will invalidate entries, which is why the generation field is reserved now.
+**Caching** is valid only while a pack exists. v2 never deletes a pack, so an entry cannot go stale; the cache is keyed on pack name and existence. Compaction will invalidate that assumption, and will bump the marker's `version` when it does.
 
 **Discovery cost grows linearly with pack count.** Every fetch enumerates `packs/`; a new client downloads every `.idx`. This is the design's main scaling weakness and the reason compaction is a real milestone.
 
@@ -192,7 +240,7 @@ The helper owns the closure. Git's `fetch` capability is defined as transferring
 | Class | Behaviour |
 |---|---|
 | CLI missing, logged out, session expired mid-operation | Startup probe plus per-call detection; actionable message |
-| CLI below pinned minimum version | Refuse to run |
+| CLI version not on the certified allowlist | Refuse to run - exact versions, not a floor |
 | `failedItems > 0` with exit code 0 | Treated as failure — never inferred from exit status |
 | Unparseable or unexpected `--json` shape | `Ambiguous`; reconcile against remote state before retry |
 | Mutation timed out after the remote may have committed | `Ambiguous`; read back before any retry |
@@ -207,7 +255,7 @@ The helper owns the closure. Git's `fetch` capability is defined as transferring
 | Corrupt, mismatched, or orphaned `.pack`/`.idx` | Byte/hash verify on read; mismatch fatal |
 | Fetch made no progress in a round | Fatal — see Termination |
 | Incomplete closure after import | Fatal; fetch never reports success |
-| Cache generation mismatch | Cache discarded and rebuilt |
+| Cached pack no longer present remotely | Entry discarded; cache rebuilt from the pack listing |
 | List pagination failure | Fatal; a truncated listing must never look like a complete one |
 | Unsupported git option (`--atomic`, `--force-with-lease`, shallow, filter) | Explicit rejection naming the option |
 | Quota, rate limit, oversized pack | Distinct messages; no silent truncation |
@@ -240,11 +288,11 @@ Executable, not prose. Produces a committed results file that becomes normative.
 
 **Stage 2 — a real `git push`.** Format marker, initialisation, lock lifecycle, ref transitions, pack build, ordering guarantee, `list for-push`. Ends when `git push proton-v2 main` works end to end against a real account.
 
-**Stage 3 — a real `git clone` and `git fetch`.** Idx cache with generations, iterative discovery with termination, single-pack consolidation, `.keep`, connectivity verification. Ends when `git clone -o proton-v2 proton::…` produces a working checkout.
+**Stage 3 — a real `git clone` and `git fetch`.** Idx cache, iterative discovery with termination, single-pack consolidation, `.keep`, connectivity verification. Ends when `git clone -o proton-v2 proton::…` produces a working checkout.
 
 **Stage 4 — productionisation.** Cross-compiled release artefacts, v1 coexistence testing, option rejection conformance, recovery documentation and its test, broader protocol conformance.
 
-Compaction and retention remain a separately approved milestone; the generation and cache contracts reserve for them now.
+Compaction and retention remain a separately approved milestone. v2 reserves nothing for them beyond the marker's `version` field, which is the seam a future layout change goes through.
 
 ## Open questions
 
@@ -262,6 +310,16 @@ Compaction and retention remain a separately approved milestone; the generation 
 ---
 
 ## Revision history
+
+**v4, 2026-07-31 — third peer-review round.** One finding was a live safety bug:
+
+- **`--force-with-lease` was not actually rejected.** Git converts it to `option cas`, then **ignores the helper's response and sends the forced push anyway** (`transport-helper.c:1029-1046`). "Reply `unsupported`" — what v3 specified — does nothing, so the push would have proceeded as a plain force, discarding the precise safety property the user asked for. The same applies to `depth`, `deepen-*`, `update-shallow`, `filter`, `from-promisor` and `no-dependents`; only `--atomic` is genuinely honoured at the option response. Replaced with a session-level poison-flag state machine enforced at the start of the batch, before any mutation. Moved from Stage 4 to Stage 2/3.
+- **The lock's release guarantee was impossible.** v3 promised release would not delete a replacement lock, but `Trash` is unconditional and verify-then-trash is check-then-act. **Takeover is removed from v2 entirely** rather than shipping a promise the transport cannot keep.
+- **Typed outcomes were applied only partially.** `Trash` still returned a plain `error`, and `transferredItems >= 1` was too permissive — a contradictory `transferred=1, skipped=1` would have read as success. Exact mutually-exclusive count tuples now defined; a missing field is `Ambiguous`, never zero.
+- **Generations were reserved and relied upon simultaneously** — absent from the marker schema, yet used by the fetch cache and error table. Removed from v2; the marker's `version` field is the forward-compatibility seam.
+- **Probe A5 had the same defect A6 did** — writer B was never validated, so a failed second upload would still have produced one node and read as `COLLIDED`. Both probes now share one strict parser in `probe-lib.ps1` that requires exact field names and returns `$null` when absent. Re-run: A5 both cases DISTINCT, A6 confirmed.
+- **The pinned CLI is stale.** Probes ran on `cli-drive@0.4.6`; Proton's current published CLI is **0.7.0**. Support is now an exact-version allowlist rather than a minimum, and Stage 1 must re-certify.
+- Fetch traversal gained a normative mechanism (temp object dir + `GIT_ALTERNATE_OBJECT_DIRECTORIES` + `cat-file --batch`); pack consolidation was replaced with helper-managed `.keep` files and no `lock` response, as the simpler path to the same guarantee; initial `HEAD` gained deterministic multi-branch and tag-only rules; the other-namespace ref rule is now labelled a knowing conservative deviation rather than presented as git-equivalent; `Trash` on a missing target is `Committed`; and `/shared-with-me` is refused as a repo root, since a folder others can write to is exactly the concurrent-writer case this design cannot survive.
 
 **v3, 2026-07-31 — second peer-review round.** Corrections, including two self-inflicted:
 
