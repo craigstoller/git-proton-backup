@@ -68,6 +68,18 @@
         "visible": true,
         "msFromUploadStart": 7331.0
       }
+    },
+    "C8": {
+      "question": "Does `upload -f merge` create a node that does not yet exist, or fail?",
+      "answer": "UPSERTS - exit 0, transferredItems=1, node present afterwards. UpdateRevision needs no prior existence check for correctness.",
+      "evidence": {
+        "nodeExistsAfter": true,
+        "failed": 0,
+        "exit": 0,
+        "transferred": 1,
+        "raisedBy": "Task 3 review (cannot-verify item)",
+        "skipped": 0
+      }
     }
   }
 }
