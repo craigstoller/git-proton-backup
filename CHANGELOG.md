@@ -17,6 +17,7 @@
 
   Found by upgrading the CLI to 0.7.0 and re-running the verification path against it, which is
   the whole argument for pinning an exact CLI version rather than a minimum.
+
 ## 0.2.3 — 2026-07-29
 
 - **Fail-closed fix in Cloud Files sync-state decoding.** `CF_PLACEHOLDER_STATE_INVALID` is
