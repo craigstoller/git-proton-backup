@@ -1,6 +1,6 @@
 # git-remote-proton — v2 design
 
-**Status:** design v5, revised 2026-08-01 after four rounds of Codex + Gemini peer review. Not implemented.
+**Status:** design v6, revised 2026-08-01 during Stage 2 implementation. v5 was settled after four rounds of Codex + Gemini peer review; v6 changes exactly one mechanism, and only because implementation proved it impossible — see the revision history.
 **Relates to:** [issue #3](https://github.com/craigstoller/git-proton-backup/issues/3).
 **Depends on:** [`docs/research/remote-helper-prior-art.md`](research/remote-helper-prior-art.md) — read first; assumed, not repeated.
 **Pinned to:** Proton Drive CLI **`cli-drive@0.7.0`** (SDK `js@0.20.0`) — Stage 1 was certified
@@ -81,9 +81,45 @@ completed, not rejected.
 
 **Ref-file grammar:** exactly 40 lowercase hex characters plus `\n`. Anything else is corruption and is fatal, never coerced.
 
-**Ref names map to remote paths directly, but NOT to local ones.** A5 (2026-07-31) verified Proton's *remote* name uniqueness is exact-byte, with no case folding or Unicode normalisation — so no escaping is needed on the remote side. That is not the whole problem. The CLI takes a **local file path** as its upload source, and CLI 0.4.6 treats a local path containing `{` as a glob and expands it, while git happily accepts `refs/heads/a{b,c}`. Windows additionally reserves names like `con`, which git also accepts.
+**Ref names map to remote paths directly, but NOT to local ones.** A5 (2026-07-31) verified Proton's *remote* name uniqueness is exact-byte, with no case folding or Unicode normalisation — so no escaping is needed on the remote side. That is not the whole problem. The CLI takes a **local file path** as its upload source, and treats a local path containing `{` as a glob and expands it, while git happily accepts `refs/heads/a{b,c}`. Windows additionally reserves names like `con`, which git also accepts. **C13 (2026-08-01) confirms the globbing hazard is live on the pinned 0.7.0 build**, not only on 0.4.6 as previously recorded: a local file literally named `a{b,c}` fails with `No paths matched`.
 
-So v2 **stages every ref write through a neutral temporary local filename** (a content-independent name in the helper's temp directory) and uploads it to the desired remote name. The ref name never appears in a local path, which sidesteps globbing, reserved names, and case-insensitive local filesystems in one move. Ref names are still validated with `git check-ref-format`, and any name the CLI cannot express as a *remote* path is rejected explicitly rather than silently mangled.
+> **SUPERSEDED 2026-08-01 — neutral local staging is not expressible on this CLI.**
+>
+> This section previously specified that v2 **stages every ref write through a neutral
+> temporary local filename** and "uploads it to the desired remote name," so that the ref name
+> never appears in a local path. **Stage 2 implementation proved that impossible.** `filesystem
+> upload localPath... parentPath` takes a **parent** path, not a target file path, and has no
+> `--name` flag — the remote node is *always* named after the **local** basename (**C11**). The
+> desired remote name is simply not an input the command accepts.
+>
+> Upload-then-`rename` was evaluated and rejected (**C12**). `rename` does exist and does refuse
+> an already-taken name with exit 1, so it could stand in for `CreateExclusive` — but it cannot
+> serve `UpdateRevision`, because renaming onto an existing ref requires trashing that ref
+> first. That is precisely the destructive `replace` pattern this document rejects for being
+> able to destroy a ref on a crash. A hybrid would also still need the name validation below,
+> since a ref created that way still could not be *updated* later.
+>
+> **The two goals — never put a ref name in a local path, and write to a chosen remote name —
+> are not jointly achievable on this transport.** Writing to the intended name wins, because
+> without it nothing works at all.
+
+**So v2 stages every ref write under the target's own leaf name** in a private temporary
+directory, and uploads that to the target's parent folder. The local basename therefore equals
+the remote leaf name. This is the only mechanism that serves **both** `CreateExclusive` — whose
+server-arbitrated name refusal is what the A6/A7 lock guarantee rests on — and `UpdateRevision`,
+which merges in place when the basenames match (**C14**).
+
+**The cost is paid explicitly, never silently.** A leaf name that cannot be expressed as a local
+staging path is **rejected with a named reason**, exactly as this document already requires for
+names the CLI cannot express as a *remote* path. The rejected set is small, because git itself
+already forbids space, control characters, `?`, `*`, `[`, `~`, `^`, and `:` in ref names. What
+remains is leaf names containing `{` or `}`, and Windows device names (`con`, `nul`, `com1`…).
+Refusing those at creation is also the *consistent* choice: such a ref could never be updated on
+this transport anyway, so accepting the create would promise something the update path cannot
+keep. Ref names are still validated with `git check-ref-format` first.
+
+**This is a transport-imposed constraint, not a preference.** If the CLI ever gains a `--name`
+flag on `upload`, neutral staging becomes possible again and this restriction should be lifted.
 
 **Pack naming:** `<sha256>` is the SHA-256 of the pack file's bytes, deliberately distinct from git's object hash so the two are never confused.
 
@@ -426,6 +462,22 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
 ---
 
 ## Revision history
+
+**v6, 2026-08-01 — first revision forced by implementation rather than by review.**
+
+- **Neutral local staging for ref writes is not expressible on the pinned CLI, and v5 specified
+  it as normative.** `filesystem upload` takes a *parent* path and has no `--name` flag, so the
+  remote node is always named after the local basename (probe C11). Every ref write, the marker,
+  and the lock would have landed under their temp-file names — and the in-memory fake would not
+  have caught it, because the fake keys on the full target path. Upload-then-`rename` was
+  evaluated and rejected: it can replace `CreateExclusive` but not `UpdateRevision`, which would
+  need the old ref trashed first (probe C12). Ref writes now stage under the target's own leaf
+  name, and leaf names that cannot be expressed as a local staging path are rejected with a named
+  reason rather than mangled. Probes C11–C14 are recorded in `stage1-results.json`.
+- **The globbing hazard that motivated neutral staging is confirmed live on 0.7.0** (probe C13),
+  not merely inherited from 0.4.6 as v5 recorded. The mitigation changed; the hazard did not.
+- This revision was **not** peer-reviewed. It is a single mechanism replacement compelled by
+  probe evidence, with the alternative enumerated and rejected on the record.
 
 **v5, 2026-08-01 — fourth peer-review round. Severity did not decay, and both engines said so explicitly.**
 
