@@ -159,7 +159,7 @@ type Transport interface {
     EnsureDir(path string) error                       // Stat-then-create; create-folder fails if it exists
     List(path string, opts ListOpts) ([]Node, error)   // non-recursive; paginates internally; unordered
     Stat(path string) (node Node, exists bool, err error)   // absence is (.., false, nil), never an error
-    ReadTo(path string, localPath string) error        // streams to disk
+    ReadTo(path string, localDir string) error         // streams INTO an existing dir, named after the node's remote basename
     CreateExclusive(path, localPath string) (Outcome, error)
     UpdateRevision(path, localPath string) (Outcome, error)
     Trash(path string) (Outcome, error)                // NOT idempotent: Stat first (see below)

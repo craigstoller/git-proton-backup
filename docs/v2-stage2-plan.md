@@ -353,7 +353,10 @@ type Transport interface {
 	EnsureDir(path string) error
 	List(path string) ([]Node, error)
 	Stat(path string) (Node, bool, error) // absence is (_, false, nil), never an error
-	ReadTo(path, localPath string) error
+	// ReadTo downloads the node at path INTO the existing local directory
+	// localDir, as a file named after the node's own remote basename. It is
+	// never a destination FILE path: the CLI's `download` takes a folder.
+	ReadTo(path, localDir string) error
 	CreateExclusive(path, localPath string) (Outcome, error)
 	UpdateRevision(path, localPath string) (Outcome, error)
 	// Trash on a MISSING target fails with exit 1 (Stage 1 C4), so implementations
@@ -371,6 +374,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -419,12 +423,17 @@ func (f *Fake) Stat(p string) (Node, bool, error) {
 	return Node{}, false, nil
 }
 
-func (f *Fake) ReadTo(p, local string) error {
+// ReadTo mirrors the CLI: localDir is an existing DIRECTORY, and the node
+// lands inside it under its own remote basename. Writing straight to localDir
+// as if it were a file path is the bug this fake originally shipped — latent
+// until Task 7's readLock became the first caller. path.Base, not
+// filepath.Base: remote paths are POSIX regardless of host OS.
+func (f *Fake) ReadTo(p, localDir string) error {
 	b, ok := f.Files[p]
 	if !ok {
 		return fmt.Errorf("not found: %s", p)
 	}
-	return os.WriteFile(local, b, 0o644)
+	return os.WriteFile(filepath.Join(localDir, path.Base(p)), b, 0o644)
 }
 
 func (f *Fake) CreateExclusive(p, local string) (Outcome, error) {
@@ -1984,5 +1993,7 @@ git commit -m "feat(v2): wire the helper; git push proton-v2 works end to end"
 **Deliberately deferred to Stage 3+ and NOT in this plan:** fetch, clone, tag transitions beyond create, `refs/notes` and other namespaces, initial `HEAD` derivation, and shallow/partial refusal beyond the poison flag. Stage 2's contract is "a real `git push` works", and each of those needs the fetch half or its own transition rules.
 
 **Known judgment calls for the implementer.** `readRef` and `readLock` both download to a temp directory because the CLI's `download` takes a destination *folder*, not a file path — do not assume a file destination. `filepathBase` is hand-rolled rather than `filepath.Base` because remote paths are always POSIX regardless of host OS, and `filepath.Base` would mishandle them on Windows.
+
+**Revised 2026-08-01 during Task 7 — the fake diverged from the CLI a second time.** `Transport.ReadTo` was declared with no comment about its destination. `CLI.ReadTo` runs `filesystem download p localDir`, where the destination is a **folder**; the fake wrote straight to `localPath` as if it were a **file**. Neither contradicted a stated contract, because there wasn't one, and `readLock` was the first caller in the codebase — so it stayed latent through Tasks 3, 4 and 5. The contract is now stated on the interface and the fake is fixed. **This is the second fake/real divergence on this branch**, after the C11 staging bug below, and both were invisible to the deterministic suite. `Trash`, `CreateExclusive` and `UpdateRevision` have never been differentially tested against their CLI counterparts either; that audit belongs in the final review, not in Task 11's live push alone.
 
 **Revised 2026-08-01 during Task 5 (probes C11–C14).** The plan originally staged every ref write through a *neutral* temporary local filename, per design v5. That is not expressible: `filesystem upload` takes a PARENT path and has no `--name` flag, so the CLI names the uploaded node after the LOCAL basename (C11), and upload-then-`rename` cannot serve `UpdateRevision` without first trashing the ref (C12). Staging now happens under the target's own **leaf name**, and leaf names hostile to a local path are rejected with a named reason rather than mangled — the rejected set being brace-globbing names (C13 confirms the hazard is live on 0.7.0) and Windows device names. `docs/v2-remote-helper-design.md` v6 records the same change. Note the in-memory fake would **not** have caught this: it keys on the full target path, so every repo-layer test would have passed while the real transport wrote to the wrong name.
