@@ -1,0 +1,73 @@
+{
+  "cli": "Proton Drive CLI cli-drive@0.7.0+5174900c",
+  "runUtc": "2026-08-01T17:44:02.2066133Z",
+  "findings": {
+    "C1": {
+      "question": "Does `upload -f merge` revise in place, or replace the node?",
+      "answer": "REVISES IN PLACE - node uid stable, revision uid changed. UpdateRevision->merge is sound.",
+      "evidence": {
+        "claimedSize": 21,
+        "counts": {
+          "t": 1,
+          "f": 0,
+          "s": 0
+        },
+        "revisionUidChanged": true,
+        "nodeUidStable": true
+      }
+    },
+    "C2": {
+      "question": "Is a byte-identical rewrite silently skipped (claimed-SHA-1 auto-skip)?",
+      "answer": "YES - skipped without writing. A no-op write is indistinguishable from a real one by exit code; read-back verification is REQUIRED.",
+      "evidence": {
+        "counts": {
+          "t": 0,
+          "f": 0,
+          "s": 1
+        },
+        "revisionUidChanged": false
+      }
+    },
+    "C3": {
+      "question": "What does `trash --json` emit? (design needs a typed Outcome from it)",
+      "answer": "DIFFERENT SHAPE - keys: uid,ok",
+      "evidence": {
+        "raw": "[\r\n{\"uid\":\"tU-Ot1Sq63NwBcxlnl7IcA~-Rqa_crVUqB4keyIbsgkQw\",\"ok\":true}\r\n]",
+        "exit": 0
+      }
+    },
+    "C4": {
+      "question": "Is trash on a MISSING target benign? (design declares it Committed)",
+      "answer": "NO - exit 1. The design must treat absent-target as a distinct, tolerated error.",
+      "evidence": {
+        "raw": "Node not found: never-existed.txt",
+        "exit": 1
+      }
+    },
+    "C5": {
+      "question": "Is create-folder on an EXISTING folder benign? (design calls EnsureDir idempotent)",
+      "answer": "NO - exit 1; EnsureDir must Stat-then-create, or tolerate this specific error",
+      "evidence": {
+        "raw": "A file or folder with that name already exists",
+        "exit": 1
+      }
+    },
+    "C6": {
+      "question": "Is an EMPTY listing distinguishable from a failed one?",
+      "answer": "exit 0 with 0 parsed element(s)",
+      "evidence": {
+        "emptyExit": 0,
+        "emptyRawLen": 6,
+        "populatedExit": 0
+      }
+    },
+    "C7": {
+      "question": "Is a completed write immediately visible to the next CLI invocation?",
+      "answer": "YES - readable by a fresh process 7331ms after upload returned",
+      "evidence": {
+        "visible": true,
+        "msFromUploadStart": 7331.0
+      }
+    }
+  }
+}

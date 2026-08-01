@@ -3,12 +3,12 @@
 **Status:** design v5, revised 2026-08-01 after four rounds of Codex + Gemini peer review. Not implemented.
 **Relates to:** [issue #3](https://github.com/craigstoller/git-proton-backup/issues/3).
 **Depends on:** [`docs/research/remote-helper-prior-art.md`](research/remote-helper-prior-art.md) — read first; assumed, not repeated.
-**Pinned to:** Proton Drive CLI `cli-drive@0.4.6` (SDK `js@0.17.3`) - the build the probes ran
-against. **Proton's current published CLI is 0.7.0**, so these results are from a stale build and
-Stage 1 must re-certify against whatever version the tool actually ships against. Support is an
-**exact-version allowlist**, not a minimum: a floor would silently admit a future build whose
-`--json` shape or auto-skip behaviour differs, which is the whole thing the pinning exists to
-prevent.
+**Pinned to:** Proton Drive CLI **`cli-drive@0.7.0`** (SDK `js@0.20.0`) — Stage 1 was certified
+against this build; results in `docs/research/probes/stage1-results.json`. Support is an
+**exact-version allowlist**, not a minimum. That is not theoretical caution: 0.4.6 and 0.7.0
+differ in the `activeRevision` payload shape, in whether a byte-identical rewrite is skipped,
+and in concurrent-startup behaviour. A version floor would have admitted 0.7.0 and broken
+verification silently — which is exactly what happened to v1 before it was fixed in 0.2.4.
 
 ---
 
@@ -120,17 +120,31 @@ const (
 )
 
 type Transport interface {
-    EnsureDir(path string) error                       // idempotent; creates parents
+    EnsureDir(path string) error                       // Stat-then-create; create-folder fails if it exists
     List(path string, opts ListOpts) ([]Node, error)   // non-recursive; paginates internally; unordered
     Stat(path string) (node Node, exists bool, err error)   // absence is (.., false, nil), never an error
     ReadTo(path string, localPath string) error        // streams to disk
     CreateExclusive(path, localPath string) (Outcome, error)
     UpdateRevision(path, localPath string) (Outcome, error)
-    Trash(path string) (Outcome, error)                // idempotent: absent target is Committed
+    Trash(path string) (Outcome, error)                // NOT idempotent: Stat first (see below)
 }
 ```
 
-**`Trash` on a missing target is `Committed`, not an error.** The desired end state is "not there", and treating absence as failure would break concurrent branch deletion and lock cleanup — both of which can legitimately race with something that already removed the node.
+**Verified CLI mappings (Stage 1, CLI 0.7.0 — `docs/research/probes/stage1-results.json`).** Three of these contradict what this document previously asserted:
+
+| Operation | CLI | Result shape | Notes |
+|---|---|---|---|
+| `CreateExclusive` | `upload -f skip --json` | transfer summary | `(1,0,0)`=Committed, `(0,1,0)`=Refused |
+| `UpdateRevision` | `upload -f merge --json` | transfer summary | **Verified revises in place** — node uid stable, revision uid changes |
+| `Trash` | `trash --json` | **`{uid, ok}` — NOT a transfer summary** | needs its own parser; the upload parser would silently read nulls |
+| `EnsureDir` | `create-folder parent name` | text | **fails on an existing folder** |
+| `List` | `list path --json` | JSON array | empty folder → exit 0, zero elements. Distinguishable from failure |
+
+**`Trash` on a missing target FAILS with exit 1** — this document previously declared it idempotent and `Committed`, which is wrong. Since the desired end state is still "not there", the helper must `Stat` first, or treat this specific absent-target error as success. It cannot simply call `Trash` and trust the exit code, which is what concurrent branch deletion and lock cleanup would otherwise do.
+
+**`EnsureDir` is NOT idempotent** — `create-folder` on an existing folder exits 1. It must be implemented as `Stat`-then-create, never create-and-ignore-error, because a generic error swallow would also hide a real permission or path failure.
+
+**A byte-identical rewrite is silently skipped.** Verified: re-uploading content whose sha1 matches the existing node returns `skippedItems=1` with no write, before any conflict strategy applies. A no-op is therefore indistinguishable from a successful write by exit code or counts alone — which is exactly why every mutable write is followed by read-back verification. This is the single strongest justification for that rule.
 
 **Every non-idempotent mutation returns `Outcome`**, including `Trash`. A plain `error` cannot distinguish a delete that failed from one that committed before the response was lost, and the error table requires that distinction.
 
@@ -383,7 +397,7 @@ The helper owns the closure. Git's `fetch` capability is defined as transferring
 
 **Vertical after Stage 1** — each later stage ends with something a user can actually do through git, so integration problems surface early rather than at the end.
 
-**Stage 1 — pinned transport contract (gate; nothing else starts until it passes).**
+**Stage 1 — pinned transport contract. COMPLETE 2026-08-01 on CLI 0.7.0.** Results are committed and normative: `docs/research/probes/stage1-results.json`, produced by `probe-stage1-transport-contract.ps1` alongside probes A4-A8. It found three assertions in this document to be wrong (Trash idempotency, EnsureDir idempotency, Trash output shape), confirmed two (merge revises in place, empty list distinguishable), and established the claimed-SHA-1 no-op that makes read-back verification mandatory. Original scope:
 Executable, not prose. Produces a committed results file that becomes normative. Covers, on a pinned CLI version:
 ~~`CreateExclusive` under two barrier-synchronised concurrent processes~~ **DONE — probe A7, 2026-08-01: 4 workers x 3 rounds, 0.3-2.8 ms spread, exactly one winner every round, winner rotating. Re-run on any CLI version change.**; whether `merge` preserves the prior revision readable until commit; whether the claimed-SHA-1 auto-skip can be defeated or must be worked around; exact `--json` shapes for success, skip, failure, and error; ambiguous-outcome boundaries (kill mid-upload, then read back); `EnsureDir` behaviour on existing and partial paths; `List` pagination and ordering; streaming limits and oversized-file behaviour; and what "durable" means — when a write becomes visible to a second client.
 **The single item most likely to invalidate the design is now settled** (A7). What remains is contract detail: `merge` revision preservation, ambiguous-outcome boundaries, `Trash` output shape, pagination, streaming, and durability.
