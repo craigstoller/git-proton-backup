@@ -184,7 +184,11 @@ makes read-back verification more important rather than less. So `UpdateRevision
 
 **Lock contents:** `{"nonce":"<uuid>","host":"…","pid":123,"acquiredAt":"<rfc3339>"}`. The **nonce**, not the hostname, is identity — two processes on one machine are otherwise indistinguishable. A local OS file lock keyed by the **canonical remote address** (not the working copy) serialises clones on the same machine before the remote attempt.
 
-**What is verified:** A6 confirms `CreateExclusive` refuses a second writer and that the refusal is detectable — **sequentially**, on CLI 0.4.6. **What is not:** atomicity under two genuinely simultaneous processes. That is Stage 1 work and it can still invalidate this design.
+**What is verified.** A6 confirms `CreateExclusive` refuses a second writer sequentially. **A7 (2026-08-01) confirms it under genuine concurrency** — the Stage 1 gate that could have invalidated this design. Four worker processes, barrier-aligned to fire spreads of 0.3–2.8 ms, three rounds, on CLI 0.4.6: every round produced **exactly one `transferred=1` and three `skipped=1`**, zero failures, with the surviving remote content always matching the winner. The **winner rotated between rounds** (W1, W4, W3), which is what distinguishes a genuine race arbitrated by the server from a harness that accidentally serialised its workers.
+
+**What that does and does not establish.** The experiment is asymmetric by construction: observing two winners would have *disproved* atomicity outright, while observing none only *supports* it. Three rounds at four workers is not proof of a race-free server, and this result should be re-run whenever the pinned CLI version changes. But the specific failure that would have sunk the lock — two writers both told they succeeded — did not occur under conditions designed to provoke it.
+
+**The lock is therefore buildable.** Acquisition rests on a server-arbitrated primitive rather than a client-side check. What remains unprotected is unchanged and stated above: ref *updates* are still last-write-wins, because create-exclusive protects names, not revisions.
 
 **What is not protected at all:** ref *updates* are last-write-wins. Without a conditional write there is no defence if two writers do run concurrently. New refs are safer, since `CreateExclusive` genuinely refuses. **The lock lowers the chance of an accident; it does not make concurrent use safe.**
 
@@ -325,8 +329,8 @@ The helper owns the closure. Git's `fetch` capability is defined as transferring
 
 **Stage 1 — pinned transport contract (gate; nothing else starts until it passes).**
 Executable, not prose. Produces a committed results file that becomes normative. Covers, on a pinned CLI version:
-`CreateExclusive` under **two barrier-synchronised concurrent processes**; whether `merge` preserves the prior revision readable until commit; whether the claimed-SHA-1 auto-skip can be defeated or must be worked around; exact `--json` shapes for success, skip, failure, and error; ambiguous-outcome boundaries (kill mid-upload, then read back); `EnsureDir` behaviour on existing and partial paths; `List` pagination and ordering; streaming limits and oversized-file behaviour; and what "durable" means — when a write becomes visible to a second client.
-**This is the stage that can still invalidate the design.**
+~~`CreateExclusive` under two barrier-synchronised concurrent processes~~ **DONE — probe A7, 2026-08-01: 4 workers x 3 rounds, 0.3-2.8 ms spread, exactly one winner every round, winner rotating. Re-run on any CLI version change.**; whether `merge` preserves the prior revision readable until commit; whether the claimed-SHA-1 auto-skip can be defeated or must be worked around; exact `--json` shapes for success, skip, failure, and error; ambiguous-outcome boundaries (kill mid-upload, then read back); `EnsureDir` behaviour on existing and partial paths; `List` pagination and ordering; streaming limits and oversized-file behaviour; and what "durable" means — when a write becomes visible to a second client.
+**The single item most likely to invalidate the design is now settled** (A7). What remains is contract detail: `merge` revision preservation, ambiguous-outcome boundaries, `Trash` output shape, pagination, streaming, and durability.
 
 **Stage 2 — a real `git push`.** Format marker, initialisation, lock lifecycle, ref transitions, pack build, ordering guarantee, `list for-push`. Ends when `git push proton-v2 main` works end to end against a real account.
 
