@@ -45,6 +45,14 @@ func run() int {
 	out := bufio.NewWriter(os.Stdout)
 	defer out.Flush()
 
+	return loop(t, root, gitDir, in, out)
+}
+
+// loop runs the git-remote-helper command exchange over in/out. Split out
+// from run so the fail-closed exit-code paths can be exercised directly with
+// an in-memory transport.Fake and buffered io.Reader/io.Writer in tests — no
+// live account, no real git remote.
+func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bufio.Writer) int {
 	var opts protocol.Options
 	var lock *repo.Lock
 	defer func() {
@@ -88,6 +96,17 @@ func run() int {
 			out.Flush()
 
 		case strings.HasPrefix(line, "push "):
+			// The lock is only ever set by a prior successful "list for-push",
+			// which git always sends first to learn the ref list before it can
+			// build a push batch. A push processed with no lock held would
+			// write packs and refs with no mutual exclusion — precisely the
+			// hazard the lock exists to prevent. Real git will not send push
+			// without list-for-push first, but trusting that implicitly is
+			// weaker than asserting it.
+			if lock == nil {
+				warn(fmt.Errorf("push received before list for-push"))
+				return 1
+			}
 			batch := []string{line}
 			for in.Scan() {
 				l := in.Text()
@@ -100,20 +119,32 @@ func run() int {
 				}
 				batch = append(batch, l)
 			}
-			// Check poison AFTER the whole batch is buffered, before mutating.
+			// One parser for both the poisoned and non-poisoned paths: a
+			// hand-rolled `dst := b[strings.Index(b, ":")+1:]` on the poison
+			// path previously trusted every buffered line to already look
+			// like "push <src>:<dst>" with no validation, so a line with no
+			// colon produced dst == the whole raw line (including the
+			// "push " prefix), corrupting the ref field of the "error <ref>
+			// <reason>" status line git expects as one whitespace-free
+			// token. Parsing once here means both paths agree on what a
+			// line means.
+			ups, err := protocol.ParsePushBatch(batch)
+			if err != nil {
+				// A batch that is both poisoned and malformed still fails
+				// closed — poisoned or not, an unparseable batch was never
+				// going to be applied.
+				warn(err)
+				return 1
+			}
+			// Check poison AFTER the whole batch is buffered and parsed,
+			// before any remote read or mutation.
 			if opts.Poisoned != "" {
-				for _, b := range batch {
-					dst := b[strings.Index(b, ":")+1:]
-					fmt.Fprintf(out, "error %s unsupported option %s\n", dst, opts.Poisoned)
+				for _, u := range ups {
+					fmt.Fprintf(out, "error %s unsupported option %s\n", u.Dst, opts.Poisoned)
 				}
 				fmt.Fprint(out, "\n")
 				out.Flush()
 				continue
-			}
-			ups, err := protocol.ParsePushBatch(batch)
-			if err != nil {
-				warn(err)
-				return 1
 			}
 			remote, err := repo.ListRefs(t, root)
 			if err != nil {
@@ -136,6 +167,17 @@ func run() int {
 			warn(fmt.Errorf("unsupported command: %q", line))
 			return 1
 		}
+	}
+	// in.Scan() returning false means either a clean EOF or a genuine read
+	// error (a broken pipe, git crashing mid-session). Falling through to
+	// "return 0" either way would report success for a session that ended
+	// abnormally, with git never having sent the terminating blank line —
+	// a literal violation of fail-closed. This does not affect the lock:
+	// the defer above fires on every return from loop, so only the exit
+	// code was ever at risk here.
+	if err := in.Err(); err != nil {
+		warn(err)
+		return 1
 	}
 	return 0
 }
