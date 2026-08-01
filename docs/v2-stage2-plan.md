@@ -1689,7 +1689,13 @@ func pushOne(t transport.Transport, root, gitDir string,
 		if !gitcmd.HasObject(gitDir, oldSha) {
 			return fail("fetch first")
 		}
-		ok, _ := gitcmd.IsAncestor(gitDir, oldSha, newSha)
+		// IsAncestor distinguishes "not an ancestor" (exit 1) from a tooling
+		// failure. Discarding the error would report a broken git as a
+		// confident non-fast-forward rejection.
+		ok, err := gitcmd.IsAncestor(gitDir, oldSha, newSha)
+		if err != nil {
+			return fail("cannot determine ancestry: " + err.Error())
+		}
 		if !ok {
 			return fail("non-fast-forward")
 		}
