@@ -1,5 +1,11 @@
 package transport
 
+// Outcome is what a mutation is known to have done. A NON-NIL ERROR ALWAYS
+// DOMINATES THE OUTCOME: every method here returns (Outcome, error), and the
+// Outcome is meaningful only when err == nil. Implementations return Ambiguous
+// alongside an error as the safe accompanying value, never as a claim the
+// caller may act on, so a caller that reads the Outcome without checking the
+// error first is reading a value that was never asserted.
 type Outcome int
 
 const (

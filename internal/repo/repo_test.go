@@ -62,6 +62,39 @@ func TestBootstrapRefusesForeignData(t *testing.T) {
 	}
 }
 
+// TestBootstrapRefusesFoldersWithNoMarker is the sibling case
+// TestBootstrapRefusesForeignData could not cover, because it plants a FILE.
+// The realistic loss-of-marker shape is a root that still has its refs/ and
+// packs/ FOLDERS but no gpb-remote.json — a marker trashed by hand, or a
+// half-completed initialisation from a build that wrote subdirs first. The
+// real CLI's `filesystem list` reports those folders, so the shipped
+// Bootstrap hard-refuses (design: "Missing or unrecognised format marker on a
+// non-empty folder | Hard refusal; never guess"). transport.Fake's List used
+// to synthesise directories from file prefixes only and never read f.Dirs, so
+// under test the same root looked EMPTY and was silently adopted — the suite
+// was certifying a Bootstrap strictly more permissive than the one that runs
+// against Proton.
+func TestBootstrapRefusesFoldersWithNoMarker(t *testing.T) {
+	f := transport.NewFake()
+	if err := f.EnsureDir("/my-files/r/refs"); err != nil {
+		t.Fatalf("EnsureDir: %v", err)
+	}
+	if err := f.EnsureDir("/my-files/r/packs"); err != nil {
+		t.Fatalf("EnsureDir: %v", err)
+	}
+
+	err := Bootstrap(f, "/my-files/r")
+	if err == nil {
+		t.Fatal("must refuse a root that has repo-shaped subfolders but no marker, never guess")
+	}
+	if !strings.Contains(err.Error(), MarkerName) {
+		t.Errorf("refusal must name the missing marker, got: %v", err)
+	}
+	if _, ok := f.Files["/my-files/r/"+MarkerName]; ok {
+		t.Error("a refused bootstrap must not adopt the folder by writing a marker into it")
+	}
+}
+
 func TestBootstrapIdempotent(t *testing.T) {
 	f := transport.NewFake()
 	_ = Bootstrap(f, "/my-files/r")

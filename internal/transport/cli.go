@@ -206,8 +206,25 @@ func parseTransferSummary(out string) (Outcome, error) {
 }
 
 func (c *CLI) upload(strategy, remoteDir, localFile string) (Outcome, error) {
-	out, _, _ := c.run("filesystem", "upload", "-f", strategy, "--json", localFile, remoteDir)
-	return parseTransferSummary(out)
+	out, code, err := c.run("filesystem", "upload", "-f", strategy, "--json", localFile, remoteDir)
+	outcome, perr := parseTransferSummary(out)
+	if perr == nil {
+		// Deliberately NOT gated on exit status: 0 covers both a transfer and
+		// a skip, so the counts are the only thing that can classify a
+		// successful upload (see classifyUpload). A parseable summary is
+		// authoritative regardless of code.
+		return outcome, nil
+	}
+	// No summary to read, so the exit code and start error are the only
+	// evidence left of what happened. This method used to discard both
+	// (`out, _, _ := c.run(...)`) — the one CLI method that did — and in the
+	// never-started case out is empty, so the caller saw "unparseable upload
+	// summary: " with the real cause gone. Every other method here wraps err
+	// with %w; this now does too.
+	if err != nil {
+		return outcome, fmt.Errorf("%w (upload exited %d: %w)", perr, code, err)
+	}
+	return outcome, fmt.Errorf("%w (upload exited %d)", perr, code)
 }
 
 // CreateExclusive and UpdateRevision both pass only dirOf(p) to the CLI,

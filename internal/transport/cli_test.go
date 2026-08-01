@@ -1,6 +1,11 @@
 package transport
 
-import "testing"
+import (
+	"errors"
+	"os/exec"
+	"strings"
+	"testing"
+)
 
 // *CLI satisfies Transport as of Task 5's write side (CreateExclusive,
 // UpdateRevision, Trash), mirroring the same assertion for *Fake in
@@ -166,8 +171,16 @@ func TestCLITrashStartFailureIsAmbiguous(t *testing.T) {
 // invoking the real proton-drive CLI: c.run's CombinedOutput on an
 // unstartable process yields empty output, which parseTransferSummary must
 // treat as unparseable — Ambiguous, not a false Committed or Refused.
+//
+// It also pins the fix for the one CLI method that discarded both the exit
+// code and the start error (`out, _, _ := c.run(...)`). With empty output the
+// message degraded to a bare "unparseable upload summary: " and the actual
+// cause was lost, which is the worst possible diagnostic for the case an
+// operator is most likely to hit — the CLI not being installed. The start
+// error must survive into the returned error.
 func TestCLIUploadStartFailureIsAmbiguous(t *testing.T) {
-	c := NewCLI("nonexistent-xyz-binary-git-proton-backup-test")
+	const exe = "nonexistent-xyz-binary-git-proton-backup-test"
+	c := NewCLI(exe)
 
 	fns := map[string]func(string, string) (Outcome, error){
 		"CreateExclusive": c.CreateExclusive,
@@ -181,6 +194,14 @@ func TestCLIUploadStartFailureIsAmbiguous(t *testing.T) {
 			}
 			if got != Ambiguous {
 				t.Fatalf("want Ambiguous, got %v", got)
+			}
+			// exec's start error names the executable it could not run; that
+			// naming is the whole diagnostic value being preserved here.
+			if !strings.Contains(err.Error(), exe) {
+				t.Errorf("error must preserve the start failure's cause, got %q", err)
+			}
+			if !errors.Is(err, exec.ErrNotFound) && !strings.Contains(err.Error(), "exited -1") {
+				t.Errorf("error must preserve the exit code or the wrapped exec error, got %q", err)
 			}
 		})
 	}
