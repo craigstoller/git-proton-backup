@@ -1,6 +1,6 @@
 # git-remote-proton — v2 design
 
-**Status:** design v4, revised 2026-07-31 after three rounds of Codex + Gemini peer review. Not implemented.
+**Status:** design v5, revised 2026-08-01 after four rounds of Codex + Gemini peer review. Not implemented.
 **Relates to:** [issue #3](https://github.com/craigstoller/git-proton-backup/issues/3).
 **Depends on:** [`docs/research/remote-helper-prior-art.md`](research/remote-helper-prior-art.md) — read first; assumed, not repeated.
 **Pinned to:** Proton Drive CLI `cli-drive@0.4.6` (SDK `js@0.17.3`) - the build the probes ran
@@ -62,11 +62,28 @@ Scoping v2 to a single writer removes the need for the SDK, for vendoring its in
 
 **Format marker.** `gpb-remote.json` is written on initialisation and read before any other operation. An unrecognised or absent marker on a non-empty folder is a hard refusal — the helper never guesses whether a folder is one of its repos.
 
-**Initialisation is create-exclusive and resumable.** The marker is written with `CreateExclusive`. A concurrent initialiser loses and re-reads. A folder containing the marker but missing `refs/` or `packs/` is a partial initialisation and is completed, not rejected.
+**Initialisation ordering is normative, because two independently-correct rules deadlocked
+without it.** v3 required the lock to be acquired before `list for-push`, and separately treated
+an absent marker in a *non-empty* folder as a hard refusal. Acquiring the lock creates `.lock`,
+which makes an empty folder non-empty - so a first push would create the lock, then refuse
+itself, permanently bricking the remote on its first command. The bootstrap sequence is:
+
+1. `Stat` the marker. If present, proceed normally.
+2. If absent, `List` the folder. **`.lock` is excluded from the emptiness test** - it is helper
+   scaffolding, not repo content.
+3. If the folder is otherwise non-empty, hard-refuse: it is someone else's data.
+4. If empty, `CreateExclusive` the marker **before** acquiring the lock. A concurrent
+   initialiser loses the race, re-reads, and proceeds.
+5. Only then acquire the lock and continue.
+
+A folder with a valid marker but missing `refs/` or `packs/` is a partial initialisation and is
+completed, not rejected.
 
 **Ref-file grammar:** exactly 40 lowercase hex characters plus `\n`. Anything else is corruption and is fatal, never coerced.
 
-**Ref names map to paths directly** — no escaping. A5 (2026-07-31) verified Proton's name uniqueness is exact-byte with no case folding or Unicode normalisation. Ref names are still validated with `git check-ref-format` before use; names git rejects are never written.
+**Ref names map to remote paths directly, but NOT to local ones.** A5 (2026-07-31) verified Proton's *remote* name uniqueness is exact-byte, with no case folding or Unicode normalisation — so no escaping is needed on the remote side. That is not the whole problem. The CLI takes a **local file path** as its upload source, and CLI 0.4.6 treats a local path containing `{` as a glob and expands it, while git happily accepts `refs/heads/a{b,c}`. Windows additionally reserves names like `con`, which git also accepts.
+
+So v2 **stages every ref write through a neutral temporary local filename** (a content-independent name in the helper's temp directory) and uploads it to the desired remote name. The ref name never appears in a local path, which sidesteps globbing, reserved names, and case-insensitive local filesystems in one move. Ref names are still validated with `git check-ref-format`, and any name the CLI cannot express as a *remote* path is rejected explicitly rather than silently mangled.
 
 **Pack naming:** `<sha256>` is the SHA-256 of the pack file's bytes, deliberately distinct from git's object hash so the two are never confused.
 
@@ -123,20 +140,25 @@ type Transport interface {
 {"transferredItems":1,"transferredBytes":8,"skippedItems":0,"failedItems":0,"failures":[]}
 ```
 
-**Count tuples are exact and mutually exclusive** for a single-file operation. `>= 1` is too permissive — a `transferred=1, skipped=1` response is contradictory for one file and must not read as success:
+**Count tuples are exact and mutually exclusive** for a single-file operation - the CLI's transfer queue records exactly one of success, skip, or failure per item, so `(0,0,2)` is contradictory and is `Ambiguous`. Any `>=` comparison is too permissive — a `transferred=1, skipped=1` response is contradictory for one file and must not read as success:
 
 | `transferred` | `skipped` | `failed` | Outcome |
 |---|---|---|---|
 | 1 | 0 | 0 | `Committed` |
 | 0 | 1 | 0 | `Refused` |
-| 0 | 0 | ≥1 | error (**exit code may still be 0**) |
+| 0 | 0 | 1 | error (**exit code may still be 0**) |
 | anything else, or unparseable JSON, or a missing field | | | `Ambiguous` |
 
 A missing count field is `Ambiguous`, never defaulted to zero — a renamed field in a future CLI must fail loudly rather than silently read as "nothing happened."
 
 **Exit codes cannot distinguish these.** A6 confirms both success and refusal exit 0. Any implementation branching on exit status is wrong.
 
-**Mutable writes require post-write verification, because the CLI may skip silently.** On CLI 0.4.6, `upload` auto-skips when the existing node's *claimed* SHA-1 matches the local file's — **before** any conflict strategy is applied. So `UpdateRevision` is not guaranteed to create a revision, and the decision is made from a digest Proton itself flags `sha1Verified: false`. Every mutable write is therefore followed by `ReadTo` and a byte comparison; equality by claimed digest is never accepted as proof. This is the one place the design cannot trust its transport, and it is why `Ambiguous` exists as a first-class outcome.
+**Mutable writes require post-write verification, because the CLI may skip silently.** **Version-specific, and previously misattributed here.** CLI **0.7.0** auto-skips when the
+existing node''s *claimed* SHA-1 matches the local file''s, **before** any conflict strategy is
+applied. CLI 0.4.6 - the build the probes ran on - does *not*; it resolves the strategy
+directly. An earlier revision of this document attributed the 0.7.0 behaviour to 0.4.6. Since
+0.7.0 is the current release, the hazard is real for the version users would install, which
+makes read-back verification more important rather than less. So `UpdateRevision` is not guaranteed to create a revision, and the decision is made from a digest Proton itself flags `sha1Verified: false`. Every mutable write is therefore followed by `ReadTo` and a byte comparison; equality by claimed digest is never accepted as proof. This is the one place the design cannot trust its transport, and it is why `Ambiguous` exists as a first-class outcome.
 
 **Immutable objects** (packs, indexes) use `CreateExclusive`. `Refused` there means identical content already exists — success *after* byte verification, not an error.
 
@@ -150,7 +172,15 @@ A missing count field is `Ambiguous`, never defaulted to zero — a renamed fiel
 2. **Verify by read-back**: after `CreateExclusive` returns `Committed`, read `.lock` and confirm the nonce matches. A `Refused` means someone holds it; report and stop.
 3. **Read refs under the lock.** The advertisement git receives must be derived after acquisition.
 4. **Hold across the entire push batch**, including all per-ref status responses.
-5. **Release only if the nonce still matches.** If it does not, another process took over; report loudly and do not delete their lock.
+5. **Release on every exit path** - normal completion, an up-to-date push that sends no batch,
+   a poisoned or rejected batch, git aborting after `list for-push`, EOF, cancellation, or
+   signal. With takeover removed, a leaked lock wedges the repo until a human clears it, so
+   release is a `defer`, not a happy-path step.
+6. **Release verifies the nonce first, and this remains check-then-act.** No conditional delete
+   exists, so if an operator manually clears a stale lock and another process acquires it in
+   the gap, this process can still delete the newcomer''s lock. The window is narrow and
+   requires manual intervention mid-operation, but it is **not** eliminated - only takeover was
+   removed, not the underlying race.
 
 **Lock contents:** `{"nonce":"<uuid>","host":"…","pid":123,"acquiredAt":"<rfc3339>"}`. The **nonce**, not the hostname, is identity — two processes on one machine are otherwise indistinguishable. A local OS file lock keyed by the **canonical remote address** (not the working copy) serialises clones on the same machine before the remote attempt.
 
@@ -172,9 +202,9 @@ Rather than ship an impossible promise, **v2 removes takeover**. A stale lock is
 
 - **`--atomic`** → git sends `option atomic true`, **checks the response, and aborts** on rejection. Replying `unsupported` is sufficient and correct.
 - **`--force-with-lease`** → git sends `option cas <ref>:<expected>`, **ignores the response, and sends the forced push batch anyway** (`transport-helper.c:1029-1046`). Replying `unsupported` accomplishes nothing: the push proceeds as a plain force, silently discarding the exact safety property the user asked for.
-- **Shallow and partial** → git likewise ignores responses to `depth`, `deepen-since`, `deepen-not`, `deepen-relative`, `update-shallow`, `filter`, `from-promisor`, and `no-dependents` (`transport-helper.c:709-724`). A fresh `git clone --depth` sends `depth`, not `update-shallow`, so watching for the latter alone misses the common case.
+- **Shallow and partial** → git likewise ignores responses to `depth`, `deepen-since`, `deepen-not`, `deepen-relative`, `update-shallow`, `filter`, `from-promisor`, `no-dependents`, and `refetch` (`transport-helper.c:709-724`, `751-767`). Git's transport layer reports success when *either* its internal layer or the helper accepts an option, which is why rejection alone protects nothing. (`no-dependents` is documented by git but no sender was located in the inspected commit - its ignore-behaviour is **unverified**). A fresh `git clone --depth` sends `depth`, not `update-shallow`, so watching for the latter alone misses the common case.
 
-**Therefore the helper maintains session state, not per-option replies.** Any unsupported safety option seen during the option phase sets a poison flag naming it. The flag is checked at the **start of the next `push` or `fetch` batch**, and the batch is failed with a message naming the option — **before any pack is uploaded, any ref is written, or any object is installed.** Replying `unsupported` to the option itself is still done, but it is treated as advisory, never as protection.
+**Therefore the helper maintains session state, not per-option replies.** Any unsupported safety option seen during the option phase sets a poison flag naming it. The flag is checked **after the complete blank-line-terminated batch has been buffered**, not when the first `push` line arrives - the protocol permits further `option` lines after the last `push` and before the terminator, so checking early can miss one. Enforcement happens, and the batch is failed with a message naming the option — **before any pack is uploaded, any ref is written, or any object is installed.** Replying `unsupported` to the option itself is still done, but it is treated as advisory, never as protection.
 
 This conformance is **Stage 2/3 work**, not Stage 4 — it is a correctness property of the first working push, not a polish item.
 
@@ -199,10 +229,18 @@ This conformance is **Stage 2/3 work**, not Stage 4 — it is a correctness prop
 
 **Initial `HEAD` is deterministic**, because it decides what a later clone checks out:
 
-- Single branch in the first push → `HEAD` points at it.
+- `HEAD` is chosen from branches whose ref writes **succeeded**, and is written **after** them - selecting a requested branch that then fails would leave `HEAD` dangling, and writing it first would violate the pack→idx→ref ordering.
+- Single successfully published branch → `HEAD` points at it.
 - Multiple branches in one first push → the branch matching the client's own `HEAD` if it is among them; otherwise the lexicographically first, so the result never depends on batch ordering.
 - Tag-only or non-branch first push → **no `HEAD` is written**, and the repo is left headless. A later branch push writes it. A clone before then fetches objects and reports that no default branch exists, rather than silently checking out nothing.
 - `HEAD` is never rewritten implicitly afterwards. Changing the default branch is an explicit operation, out of scope for v2.
+
+**Protocol mechanics the helper must implement** — referenced throughout but previously never stated, which alone blocked implementation:
+
+- **`list` / `list for-push` output:** one `<40-hex-sha> SP <refname>` line per ref, plus `@<refname> SP HEAD` for the symref on plain `list`, terminated by a blank line.
+- **Push commands arrive as `push <src>:<dst>`**, batched, blank-line terminated. **A leading `+` on `<src>` is how a forced push is signalled** — `push +refs/heads/main:refs/heads/main`. There is no separate force option; the helper parses the prefix. Nothing else distinguishes forced from unforced.
+- **Push responses:** `ok <dst>` or `error <dst> <reason>`, one per ref, then a blank line. Every ref in the batch receives exactly one status, including refs rejected during validation.
+- **Object type is resolved locally with `git cat-file -t <sha>`** before packing. The helper receives only hashes from git, so the "branch target must be a commit" rule is unenforceable without this — it was specified as a rule with no mechanism.
 
 **Object transfer per batch:** compute `git rev-list --objects <new> ^<remote-tip>…`, excluding only advertised tips that also exist locally (unknown tips are simply not excluded — larger pack, never wrong); build **one non-thin pack** (`--no-thin`); `CreateExclusive` the pack, then the `.idx`; **`Stat` both to confirm presence before any ref is written**. A ref whose index is missing is not fetch-discoverable.
 
@@ -210,7 +248,7 @@ This conformance is **Stage 2/3 work**, not Stage 4 — it is a correctness prop
 
 **Multi-ref batches are not atomic.** Each ref reports its own `ok`/`error`; partial success is expected.
 
-**Shallow and promisor repositories are refused**, and — because a fresh `git clone --depth` is not yet shallow when the helper starts — the helper must also reject git's `update-shallow` and `filter` **protocol options** during fetch. A startup check alone is insufficient.
+**Shallow and promisor repositories are refused**, and — because a fresh `git clone --depth` is not yet shallow when the helper starts — the helper must poison on the full set - `depth`, `deepen-since`, `deepen-not`, `deepen-relative`, `update-shallow`, `filter`, `from-promisor`, `no-dependents`, `refetch`. A startup check alone is insufficient.
 
 ## Fetch
 
@@ -219,10 +257,14 @@ The helper owns the closure. Git's `fetch` capability is defined as transferring
 1. Advertise refs plus `@refs/heads/<branch> HEAD`.
 2. Download `.idx` sidecars not already cached; build an object-to-pack map.
 3. Download packs containing wanted objects into a temp area.
-4. **Traverse.** An `.idx` maps object IDs to byte offsets and carries no connectivity data, so parents and trees can only be discovered by reading the objects themselves. The mechanism is normative: index each downloaded pack into a **temporary object directory**, expose it via `GIT_ALTERNATE_OBJECT_DIRECTORIES`, and read objects with `git cat-file --batch`. That keeps unverified remote objects out of the real object database until the closure is proven, and avoids writing a git object parser in Go. Collect missing parents/trees/blobs/tags, look them up in the map, repeat.
-5. **Install the verified packs directly, with helper-managed `.keep` files.** Git's `transport-helper.c` retains only the **first** `lock <path>` response and merely warns about later ones, so a multi-pack install cannot be protected by multiple protocol-level locks. Rather than build a repacking pipeline to consolidate the closure into one pack, the helper writes each pack into `.git/objects/pack/`, creates its **own** `.keep` beside it, and **omits the `lock` response entirely** — that response only asks git to clean up a lockfile on the helper's behalf, which is unnecessary when the helper owns the lifecycle. Keeps are named identifiably (`git-remote-proton-<sha256>.keep`) and swept at the start of the next fetch, so a crash leaks at worst some unreaped objects rather than corrupting anything.
+4. **Traverse.** An `.idx` maps object IDs to byte offsets and carries no connectivity data, so the object graph must be walked. Index each downloaded pack into a **temporary object directory** and expose it via `GIT_ALTERNATE_OBJECT_DIRECTORIES`, keeping unverified remote objects out of the real database until closure is proven.
 
-   *(Consolidating into a single pack is also correct and was independently validated; it was rejected as the more complex path, since it requires local repacking plumbing for no additional safety.)*
+   **The walk uses git plumbing, not a hand-written parser.** `git cat-file --batch` decompresses and identifies objects but does *not* enumerate commit parents, tag targets, or tree entries — an earlier draft claimed it removed the need for a parser, which was wrong. Instead run `git rev-list --objects --missing=print <wants>` against the temp directory: git performs the traversal and reports missing OIDs prefixed with `?`. Feed those back through the object-to-pack map, download, repeat. This also handles gitlinks and malformed objects with git's own semantics rather than reimplemented ones.
+5. **Consolidate the closure into ONE pack, install it, and emit git's single `lock`.** Git's `transport-helper.c` retains only the **first** `lock <path>` response, so a multi-pack install cannot be protected by multiple protocol locks.
+
+   **This decision reversed twice and is now settled on the merits.** v2 used consolidation; v3 replaced it with helper-managed `.keep` files swept at the start of the next fetch; v4 restores consolidation. The helper-managed variant is **not crash-safe**: if a fetch dies after installing a pack but before git updates refs, the next fetch removes that pack's protection *before* refs exist, and a concurrent `git gc` can delete it between connectivity verification and git's ref write — leaving refs pointing at missing objects. It also leaks permanently if the user never fetches from that remote again. Git's protocol lock exists precisely to cover the install-to-ref-update interval and is released only after both complete. Corruption beats a repacking pipeline as a thing to avoid.
+
+   **Naming is normative:** git recognises a `.keep` only when its stem exactly matches the adjacent pack (`packfile.c:368-384`). The installed files are `pack-<git-pack-hash>.{pack,idx,keep}` using git's own naming from `index-pack`, not the remote's SHA-256 content name.
 6. **Verify connectivity against the exact requested wants**, after all imports and before reporting success — an explicit missing-object-fatal traversal rooted at the wants, not a generic `fsck`, since the wants are not yet referenced by any ref.
 
 **Termination is explicit.** The loop maintains a set of already-downloaded packs and a set of still-missing OIDs. Each round must either download a pack not previously downloaded, or resolve at least one missing OID. **A round that does neither is fatal** — that is the signature of a stale or corrupt index mapping a missing OID into a pack already held, and without this check the loop runs forever.
@@ -290,7 +332,7 @@ Executable, not prose. Produces a committed results file that becomes normative.
 
 **Stage 3 — a real `git clone` and `git fetch`.** Idx cache, iterative discovery with termination, single-pack consolidation, `.keep`, connectivity verification. Ends when `git clone -o proton-v2 proton::…` produces a working checkout.
 
-**Stage 4 — productionisation.** Cross-compiled release artefacts, v1 coexistence testing, option rejection conformance, recovery documentation and its test, broader protocol conformance.
+**Stage 4 — productionisation.** Cross-compiled release artefacts, v1 coexistence testing, recovery documentation and its test, broader protocol conformance.
 
 Compaction and retention remain a separately approved milestone. v2 reserves nothing for them beyond the marker's `version` field, which is the seam a future layout change goes through.
 
@@ -310,6 +352,17 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
 ---
 
 ## Revision history
+
+**v5, 2026-08-01 — fourth peer-review round. Severity did not decay, and both engines said so explicitly.**
+
+- **A v3 fix created an initialisation deadlock.** Acquiring the lock before `list for-push` (correct) plus hard-refusing an absent marker in a non-empty folder (correct) meant a first push created `.lock`, making the folder non-empty, then refused itself — bricking the remote on its first command. Bootstrap order is now normative and `.lock` is excluded from the emptiness test.
+- **The v4 `.keep` change was a crash-safety regression; consolidation is restored.** Helper-managed keeps swept at the next fetch cannot cover a crash between pack install and git's ref update — the sweep removes protection *before* refs exist, so a concurrent `gc` can delete the pack and leave refs pointing at missing objects. They also leak permanently if the user never fetches again. This flip-flopped across three revisions, chasing whichever reviewer spoke last; it is now settled on merits, with keep/pack stem naming made normative.
+- **A factual error I introduced by trusting a review finding.** The pre-strategy SHA-1 auto-skip is **0.7.0** behaviour; **0.4.6** resolves the conflict strategy directly. A round-2 finding read `main` and I attributed it to the pinned build without checking the tag. Verified against both. The hazard remains real, since 0.7.0 is what users install.
+- **Poison-flag timing was wrong.** The protocol permits `option` lines *after* the last `push` and before the terminator, so checking at the first `push` can miss one. The full batch is buffered first. `refetch` added; `no-dependents` marked unverified.
+- **Ref names do not map safely to LOCAL paths.** A5 proved *remote* equivalence only. CLI 0.4.6 glob-expands local paths containing `{`, and git accepts `refs/heads/a{b,c}`; Windows reserves `con`. Ref writes now stage through a neutral temporary local filename.
+- **`cat-file --batch` does not enumerate parents or tree entries**, so claiming it removed the need for a parser was wrong. Traversal now uses `rev-list --objects --missing=print`.
+- **Protocol mechanics were never stated** — `list` grammar, the `+` prefix as the *only* forced-push signal, `ok`/`error` response format, and `cat-file -t` for the commit-target rule, which had been a rule with no mechanism. This alone blocked implementation.
+- Lock release is now a `defer` covering EOF, cancellation and no-batch pushes (a leak wedges the repo now takeover is gone), and the residual check-then-act race on release is stated rather than implied away. Failure tuple tightened to exactly `(0,0,1)`. Initial `HEAD` is chosen from *successfully published* branches, after their ref writes.
 
 **v4, 2026-07-31 — third peer-review round.** One finding was a live safety bug:
 
