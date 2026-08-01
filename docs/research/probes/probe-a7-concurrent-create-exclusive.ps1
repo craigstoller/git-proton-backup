@@ -139,6 +139,16 @@ try {
         $lost = @($parsed | Where-Object { $_.Skipped -eq 1 -and $_.Transferred -eq 0 })
         $bad  = @($parsed | Where-Object { $_.Failed -gt 0 })
 
+        # A loser can fail for two very different reasons, and conflating them makes this probe
+        # claim things it has not shown (probe A8, 2026-08-01):
+        #   SERVER-REFUSED  - reached Proton, was refused. THIS is atomicity evidence.
+        #   STARTUP-BLOCKED - died in the CLI's local SQLite session cache during init, before
+        #                     any network request. Says nothing about the server at all.
+        # CLI 0.7.0 produces the second under simultaneous starts; 0.4.6 produced the first.
+        $startupBlocked = @($parsed | Where-Object { "$($_.Raw)" -match 'SQLITE_BUSY|database is locked' })
+        $otherFail      = @($parsed | Where-Object {
+            $_.Transferred -ne 1 -and $_.Skipped -ne 1 -and "$($_.Raw)" -notmatch 'SQLITE_BUSY|database is locked' })
+
         # what actually survived on the remote
         $dl = Join-Path $ws "r$round-readback"; New-Item -ItemType Directory -Path $dl -Force | Out-Null
         [void](Invoke-ProbeCli -CliArgs @('filesystem','download',"$sub/$name",$dl) -RemotePaths @("$sub/$name"))
@@ -151,22 +161,24 @@ try {
             [math]::Round((($times | Measure-Object -Maximum).Maximum - ($times | Measure-Object -Minimum).Minimum).TotalMilliseconds, 1)
         } else { $null }
 
-        "  responded: $($parsed.Count)/$Workers   won: $($won.Count)   refused: $($lost.Count)   failed: $($bad.Count)"
+        "  responded: $($parsed.Count)/$Workers   won: $($won.Count)   server-refused: $($lost.Count)   startup-blocked: $($startupBlocked.Count)   other-fail: $($otherFail.Count)"
         "  fire spread: ${spread}ms   surviving content: '$survivor'"
 
         $verdict =
-            if ($parsed.Count -lt $Workers)      { 'ERROR - not every worker reported' }
-            elseif ($bad.Count -gt 0)            { 'ERROR - a worker reported failedItems' }
-            elseif ($won.Count -gt 1)            { 'NOT ATOMIC - MORE THAN ONE WRITER WON' }
-            elseif ($won.Count -eq 0)            { 'ERROR - nobody won' }
-            elseif ($won[0].Worker -ne $survivor){ "INCONSISTENT - winner $($won[0].Worker) but remote holds '$survivor'" }
-            elseif ($lost.Count -ne ($Workers-1)){ 'ERROR - losers did not all report a clean skip' }
-            else                                 { 'OK - exactly one winner, all others refused' }
+            if ($parsed.Count -lt $Workers)       { 'ERROR - not every worker reported' }
+            elseif ($won.Count -gt 1)             { 'NOT ATOMIC - MORE THAN ONE WRITER WON' }
+            elseif ($won.Count -eq 0)             { 'ERROR - nobody won' }
+            elseif ($won[0].Worker -ne $survivor) { "INCONSISTENT - winner $($won[0].Worker) but remote holds '$survivor'" }
+            elseif ($lost.Count -eq ($Workers-1)) { 'OK - one winner, all losers REFUSED BY THE SERVER (atomicity evidence)' }
+            elseif ($startupBlocked.Count -gt 0)  { "NOT EVIDENCE - $($startupBlocked.Count) loser(s) died in local CLI startup (SQLite cache), never reached Proton" }
+            elseif ($bad.Count -gt 0)             { 'ERROR - a worker reported failedItems' }
+            else                                  { 'ERROR - losers reported neither a server refusal nor a known local failure' }
         "  ROUND VERDICT: $verdict"
 
         $roundResults.Add([pscustomobject]@{
             Round=$round; Responded=$parsed.Count; Won=$won.Count; Refused=$lost.Count
-            Failed=$bad.Count; SpreadMs=$spread; Survivor=$survivor; Verdict=$verdict })
+            StartupBlocked=$startupBlocked.Count; Other=$otherFail.Count
+            SpreadMs=$spread; Survivor=$survivor; Verdict=$verdict })
     }
 }
 finally {
@@ -175,10 +187,11 @@ finally {
 }
 
 "`n=== A7 SUMMARY ==="
-$roundResults | Format-Table -AutoSize Round, Responded, Won, Refused, Failed, SpreadMs, Survivor, Verdict
+$roundResults | Format-Table -AutoSize Round, Responded, Won, Refused, StartupBlocked, Other, SpreadMs, Survivor, Verdict
 
-$ok      = @($roundResults | Where-Object { $_.Verdict -like 'OK*' })
-$notAtom = @($roundResults | Where-Object { $_.Verdict -like 'NOT ATOMIC*' })
+$ok       = @($roundResults | Where-Object { $_.Verdict -like 'OK*' })
+$notAtom  = @($roundResults | Where-Object { $_.Verdict -like 'NOT ATOMIC*' })
+$blocked  = @($roundResults | Where-Object { $_.Verdict -like 'NOT EVIDENCE*' })
 ''
 if ($notAtom.Count) {
     'OVERALL: NOT ATOMIC. More than one writer was told it transferred.'
@@ -187,6 +200,24 @@ if ($notAtom.Count) {
     "OVERALL: CONSISTENT WITH ATOMICITY across $($ok.Count) round(s)."
     'Supportive, NOT proof - no race was observed, which is weaker evidence than observing one.'
     'Record the round count, worker count and fire spread alongside this result.'
+} elseif ($blocked.Count -gt 0 -and $notAtom.Count -eq 0) {
+    # Mixed run. Rounds whose losers reached the server ARE evidence and must be counted;
+    # rounds lost to local startup contention are simply uninformative, not negative.
+    "OVERALL: MIXED - $($ok.Count) informative round(s), $($blocked.Count) lost to local startup contention."
+    ''
+    if ($ok.Count -gt 0) {
+        "  $($ok.Count) round(s) DID produce server-refusal evidence: one winner, every loser"
+        '  refused by Proton with skippedItems=1. That is genuine atomicity evidence on this'
+        '  CLI version, and no round showed two winners.'
+        ''
+    }
+    "  $($blocked.Count) round(s) are uninformative: losers died in the CLI's local SQLite"
+    '  session cache during startup, before any network request. Not a negative result about'
+    '  the server, and not a harness fault - simultaneous starts of this CLI collide (probe A8:'
+    '  the lock covers startup only, so staggered starts are fine).'
+    ''
+    'Net: absence of evidence in the blocked rounds, not evidence of absence. Increase -Rounds'
+    'to collect more informative samples, since which rounds collide is timing-dependent.'
 } else {
     'OVERALL: INCONCLUSIVE - see per-round verdicts above. Fix the harness before concluding.'
 }
