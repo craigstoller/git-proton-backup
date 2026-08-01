@@ -331,7 +331,7 @@ This conformance is **Stage 2/3 work**, not Stage 4 — it is a correctness prop
 | Delete (`push :dst`) | `Trash`; refuse to delete the branch `HEAD` points at |
 | Tag create | `CreateExclusive` |
 | Tag update | Requires force, matching git's rule; no ancestry check |
-| `refs/notes/*`, `refs/replace/*`, other valid namespaces | Create-exclusive on create; **force required to move** — an intentional conservative deviation, see below |
+| `refs/notes/*`, `refs/replace/*`, other valid namespaces | **NOT IMPLEMENTED IN STAGE 2 — rejected outright with a named reason.** See the v6.1 note below; the rule as written here is unimplementable while `ListRefs` is non-recursive |
 | Pseudorefs and unsupported destinations | Explicit rejection with a named reason |
 | First push to empty remote | Write the marker, then `HEAD` per the deterministic rules below |
 
@@ -462,6 +462,25 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
 ---
 
 ## Revision history
+
+**v6.1, 2026-08-01 — Stage 2 rejects the other namespaces rather than supporting them conservatively.**
+
+- The ref-transition table promised `refs/notes/*`, `refs/replace/*` and "other valid
+  namespaces" would be create-exclusive on create with force required to move. **Stage 2 rejects
+  them outright instead**, with a named reason, at the top of `pushOne` before anything is
+  packed. Two reasons. First, the rule is unimplementable as written while `ListRefs` is
+  non-recursive: those namespaces are nested, so the advertisement cannot see them, `exists`
+  is always false, the ancestry rule never applies, and `WriteRef` would upload into a parent
+  folder that does not exist. Second, without the guard the failure was expensive and
+  misleading — a full pack was built and uploaded to paid storage before `WriteRef` failed with
+  a message naming neither the ref shape nor the limitation, leaving an orphan pack that Stage 2
+  has no way to collect. `refs/stash` was worse: written, reported `ok`, and then permanently
+  invisible to the advertisement.
+- This also implements the error table's "Pseudorefs and unsupported destinations → Explicit
+  rejection with a named reason," which had no mechanism before.
+- The deviation is in the fail-closed direction and is a narrowing, not a change of intent.
+  Stage 3 owns recursive listing and parent creation; when it lands, this row becomes
+  implementable and should be revisited against the conservative rule originally stated here.
 
 **v6, 2026-08-01 — first revision forced by implementation rather than by review.**
 
