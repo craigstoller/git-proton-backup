@@ -158,3 +158,118 @@ func (c *CLI) EnsureDir(p string) error {
 	}
 	return nil
 }
+
+// transferSummary mirrors an `upload --json` response. Fields are pointers,
+// not plain ints: a JSON key that is absent (a renamed field on a future
+// CLI, or any unexpected shape) must decode as "missing", never silently
+// default to the zero value. Design: "A missing count field is Ambiguous,
+// never defaulted to zero — a renamed field in a future CLI must fail
+// loudly rather than silently read as 'nothing happened.'"
+type transferSummary struct {
+	Transferred *int `json:"transferredItems"`
+	Skipped     *int `json:"skippedItems"`
+	Failed      *int `json:"failedItems"`
+}
+
+// classifyUpload turns an exact, mutually exclusive count tuple into an
+// Outcome. Tuples are exact, not >=: for a single-file operation the CLI
+// records exactly one of success, skip, or failure, so e.g. (1,1,0) is
+// contradictory and Ambiguous. Exit code cannot distinguish success from
+// refusal — both are 0 — so this never looks at exit status.
+func classifyUpload(transferred, skipped, failed int) Outcome {
+	switch {
+	case transferred == 1 && skipped == 0 && failed == 0:
+		return Committed
+	case transferred == 0 && skipped == 1 && failed == 0:
+		return Refused
+	default:
+		return Ambiguous
+	}
+}
+
+// parseTransferSummary decodes an upload --json body. Missing-field
+// detection lives here, in the decoding step, not in classifyUpload: an
+// absent count field must be caught before it ever reaches classifyUpload,
+// so a renamed or dropped field can never be silently read as a confident
+// zero — it fails loudly as Ambiguous instead.
+func parseTransferSummary(out string) (Outcome, error) {
+	var s transferSummary
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &s); err != nil {
+		// Unparseable output is Ambiguous, never assumed-failed: the write may
+		// have landed. Callers reconcile by reading remote state.
+		return Ambiguous, fmt.Errorf("unparseable upload summary: %s", strings.TrimSpace(out))
+	}
+	if s.Transferred == nil || s.Skipped == nil || s.Failed == nil {
+		return Ambiguous, fmt.Errorf("upload summary missing a count field: %s", strings.TrimSpace(out))
+	}
+	return classifyUpload(*s.Transferred, *s.Skipped, *s.Failed), nil
+}
+
+func (c *CLI) upload(strategy, remoteDir, localFile string) (Outcome, error) {
+	out, _, _ := c.run("filesystem", "upload", "-f", strategy, "--json", localFile, remoteDir)
+	return parseTransferSummary(out)
+}
+
+func (c *CLI) CreateExclusive(p, localFile string) (Outcome, error) {
+	return c.upload("skip", dirOf(p), localFile)
+}
+
+// UpdateRevision maps to `merge`, which revises the existing node in place
+// (Stage 1 C1: node uid stable, revision uid changes) and upserts a node
+// that does not yet exist (Stage 1 C8: exit 0, transferred=1), so no prior
+// existence check is needed for correctness. NOT `replace`, which trashes
+// the node before creating the new one and can destroy a ref on a crash.
+func (c *CLI) UpdateRevision(p, localFile string) (Outcome, error) {
+	return c.upload("merge", dirOf(p), localFile)
+}
+
+// trashItem mirrors one element of a `trash --json` response: a JSON array
+// of {uid, ok} objects (Stage 1 C3) — a different shape from the upload
+// transfer summary. Feeding this through the upload parser would silently
+// read every count field as missing.
+type trashItem struct {
+	UID string `json:"uid"`
+	OK  bool   `json:"ok"`
+}
+
+// parseTrashResult decodes a trash --json body. The delete is Committed
+// only when the response affirmatively confirms it: exactly one item,
+// ok:true. Anything else — ok:false, zero or multiple items, or
+// unparseable JSON — is Ambiguous. Success is never inferred from exit
+// status alone (design error table: a failure reported in the body "with
+// exit code 0" is "treated as failure — never inferred from exit status").
+func parseTrashResult(out string) (Outcome, error) {
+	var results []trashItem
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &results); err != nil {
+		return Ambiguous, fmt.Errorf("unparseable trash result: %s", strings.TrimSpace(out))
+	}
+	if len(results) != 1 || !results[0].OK {
+		return Ambiguous, fmt.Errorf("trash not affirmatively confirmed: %s", strings.TrimSpace(out))
+	}
+	return Committed, nil
+}
+
+// Trash exits 1 on a missing target (Stage 1 C4), so absence is checked
+// first and reported as Committed — the desired end state is "not there".
+func (c *CLI) Trash(p string) (Outcome, error) {
+	if _, ok, err := c.Stat(p); err != nil {
+		return Ambiguous, err
+	} else if !ok {
+		return Committed, nil
+	}
+	out, code, err := c.run("filesystem", "trash", p, "--json")
+	if code != 0 {
+		if err != nil {
+			return Ambiguous, fmt.Errorf("trash %s failed: %s: %w", p, strings.TrimSpace(out), err)
+		}
+		return Ambiguous, fmt.Errorf("trash %s failed: %s", p, strings.TrimSpace(out))
+	}
+	return parseTrashResult(out)
+}
+
+func dirOf(p string) string {
+	if i := strings.LastIndex(p, "/"); i > 0 {
+		return p[:i]
+	}
+	return "/"
+}
