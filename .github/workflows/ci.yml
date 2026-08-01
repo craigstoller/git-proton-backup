@@ -27,3 +27,35 @@ jobs:
           Import-Module Pester -MinimumVersion 5.5
           git config --global user.email 'ci@ci'; git config --global user.name 'ci'
           Invoke-Pester -Path tests -CI
+  go:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v5
+        with:
+          # 'stable' rather than go-version-file: go.mod declares the oldest
+          # supported toolchain (the floor), and CI should prove the code still
+          # builds on the newest one. Building only at the floor would let a
+          # break on current Go reach main unnoticed.
+          go-version: stable
+      - name: Build
+        shell: pwsh
+        run: go build ./...
+      - name: Vet
+        shell: pwsh
+        run: go vet ./...
+      - name: Test
+        shell: pwsh
+        # The repo tests are hermetic: everything above internal/transport runs
+        # against transport.Fake, and the few that need real git plumbing build
+        # a throwaway repo under t.TempDir(). Nothing here contacts Proton.
+        run: go test ./...
+      - name: gofmt
+        shell: pwsh
+        run: |
+          $unformatted = gofmt -l .
+          if ($unformatted) {
+            $unformatted | Write-Host
+            throw "gofmt: $(@($unformatted).Count) file(s) need formatting"
+          }
+          Write-Host 'gofmt: clean'

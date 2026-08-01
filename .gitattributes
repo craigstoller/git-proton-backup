@@ -1,0 +1,14 @@
+# Go sources are checked out with LF endings regardless of core.autocrlf.
+#
+# gofmt considers CRLF-terminated source unformatted. This repo is developed on
+# Windows with core.autocrlf=true, so without this rule git rewrites committed
+# LF content to CRLF in the working tree and `gofmt -l .` reports every such
+# file — a false positive against content that is already clean in the index,
+# and one that made a local run disagree with CI's gofmt gate. Pinning the
+# checkout is what makes the two agree. Committed bytes are unaffected.
+*.go text eol=lf
+
+# go.mod / go.sum are likewise tool-written and tool-read; keep them LF for the
+# same reason.
+go.mod text eol=lf
+go.sum text eol=lf
