@@ -184,7 +184,7 @@ makes read-back verification more important rather than less. So `UpdateRevision
 
 **Lock contents:** `{"nonce":"<uuid>","host":"…","pid":123,"acquiredAt":"<rfc3339>"}`. The **nonce**, not the hostname, is identity — two processes on one machine are otherwise indistinguishable. A local OS file lock keyed by the **canonical remote address** (not the working copy) serialises clones on the same machine before the remote attempt.
 
-> ### ⚠ STAGE 1 BLOCKER — the CLI cannot be invoked concurrently (CLI 0.7.0)
+> ### STAGE 1 FINDING (RESOLVED) — the CLI cannot be STARTED concurrently (CLI 0.7.0)
 >
 > Discovered while re-running the probes against 0.7.0 on 2026-08-01. **Two `proton-drive`
 > processes cannot run at the same time on one machine.** The second dies during startup:
@@ -213,10 +213,32 @@ makes read-back verification more important rather than less. So `UpdateRevision
 >    the CLI's cache path rather than to the repo. That is a different lock from the remote
 >    `.lock`, with a different scope, and the design previously had no concept of it.
 >
-> **Open, for Stage 1:** whether this is transient (`SQLITE_BUSY_RECOVERY` may clear on retry) or
-> a hard serialisation limit; whether a shared `--cache-dir`-style option exists to give each
-> process its own cache; and whether 0.4.6's tolerance was deliberate or accidental. Until
-> answered, treat machine-wide CLI serialisation as **required**.
+> **RESOLVED by probe A8 (2026-08-01): the lock is TRANSIENT, and covers CLI STARTUP only.**
+>
+> A holder process ran a real 8.4-second upload (exit 0). A second process issued a cheap
+> read 3.1 seconds in — **while the holder was still running** — and succeeded first try, with
+> zero `SQLITE_BUSY` failures. The stack trace corroborates: the failure occurs at
+> `src/init.ts:49 → new SQLiteCache`, during initialisation, not during the operation.
+>
+> So processes collide **only when their startups overlap**, which is exactly what A7 forced by
+> firing four workers within 0.3 ms. Once a process is past init, another can start freely.
+>
+> **Revised consequences:**
+>
+> - **Machine-wide serialisation is NOT required.** The helper needs **retry with backoff on the
+>   SQLite signature at startup**, which is a far cheaper obligation than a global mutex.
+> - **v1/v2 coexistence is back on**, provided both retry. A v1 sweep and a v2 push can overlap;
+>   what they cannot do is *start* at the same instant without one retrying.
+> - **A7's 0.4.6 result stands as genuine evidence of server-side atomicity** — its losers reached
+>   the server and were refused with `skippedItems=1`. A7 on 0.7.0 remains uninformative about
+>   the server, because its losers died locally.
+>
+> **Not measured:** the width of the startup window. A8 sampled at 3.1 s and found it clear; it
+> did not bisect for the boundary. Retry policy should therefore be derived from observation
+> during Stage 2 rather than from a guessed constant.
+>
+> **No per-process cache option exists** — the CLI's only global flags are `--help`, `--json`,
+> and `--verbose` — so retry is the mechanism, not isolation.
 
 **What is verified.** A6 confirms `CreateExclusive` refuses a second writer sequentially, on both 0.4.6 and 0.7.0. **A7 on CLI 0.4.6 (2026-08-01) confirms it under genuine concurrency** — the Stage 1 gate that could have invalidated this design. The 0.7.0 re-run does *not* corroborate it, for the reason in the blocker above. Four worker processes, barrier-aligned to fire spreads of 0.3–2.8 ms, three rounds, on CLI 0.4.6: every round produced **exactly one `transferred=1` and three `skipped=1`**, zero failures, with the surviving remote content always matching the winner. The **winner rotated between rounds** (W1, W4, W3), which is what distinguishes a genuine race arbitrated by the server from a harness that accidentally serialised its workers.
 
