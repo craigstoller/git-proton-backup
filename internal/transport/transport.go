@@ -31,6 +31,12 @@ type Transport interface {
 	EnsureDir(path string) error
 	List(path string) ([]Node, error)
 	Stat(path string) (Node, bool, error) // absence is (_, false, nil), never an error
+	// ReadTo downloads the node at path into the existing local directory
+	// localPath, landing as a file named after path's own remote basename —
+	// this mirrors `filesystem download path... localFolder` exactly.
+	// localPath is a directory, never a destination file path; implementations
+	// do not create it, and a missing or non-directory localPath must surface
+	// as the error it naturally is.
 	ReadTo(path, localPath string) error
 	CreateExclusive(path, localPath string) (Outcome, error)
 	UpdateRevision(path, localPath string) (Outcome, error)

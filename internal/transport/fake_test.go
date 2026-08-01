@@ -122,6 +122,37 @@ func TestFakeFailNextForcesAmbiguousOnce(t *testing.T) {
 	}
 }
 
+// TestFakeReadToLandsUnderRemoteBasenameInAnExistingDir pins the contract now
+// documented on Transport.ReadTo: local is a pre-existing directory, and the
+// downloaded content lands under the remote path's own basename, mirroring
+// `filesystem download path... localFolder`. Before this fix Fake.ReadTo
+// wrote directly to local as if it were a destination file, which broke the
+// first real caller (repo.readLock, Task 7) the moment one existed — nothing
+// exercised ReadTo before that. This test exists so a future "simplification"
+// back to file-destination semantics fails loudly here instead of silently
+// resurfacing in a caller.
+func TestFakeReadToLandsUnderRemoteBasenameInAnExistingDir(t *testing.T) {
+	f := NewFake()
+	local := writeTemp(t, "lock body")
+	if _, err := f.CreateExclusive("/my-files/r/.lock", local); err != nil {
+		t.Fatalf("seed create: %v", err)
+	}
+
+	dir := t.TempDir()
+	if err := f.ReadTo("/my-files/r/.lock", dir); err != nil {
+		t.Fatalf("ReadTo: %v", err)
+	}
+
+	want := filepath.Join(dir, ".lock")
+	got, err := os.ReadFile(want)
+	if err != nil {
+		t.Fatalf("expected downloaded file at %s: %v", want, err)
+	}
+	if string(got) != "lock body" {
+		t.Errorf("downloaded content = %q, want %q", got, "lock body")
+	}
+}
+
 func TestFakeEnsureDirAndList(t *testing.T) {
 	f := NewFake()
 	if err := f.EnsureDir("/refs/heads"); err != nil {

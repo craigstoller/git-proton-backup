@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -52,12 +53,17 @@ func (f *Fake) Stat(p string) (Node, bool, error) {
 	return Node{}, false, nil
 }
 
+// ReadTo mirrors the real CLI's folder-destination download: local must
+// already be a directory, and the file lands under path's own remote
+// basename (path.Base, not filepath.Base — remote paths are always POSIX
+// regardless of host OS). A missing or non-directory local is not created
+// on the caller's behalf; os.WriteFile reports it as the error it is.
 func (f *Fake) ReadTo(p, local string) error {
 	b, ok := f.Files[p]
 	if !ok {
 		return fmt.Errorf("not found: %s", p)
 	}
-	return os.WriteFile(local, b, 0o644)
+	return os.WriteFile(filepath.Join(local, path.Base(p)), b, 0o644)
 }
 
 func (f *Fake) CreateExclusive(p, local string) (Outcome, error) {
