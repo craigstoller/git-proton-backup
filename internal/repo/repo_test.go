@@ -222,3 +222,99 @@ func TestAcquireLockRefusalOnUnreadableLockIsDistinct(t *testing.T) {
 		t.Errorf("refusal on a corrupt lock must say so distinctly, got: %v", err)
 	}
 }
+
+func TestWriteAndListRefs(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	if out, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil || out != transport.Committed {
+		t.Fatalf("create ref: %v %v", out, err)
+	}
+	refs, err := ListRefs(f, "/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refs["refs/heads/main"] != sha {
+		t.Errorf("got %q", refs["refs/heads/main"])
+	}
+}
+
+func TestListRefsRejectsCorruptRefFile(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	f.Files["/r/refs/heads/bad"] = []byte("not-a-sha\n")
+	if _, err := ListRefs(f, "/r"); err == nil {
+		t.Error("a malformed ref file must be fatal, never coerced")
+	}
+}
+
+// TestWriteRefRefusesNonSha covers the brief's guard directly: WriteRef must
+// reject a non-sha value before ever touching the transport, not attempt to
+// stage or upload it. A ref file that is not exactly 40 lowercase hex plus a
+// newline is corruption per the task's binding rule, so this must be refused
+// outright rather than passed through.
+func TestWriteRefRefusesNonSha(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	if out, err := WriteRef(f, "/r", "refs/heads/main", "not-a-sha", false); err == nil {
+		t.Errorf("must refuse a non-sha value, got %v, nil error", out)
+	}
+	if _, ok := f.Files["/r/refs/heads/main"]; ok {
+		t.Error("nothing must be written to the transport for a refused non-sha value")
+	}
+}
+
+// lyingWriteTransport wraps a Fake but makes CreateExclusive report Committed
+// while actually landing different content than what was staged — a
+// transport that lies about what it wrote. This is the shape probe C2
+// describes in miniature: an Outcome the caller cannot take at face value.
+// transport.Fake's own CreateExclusive always writes exactly what was staged,
+// so it cannot drive this case; a small local stub is the only way to
+// exercise it against the real transport.Transport interface, the same
+// technique ambiguousTrashTransport above already uses.
+type lyingWriteTransport struct {
+	*transport.Fake
+}
+
+func (l lyingWriteTransport) CreateExclusive(p, local string) (transport.Outcome, error) {
+	l.Fake.Files[p] = []byte("2222222222222222222222222222222222222222\n")
+	return transport.Committed, nil
+}
+
+// TestWriteRefCatchesReadBackMismatch is the most important test in this
+// task: read-back is the design's answer to a transport it cannot trust
+// (probe C2's silently-skipped rewrite rests on a digest Proton itself flags
+// sha1Verified: false), and an untested read-back is a guarantee on paper
+// only. Here CreateExclusive reports Committed but leaves different bytes at
+// the path than WriteRef asked for; WriteRef must catch that on read-back
+// and report Ambiguous with an error, never Committed.
+func TestWriteRefCatchesReadBackMismatch(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	lying := lyingWriteTransport{f}
+	sha := "1111111111111111111111111111111111111111"
+
+	out, err := WriteRef(lying, "/r", "refs/heads/main", sha, false)
+	if err == nil {
+		t.Fatalf("a read-back mismatch must be reported as an error, got out=%v", out)
+	}
+	if out != transport.Ambiguous {
+		t.Errorf("a read-back mismatch must report Ambiguous, got %v", out)
+	}
+}
+
+// TestWriteRefRejectsHostileLeaf covers a ref whose leaf name
+// checkStageableLeaf refuses (mirroring TestStagedFileUsesTheLeafNameAndRefusesHostileOnes).
+// WriteRef must surface stagedFile's refusal as an error rather than mangling
+// the name into something stageable, and nothing must reach the transport.
+func TestWriteRefRejectsHostileLeaf(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	if out, err := WriteRef(f, "/r", "refs/heads/con", sha, false); err == nil {
+		t.Errorf("a leaf name checkStageableLeaf rejects must surface as an error, got %v, nil error", out)
+	}
+	if _, ok := f.Files["/r/refs/heads/con"]; ok {
+		t.Error("nothing must be written to the transport for a rejected leaf name")
+	}
+}
