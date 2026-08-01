@@ -78,6 +78,42 @@ each turned into its own test in the same task it surfaced in.
   data, wrong shape. Fixed with an explicit curated-column table format, with the full object still
   available for anyone piping into something else.
 
+## Why releases are strict: there is a downstream that pins exact versions
+
+This tool has a private downstream consumer — a personal backup system that runs it across a dozen
+repositories and imports it with `-RequiredVersion` against an exact pin, not a floor. That single
+fact shapes the release discipline here, so it is worth stating plainly rather than leaving as
+unexplained fussiness.
+
+Every behaviour change gets a version bump and a CHANGELOG entry, because something out there
+declares a version and will get exactly what it asks for. And the pin is *exact* rather than a
+minimum, because a floor silently admits whatever ships next.
+
+That is not hypothetical. Version 0.2.4 exists because of it.
+
+The Proton Drive CLI moved from 0.4.6 to 0.7.0 and dropped the `{ok, value}` wrapper around
+`activeRevision` in `filesystem info --json`. Before the change, upload confirmation read
+`activeRevision.value.state`; after it, the field lives at `activeRevision.state`. Reading only the
+wrapped form meant **every healthy bundle reported as unconfirmed** — fleet-wide, with no error,
+because the code failed closed exactly as designed.
+
+The misdiagnosis was worse than the break. With the state parse failing, control fell through to
+auth detection, which matched the bare substring `auth` — and the *success* payload contains
+`keyAuthor`, `nameAuthor` and `contentAuthor`. So a healthy bundle on a valid session reported
+`auth_error`, and a user would have gone off to re-authenticate a session that was never broken.
+
+Both are fixed: the parser accepts either payload shape, and auth detection now requires a non-zero
+exit code and uses word boundaries. Five regression tests cover both shapes, the `keyAuthor` false
+positive, a genuine auth failure, and the `ok: false` case.
+
+Two things generalise from that:
+
+- **A dependency that silently changes an output shape is more dangerous than one that breaks
+  loudly.** Nothing crashed. Exit codes stayed 0. The only symptom was a fleet reporting work it had
+  actually done as not done.
+- **A version floor would have admitted 0.7.0 automatically.** The exact-version allowlist in the v2
+  design is not caution for its own sake — it is this incident, written down as a rule.
+
 ## The takeaway
 
 None of these were caught by the person who wrote them. The lock and collision issues were caught by
