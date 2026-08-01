@@ -2,10 +2,12 @@ package repo
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/craigstoller/git-proton-backup/internal/protocol"
 	"github.com/craigstoller/git-proton-backup/internal/transport"
 )
 
@@ -316,5 +318,215 @@ func TestWriteRefRejectsHostileLeaf(t *testing.T) {
 	}
 	if _, ok := f.Files["/r/refs/heads/con"]; ok {
 		t.Error("nothing must be written to the transport for a rejected leaf name")
+	}
+}
+
+// newGitRepoForPush builds a real, throwaway git repo under t.TempDir() with
+// one commit, mirroring internal/gitcmd/gitcmd_test.go's newRepo helper. That
+// helper lives in a different package and cannot be reused here, so this is a
+// separate copy. Every setup command's error is checked: a bare t.TempDir()
+// is an empty directory, not a git repository, so pushOne's resolve() (which
+// shells out to `git rev-parse`) would fail before the ancestry logic under
+// test is ever reached — the brief's original TestPushRejectsNonFastForward
+// passed t.TempDir() directly as gitDir and could not have passed for that
+// reason.
+func newGitRepoForPush(t *testing.T) string {
+	t.Helper()
+	d := t.TempDir()
+	for _, a := range [][]string{
+		{"init", "-qb", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"},
+	} {
+		if err := exec.Command("git", append([]string{"-C", d}, a...)...).Run(); err != nil {
+			t.Fatalf("git %v: %v", a, err)
+		}
+	}
+	if err := os.WriteFile(d+"/a.txt", []byte("one"), 0o644); err != nil {
+		t.Fatalf("write a.txt: %v", err)
+	}
+	if err := exec.Command("git", "-C", d, "add", ".").Run(); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if err := exec.Command("git", "-C", d, "commit", "-qm", "c1").Run(); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+	return d
+}
+
+// headOf returns the full HEAD sha of the repo at d, failing the test loudly
+// (rather than silently misbehaving on a short slice) if rev-parse errors or
+// returns something other than a 40-char sha.
+func headOf(t *testing.T, d string) string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", d, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	sha := strings.TrimSpace(string(out))
+	if len(sha) != 40 {
+		t.Fatalf("rev-parse HEAD returned %q, want a 40-char sha", sha)
+	}
+	return sha
+}
+
+// TestPushRejectsNonFastForward fixes a defect in the brief: passing
+// t.TempDir() as gitDir is an empty directory, not a git repository, so
+// resolve() would fail at `git rev-parse` before the ancestry logic under
+// test is ever reached, and the result's error would be "cannot resolve
+// refs/heads/main" rather than the "fetch first" this test asserts. Using a
+// real repo (newGitRepoForPush) lets refs/heads/main resolve to a real sha,
+// so the intended path is exercised: the ref exists remotely at the unknown
+// sha "1111...", HasObject cannot find that object locally, and the result
+// is "fetch first".
+func TestPushRejectsNonFastForward(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	old := "1111111111111111111111111111111111111111"
+	_, _ = WriteRef(f, "/r", "refs/heads/main", old, false)
+
+	gitDir := newGitRepoForPush(t)
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/main"}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{"refs/heads/main": old})
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("want one failed result, got %+v", res)
+	}
+	if !strings.Contains(res[0].Err, "fetch first") {
+		t.Errorf("unknown old sha must report 'fetch first', got %q", res[0].Err)
+	}
+}
+
+// TestPushDeleteRef is fine using t.TempDir() (not a real repo) as gitDir,
+// unlike TestPushRejectsNonFastForward above: a delete update carries an
+// empty Src, so pushOne returns before resolve() — and therefore before any
+// `git` invocation — is ever reached. The asymmetry with the sibling test
+// above is deliberate, not an oversight.
+func TestPushDeleteRef(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	sha := "2222222222222222222222222222222222222222"
+	_, _ = WriteRef(f, "/r", "refs/heads/tmp", sha, false)
+
+	ups := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/tmp"}}
+	res := Push(f, "/r", t.TempDir(), ups, map[string]string{"refs/heads/tmp": sha})
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("delete should succeed: %+v", res)
+	}
+	if _, ok := f.Files["/r/refs/heads/tmp"]; ok {
+		t.Error("ref file must be gone")
+	}
+}
+
+// countPackFiles reports how many .pack and .idx entries exist under
+// root+"/packs/" in a Fake's Files map.
+func countPackFiles(f *transport.Fake, root string) (packs, idxs int) {
+	prefix := root + "/packs/"
+	for p := range f.Files {
+		if !strings.HasPrefix(p, prefix) {
+			continue
+		}
+		switch {
+		case strings.HasSuffix(p, ".pack"):
+			packs++
+		case strings.HasSuffix(p, ".idx"):
+			idxs++
+		}
+	}
+	return packs, idxs
+}
+
+// TestPushOrderingPackAndIdxLandBeforeRef covers the task's central promise:
+// a successful push writes the pack AND the idx, and only then the ref, and
+// all three end up present. This is a first push of refs/heads/main (remote
+// carries no entry for it), so the ancestry check is skipped and the full
+// object range is packed.
+func TestPushOrderingPackAndIdxLandBeforeRef(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/main"}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("push should succeed: %+v", res)
+	}
+
+	sha, err := readRef(f, "/r/refs/heads/main")
+	if err != nil || sha != head {
+		t.Fatalf("ref not published correctly: sha=%q err=%v want=%q", sha, err, head)
+	}
+	if packs, idxs := countPackFiles(f, "/r"); packs == 0 || idxs == 0 {
+		t.Errorf("want a pack/idx pair under packs/, got pack=%d idx=%d", packs, idxs)
+	}
+}
+
+// ambiguousPackUploadTransport wraps a Fake but forces CreateExclusive to
+// report Ambiguous for anything staged under packs/, while behaving normally
+// for everything else (the marker, refs, the lock). Fake's FailNext field
+// only fires for the very next mutating call, and Bootstrap and the ref
+// machinery both perform mutations before pushOne ever reaches the pack
+// upload step, so FailNext cannot selectively target only that step; a small
+// local stub — the same technique repo_test.go already uses above for
+// ambiguousTrashTransport and lyingWriteTransport — is the only way to drive
+// this deterministically against the real transport.Transport interface.
+type ambiguousPackUploadTransport struct {
+	*transport.Fake
+}
+
+func (a ambiguousPackUploadTransport) CreateExclusive(p, local string) (transport.Outcome, error) {
+	if strings.HasPrefix(p, "/r/packs/") {
+		return transport.Ambiguous, nil
+	}
+	return a.Fake.CreateExclusive(p, local)
+}
+
+// TestPushRefNotPublishedWhenPackUploadIsAmbiguous is the ordering guarantee
+// from the other direction: when the pack upload cannot be confirmed, the ref
+// must never be published, because that would leave a ref pointing at
+// objects the remote may not actually have. Untested, "pack -> idx -> confirm
+// both -> ref" is a promise on paper only.
+func TestPushRefNotPublishedWhenPackUploadIsAmbiguous(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	amb := ambiguousPackUploadTransport{f}
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/main"}}
+	res := Push(amb, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("want a failed result when the pack upload is ambiguous, got %+v", res)
+	}
+	if _, ok := f.Files["/r/refs/heads/main"]; ok {
+		t.Error("ref must not be published when the pack upload could not be confirmed")
+	}
+}
+
+// TestPushForceSkipsAncestryCheck drives a forced update whose remote-known
+// old sha does not exist locally at all: without Force, this would be
+// rejected as "fetch first" before ever reaching the pack step (see
+// TestPushRejectsNonFastForward above). With Force set, pushOne must skip the
+// ancestry gate entirely and still go through pack upload and ref
+// publication — proving Force actually short-circuits the check rather than
+// merely happening not to trip it.
+func TestPushForceSkipsAncestryCheck(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
+
+	old := "3333333333333333333333333333333333333333"
+	_, _ = WriteRef(f, "/r", "refs/heads/main", old, false)
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/main", Force: true}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{"refs/heads/main": old})
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("forced push should succeed despite an unresolvable old sha: %+v", res)
+	}
+
+	sha, err := readRef(f, "/r/refs/heads/main")
+	if err != nil || sha != head {
+		t.Fatalf("ref not updated to the new head: sha=%q err=%v want=%q", sha, err, head)
+	}
+	if packs, idxs := countPackFiles(f, "/r"); packs == 0 || idxs == 0 {
+		t.Errorf("forced push must still upload a pack/idx pair, got pack=%d idx=%d", packs, idxs)
 	}
 }

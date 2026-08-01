@@ -88,6 +88,17 @@ func IsAncestor(gitDir, old, new string) (bool, error) {
 	}
 }
 
+// RevParse resolves rev (a ref name, HEAD, or any other `git rev-parse`
+// input) to its sha. It returns the trimmed output, the raw exit code, and
+// any start/run error, the same three-value shape git() itself returns:
+// callers (Task 10's resolve()) decide what counts as success themselves,
+// the same way IsAncestor and WritePack above interpret git's exit codes
+// rather than collapsing them into a single bool.
+func RevParse(gitDir, rev string) (string, int, error) {
+	out, code, err := git(gitDir, "rev-parse", rev)
+	return out, code, err
+}
+
 // WritePack builds a NON-THIN pack containing the objects reachable from
 // want but not from any of haves, and writes it into outDir. --no-thin is
 // deliberate: a thin pack would depend on delta bases the remote may not
