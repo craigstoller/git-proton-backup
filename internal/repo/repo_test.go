@@ -3,6 +3,7 @@ package repo
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/craigstoller/git-proton-backup/internal/transport"
@@ -158,5 +159,66 @@ func TestReleaseFailsClosedOnAmbiguousTrash(t *testing.T) {
 	}
 	if _, ok := f.Files["/my-files/r/.lock"]; !ok {
 		t.Error("lock file must still be reported present; Trash never actually removed it")
+	}
+}
+
+// TestReleaseFailsClosedOnUnreadableLock covers review finding 1: readLock
+// must not conflate "absent" with "present but corrupt". Before the fix, a
+// .lock that failed to unmarshal was reported as (_, false, nil) — the exact
+// shape Release treats as "not ours any more, leave it alone" — so Release
+// returned success without ever calling Trash. This seeds that scenario
+// directly: acquire normally, then corrupt the lock's own content in place
+// (still this process's lock by path, now unparseable), and confirm Release
+// (a) fails instead of reporting success, and (b) leaves the file in place,
+// because it cannot prove the corrupt content is safe to delete.
+func TestReleaseFailsClosedOnUnreadableLock(t *testing.T) {
+	f := transport.NewFake()
+	l, err := AcquireLock(f, "/my-files/r")
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	f.Files["/my-files/r/.lock"] = []byte("not json")
+
+	if err := l.Release(); err == nil {
+		t.Error("Release must return an error when the lock is present but unreadable")
+	}
+	if _, ok := f.Files["/my-files/r/.lock"]; !ok {
+		t.Error("Release must not trash a lock it cannot prove is its own")
+	}
+}
+
+// TestLockRefusalReportsHolderNonce covers review finding 2: the design's
+// binding rule is that a stale lock is reported with holder nonce, host, and
+// age — the nonce is the actual identity, since two processes on one machine
+// are otherwise indistinguishable by host/pid alone.
+func TestLockRefusalReportsHolderNonce(t *testing.T) {
+	f := transport.NewFake()
+	first, err := AcquireLock(f, "/my-files/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = AcquireLock(f, "/my-files/r")
+	if err == nil {
+		t.Fatal("second acquire must fail while the first holds it")
+	}
+	if !strings.Contains(err.Error(), first.nonce) {
+		t.Errorf("refusal message must name the holder's nonce, got: %v", err)
+	}
+}
+
+// TestAcquireLockRefusalOnUnreadableLockIsDistinct pins the coherent decision
+// made in AcquireLock's Refused branch: an unreadable lock is reported
+// distinctly from a normal, healthy holder, rather than silently falling
+// through to the generic "repo is locked" message.
+func TestAcquireLockRefusalOnUnreadableLockIsDistinct(t *testing.T) {
+	f := transport.NewFake()
+	f.Files["/my-files/r/.lock"] = []byte("not json")
+
+	_, err := AcquireLock(f, "/my-files/r")
+	if err == nil {
+		t.Fatal("acquire must refuse when .lock exists, even if unreadable")
+	}
+	if !strings.Contains(err.Error(), "unreadable") {
+		t.Errorf("refusal on a corrupt lock must say so distinctly, got: %v", err)
 	}
 }

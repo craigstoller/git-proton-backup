@@ -153,6 +153,27 @@ func TestFakeReadToLandsUnderRemoteBasenameInAnExistingDir(t *testing.T) {
 	}
 }
 
+// TestFakeReadToIntoMissingDirectoryErrors covers the other half of the
+// ReadTo contract: local must already be a directory, and implementations do
+// not create it on the caller's behalf, because the real CLI does not either.
+// A missing (or non-directory) destination must surface as the error it
+// naturally is, not be silently papered over.
+func TestFakeReadToIntoMissingDirectoryErrors(t *testing.T) {
+	f := NewFake()
+	local := writeTemp(t, "x")
+	if _, err := f.CreateExclusive("/objects/cc", local); err != nil {
+		t.Fatalf("seed create: %v", err)
+	}
+
+	dest := filepath.Join(t.TempDir(), "does-not-exist")
+	if err := f.ReadTo("/objects/cc", dest); err == nil {
+		t.Fatal("ReadTo into a missing directory must error, not silently succeed")
+	}
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Errorf("ReadTo must not create the destination directory for the caller; stat error = %v", err)
+	}
+}
+
 func TestFakeEnsureDirAndList(t *testing.T) {
 	f := NewFake()
 	if err := f.EnsureDir("/refs/heads"); err != nil {
