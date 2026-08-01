@@ -8,3 +8,7 @@ testResults.xml
 # key, a connection string -- is stored in this file in plain text. Treat it
 # like .env and never commit it.
 **/.claude/settings.local.json
+
+# git-remote-proton build output
+/git-remote-proton
+/git-remote-proton.exe
