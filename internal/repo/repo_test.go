@@ -11,6 +11,76 @@ import (
 	"github.com/craigstoller/git-proton-backup/internal/transport"
 )
 
+// TestCanonicalRootNormalises covers the normalisation half of the design's
+// path-canonicalisation rule. None of it existed: main.go did only
+// strings.TrimPrefix(os.Args[2], "proton::"), so a trailing slash produced
+// "//refs/heads" paths and an empty root produced "/refs/heads" — addresses
+// that would be sent to the Proton CLI verbatim. The canonical form is also
+// the cache and lock identity, so two spellings of one repo that normalise
+// differently are two locks over one repo.
+func TestCanonicalRootNormalises(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"/my-files/GitRemotes/myrepo", "/my-files/GitRemotes/myrepo"},
+		{"proton::/my-files/r", "/my-files/r"},
+		{"proton:://my-files//r/", "/my-files/r"},
+		{"/my-files/r/", "/my-files/r"},
+		{"/my-files/r///", "/my-files/r"},
+		{"//my-files//GitRemotes///myrepo//", "/my-files/GitRemotes/myrepo"},
+		{"  /my-files/r  ", "/my-files/r"},
+		{"/devices/laptop/repos/r", "/devices/laptop/repos/r"},
+	}
+	for _, c := range cases {
+		t.Run(c.in, func(t *testing.T) {
+			got, err := CanonicalRoot(c.in)
+			if err != nil {
+				t.Fatalf("CanonicalRoot(%q) errored: %v", c.in, err)
+			}
+			if got != c.want {
+				t.Errorf("CanonicalRoot(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+// TestCanonicalRootRejects covers the refusal half. The /shared-with-me row is
+// a SAFETY rule, not tidiness: the CLI permits creating there, and a repo in a
+// folder another person can write to is the one failure mode the single-writer
+// model cannot survive. The dot rows pin "rejected outright rather than
+// resolved" — resolving would let an address walk out of the namespace the
+// check just verified.
+func TestCanonicalRootRejects(t *testing.T) {
+	cases := []struct{ name, in, wantIn string }{
+		{"empty", "", "empty remote address"},
+		{"scheme only", "proton::", "empty remote address"},
+		{"whitespace only", "   ", "empty remote address"},
+		{"relative", "my-files/r", "absolute"},
+		{"drive root", "/", "Drive root"},
+		{"dot component", "/my-files/./r", "rejected rather than resolved"},
+		{"dotdot component", "/my-files/../devices/r", "rejected rather than resolved"},
+		{"dotdot escaping the namespace", "/my-files/r/../../shared-with-me/r", "rejected rather than resolved"},
+		{"shared-with-me", "/shared-with-me/theirrepo", "concurrent-writer"},
+		{"shared-with-me root", "/shared-with-me", "concurrent-writer"},
+		{"foreign namespace", "/trash/r", "must lie under"},
+		{"my-files itself", "/my-files", "top-level"},
+		{"my-files with trailing slash", "/my-files/", "top-level"},
+		{"devices itself", "/devices", "top-level"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := CanonicalRoot(c.in)
+			if err == nil {
+				t.Fatalf("CanonicalRoot(%q) = %q, want a refusal", c.in, got)
+			}
+			if got != "" {
+				t.Errorf("a refused address must return an empty root, got %q", got)
+			}
+			if !strings.Contains(err.Error(), c.wantIn) {
+				t.Errorf("refusal must name the reason (%q), got: %v", c.wantIn, err)
+			}
+		})
+	}
+}
+
 func TestBootstrapEmptyRemote(t *testing.T) {
 	f := transport.NewFake()
 	if err := Bootstrap(f, "/my-files/r"); err != nil {

@@ -24,7 +24,20 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "git-remote-proton: must be run by git as a remote helper")
 		return 1
 	}
-	root := strings.TrimPrefix(os.Args[2], "proton::")
+	// Canonicalise BEFORE anything else touches the address. Every remote path
+	// in this process is built by concatenation onto root, so a trailing slash
+	// produced "//refs/heads" and an empty address produced "/refs/heads" —
+	// both sent to the Proton CLI verbatim. The canonical form is also the
+	// lock identity, so two spellings of one repo would otherwise be two locks
+	// over one repo. repo.CanonicalRoot additionally refuses /shared-with-me,
+	// which is a safety rule rather than a tidiness one: a repo in a folder
+	// another person can write to is the one failure mode the single-writer
+	// model cannot survive.
+	root, err := repo.CanonicalRoot(os.Args[2])
+	if err != nil {
+		warn(err)
+		return 1
+	}
 	gitDir := os.Getenv("GIT_DIR")
 	if gitDir == "" {
 		gitDir = "."
@@ -57,7 +70,24 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 	var lock *repo.Lock
 	defer func() {
 		if lock != nil {
-			_ = lock.Release() // release on EVERY exit path; a leak wedges the repo
+			// Release on EVERY exit path; a leak wedges the repo. Its error is
+			// REPORTED but deliberately does NOT change the exit code.
+			//
+			// Release returns two fully-formed operator messages — "lock at %s
+			// is present but its contents are unreadable" and "lock release
+			// for %s is unconfirmed (Trash reported %s)" — and discarding them
+			// meant that when a release failed, the push exited 0, stderr said
+			// nothing, .lock stayed on the remote, and, because v2 has no
+			// takeover, every subsequent push failed until a human cleared it
+			// by hand with no clue why.
+			//
+			// The exit code stays as it was because the push itself succeeded:
+			// reporting failure for a completed push would make git discard
+			// its remote-tracking update for refs that really did land, which
+			// is its own wrong answer. Do not "fix" this into a `return 1`.
+			if err := lock.Release(); err != nil {
+				warn(err)
+			}
 		}
 	}()
 

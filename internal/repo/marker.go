@@ -23,6 +23,73 @@ const (
 	markerContent = `{"format":"` + markerFormat + `","version":1}`
 )
 
+// AddressScheme is the prefix git configures a proton remote with. git strips
+// it before spawning the helper, so argv usually arrives without it; trimming
+// it here anyway means one function owns address handling end to end and can
+// be tested on either form.
+const AddressScheme = "proton::"
+
+// CanonicalRoot turns a remote address into the single canonical form every
+// remote path in this helper is built from, or refuses it with a named reason.
+// The design requires the address be "normalised before use — duplicate and
+// trailing slashes collapsed, `.` and `..` rejected outright rather than
+// resolved, empty path rejected, and the root must lie under `/my-files` or
+// `/devices`", and separately refuses `/shared-with-me`.
+//
+// Three things here are deliberate and should not be "simplified":
+//
+//   - `.` and `..` are REJECTED, never resolved. Resolving them would mean
+//     validating the namespace prefix and then letting the address walk out of
+//     it, which is the check defeating itself. There is also no server-side
+//     path resolution to be consistent with: these strings would be sent to
+//     the CLI verbatim.
+//   - The canonical form is the cache and lock identity. Two spellings of one
+//     repo that normalise differently are two locks over one repo, which is
+//     the single-writer guarantee quietly gone.
+//   - `/shared-with-me` is refused for SAFETY, not tidiness. The CLI permits
+//     creating there, but a repo in a folder another person can write to is
+//     precisely the concurrent-writer case this design has no defence against.
+func CanonicalRoot(addr string) (string, error) {
+	addr = strings.TrimPrefix(strings.TrimSpace(addr), AddressScheme)
+	if addr == "" {
+		return "", fmt.Errorf("empty remote address: expected something like " +
+			AddressScheme + "/my-files/GitRemotes/myrepo")
+	}
+	if !strings.HasPrefix(addr, "/") {
+		return "", fmt.Errorf("remote address %q must be an absolute Proton Drive path "+
+			"beginning with /my-files or /devices", addr)
+	}
+	var parts []string
+	for _, c := range strings.Split(addr, "/") {
+		switch c {
+		case "": // a duplicate or trailing slash; collapsed
+			continue
+		case ".", "..":
+			return "", fmt.Errorf("remote address %q contains a %q component, which is "+
+				"rejected rather than resolved: resolving it would let an address walk out "+
+				"of the namespace this check just verified", addr, c)
+		}
+		parts = append(parts, c)
+	}
+	switch {
+	case len(parts) == 0:
+		return "", fmt.Errorf("remote address %q names the Drive root, not a repo folder", addr)
+	case parts[0] == "shared-with-me":
+		return "", fmt.Errorf("refusing remote address %q: a repo under /shared-with-me sits "+
+			"in a folder another person can write to, which is precisely the concurrent-writer "+
+			"case this design has no defence against — put the repo under /my-files or /devices "+
+			"instead", addr)
+	case parts[0] != "my-files" && parts[0] != "devices":
+		return "", fmt.Errorf("refusing remote address %q: a repo root must lie under "+
+			"/my-files or /devices, not /%s", addr, parts[0])
+	case len(parts) < 2:
+		return "", fmt.Errorf("refusing remote address %q: /%s is a Proton Drive top-level "+
+			"namespace, not a repo folder; name a folder beneath it, e.g. "+
+			"/my-files/GitRemotes/myrepo", addr, parts[0])
+	}
+	return "/" + strings.Join(parts, "/"), nil
+}
+
 // markerBody is the marker's on-disk shape. Fields are plain values rather
 // than pointers because both are compared against a required exact value: an
 // absent key decodes to the zero value, which matches neither markerFormat nor
