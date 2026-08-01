@@ -1,7 +1,34 @@
 # Remote-helper prior art: git-remote-dropbox, and what Proton Drive actually exposes
 
 **Research memo for [issue #3](https://github.com/craigstoller/git-proton-backup/issues/3) (v2 direction: `git-remote-proton`).**
-Date: 2026-07-23. Status: research only — no implementation decisions are made here.
+Written 2026-07-23. Status: research only — no implementation decisions are made here.
+
+> **Verification status — updated 2026-07-31.** Two of the five load-bearing assumptions in §3b
+> have now been tested against a live account and **both hold**:
+>
+> | | Assumption | Result | How |
+> |---|---|---|---|
+> | **A4** | a trashed ref file does not still occupy its name | ✅ **HOLDS** | CLI probe |
+> | **A5** | name uniqueness is exact-byte on the plaintext | ✅ **HOLDS** | CLI probe |
+> | A1 | read-under-draft | ⏳ blocked | needs SDK |
+> | A2 | fenced commit | ⏳ blocked | needs SDK |
+> | A3 | lock scope | ⏳ blocked | needs SDK |
+>
+> Details in §3b. Probe scripts: `docs/research/probes/`.
+>
+> **Correction to this memo's own instructions.** The text below originally required a *throwaway*
+> account for these tests. In the event the author chose to use his real account, accepting the
+> risk in exchange for mechanical guardrails (all writes confined to `/my-files/_cas-probe` by a
+> path assertion with no override, no remote path accepted as a script parameter, byte-sized
+> payloads, automatic cleanup, and a precondition that the production backup fleet be verified
+> green first). That is a different risk posture than this memo recommended and is recorded here
+> rather than quietly changed.
+>
+> **A1–A3 are not "~50-line scripts."** That estimate assumed an authenticated SDK session. There
+> isn't one: §3c identifies third-party auth as the largest gap, and the CLI cannot substitute
+> because it exposes no draft lifecycle — `filesystem upload` offers conflict *strategies*
+> (`merge`/`keep-both`/`replace`/`skip`), which are policy, not primitives (§3a). Every remaining
+> assumption is gated behind the auth question, not behind test-writing effort.
 
 Sources examined (all read in full or in relevant part, pinned to the versions studied):
 
@@ -9,7 +36,7 @@ Sources examined (all read in full or in relevant part, pinned to the versions s
 - [gitremote-helpers(7)](https://git-scm.com/docs/gitremote-helpers) — git's own remote-helper protocol documentation (read from the local git 2.x install)
 - [git-remote-gcrypt](https://github.com/spwhitton/git-remote-gcrypt) @ `72f93b3` (2024-12-29) — README/design skim for contrast
 - [Proton Drive SDK](https://github.com/ProtonDriveApps/sdk) @ `e0ad37e` (2026-07-22) — the open-source (MIT) SDK that Proton's first-party clients are being migrated onto; includes the source of the `proton-drive` CLI itself. API semantics below are read from its OpenAPI-derived type definitions, upload manager, and tests
-- Proton Drive CLI (`proton-drive.exe`, local install) — full help text for every subcommand. **Live probing was not possible**: the CLI reported "You need to login first" in this session, and per the research ground rules (strictly read-only against a real account) no login or write of any kind was performed. Nothing in this memo depends on live behavior; where a claim rests only on SDK type definitions rather than observed behavior, it is flagged.
+- Proton Drive CLI (`proton-drive.exe`, local install) — full help text for every subcommand. **In the original research session live probing was not possible**: the CLI reported "You need to login first", and per the ground rules then in force (strictly read-only against a real account) no login or write of any kind was performed. Everything in Parts 1–4 below rests on source and documentation rather than observed behavior, and where a claim rests only on SDK type definitions it is flagged. *The A4/A5 results added 2026-07-31 are the exception and are explicitly live-tested — see the verification-status note above.*
 - [rclone's Proton Drive backend docs](https://rclone.org/protondrive/) and Proton's SDK blog posts ([July 2025 preview](https://proton.me/blog/proton-drive-sdk-preview), [January 2026 update](https://proton.me/blog/drive-sdk-january-2026))
 
 ---
@@ -124,13 +151,24 @@ The load-bearing observation: **upload's conflict handling is a policy knob, not
 
 Either way, the durable fix is upstream: a public way to pass an expected `CurrentRevisionID` (or a public draft-lifecycle handle) is a small, well-motivated SDK feature request — and exactly the kind of concrete third-party need Proton has invited feedback on.
 
-**The load-bearing assumptions, stated as test cases.** The lock construction (and parts of both) rests on behaviors that SDK types cannot prove — type definitions document intended request/response shapes, not backend linearizability. Before any spec commits to this design, a ~50-line script against a **throwaway Proton account** (never the real one) must confirm:
+**The load-bearing assumptions, stated as test cases.** The lock construction (and parts of both) rests on behaviors that SDK types cannot prove — type definitions document intended request/response shapes, not backend linearizability. Before any spec commits to this design, each of the following must be confirmed against a live account.
+
+> *Originally this paragraph specified a **throwaway** account, and a ~50-line script per assumption. Both have been revised in light of doing the work — see the verification-status note at the top of this memo. In short: A4 and A5 were run against a real account behind mechanical guardrails and both hold; A1–A3 need an authenticated SDK session that does not yet exist, so their cost is dominated by the auth question rather than by script length. The per-assumption text below is unchanged apart from the recorded results.*
 
 - **A1 — read-under-draft:** downloading a file's *committed* content while another client holds an open draft returns the committed revision (not a block, not the draft). If reads block or go inconsistent under a draft, the verify step collapses.
 - **A2 — fenced commit:** after a draft is deleted by another client — whether via foreign override or the SDK's *immediate same-ClientUID* delete-and-retry — the original uploader's commit of that draft **fails** — i.e., commit validates the specific draft-revision UID, not just the node. If commit isn't fenced, takeover enables a silent lost update, which is worse than the liveness problem it solves. (`commitDraftRevision` addresses a `nodeRevisionUid`, which suggests fencing — suggestion is not proof.) Test both the foreign-override case and the same-UID case explicitly.
 - **A3 — lock scope:** an open draft actually excludes, or at least is not silently invalidated by, concurrent trash/move/rename/delete of the same node.
 - **A4 — trash and the namespace:** a *trashed* ref file does not still occupy its name for create-exclusive purposes — otherwise deleting a branch and recreating one with the same name breaks until the trash is emptied.
+
+  ✅ **VERIFIED 2026-07-31 — holds.** Uploaded `a4-ref-probe.txt` (4 bytes, `AAAA`), trashed it, confirmed the path stopped resolving and the folder listed zero nodes, then uploaded the same name again with different content (8 bytes, `BBBBBBBB`) using `-f skip` so a collision would surface as a skip rather than a silent replace. The path resolved to a **new node UID**, `activeRevision.value.claimedSize` of 8, and `claimedDigests.sha1` equal to `sha1("BBBBBBBB")` — verified independently, and *not* equal to `sha1("AAAA")`. Trash therefore frees the name, and the node reclaiming it is genuinely the new file rather than a restored original. **Storage files can be named after refs directly.**
+
+  *Field-name trap for anyone re-running this:* the plaintext length is `activeRevision.value.claimedSize`. There is no `.size`, and `storageSize`/`totalStorageSize` both read **86** for that 8-byte file because they include E2EE overhead.
+
 - **A5 — name equivalence:** Proton's server-side name-uniqueness (computed over hashed names) is exact-byte on the plaintext — no case folding or Unicode normalization that would make two distinct git refs collide (the Dropbox helper genuinely has this problem; see 1c).
+
+  ✅ **VERIFIED 2026-07-31 — holds, in both dimensions.** `Foo.txt` and `foo.txt` uploaded to the same folder produced **two distinct nodes**, as did `café.txt` in NFD (`63 61 66 65 cc 81`) and NFC (`63 61 66 c3 a9`) — byte sequences that render identically. In every case the listing returned the name bytes exactly as supplied. No case folding, no Unicode normalization. Each candidate was uploaded from its own local directory, because Windows' own case-insensitive filesystem would otherwise have masked the remote's behavior.
+
+  **This is a point where Proton is strictly better than Dropbox**, and it removes a design obligation: `refs/heads/Foo` and `refs/heads/foo` are distinct on the remote, so a helper needs no escaping layer between ref names and storage names — where git-remote-dropbox must lowercase the entire repo path to survive (§1c).
 
 Liveness is the flip side of the lock: an abandoned draft blocks all writers until cleaned up. A helper needs an explicit stale-draft takeover policy — and the safe default is *conservative*: surface the block to the user (whose draft, how old) rather than auto-deleting, with automatic takeover only past a generous age threshold and only once A2 is proven, since a slow-but-alive writer misclassified as dead is exactly the split-brain case A2 exists to catch. Dropbox's design never needed any of this; it is the one genuinely new protocol element `git-remote-proton` must specify.
 
@@ -162,7 +200,7 @@ For completeness: rename/move are fail-if-target-exists (no rename-over-CAS avai
 | Chunked upload sessions (50 MB) | SDK block-based upload (handled internally, resumable drafts) | ✅ exists |
 | OAuth refresh token + `git dropbox login` + config file | **Gap:** no third-party auth module yet; CLI's session code is the reference; `incubating/account` in progress | ⚠️ largest gap |
 | Loose-object layout (round-trip per object) | Portable but ill-fitting: per-node crypto overhead + rate-limit guidelines punish many small files | ⚠️ layout should change (packs) |
-| Ref deletion (unconditioned delete) | `trash`/`delete` (two-stage) | ✅ exists (two-stage is arguably safer — but see A4: a trashed ref file must not block recreating the name) |
+| Ref deletion (unconditioned delete) | `trash`/`delete` (two-stage) | ✅ exists; **A4 verified 2026-07-31** — trash frees the name, so delete-then-recreate works without emptying the trash |
 | Shared-folder collaboration | `sharing`/`invitation` command groups + shared-with-me paths | ✅ exists (future option) |
 
 ---
@@ -174,7 +212,7 @@ For completeness: rename/move are fail-if-target-exists (no rename-over-CAS avai
 1. **The two-mode atomic ref write** — create-exclusive for new refs, revision-conditioned update for existing ones — and the *capture-revision-at-`list`-time* discipline that makes the condition meaningful (adapted to the draft-lock construction on Proton, once verified). And go one better than the original: **condition *forced* writes and deletions on the observed revision too** (force should bypass the ancestry check, not the observed-state check). That closes the `--force-with-lease` race and the delete-vs-update race that git-remote-dropbox knowingly leaves open — the CAS costs nothing extra once the machinery exists.
 2. **`error <dst> fetch first` as the primary contention story.** No helper-side retry loops; surface the conflict in git's native idiom and let the user fetch. It keeps the helper stateless. Extend it with the two states dumb storage adds: "another push is in flight" (name reserved by an uncommitted draft — retry, don't fetch) and ambiguous outcomes (commit response lost, crash between pack upload and ref publication) — the retry path must reconcile against current remote state first and treat "ref already at the desired sha" as success, not conflict.
 3. **Client-side incremental computation via git plumbing** (`rev-list --objects <want> ^<have>`): zero server smarts needed, and v1's bundle engine already trades on the same idea.
-4. **Verify-on-fetch** (re-hash every object downloaded; trust nothing dumb storage returns) and **resume-safe fetch** (history-completeness check before pruning the walk).
+4. **Verify-on-fetch** (re-hash every object downloaded; trust nothing dumb storage returns) and **resume-safe fetch** (history-completeness check before pruning the walk). **The A4 probe turned up direct support for this**: node metadata carries `claimedDigests: { sha1: …, sha1Verified: false }` — a *client-asserted* digest the server has explicitly not verified. It is a convenience field, not an integrity guarantee, and a helper must never substitute it for re-hashing the bytes it actually received. The field name says so out loud.
 5. **The recoverability property**: document exactly how to reconstruct a working repo from the raw remote files without the helper installed. For a backup-positioned tool this is not a nicety, it's the product promise. (A pack-based layout can keep it: `git index-pack` + a documented layout is still a five-line recovery.) Recoverability is *not* retention, though — force pushes, ref deletions, and pack compaction all discard history, so a backup-positioned spec must separately state what is retained and for how long (immutable packs kept N days? rely on Drive's revision history? tombstones?) rather than letting "recoverable" imply "nothing is ever lost."
 6. **Protocol hygiene details**: binary-mode stdout on Windows, stderr-only diagnostics, per-ref `ok`/`error` reporting, config-file versioning with migration, actionable auth errors, whoami preflight. If the layout is pack-based, also adopt the fetch-side hygiene git's protocol provides for exactly that case: emit `lock <path>.keep` while a fetched pack is not yet referenced (so a concurrent local repack can't reap it), verify with `git index-pack`, and honor `check-connectivity`.
 7. From gcrypt (the one thing worth taking): **packfile stacking as the transfer unit** — each push uploads one pack. But this drags in a design obligation gcrypt solved badly: **pack discovery.** `fetch <sha>` must locate which pack(s) contain the closure without downloading everything. Two schemes that don't reintroduce the mutable-manifest problem: (a) *manifest-free* — content-named immutable packs each uploaded with a small `.idx` sidecar; clients list the pack folder and pull only the idx files to build the object→pack map locally; or (b) a manifest that is itself updated through the same CAS'd ref-write protocol. Failed pushes leave orphan packs — harmless because immutable and unreferenced, but compaction must be specified deliberately (generation-tagged, reader-safe, delayed reclamation) to avoid gcrypt's full-reupload cliff and to avoid deleting packs a concurrent fetch is reading.
@@ -194,7 +232,11 @@ For completeness: rename/move are fail-if-target-exists (no rename-over-CAS avai
 
 **Feasibility verdict: engineering project, conditional on a short verification campaign** — per the framing in issue #3's comment thread. The single question the thread called load-bearing ("does Proton's CLI/SDK expose any conditional-write or equivalent atomicity guarantee?") has a positive, specific answer at the interface level: *revision-conditioned draft creation (`CurrentRevisionID`, 409 on staleness) plus exclusive draft locks plus server-enforced name uniqueness*, all visible in the MIT-licensed SDK Proton's own clients use, all within the published third-party usage guidelines. That is the primitive git-remote-dropbox's safety argument needs, in a form that may even be stronger (a critical section rather than a single-shot compare).
 
-The conditionality is real, though: interface evidence is not concurrency evidence. Assumptions A1–A5 (§3b) — read-under-draft, commit fencing, lock scope, trash/namespace behavior, name equivalence — are each individually checkable with a ~50-line script and a throwaway account, and each is individually capable of sinking the lock-based design if it fails (fallbacks exist: the internal-layer literal CAS, or a lock-node scheme). So the precise verdict: **the concurrency question has moved from "open research question" to "specific, cheaply testable claims."** If the verification passes, everything that remains — auth/session plumbing, pack layout and discovery, SDK churn through the announced crypto migration — is engineering. The residual risk is *platform-tracking*, not computer science.
+The conditionality is real, though: interface evidence is not concurrency evidence. Assumptions A1–A5 (§3b) — read-under-draft, commit fencing, lock scope, trash/namespace behavior, name equivalence — are each individually capable of sinking the lock-based design if they fail (fallbacks exist: the internal-layer literal CAS, or a lock-node scheme). So the precise verdict: **the concurrency question has moved from "open research question" to "specific, testable claims."**
+
+**Verification progress (2026-07-31).** The two assumptions that turned out to be testable without an SDK session are **both confirmed**: A4 (trash frees the name) and A5 (exact-byte name uniqueness, case *and* Unicode). Both were live-tested; A5 in particular removes a design obligation rather than merely passing, since ref names can be used as storage names unescaped. Neither of the two known prior-art hazards inherited from git-remote-dropbox — case-folded ref collisions, and delete-then-recreate breaking — applies to Proton.
+
+**What that leaves is one gate, not three.** A1–A3 all require holding a draft revision open across observations, which the CLI cannot express (§3a); they need the SDK, and the SDK ships no auth. The earlier framing of "each checkable with a ~50-line script" understated this: the scripts are indeed small, but every one of them sits behind the auth/session question that §3c already names as the largest gap and decision #1 below already names as dominating effort and fragility. **The remaining concurrency verification is therefore not separately schedulable — it is a downstream consequence of settling substrate and auth.** If those three then pass, everything left — pack layout and discovery, SDK churn through the announced crypto migration — is engineering, and the residual risk is *platform-tracking*, not computer science.
 
 **The top three design decisions a v2 spec must make:**
 
@@ -212,4 +254,8 @@ The conditionality is real, though: interface evidence is not concurrency eviden
 
 ---
 
-*Written as read-only research: no code in this repository was modified and nothing was uploaded to Proton Drive while producing it. Findings were peer-reviewed by two independent models before publication.*
+*Originally written as read-only research: no code in this repository was modified and nothing was uploaded to Proton Drive while producing it. Findings were peer-reviewed by two independent models before publication.*
+
+*Updated 2026-07-31 with live verification of A4 and A5. Unlike the original research, that update **did** write to Proton Drive — byte-sized probe files confined to `/my-files/_cas-probe` by a path assertion with no override, cleaned up afterwards, and gated on the production backup fleet verifying green first. Probe scripts are in `docs/research/probes/` so the results are reproducible rather than merely reported.*
+
+*One methodological note, recorded because it nearly produced a false finding. The first A5 run reported* `COLLIDED` *— that Proton folds distinct names together, which would have forced an escaping layer into the v2 design. It was an artifact: `filesystem create-folder` takes* `parentPath name` *as two arguments, one was passed, so nothing was ever uploaded, and a text-parsing heuristic counted the resulting* `Node not found` *error line as a directory entry. The probes were rewritten to assert their preconditions, parse `--json` into objects rather than scraping text, and emit* `ERROR` *rather than a substantive verdict when an experiment fails to run. A probe that cannot distinguish "the remote did X" from "my call was malformed" is worse than no probe.*
