@@ -95,6 +95,62 @@ func TestBootstrapRefusesFoldersWithNoMarker(t *testing.T) {
 	}
 }
 
+// TestBootstrapRefusesUnrecognisedMarkerContent covers the half of the design
+// rule that was never implemented: "An unrecognised OR absent marker on a
+// non-empty folder is a hard refusal — the helper never guesses whether a
+// folder is one of its repos." Bootstrap only ever Stat'd the marker and, if
+// present, proceeded; it never read it. So a folder holding a gpb-remote.json
+// that says {"format":"something-else"} was adopted in silence.
+//
+// The version case is the one that will actually bite: the design nominates
+// `version` as "the forward-compatibility seam: compaction will bump it and
+// define its own ordering scheme at that point." A build that bumps to 2 and
+// changes what the layout means must not be silently adopted by this build,
+// which cannot honour whatever the bump stands for.
+func TestBootstrapRefusesUnrecognisedMarkerContent(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		wantIn  string
+	}{
+		{"wrong format", `{"format":"something-else","version":1}`, "something-else"},
+		{"future version", `{"format":"git-remote-proton","version":99}`, "99"},
+		{"unparseable", `not json at all`, "could not be parsed"},
+		{"empty file", ``, "could not be parsed"},
+		{"json but missing both fields", `{}`, "format"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := transport.NewFake()
+			f.Files["/my-files/r/"+MarkerName] = []byte(c.content)
+
+			err := Bootstrap(f, "/my-files/r")
+			if err == nil {
+				t.Fatal("an unrecognised marker must be a hard refusal, never adopted")
+			}
+			if !strings.Contains(err.Error(), c.wantIn) {
+				t.Errorf("refusal must name what it found (%q), got: %v", c.wantIn, err)
+			}
+			if f.Dirs["/my-files/r/refs/heads"] {
+				t.Error("a refused bootstrap must not go on to create subdirs in the folder")
+			}
+		})
+	}
+}
+
+// TestBootstrapAcceptsItsOwnMarker is the negative control for the test above:
+// the validation must not be so strict that the marker this package itself
+// writes is rejected.
+func TestBootstrapAcceptsItsOwnMarker(t *testing.T) {
+	f := transport.NewFake()
+	if err := Bootstrap(f, "/my-files/r"); err != nil {
+		t.Fatalf("first bootstrap: %v", err)
+	}
+	if err := Bootstrap(f, "/my-files/r"); err != nil {
+		t.Fatalf("the marker this package writes must validate on the next run: %v", err)
+	}
+}
+
 func TestBootstrapIdempotent(t *testing.T) {
 	f := transport.NewFake()
 	_ = Bootstrap(f, "/my-files/r")
@@ -291,11 +347,51 @@ func TestListRefsRejectsCorruptRefFile(t *testing.T) {
 func TestWriteRefRefusesNonSha(t *testing.T) {
 	f := transport.NewFake()
 	_ = Bootstrap(f, "/r")
-	if out, err := WriteRef(f, "/r", "refs/heads/main", "not-a-sha", false); err == nil {
+	out, err := WriteRef(f, "/r", "refs/heads/main", "not-a-sha", false)
+	if err == nil {
 		t.Errorf("must refuse a non-sha value, got %v, nil error", out)
 	}
 	if _, ok := f.Files["/r/refs/heads/main"]; ok {
 		t.Error("nothing must be written to the transport for a refused non-sha value")
+	}
+	// shaRe is 40-hex only, so a SHA-256 repository fails here too — true, but
+	// "not a 40-hex sha" alone reads as corruption rather than an unsupported
+	// repository format. The message must name it.
+	if !strings.Contains(err.Error(), "SHA-256") {
+		t.Errorf("the refusal must name SHA-256 repositories as unsupported, got: %v", err)
+	}
+}
+
+// TestPushResolveFailureCarriesGitsOwnReason covers a resolve() that discarded
+// both rev-parse's output and its error and reported only "cannot resolve %s".
+// gitcmd.RevParse was deliberately given a three-value shape so callers could
+// interpret it; git's own message is what distinguishes an unknown ref from an
+// ambiguous one from an unreadable repository, and the operator saw none of it.
+//
+// It also pins the flattening in fail(): git's diagnostic here is genuinely
+// multi-line, and results are rendered as one "error <ref> <reason>" status
+// line each, so an embedded newline would split one status line into two and
+// desynchronise git's read of the batch.
+func TestPushResolveFailureCarriesGitsOwnReason(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/no-such-branch", Dst: "refs/heads/main"}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("an unresolvable source must fail, got %+v", res)
+	}
+	t.Logf("reported reason: %q", res[0].Err)
+
+	if !strings.Contains(res[0].Err, "cannot resolve refs/heads/no-such-branch") {
+		t.Errorf("must still name what could not be resolved, got %q", res[0].Err)
+	}
+	if !strings.Contains(res[0].Err, "unknown revision") && !strings.Contains(res[0].Err, "ambiguous argument") {
+		t.Errorf("git's own reason must survive into the reported error, got %q", res[0].Err)
+	}
+	if strings.ContainsAny(res[0].Err, "\r\n") {
+		t.Errorf("a reason becomes one \"error <ref> <reason>\" status line and must not contain newlines, got %q", res[0].Err)
 	}
 }
 
@@ -530,6 +626,101 @@ func TestPushRefNotPublishedWhenPackUploadIsAmbiguous(t *testing.T) {
 	}
 	if _, ok := f.Files["/r/refs/heads/main"]; ok {
 		t.Error("ref must not be published when the pack upload could not be confirmed")
+	}
+}
+
+// assertNothingUploaded fails the test if anything at all was written under
+// root+"/packs/". The point of the destination guard is that it fires BEFORE
+// any packing or uploading, so "rejected" is not enough — a rejection that
+// still cost a pack upload to the user's paid Drive, and left an orphan behind
+// that Stage 2 has no GC to reclaim, is the defect, not the fix.
+func assertNothingUploaded(t *testing.T, f *transport.Fake, root string) {
+	t.Helper()
+	for p := range f.Files {
+		if strings.HasPrefix(p, root+"/packs/") {
+			t.Errorf("rejection must happen before any upload, but %s was written", p)
+		}
+	}
+}
+
+// TestPushRejectsHierarchicalDestinationBeforePacking covers the ref shape git
+// accepts and users create constantly — refs/heads/feat/x — against a repo
+// layer whose only prefix logic was isBranch. ListRefs is non-recursive
+// (refs.go documents this), so the ref was invisible to the advertisement,
+// exists came back false, the ancestry check was SKIPPED, a full pack was
+// built and uploaded, and only then did WriteRef fail because refs/heads/feat
+// does not exist — with a message naming neither the ref shape nor the
+// limitation, and an orphan pack left on the remote.
+func TestPushRejectsHierarchicalDestinationBeforePacking(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feat/x"}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{})
+
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("a hierarchical destination must be rejected, got %+v", res)
+	}
+	if !strings.Contains(res[0].Err, "refs/heads/feat/x") {
+		t.Errorf("rejection must name the destination, got %q", res[0].Err)
+	}
+	if !strings.Contains(res[0].Err, "refs/heads/<name>") {
+		t.Errorf("rejection must name the actual limitation, got %q", res[0].Err)
+	}
+	assertNothingUploaded(t, f, "/r")
+}
+
+// TestPushRejectsPseudorefDestination covers the design's error-table row
+// "Pseudorefs and unsupported destinations | Explicit rejection with a named
+// reason". Before the guard, `git push proton-v2 main:refs/stash` wrote
+// <root>/refs/stash, reported ok, and created a ref ListRefs will never
+// advertise — so the NEXT push of it failed with "ref changed concurrently",
+// a message describing a race that never happened.
+func TestPushRejectsPseudorefDestination(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+
+	// A fresh Fake per subtest: assertNothingUploaded inspects the whole
+	// Files map, so a shared one would let the first leak taint every later
+	// case (or, worse, pass because a sibling already uploaded).
+	for _, dst := range []string{"refs/stash", "HEAD", "refs/heads", "refs/heads/", "refs/notes/commits"} {
+		t.Run(dst, func(t *testing.T) {
+			f := transport.NewFake()
+			_ = Bootstrap(f, "/r")
+			ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: dst}}
+			res := Push(f, "/r", gitDir, ups, map[string]string{})
+			if len(res) != 1 || res[0].OK {
+				t.Fatalf("%q must be rejected with a named reason, got %+v", dst, res)
+			}
+			if _, ok := f.Files["/r/"+dst]; ok {
+				t.Errorf("%q must not be written to the remote", dst)
+			}
+			assertNothingUploaded(t, f, "/r")
+		})
+	}
+}
+
+// TestPushRejectsUnsupportedDeleteDestination covers the delete path, which
+// returned OK: true for any ref it could not see — and it can never see a
+// pseudoref, because ListRefs does not advertise one. Reporting success for a
+// deletion that certainly did not happen is worse than a plain failure: git
+// drops its remote-tracking ref on the strength of it.
+func TestPushRejectsUnsupportedDeleteDestination(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	sha := "2222222222222222222222222222222222222222"
+	f.Files["/r/refs/stash"] = []byte(sha + "\n")
+
+	// The remote map is empty on purpose: this is what ListRefs actually
+	// returns for a pseudoref, so !exists is the branch that used to fire.
+	ups := []protocol.RefUpdate{{Src: "", Dst: "refs/stash"}}
+	res := Push(f, "/r", t.TempDir(), ups, map[string]string{})
+
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("deleting an unsupported destination must be rejected, not reported ok for a ref we cannot see, got %+v", res)
+	}
+	if _, ok := f.Files["/r/refs/stash"]; !ok {
+		t.Error("a rejected delete must not have trashed anything")
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/craigstoller/git-proton-backup/internal/transport"
@@ -163,7 +164,7 @@ func readLock(t transport.Transport, p string) (lockBody, lockPresence, error) {
 	if len(entries) == 0 {
 		return lockBody{}, lockUnreadable, fmt.Errorf("lock at %s downloaded no content", p)
 	}
-	raw, err := os.ReadFile(dir + string(os.PathSeparator) + entries[0].Name())
+	raw, err := os.ReadFile(filepath.Join(dir, entries[0].Name()))
 	if err != nil {
 		return lockBody{}, lockUnreadable, err
 	}

@@ -3,12 +3,18 @@ package repo
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
 	"github.com/craigstoller/git-proton-backup/internal/transport"
 )
 
+// shaRe matches a sha-1 object name and nothing else. A SHA-256 repository's
+// 64-hex object names do not match, so such a repo fails closed at the first
+// ref write rather than producing a ref file this helper cannot read back —
+// correct, but the message has to say so, because "not a 40-hex sha" on its
+// own reads like corruption rather than an unsupported repository format.
 var shaRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 // ListRefs lists refs/heads and refs/tags NON-RECURSIVELY: it lists the
@@ -60,7 +66,7 @@ func readRef(t transport.Transport, p string) (string, error) {
 	if err != nil || len(entries) == 0 {
 		return "", fmt.Errorf("ref %s could not be read back", p)
 	}
-	raw, err := os.ReadFile(dir + string(os.PathSeparator) + entries[0].Name())
+	raw, err := os.ReadFile(filepath.Join(dir, entries[0].Name()))
 	if err != nil {
 		return "", err
 	}
@@ -76,9 +82,15 @@ func readRef(t transport.Transport, p string) (string, error) {
 // (probe C11). A leaf hostile to a local path is rejected by stagedFile with a
 // named reason rather than mangled. It then verifies by read-back, because a
 // byte-identical write is silently skipped.
+//
+// WriteRef shares ListRefs' non-recursive limitation, documented above: it
+// uploads into <root>/<ref>'s parent folder without creating it, so a ref with
+// more than one component after its namespace would fail here. repo.pushOne's
+// checkDst rejects those shapes before any of this runs.
 func WriteRef(t transport.Transport, root, ref, sha string, exists bool) (transport.Outcome, error) {
 	if !shaRe.MatchString(sha) {
-		return transport.Ambiguous, fmt.Errorf("refusing to write non-sha %q to %s", sha, ref)
+		return transport.Ambiguous, fmt.Errorf("refusing to write non-sha %q to %s "+
+			"(ref files are exactly 40 lowercase hex; SHA-256 repositories are not supported)", sha, ref)
 	}
 	leaf := ref[strings.LastIndex(ref, "/")+1:]
 	staged, cleanup, err := stagedFile([]byte(sha+"\n"), leaf)
