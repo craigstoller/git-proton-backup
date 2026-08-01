@@ -427,6 +427,50 @@ Describe 'GpbMirror lifecycle' {
     }
 }
 
+Describe 'Confirm-BundleUploaded across CLI payload shapes' {
+    # Regression: the CLI dropped the {ok,value} Result wrapper around activeRevision between
+    # 0.4.6 and 0.7.0. Reading only the wrapped form made every healthy bundle read as
+    # unconfirmed on 0.7.0 - and, because the success payload contains keyAuthor/nameAuthor,
+    # the fall-through matched the bare substring 'auth' and reported auth_error, pointing the
+    # user at a login problem that did not exist.
+
+    # Pester 5: a Describe body runs at DISCOVERY, so fixtures declared there are $null when the
+    # Its execute. They must live in BeforeAll. This is the same discovery/run split that has
+    # bitten this project before, and it fails silently - the closure just captures nothing.
+    BeforeAll {
+        $script:wrapped   = '{"uid":"u1","name":{"ok":true,"value":"x.bundle"},"keyAuthor":{"ok":true,"value":"me@pm.me"},"nameAuthor":{"ok":true,"value":"me@pm.me"},"activeRevision":{"ok":true,"value":{"uid":"r1","state":"active","claimedSize":8}}}'
+        $script:unwrapped = '{"uid":"u1","name":{"ok":true,"value":"x.bundle"},"keyAuthor":{"ok":true,"value":"me@pm.me"},"nameAuthor":{"ok":true,"value":"me@pm.me"},"contentAuthor":{"ok":true,"value":"me@pm.me"},"activeRevision":{"uid":"r1","state":"active","claimedSize":8}}'
+    }
+
+    It 'confirms the 0.4.6 wrapped shape' {
+        $w = $script:wrapped; $runner = { param($cp,$cli) [pscustomobject]@{ ExitCode=0; Output=$w } }.GetNewClosure()
+        (Confirm-BundleUploaded -CloudPath '/x' -CliPath 'p' -InfoRunner $runner).Confirmed | Should -BeTrue
+    }
+    It 'confirms the 0.7.0 unwrapped shape' {
+        $u = $script:unwrapped; $runner = { param($cp,$cli) [pscustomobject]@{ ExitCode=0; Output=$u } }.GetNewClosure()
+        $r = Confirm-BundleUploaded -CloudPath '/x' -CliPath 'p' -InfoRunner $runner
+        $r.Confirmed | Should -BeTrue
+        $r.Reason    | Should -Be 'cli_confirmed'
+    }
+    It 'does NOT report auth_error just because the payload contains keyAuthor/nameAuthor' {
+        # exit 0 with a non-active state: must be 'unverified', never 'auth_error'
+        $inactive = $script:unwrapped -replace '"state":"active"','"state":"draft"'
+        $runner = { param($cp,$cli) [pscustomobject]@{ ExitCode=0; Output=$inactive } }.GetNewClosure()
+        $r = Confirm-BundleUploaded -CloudPath '/x' -CliPath 'p' -InfoRunner $runner
+        $r.Confirmed | Should -BeFalse
+        $r.Reason    | Should -Not -Be 'auth_error'
+    }
+    It 'still reports auth_error on a genuine failed call' {
+        $runner = { param($cp,$cli) [pscustomobject]@{ ExitCode=1; Output='Error: You need to login first' } }.GetNewClosure()
+        (Confirm-BundleUploaded -CloudPath '/x' -CliPath 'p' -InfoRunner $runner).Reason | Should -Be 'auth_error'
+    }
+    It 'honours ok=false in the wrapped shape as no usable revision' {
+        $bad = $script:wrapped -replace '"ok":true,"value":\{"uid":"r1","state":"active","claimedSize":8\}','"ok":false'
+        $runner = { param($cp,$cli) [pscustomobject]@{ ExitCode=0; Output=$bad } }.GetNewClosure()
+        (Confirm-BundleUploaded -CloudPath '/x' -CliPath 'p' -InfoRunner $runner).Confirmed | Should -BeFalse
+    }
+}
+
 Describe 'Cloud Files placeholder state decoding' {
     # CF_PLACEHOLDER_STATE values per cfapi.h:
     #   NO_STATES 0x0  PLACEHOLDER 0x1  SYNC_ROOT 0x2  ESSENTIAL_PROP 0x4

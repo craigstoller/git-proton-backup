@@ -398,9 +398,20 @@ function Confirm-BundleUploaded {
         $state = $null
         try {
             $json = $r.Output | ConvertFrom-Json -ErrorAction Stop
+            # The CLI changed this payload's shape between versions, so BOTH are accepted:
+            #   0.4.6 and earlier : activeRevision = { ok: true, value: { state: 'active', ... } }
+            #   0.7.0 and later   : activeRevision = { uid: ..., state: 'active', ... }
+            # The Result wrapper was dropped. Reading only the wrapped form made every healthy
+            # bundle read as unconfirmed on 0.7.0 - a silent fail-closed across the whole fleet.
             $rev = $json.PSObject.Properties['activeRevision'] ? $json.activeRevision : $null
-            if ($rev -and $rev.PSObject.Properties['ok'] -and $rev.ok -and $rev.PSObject.Properties['value']) {
-                $state = $rev.value.PSObject.Properties['state'] ? $rev.value.state : $null
+            if ($rev) {
+                if ($rev.PSObject.Properties['ok'] -and $rev.PSObject.Properties['value']) {
+                    # wrapped: honour ok=false as "no usable revision"
+                    if ($rev.ok) { $state = $rev.value.PSObject.Properties['state'] ? $rev.value.state : $null }
+                } elseif ($rev.PSObject.Properties['state']) {
+                    # unwrapped
+                    $state = $rev.state
+                }
             }
         } catch { $state = $null }
         if ($state -eq 'active') { return [pscustomobject]@{ Confirmed=$true; Reason='cli_confirmed' } }
@@ -411,7 +422,12 @@ function Confirm-BundleUploaded {
     if ($r.Output -match 'Node not found') {
         return [pscustomobject]@{ Confirmed=$false; Reason='not_in_cloud' }
     }
-    if ($r.Output -match 'auth|login|unauthor|session') {
+    # Auth detection is gated on a FAILED call and uses word boundaries. Neither guard was
+    # present, and both were needed: the success payload contains keyAuthor / nameAuthor /
+    # contentAuthor, and the bare substring 'auth' matches every one of them. A healthy bundle
+    # on a valid session therefore reported auth_error, sending the user to debug a login
+    # problem that did not exist. Only a non-zero exit can be an auth failure.
+    if ($r.ExitCode -ne 0 -and $r.Output -match '(?i)\bauth\b|\bauthentication\b|\bunauthori[sz]ed\b|\blogin\b|\bsigned out\b|\bsession\b|need to login') {
         return [pscustomobject]@{ Confirmed=$false; Reason='auth_error' }
     }
     [pscustomobject]@{ Confirmed=$false; Reason='unverified' }

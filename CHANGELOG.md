@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.4 — 2026-08-01
+
+- **Compatibility fix for Proton Drive CLI 0.7.0.** The CLI dropped the `{ok, value}` Result
+  wrapper around `activeRevision` in `filesystem info --json`: 0.4.6 returns
+  `activeRevision.value.state`, 0.7.0 returns `activeRevision.state`. Reading only the wrapped
+  form meant **every healthy bundle reported as unconfirmed on 0.7.0** — a silent fleet-wide
+  fail-closed. Both shapes are now accepted, and `ok: false` in the wrapped form is still
+  honoured as "no usable revision".
+
+- **Fixed a false `auth_error` that made the above much worse.** Auth detection matched the bare
+  substring `auth`, and the success payload contains `keyAuthor`, `nameAuthor` and
+  `contentAuthor`. So a healthy bundle on a perfectly valid session reported an authentication
+  failure, sending the user to debug a login problem that did not exist. Auth detection is now
+  gated on a **non-zero exit code** and uses word-boundary patterns.
+
+  Found by upgrading the CLI to 0.7.0 and re-running the verification path against it, which is
+  the whole argument for pinning an exact CLI version rather than a minimum.
 ## 0.2.3 — 2026-07-29
 
 - **Fail-closed fix in Cloud Files sync-state decoding.** `CF_PLACEHOLDER_STATE_INVALID` is
