@@ -49,18 +49,43 @@ func ObjectType(gitDir, sha string) (string, error) {
 }
 
 // HasObject reports whether sha exists in gitDir's object store.
+//
+// A false return means "not confirmed present", not "confirmed absent": the
+// signature (fixed by the plan; Task 10 is written against it) has no error
+// channel, so a tooling failure (git missing from PATH, a corrupt repo, an
+// unexpected exit code) is indistinguishable here from a genuine miss. That
+// is tolerable specifically because of how HasObject is used: the design's
+// object-transfer rule for advertised tips is that objects that cannot be
+// confirmed locally are simply not excluded from the pack — collapsing
+// "not confirmed" into "false" only makes the pack larger, never wrong.
 func HasObject(gitDir, sha string) bool {
 	_, code, _ := git(gitDir, "cat-file", "-e", sha+"^{object}")
 	return code == 0
 }
 
 // IsAncestor reports whether old is an ancestor of new (a commit is its own
-// ancestor). A non-zero exit from merge-base --is-ancestor is the normal
-// "not an ancestor" answer, not a failure, so it is not surfaced as an
-// error.
+// ancestor). Only exit code 1 from merge-base --is-ancestor is the genuine,
+// confirmed negative answer ("not an ancestor"); any other outcome — a
+// higher exit code from a malformed or missing object, or the -1 sentinel
+// git() returns when the git binary itself never started — means the
+// question could not actually be answered, and is surfaced as (false, err)
+// rather than silently folded into the same "not an ancestor" result. Task
+// 10 gates non-fast-forward rejection on this return value, so a genuine
+// tooling failure must not present as "confirmed safe to reject" with no
+// diagnostic trail.
 func IsAncestor(gitDir, old, new string) (bool, error) {
-	_, code, _ := git(gitDir, "merge-base", "--is-ancestor", old, new)
-	return code == 0, nil
+	out, code, err := git(gitDir, "merge-base", "--is-ancestor", old, new)
+	switch code {
+	case 0:
+		return true, nil
+	case 1:
+		return false, nil
+	default:
+		if err != nil {
+			return false, fmt.Errorf("merge-base --is-ancestor %s %s: %s: %w", old, new, out, err)
+		}
+		return false, fmt.Errorf("merge-base --is-ancestor %s %s: %s (exit %d)", old, new, out, code)
+	}
 }
 
 // WritePack builds a NON-THIN pack containing the objects reachable from

@@ -62,8 +62,76 @@ func TestObjectTypeAndAncestry(t *testing.T) {
 	if !HasObject(d, head) {
 		t.Error("HasObject must find HEAD")
 	}
-	if ok, _ := IsAncestor(d, head, head); !ok {
-		t.Error("a commit is its own ancestor")
+	if ok, err := IsAncestor(d, head, head); !ok || err != nil {
+		t.Errorf("IsAncestor(head, head) = %v, %v; want true, nil (a commit is its own ancestor)", ok, err)
+	}
+}
+
+// TestHasObjectMissing covers the negative path Task 10 depends on: a sha
+// that is well-formed but does not exist in the repo must report false, not
+// merely be left untested alongside the positive "finds HEAD" case above.
+func TestHasObjectMissing(t *testing.T) {
+	d := newRepo(t)
+	missing := "0000000000000000000000000000000000000000"
+	if HasObject(d, missing) {
+		t.Error("HasObject must not report a nonexistent object as present")
+	}
+}
+
+// TestIsAncestorNonAncestor covers the genuine negative answer using two
+// commits that actually diverge, not just the trivial self-ancestor case:
+// a commit on branchA and a commit on branchB, both built on the same base
+// commit from newRepo, are ancestors of neither each other.
+func TestIsAncestorNonAncestor(t *testing.T) {
+	d := newRepo(t)
+
+	commitOn := func(branch, file, content string) string {
+		if err := exec.Command("git", "-C", d, "checkout", "-qb", branch).Run(); err != nil {
+			t.Fatalf("checkout %s: %v", branch, err)
+		}
+		if err := os.WriteFile(d+"/"+file, []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", file, err)
+		}
+		if err := exec.Command("git", "-C", d, "add", ".").Run(); err != nil {
+			t.Fatalf("add: %v", err)
+		}
+		if err := exec.Command("git", "-C", d, "commit", "-qm", branch).Run(); err != nil {
+			t.Fatalf("commit %s: %v", branch, err)
+		}
+		return headOf(t, d)
+	}
+
+	commitA := commitOn("branchA", "b.txt", "A")
+	if err := exec.Command("git", "-C", d, "checkout", "-q", "main").Run(); err != nil {
+		t.Fatalf("checkout main: %v", err)
+	}
+	commitB := commitOn("branchB", "c.txt", "B")
+
+	if ok, err := IsAncestor(d, commitA, commitB); ok || err != nil {
+		t.Fatalf("IsAncestor(A, B) = %v, %v; want false, nil for genuinely divergent commits", ok, err)
+	}
+	if ok, err := IsAncestor(d, commitB, commitA); ok || err != nil {
+		t.Fatalf("IsAncestor(B, A) = %v, %v; want false, nil for genuinely divergent commits", ok, err)
+	}
+}
+
+// TestIsAncestorMalformedObjectIsError proves the new error path added in
+// this fix round is actually reachable: merge-base --is-ancestor exits 128
+// (verified against a real git invocation), not 1, for a malformed object
+// name, so this must come back as a non-nil error rather than a confirmed
+// (false, nil). If IsAncestor were reverted to testing only `code == 0`,
+// this would observe (false, nil) and fail — that is what makes this a real
+// regression test rather than one that could never fail.
+func TestIsAncestorMalformedObjectIsError(t *testing.T) {
+	d := newRepo(t)
+	head := headOf(t, d)
+
+	ok, err := IsAncestor(d, "not-a-real-sha-0000000000000000000000", head)
+	if err == nil {
+		t.Fatalf("want a non-nil error for a malformed object, got ok=%v err=nil", ok)
+	}
+	if ok {
+		t.Fatalf("want ok=false alongside the error, got true")
 	}
 }
 
