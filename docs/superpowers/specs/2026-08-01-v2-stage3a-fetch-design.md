@@ -37,7 +37,9 @@ The parent design writes `HEAD` only when initialising, and says it "is never re
 
 This is consistent with the design rather than a deviation from it. That document already rules that "a folder with a valid marker but missing `refs/` or `packs/` is a partial initialisation and is completed, not rejected." A missing `HEAD` is the same condition.
 
-Without it, every repository pushed by Stage 2 or 2.1 — including anything pushed between now and 3a shipping — is **permanently unclonable**, with no in-tool remedy.
+**What actually happens without it, stated accurately** — an earlier draft of this section said such a repository would be "permanently unclonable", and that is wrong. Both review engines independently corrected it. `git clone` of a headless remote **succeeds**: it downloads the objects, sets up `.git`, then skips the checkout and warns that remote `HEAD` cannot be checked out, leaving an empty working tree. The user recovers with `git checkout <branch>` or by cloning with `-b`.
+
+So the cost is a broken-looking clone rather than an impossible one. That is still worth fixing — this stage's gate is *a working checkout*, and "clone appears to succeed and leaves you with nothing" is a bad first experience — but it is a usability failure, not data loss, and the spec should not have claimed otherwise.
 
 ---
 
@@ -57,8 +59,12 @@ Seeded with the three divergences that actually bit — C11 upload-names-by-loca
 
 ### 2. `internal/repo/head.go` — `HEAD`
 
-- `DeriveHEAD(published []string, clientHEAD string) (string, bool)` — a **pure function** holding the deterministic rules, testable with no transport: single published branch wins; several, the one matching the client's own `HEAD` if present, else lexicographically first, so the result never depends on batch ordering; tag-only or non-branch publishes nothing and the repo stays headless.
-- `WriteHEAD(t, root, branch)` — writes `ref: refs/heads/<branch>\n`, staged under the leaf name `HEAD`, read-back verified like every other mutable write.
+- `DeriveHEAD(candidates []string, clientHEAD string) (string, bool)` — a **pure function** holding the deterministic rules, testable with no transport: one candidate wins outright; among several, the one matching the client's own `HEAD` if present, else lexicographically first, so the result never depends on batch ordering; no branch candidates means nothing is written and the repo stays headless.
+
+  **`candidates` is every branch on the remote after this push, not just the ones this push published.** On a first push those are the same set. On a **backfill** they are not, and taking only the published set would be wrong: a repo whose `main` was pushed last week, receiving a push of `bugfix` today, would get `HEAD` pointed at `bugfix`. The candidate set is therefore the post-push ref listing filtered to `refs/heads/`, intersected with branches whose writes actually succeeded plus those already present — selecting a branch that failed to publish would leave `HEAD` dangling.
+- `WriteHEAD(t, root, branch)` — writes `ref: refs/heads/<branch>\n`, staged under the leaf name `HEAD`, read-back verified.
+
+  **It cannot reuse `WriteRef`.** That function validates its payload against `^[0-9a-f]{40}$` and refuses anything else, which is correct for a ref file and fatal for a symref. `WriteHEAD` needs its own write-and-verify path with a symref-shaped validator, sharing `stagedFile` but not `WriteRef`.
 - `ReadHEAD(t, root)` — serves the advertisement.
 
 The client's own `HEAD` comes from `git symbolic-ref HEAD` locally; git never sends it to a helper. Push wires this in **after** refs are published and only from branches that actually succeeded — selecting a branch that then failed would leave `HEAD` dangling.
@@ -68,7 +74,11 @@ The client's own `HEAD` comes from `git symbolic-ref HEAD` locally; git never se
 `Fetch(t, root, gitDir string, wants []string) (keepPath string, err error)`:
 
 1. List `packs/`; download every `.pack`/`.idx` pair into `<tmp>/objects/pack/`.
-2. Verify each pair — checksum against basename, and `index-pack --verify` — reusing the Stage 2.1 helpers.
+2. Verify each pair, **per member — the two are not checked the same way**:
+   - the **`.pack`** by recomputing its content checksum against its basename, and
+   - the **pair** by `index-pack --verify`.
+
+   **The `.idx` is never checksummed against its basename.** Its basename is the *pack's* checksum, not its own, so that comparison is not merely wrong but guaranteed to fail — it would abort every fetch. This mirrors exactly the per-member asymmetry Stage 2.1 established on the push side in `publishPack`/`publishIdx`, and reuses those helpers. Getting it wrong here would re-break the single most peer-reviewed decision in the parent design.
 3. `rev-list --objects <wants> --not --all` against the temp alternate.
 4. Verify connectivity, rooted at the exact wants. **Before installing anything.**
 5. `pack-objects` the result; install `pack-<hash>.{pack,idx,keep}`.
@@ -80,9 +90,19 @@ The client's own `HEAD` comes from `git symbolic-ref HEAD` locally; git never se
 
 `SymbolicRef`; a `rev-list` wrapper accepting an alternate object directory; and a connectivity check that is **missing-object-fatal rooted at the wants**, not a generic `fsck` — the wants are not yet referenced by any ref, so `fsck` would not reach them.
 
+The check is a `rev-list` traversal with `GIT_ALTERNATE_OBJECT_DIRECTORIES` pointed at `<tmp>/objects`, the want OIDs fed in explicitly rather than discovered from refs, `--not --all` to stop at what the repository already has, and a zero exit as the pass condition. Both engines confirmed refs are unnecessary for this — an explicit OID root is enough.
+
+**The exact flag set is deliberately not pinned here.** One reviewer proposed a specific invocation; I have not run it against the installed git, and a design document asserting an unverified command line is how a plan inherits a wrong one. The first implementation task pins it with a test that fails when an object is genuinely missing — which also proves the check can fail, the standard this project applies to every guard.
+
 ### 5. `cmd/git-remote-proton/main.go`
 
-Advertise `fetch`; handle plain `list`; buffer the blank-line-terminated `fetch` batch; emit the single `lock <keep-path>` then the terminating blank line. Git retains only the **first** `lock`, which is why the closure is consolidated into one pack.
+Advertise `fetch`; handle plain `list`; buffer the blank-line-terminated `fetch` batch; emit the single `lock <keep-path>`, then **`connectivity-ok` if the option was accepted**, then the terminating blank line. Git retains only the **first** `lock`, which is why the closure is consolidated into one pack.
+
+**`check-connectivity` is a capability as well as an option, and both halves are needed.** It must appear in the advertised capability list — git recognises `connectivity-ok` only from a helper that advertised it. Then git sends `option check-connectivity true`, whose boolean must be *tracked*, and `connectivity-ok` is emitted only when it was `true` **and** the check passed. Today the option handler replies `unsupported` to everything, so this needs changing.
+
+Being precise about the stakes, because an earlier draft of this section overstated them: replying `unsupported` does **not** break the fetch. Git falls back to running its own connectivity check. The reason to do this properly is that the parent design puts closure ownership on the helper, and a helper that silently leaves the check to git is not honouring the contract it claims — not that anything visibly fails.
+
+`check-connectivity` is **not** a poison option and must not be added to that list. The poison flag exists for options git *ignores our rejection of*; this is the opposite case, where git honours the answer.
 
 ### 6. The temp object directory
 
@@ -105,12 +125,17 @@ Must carry git's own layout — `<tmp>/objects/pack/pack-<hash>.{pack,idx}`. Dro
 | Condition | Behaviour |
 |---|---|
 | Marker absent or unrecognised | Hard refusal; never initialise |
-| A downloaded pair fails checksum-vs-basename or `index-pack --verify` | Fatal, before install |
+| A downloaded `.pack` fails checksum-vs-basename, or a pair fails `index-pack --verify` | Fatal, before install. Note the `.idx` is **not** checksummed against its basename — see Orchestration step 2 |
 | Closure incomplete against the wants | Fatal, before install; never report success |
 | Refs advertised but `packs/` empty | Fatal — the remote is corrupt, and "up to date" would be a lie |
-| Any failure | **Local object store unchanged** |
+| Any download, integrity, or connectivity failure | **Local object store unchanged** — every one of these happens before install |
+| A failure *after* install (protocol write error, crash) | The pack and index remain. Best-effort rollback, and the residue is named below rather than pretended away |
 
-**Verify before install, not after.** Installing and then verifying leaks: a failure after install has already written a pack and a `.keep` into the user's repository, and the `.keep` protects a pack git was never told about — so `gc` will never reclaim it and nothing will ever remove it. Verifying in the temp area first means a failed fetch leaves the local repository byte-for-byte untouched, which is the only defensible answer when the thing at risk is the user's own history.
+**Verify before install, not after.** Installing and then verifying leaks: a failure after install has already written a pack and a `.keep` into the user's repository, and the `.keep` protects a pack git was never told about — so `gc` will never reclaim it and nothing will ever remove it. Verifying in the temp area first means every *download, integrity and connectivity* failure leaves the local repository byte-for-byte untouched.
+
+**The residual window, stated rather than papered over.** An earlier draft promised an unchanged object store after *any* failure. That is not achievable and the claim has been withdrawn. Between install and git's ref update there is an irreducible gap: if the helper dies after installing but before git receives the `lock` line, the pack, index and `.keep` all remain, and because git was never told about the `.keep` nothing will ever remove it. Best-effort rollback on a post-install error narrows it; it cannot close it. This is the same shape as push's orphan-pack window, and the same answer applies — the residue is inert and a retry reconciles — except that here the residue also carries a `.keep`, so it costs disk that `gc` will not reclaim until a human removes the file.
+
+**One scope limit on `connectivity-ok`.** The check runs against the temp alternate plus the existing local object database. For an ordinary clone into an empty repository those are the same thing. Under `git clone --reference`, borrowed alternates can satisfy links the fetched packs do not contain, so a passing check would establish that *this repository* is whole without establishing that the pack is self-contained — which is what `connectivity-ok` claims. 3a does not support `--reference`; the limit is recorded here so the claim is not later assumed to be stronger than it is.
 
 ---
 
