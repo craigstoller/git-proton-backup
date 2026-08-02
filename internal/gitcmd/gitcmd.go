@@ -178,7 +178,31 @@ func RevParse(gitDir string, args ...string) (string, int, error) {
 // When rev-list finds nothing to send (want is already covered by haves),
 // WritePack returns ("", "", nil): a legitimate, distinct outcome, not an
 // error.
+//
+// outDir is resolved to an ABSOLUTE path first, and the returned paths are
+// absolute as a result. This is the untreated twin of the path-doubling bug
+// the Stage 3a live gate found in repo.consolidateAndInstall: outDir becomes
+// PackObjectsFromList's outStem, which is an ARGUMENT to a `git -C gitDir ...`
+// subprocess, and -C changes the directory relative arguments resolve against
+// too — so a relative outDir would be resolved against gitDir by the child
+// while this function's own os.Stat guards below resolve it against the
+// process cwd. Every current caller happens to pass an absolute temp dir, so
+// the hazard is latent and fails closed (pack-objects errors on a directory
+// that does not exist) rather than silently misplacing a pack. It is fixed
+// anyway because PackObjectsFromList is now a SHARED exec site with two
+// callers holding different path disciplines, and "latent" is a property of
+// today's callers, not of the function.
 func WritePack(gitDir, want string, haves []string, outDir string) (string, string, error) {
+	absOut, err := filepath.Abs(outDir)
+	if err != nil {
+		return "", "", fmt.Errorf("cannot resolve pack output directory %q to an absolute "+
+			"path: %w", outDir, err)
+	}
+	// Assigned only AFTER the error check: on failure filepath.Abs returns "",
+	// and overwriting outDir first would make the message above name an empty
+	// path instead of the one the caller actually passed.
+	outDir = absOut
+
 	revArgs := []string{"rev-list", "--objects", want}
 	for _, h := range haves {
 		revArgs = append(revArgs, "^"+h)
@@ -232,6 +256,16 @@ func WritePack(gitDir, want string, haves []string, outDir string) (string, stri
 // separated object list, as rev-list --objects produces — writing the result
 // under outStem (pack-objects appends "-<hash>.{pack,idx}" itself) and
 // returning that hash.
+//
+// outStem MUST BE ABSOLUTE. It is passed as an argument to `git -C gitDir
+// pack-objects`, and -C changes the directory relative arguments resolve
+// against, so a relative stem is resolved against gitDir by this subprocess —
+// not against the cwd the caller built it from. Both callers absolutise
+// before calling (WritePack's outDir, consolidateAndInstall's realPack), each
+// for a reason recorded at its own site; this is the shared contract those two
+// independently satisfy. Not enforced here, because the failure is a
+// caller-side path-discipline bug and a check here would only rediscover it
+// one frame later, with less context about which discipline was violated.
 //
 // altObjects, when non-empty, is spliced in as an alternate object store via
 // GIT_ALTERNATE_OBJECT_DIRECTORIES — the same mechanism revListWithAlt above

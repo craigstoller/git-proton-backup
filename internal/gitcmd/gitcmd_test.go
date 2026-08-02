@@ -177,6 +177,82 @@ func TestWritePack(t *testing.T) {
 	})
 }
 
+// chdirForTest changes the process's working directory to dir for the
+// duration of the test and restores it afterward via t.Cleanup.
+//
+// Not testing.Chdir: that requires Go 1.24 and this module's go.mod
+// deliberately floors at go 1.22 (see the identical helpers in
+// internal/repo/repo_test.go and cmd/git-remote-proton/main_test.go, which
+// carry the full reasoning). No test in this package calls t.Parallel(), so
+// the process-wide cwd this mutates is not at risk of a concurrent sibling
+// reading it mid-change.
+func chdirForTest(t *testing.T, dir string) {
+	t.Helper()
+	orig, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("Chdir(%s): %v", dir, err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(orig); err != nil {
+			t.Fatalf("restore Chdir(%s): %v", orig, err)
+		}
+	})
+}
+
+// RED. WritePack's outDir is handed to PackObjectsFromList as an outStem, and
+// that runs `git -C gitDir pack-objects ... <outStem>` — where -C changes the
+// directory relative ARGUMENTS resolve against too. A RELATIVE outDir is
+// therefore resolved against gitDir by the subprocess, not against this
+// process's cwd as the caller (and WritePack's own os.Stat guards below)
+// assume: the same path-doubling class the Stage 3a live gate hit in
+// repo.consolidateAndInstall, untreated on this side.
+//
+// Every current caller passes an absolute temp dir, so it is latent — but
+// WritePack and consolidateAndInstall are now two callers of ONE exec site
+// holding different path disciplines, which is exactly how a latent hazard
+// becomes a live one. Absolutising at the top of WritePack means the exec site
+// only ever sees paths with a single, unambiguous resolution.
+//
+// Pre-fix this failed with pack-objects unable to write into
+// "<gitDir>/out/pack-...", which does not exist.
+func TestWritePackResolvesARelativeOutDirAgainstTheProcessCwd(t *testing.T) {
+	d := newRepo(t)
+	head := headOf(t, d)
+
+	work := t.TempDir()
+	chdirForTest(t, work)
+	if err := os.Mkdir("out", 0o700); err != nil {
+		t.Fatalf("mkdir out: %v", err)
+	}
+
+	packPath, idxPath, err := WritePack(d, head, nil, "out") // RELATIVE, and not under gitDir
+	if err != nil {
+		t.Fatalf("WritePack with a relative outDir: %v", err)
+	}
+	if packPath == "" || idxPath == "" {
+		t.Fatalf("want real paths, got pack=%q idx=%q", packPath, idxPath)
+	}
+	if !filepath.IsAbs(packPath) || !filepath.IsAbs(idxPath) {
+		t.Errorf("returned paths must be absolute so a caller cannot re-resolve them in "+
+			"another context: pack=%q idx=%q", packPath, idxPath)
+	}
+	for _, p := range []string{packPath, idxPath} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("returned path does not exist on disk: %v", err)
+		}
+	}
+	// The pack must land under the cwd's out/, NOT under gitDir's.
+	if got := countPacks(t, filepath.Join(work, "out")); got != 1 {
+		t.Errorf("want 1 pack under the process cwd's out/, got %d", got)
+	}
+	if _, err := os.Stat(filepath.Join(d, "out")); err == nil {
+		t.Error("a relative outDir must not be resolved against gitDir: found out/ inside the repo")
+	}
+}
+
 // bigRepo builds a repo with enough INCOMPRESSIBLE data to exceed git's
 // minimum pack-size limit. git clamps pack.packSizeLimit to 1 MiB, so a small
 // repo cannot demonstrate the pin at all — the first draft of this test set
