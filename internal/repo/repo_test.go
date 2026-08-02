@@ -569,6 +569,29 @@ func headOfPushRepo(t *testing.T, dir string) string {
 	return sha
 }
 
+// commitOnPushRepo adds a second commit (file=content) on top of whatever
+// HEAD dir currently has, and returns the new HEAD sha.
+//
+// Added in fix round 1 for TestFetchRejectsACorruptPackAndInstallsNothing:
+// once that test primes dst with a genuine first fetch (so `before` is a real
+// 1, not 0 by construction), re-fetching the SAME want would let Fetch's
+// up-to-date short-circuit return before the corrupt pack under test is ever
+// downloaded — the corruption would never be read, and the test would pass
+// for the wrong reason. A second, not-yet-fetched commit gives the corrupted
+// second fetch an actual want to chase.
+func commitOnPushRepo(t *testing.T, dir, file, content string) string {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, file), []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", file, err)
+	}
+	for _, a := range [][]string{{"add", "."}, {"commit", "-qm", "c2"}} {
+		if err := exec.Command("git", append([]string{"-C", dir}, a...)...).Run(); err != nil {
+			t.Fatalf("git %v: %v", a, err)
+		}
+	}
+	return headOfPushRepo(t, dir)
+}
+
 // refusingUploadTransport reports Refused for a chosen remote suffix, leaving
 // whatever bytes the test planted at that path untouched.
 type refusingUploadTransport struct {
@@ -1478,9 +1501,11 @@ func TestPushTagOnlyLeavesRepoHeadless(t *testing.T) {
 // covers the author and committer timestamps at one-second resolution. Two
 // such repos created inside the same second get the SAME sha, so a "fetch into
 // a repo that lacks the objects" test would silently be fetching into a repo
-// that already has them: RevListNewObjects returns nothing, Fetch returns
-// ("", nil), and the test fails for a reason unrelated to the code under test.
-// Flaky by the clock, which is worse than simply wrong.
+// that already has them: Fetch's up-to-date short-circuit (ConnectivityOK
+// against gitDir alone, no alternate — see fetch.go) would see the object
+// already present and return ("", nil), and the test fails for a reason
+// unrelated to the code under test. Flaky by the clock, which is worse than
+// simply wrong.
 func emptyGitRepo(t *testing.T) string {
 	t.Helper()
 	d := t.TempDir()
@@ -1538,10 +1563,36 @@ func TestFetchInstallsTheClosure(t *testing.T) {
 	if !gitcmd.HasObject(dst, sha) {
 		t.Error("the wanted object must be present after a fetch")
 	}
+
+	// Fix round 1 test strengthening: pin the one-pack invariant the caller's
+	// single lock response depends on (consolidateAndInstall must produce
+	// exactly ONE pack, never one per downloaded remote pack), and pin that
+	// .keep lands beside it in the REAL object store — not in the temp
+	// alt-objects area, and not anywhere filepath.IsAbs's fallback join could
+	// misplace it (I2, fix round 1).
+	if n := countInstalledPackFiles(t, dst); n != 1 {
+		t.Errorf("want exactly 1 installed pack, got %d", n)
+	}
+	wantDir := filepath.Join(dst, ".git", "objects", "pack")
+	if got := filepath.Dir(keep); got != wantDir {
+		t.Errorf(".keep must live in %s, got %s", wantDir, got)
+	}
 }
 
-// RED. A second fetch of the same want installs nothing — this is what
-// --not --all buys, and without it every fetch reinstalls all of history.
+// RED. A second fetch of the same want installs nothing. This is what
+// Fetch's up-to-date short-circuit buys (ConnectivityOK against gitDir alone,
+// no alternate — see fetch.go's comment on it), NOT what RevListNewObjects's
+// own --not --all buys by itself: that flag excludes by ref reachability, and
+// Fetch never writes local refs (git's own porcelain does that, after this
+// helper exits), so on a destination like dst below — the object physically
+// present, no ref reaching it — --not --all alone would recompute and
+// reinstall the full closure on every call.
+//
+// Fix round 1 test strengthening: the packs are deleted from the Fake before
+// the second call, so this proves BOTH that "present but unreferenced"
+// converges to ("", nil) AND that a genuinely up-to-date fetch never touches
+// the remote — before this change the test passed identically with the
+// short-circuit deleted, since the packs were still there to redownload.
 func TestFetchIsIdempotentAndInstallsNothingWhenUpToDate(t *testing.T) {
 	src := newGitRepoForPush(t)
 	sha := headOfPushRepo(t, src)
@@ -1552,6 +1603,17 @@ func TestFetchIsIdempotentAndInstallsNothingWhenUpToDate(t *testing.T) {
 	if _, err := Fetch(f, "/r", dst, []string{sha}); err != nil {
 		t.Fatalf("first fetch: %v", err)
 	}
+
+	// Remove every pack/idx from the remote. If the second Fetch call had to
+	// redownload anything, it would fail outright (downloadAllPacks refuses
+	// an empty packs/ folder) rather than merely reinstalling redundantly —
+	// so this also proves the remote is never touched once up to date.
+	for name := range f.Files {
+		if strings.HasSuffix(name, ".pack") || strings.HasSuffix(name, ".idx") {
+			delete(f.Files, name)
+		}
+	}
+
 	keep, err := Fetch(f, "/r", dst, []string{sha})
 	if err != nil {
 		t.Fatalf("second fetch: %v", err)
@@ -1563,11 +1625,46 @@ func TestFetchIsIdempotentAndInstallsNothingWhenUpToDate(t *testing.T) {
 
 // RED. A corrupt remote pack must be fatal, and must leave the local store
 // untouched — fetch is the one path that can damage the user's own repo.
+//
+// Fix round 1 test strengthening: a genuine first fetch runs BEFORE the
+// corruption is injected, so `before` is a real 1 (a pack this test proves
+// was actually installed), not merely 0 by construction. Before this change
+// `before == after == 0` would have passed even if verifyDownloadedPacks were
+// entirely deleted, since dst never had a pack to lose either way.
 func TestFetchRejectsACorruptPackAndInstallsNothing(t *testing.T) {
 	src := newGitRepoForPush(t)
 	sha := headOfPushRepo(t, src)
 	f := transport.NewFake()
 	plantRepoOnFake(t, f, "/r", src, sha)
+
+	dst := emptyGitRepo(t)
+	if _, err := Fetch(f, "/r", dst, []string{sha}); err != nil {
+		t.Fatalf("priming fetch: %v", err)
+	}
+	before := countInstalledPackFiles(t, dst)
+	if before != 1 {
+		t.Fatalf("priming fetch must have installed exactly 1 pack, got %d", before)
+	}
+
+	// A second, distinct want, so the corrupted pack is actually needed —
+	// otherwise the up-to-date short-circuit would return ("", nil) before
+	// ever downloading (and therefore before ever reading) the corrupt pack,
+	// and this test would pass without exercising verifyDownloadedPacks at
+	// all. plantRepoOnFake already wrote one pack pair for `sha`; a second
+	// commit on src, packed and planted under a second remote name, gives
+	// Fetch a want whose closure is not yet satisfied locally.
+	second := commitOnPushRepo(t, src, "b.txt", "two")
+	packPath, idxPath, err := gitcmd.WritePack(src, second, []string{sha}, t.TempDir())
+	if err != nil || packPath == "" {
+		t.Fatalf("WritePack: %v", err)
+	}
+	for _, p := range []string{packPath, idxPath} {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.Files["/r/packs/"+filepath.Base(p)] = b
+	}
 
 	for name, b := range f.Files {
 		if strings.HasSuffix(name, ".pack") {
@@ -1577,9 +1674,7 @@ func TestFetchRejectsACorruptPackAndInstallsNothing(t *testing.T) {
 		}
 	}
 
-	dst := emptyGitRepo(t)
-	before := countInstalledPackFiles(t, dst)
-	if _, err := Fetch(f, "/r", dst, []string{sha}); err == nil {
+	if _, err := Fetch(f, "/r", dst, []string{second}); err == nil {
 		t.Fatal("a corrupt remote pack must be fatal")
 	}
 	if got := countInstalledPackFiles(t, dst); got != before {
@@ -1599,6 +1694,47 @@ func TestFetchRefusesAnUnmarkedRemote(t *testing.T) {
 	}
 	if _, ok := f.Files["/r/gpb-remote.json"]; ok {
 		t.Error("fetch must never create a marker")
+	}
+}
+
+// RED (fix round 1, I2). validateGitDirOutput does not exist yet. RevParse's
+// result is git()'s COMBINED stdout+stderr (trimmed) — a single git warning
+// merged in alongside a genuinely successful "--git-dir" answer must never be
+// trusted as a filesystem path outright, since consolidateAndInstall
+// MkdirAlls under it and a relative, warning-prefixed answer would land
+// inside the user's WORKING TREE (filepath.IsAbs sees false, so the fallback
+// join fires) rather than being refused.
+func TestValidateGitDirOutputRejectsUntrustedCombinedOutput(t *testing.T) {
+	d := t.TempDir()
+	if err := os.Mkdir(filepath.Join(d, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(d, "worktrees-git-dir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name    string
+		v       string
+		wantErr bool
+	}{
+		{"the ordinary answer", ".git", false},
+		{"an absolute path", filepath.Join(d, ".git"), false},
+		{"a relative path that genuinely exists under gitDir", "worktrees-git-dir", false},
+		{"a warning merged in before a real answer", "warning: something\n.git", true},
+		{"a warning merged in after a real answer", ".git\nwarning: something", true},
+		{"a relative path that does not exist", "not-a-real-dir", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := validateGitDirOutput(d, c.v)
+			if c.wantErr && err == nil {
+				t.Errorf("validateGitDirOutput(%q) = nil, want an error", c.v)
+			}
+			if !c.wantErr && err != nil {
+				t.Errorf("validateGitDirOutput(%q) = %v, want nil", c.v, err)
+			}
+		})
 	}
 }
 

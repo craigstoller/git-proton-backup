@@ -186,52 +186,11 @@ func WritePack(gitDir, want string, haves []string, outDir string) (string, stri
 		return "", "", nil // nothing to send
 	}
 
-	// pack-objects writes the pack hash to stdout, which is then parsed into
-	// a filename below. stdout must not be mixed with stderr here (unlike
-	// the git() helper above) — any warning git writes to stderr would
-	// corrupt the parsed name and produce a path that does not exist. stdout
-	// is captured alone for parsing; stderr is kept separately and folded
-	// into the error message on failure so diagnostics still surface.
-	// Both pins are normative (design v6.2). packSizeLimit must be overridden
-	// as CONFIG, not as --max-pack-size=0: git reads 0 there as "unset" and
-	// falls back to the very config being overridden. The index-version pin
-	// must be on the command line too, because pack.indexVersion is
-	// user-configurable and `index-pack --verify` validates an index in
-	// whatever version it already is.
-	cmd := exec.Command("git", "-C", gitDir,
-		"-c", "pack.packSizeLimit=0",
-		"pack-objects", "--no-thin", "--index-version=2", "-q",
-		filepath.Join(outDir, "pack"))
-	cmd.Stdin = strings.NewReader(objs + "\n")
-	var stdout, stderr strings.Builder
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	// Same exposure as git() above, for the same reason: *strings.Builder is
-	// not an *os.File, so these are pipes a grandchild can hold open past the
-	// child's exit. See waitDelay: DO NOT DELETE as unnecessary.
-	cmd.WaitDelay = waitDelay
-	if err := cmd.Run(); err != nil {
-		// ErrWaitDelay means pack-objects itself exited 0 but the pipe was
-		// abandoned, so stdout — which is the pack NAME this function parses a
-		// filename out of — may be short. A truncated hash yields a path that
-		// does not exist, and the os.Stat guards below would report that as a
-		// missing pack, blaming the wrong thing. Name the real cause instead.
-		if errors.Is(err, exec.ErrWaitDelay) {
-			return "", "", fmt.Errorf("pack-objects exited but something still held its output "+
-				"pipe open after %s, so the pack name it printed cannot be trusted to be "+
-				"complete; refusing to guess which pack it wrote", waitDelay)
-		}
-		return "", "", fmt.Errorf("pack-objects: %s: %w", strings.TrimSpace(stderr.String()), err)
-	}
-	name := strings.TrimSpace(stdout.String())
-
-	// One pack is an invariant the whole publication path rests on: a second
-	// pack silently dropped would publish a ref whose objects are only
-	// half-uploaded. The size pin above should make this unreachable, so
-	// treat it as a hard error rather than parsing the first line.
-	if strings.ContainsAny(name, " \t\r\n") {
-		return "", "", fmt.Errorf("pack-objects emitted more than one pack (%q); "+
-			"the one-pack invariant is broken", name)
+	// No alternate: WritePack packs purely from gitDir's own store, which is
+	// exactly what an empty altObjects means to PackObjectsFromList below.
+	name, err := PackObjectsFromList(gitDir, "", objs, filepath.Join(outDir, "pack"))
+	if err != nil {
+		return "", "", err
 	}
 	base := filepath.Join(outDir, "pack-"+name)
 	packPath, idxPath := base+".pack", base+".idx"
@@ -248,6 +207,79 @@ func WritePack(gitDir, want string, haves []string, outDir string) (string, stri
 		return "", "", fmt.Errorf("pack-objects reported %s but the idx file is missing: %w", idxPath, err)
 	}
 	return packPath, idxPath, nil
+}
+
+// PackObjectsFromList runs `git pack-objects` against objs — a newline-
+// separated object list, as rev-list --objects produces — writing the result
+// under outStem (pack-objects appends "-<hash>.{pack,idx}" itself) and
+// returning that hash.
+//
+// altObjects, when non-empty, is spliced in as an alternate object store via
+// GIT_ALTERNATE_OBJECT_DIRECTORIES — the same mechanism revListWithAlt above
+// uses. An empty altObjects means gitDir's own store only (the same contract
+// ConnectivityOK's doc states), and the variable is set to that empty value
+// explicitly rather than left unset, so a value already present in the
+// calling process's own environment can never leak in unnoticed.
+//
+// This is WritePack's own exec site, extracted (fix round 1, I1) so a second
+// caller — repo.consolidateAndInstall, which packs the alt-objects closure a
+// fetch downloads — gets the same WaitDelay / ErrWaitDelay /
+// multi-pack-rejection guards WritePack already had, rather than a second,
+// easily-drifting copy of them missing all three (which is exactly what
+// consolidateAndInstall had before this extraction: a hang after the pack was
+// already written into the user's live object store, unkept and unknown to
+// git, plus no defence against a truncated pack name). See waitDelay: DO NOT
+// DELETE as unnecessary.
+//
+// Both pins are normative (design v6.2). packSizeLimit must be overridden as
+// CONFIG, not as --max-pack-size=0: git reads 0 there as "unset" and falls
+// back to the very config being overridden. The index-version pin must be on
+// the command line too, because pack.indexVersion is user-configurable and
+// `index-pack --verify` validates an index in whatever version it already is.
+func PackObjectsFromList(gitDir, altObjects, objs, outStem string) (string, error) {
+	cmd := exec.Command("git", "-C", gitDir,
+		"-c", "pack.packSizeLimit=0",
+		"pack-objects", "--no-thin", "--index-version=2", "-q", outStem)
+	cmd.Env = append(os.Environ(), "GIT_ALTERNATE_OBJECT_DIRECTORIES="+altObjects)
+	// A trailing newline is required, and at most one is wanted: rev-list's
+	// own untrimmed output (RevListNewObjects, fed here unmodified by
+	// repo.consolidateAndInstall) already ends with one, while git()'s
+	// trimmed output (fed here by WritePack above) does not. TrimRight then
+	// re-adding exactly one normalises either caller's input the same way.
+	cmd.Stdin = strings.NewReader(strings.TrimRight(objs, "\r\n") + "\n")
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	// Same exposure as git() above, for the same reason: *strings.Builder is
+	// not an *os.File, so these are pipes a grandchild can hold open past the
+	// child's exit. See waitDelay: DO NOT DELETE as unnecessary.
+	cmd.WaitDelay = waitDelay
+	if err := cmd.Run(); err != nil {
+		// ErrWaitDelay means pack-objects itself exited 0 but the pipe was
+		// abandoned, so stdout — which is the pack NAME this function parses a
+		// filename out of — may be short. A truncated hash yields a path that
+		// does not exist, and a caller's os.Stat guard would report that as a
+		// missing pack, blaming the wrong thing. Name the real cause instead.
+		if errors.Is(err, exec.ErrWaitDelay) {
+			return "", fmt.Errorf("pack-objects exited but something still held its output "+
+				"pipe open after %s, so the pack name it printed cannot be trusted to be "+
+				"complete; refusing to guess which pack it wrote", waitDelay)
+		}
+		return "", fmt.Errorf("pack-objects: %s: %w", strings.TrimSpace(stderr.String()), err)
+	}
+	name := strings.TrimSpace(stdout.String())
+
+	// One pack is an invariant every caller's ordering guarantee rests on: a
+	// second pack silently dropped would mean a caller trusts a name it never
+	// actually got — a ref published against half-uploaded objects on the
+	// push side, or an untracked pack in the live object store on the fetch
+	// side. The size pin above should make this unreachable, so treat it as a
+	// hard error rather than parsing the first line.
+	if strings.ContainsAny(name, " \t\r\n") {
+		return "", fmt.Errorf("pack-objects emitted more than one pack (%q); "+
+			"the one-pack invariant is broken", name)
+	}
+	return name, nil
 }
 
 // SymbolicRef returns the ref a symbolic ref points at — "refs/heads/main" for
@@ -313,7 +345,10 @@ func revListWithAlt(gitDir, altObjects string, wants []string, args ...string) (
 
 // ConnectivityOK reports whether every object reachable from wants is present,
 // counting gitDir's own store plus altObjects. A nil return means the closure
-// is complete.
+// is complete. An empty altObjects means no alternate is spliced in at all —
+// gitDir's own store only — which is the contract repo.Fetch's up-to-date
+// short-circuit relies on: calling this with altObjects="" asks purely
+// whether gitDir already has the closure, with nothing downloaded yet.
 //
 // This is a traversal, not an fsck: the wants are not referenced by any ref, so
 // fsck would never reach them. --quiet suppresses the object list; the exit

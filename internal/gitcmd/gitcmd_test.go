@@ -409,6 +409,63 @@ func TestSymbolicRef(t *testing.T) {
 	}
 }
 
+// RED (fix round 1, I1). PackObjectsFromList does not exist yet — it is the
+// extraction of WritePack's own exec site so repo.consolidateAndInstall gets
+// the same WaitDelay / ErrWaitDelay / multi-pack-rejection guards WritePack
+// already has, instead of a second copy of them (which is exactly what
+// consolidateAndInstall had before this fix round: an inlined pack-objects
+// call with none of those guards).
+func TestPackObjectsFromListBuildsFromGitDirAlone(t *testing.T) {
+	d := newRepo(t)
+	head := headOf(t, d)
+	objs, code, err := git(d, "rev-list", "--objects", head)
+	if code != 0 || err != nil {
+		t.Fatalf("rev-list: %v (code %d)", err, code)
+	}
+
+	out := t.TempDir()
+	name, err := PackObjectsFromList(d, "", objs, filepath.Join(out, "pack"))
+	if err != nil {
+		t.Fatalf("PackObjectsFromList: %v", err)
+	}
+	packPath := filepath.Join(out, "pack-"+name+".pack")
+	if _, err := os.Stat(packPath); err != nil {
+		t.Errorf("returned name does not name a pack that exists on disk: %v", err)
+	}
+	if err := IndexPackVerify(packPath); err != nil {
+		t.Errorf("built pack must verify: %v", err)
+	}
+}
+
+// RED (fix round 1, I1). Covers the OTHER caller's shape directly:
+// repo.consolidateAndInstall packs objects that live ONLY in a downloaded,
+// not-yet-installed alternate store — exactly what altObjects exists for, and
+// exactly the path that had no guards before this fix round.
+func TestPackObjectsFromListSplicesInAnAlternate(t *testing.T) {
+	src, _, second := twoCommitRepo(t)
+	full, _, err := WritePack(src, second, nil, t.TempDir())
+	if err != nil || full == "" {
+		t.Fatalf("WritePack: %v", err)
+	}
+	alt := altObjectsWith(t, full)
+
+	empty := newRepo(t) // shares no objects with src
+	objs, err := RevListNewObjects(empty, alt, []string{second})
+	if err != nil {
+		t.Fatalf("RevListNewObjects: %v", err)
+	}
+
+	out := t.TempDir()
+	name, err := PackObjectsFromList(empty, alt, objs, filepath.Join(out, "pack"))
+	if err != nil {
+		t.Fatalf("PackObjectsFromList: %v", err)
+	}
+	packPath := filepath.Join(out, "pack-"+name+".pack")
+	if err := IndexPackVerify(packPath); err != nil {
+		t.Errorf("pack built from an alternate must verify: %v", err)
+	}
+}
+
 // RED. IndexPackVerify does not exist yet.
 func TestIndexPackVerifyAcceptsGoodPairRejectsCorrupt(t *testing.T) {
 	d := newRepo(t)

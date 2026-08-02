@@ -3,7 +3,6 @@ package repo
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -183,10 +182,27 @@ func consolidateAndInstall(gitDir, altObjects, objs string) (string, error) {
 	// whose .git is a file, and on a normal repo that happens to have no
 	// objects/pack yet — in that last case it would create one in the WORKING
 	// TREE, which is silently wrong.
-	gitDirAbs, code, err := gitcmd.RevParse(gitDir, "--git-dir")
-	if err != nil || code != 0 {
-		return "", fmt.Errorf("cannot locate the git directory for %s: %v", gitDir, err)
+	out, code, err := gitcmd.RevParse(gitDir, "--git-dir")
+	if err != nil {
+		return "", fmt.Errorf("cannot locate the git directory for %s: %w", gitDir, err)
 	}
+	if code != 0 {
+		return "", fmt.Errorf("cannot locate the git directory for %s: rev-parse --git-dir "+
+			"exited %d: %s", gitDir, code, out)
+	}
+	// RevParse's result is git()'s COMBINED stdout+stderr (trimmed), not
+	// stdout alone. A single warning line merged in alongside a genuinely
+	// successful "--git-dir" answer — an inaccessible ~/.gitconfig, a broken
+	// ref notice — would otherwise be trusted as part of the path outright:
+	// filepath.IsAbs sees false on "warning: ...\n.git", the join below lands
+	// inside gitDir, and MkdirAll creates a real pack in the user's WORKING
+	// TREE — precisely the outcome asking git instead of guessing was
+	// supposed to prevent. Refuse anything that does not look like a genuine
+	// --git-dir answer before trusting it as a path at all.
+	if err := validateGitDirOutput(gitDir, out); err != nil {
+		return "", fmt.Errorf("cannot locate the git directory for %s: %w", gitDir, err)
+	}
+	gitDirAbs := out
 	if !filepath.IsAbs(gitDirAbs) {
 		gitDirAbs = filepath.Join(gitDir, gitDirAbs)
 	}
@@ -195,22 +211,17 @@ func consolidateAndInstall(gitDir, altObjects, objs string) (string, error) {
 		return "", err
 	}
 
-	cmd := exec.Command("git", "-C", gitDir,
-		"-c", "pack.packSizeLimit=0",
-		"pack-objects", "--no-thin", "--index-version=2", "-q",
-		filepath.Join(realPack, "pack"))
-	cmd.Env = append(os.Environ(), "GIT_ALTERNATE_OBJECT_DIRECTORIES="+altObjects)
-	cmd.Stdin = strings.NewReader(objs)
-	var stdout, stderr strings.Builder
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("pack-objects: %s: %w", strings.TrimSpace(stderr.String()), err)
-	}
-	name := strings.TrimSpace(stdout.String())
-	if strings.ContainsAny(name, " \t\r\n") {
-		return "", fmt.Errorf("pack-objects emitted more than one pack (%q); the "+
-			"one-pack invariant the lock response depends on is broken", name)
+	// gitcmd.PackObjectsFromList owns the exec site (WaitDelay, the
+	// ErrWaitDelay truncation guard, and the multi-pack-rejection check) —
+	// see its doc for why this must not be reimplemented here: a bare
+	// exec.Command with no WaitDelay can hang forever on a grandchild (e.g. a
+	// core.fsmonitor daemon) holding the output pipe open, and it would hang
+	// AFTER pack-objects has already written the pack into the live
+	// objects/pack computed above — unkept, unknown to git, permanent if the
+	// process is killed.
+	name, err := gitcmd.PackObjectsFromList(gitDir, altObjects, objs, filepath.Join(realPack, "pack"))
+	if err != nil {
+		return "", err
 	}
 
 	stem := filepath.Join(realPack, "pack-"+name)
@@ -224,4 +235,29 @@ func consolidateAndInstall(gitDir, altObjects, objs string) (string, error) {
 		return "", fmt.Errorf("cannot write %s: %w", keep, err)
 	}
 	return keep, nil
+}
+
+// validateGitDirOutput guards the untrusted combined-output value RevParse
+// hands back before consolidateAndInstall treats it as a filesystem path (see
+// the comment at its call site for the mechanism this defends against). A
+// newline anywhere is refused outright — a genuine --git-dir answer is always
+// one line, so any newline proves something else (a git warning) was merged
+// into it. Beyond that, v must be one of the shapes git actually returns for
+// --git-dir: the literal ".git", an absolute path, or a path that (resolved
+// against gitDir, since RevParse ran with `-C gitDir`) names a directory that
+// genuinely exists.
+func validateGitDirOutput(gitDir, v string) error {
+	if strings.ContainsAny(v, "\r\n") {
+		return fmt.Errorf("rev-parse --git-dir returned more than one line (%q); this usually "+
+			"means a git warning was merged into the combined output, and the result cannot be "+
+			"trusted as a path", v)
+	}
+	if v == ".git" || filepath.IsAbs(v) {
+		return nil
+	}
+	if st, err := os.Stat(filepath.Join(gitDir, v)); err == nil && st.IsDir() {
+		return nil
+	}
+	return fmt.Errorf("rev-parse --git-dir returned %q, which is neither \".git\", an absolute "+
+		"path, nor an existing directory under %s; refusing to treat it as the git directory", v, gitDir)
 }
