@@ -66,13 +66,27 @@ func WriteHEAD(t transport.Transport, root, branch string) (transport.Outcome, e
 	if err != nil {
 		return transport.Ambiguous, err
 	}
+	// A value switch with an explicit arm per constant, not a boolean switch
+	// with `if out == ...` cases: the boolean form has no way to express
+	// "anything else", so an unrecognised Outcome fell through into the
+	// read-back below and, had it happened to match, would have been reported
+	// as Committed on the strength of a value nobody recognised. Zero risk
+	// today, since Outcome is a closed three-constant set in this module, but
+	// AcquireLock, Bootstrap, publishPack and publishIdx are all guarded this
+	// way; leaving WriteHEAD as the one exception would make the pattern
+	// advisory rather than the rule.
 	switch out {
-	case transport.Ambiguous:
-		return transport.Ambiguous, fmt.Errorf("HEAD write outcome ambiguous for %s; re-run to reconcile", p)
+	case transport.Committed:
+		// Falls out of the switch into the read-back verification below.
 	case transport.Refused:
 		// Someone wrote HEAD between our check and our write. We never
 		// overwrite an existing HEAD, so adopt theirs.
 		return transport.Refused, nil
+	case transport.Ambiguous:
+		return transport.Ambiguous, fmt.Errorf("HEAD write outcome ambiguous for %s; re-run to reconcile", p)
+	default:
+		return transport.Ambiguous, fmt.Errorf("HEAD write for %s returned an unrecognised outcome %s; "+
+			"refusing to guess whether it landed", p, out)
 	}
 	got, ok, err := ReadHEAD(t, root)
 	if err != nil {

@@ -1295,3 +1295,105 @@ func TestReadHEADRejectsCorruptContent(t *testing.T) {
 		t.Error("HEAD must point at a branch")
 	}
 }
+
+// TestWriteHEADFailsClosedOnUnrecognisedOutcome covers fix-round-1's Important
+// finding: before the fix, WriteHEAD's outcome switch handled only Ambiguous
+// and Refused, and let everything else — including a value nobody
+// recognises — fall through into the read-back verification, where it would
+// have been reported as Committed if the read-back happened to match. That is
+// the same exposure AcquireLock, Bootstrap, publishPack and publishIdx are all
+// already guarded against (each with its own default arm and test); WriteHEAD
+// was the one CreateExclusive caller without it. Reuses
+// unknownOutcomeTransport (defined above for the Bootstrap/AcquireLock
+// variants of this exact test) rather than inventing a second stub, since the
+// shape — force CreateExclusive to an out-of-range Outcome for one chosen
+// path — is identical.
+func TestWriteHEADFailsClosedOnUnrecognisedOutcome(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	tr := unknownOutcomeTransport{Fake: f, forPath: "/r/" + HeadName}
+
+	out, err := WriteHEAD(tr, "/r", "refs/heads/main")
+	if err == nil {
+		t.Fatal("WriteHEAD must fail closed on an unrecognised outcome")
+	}
+	if out != transport.Ambiguous {
+		t.Errorf("an unrecognised outcome must be reported as Ambiguous, got %v", out)
+	}
+	if !strings.Contains(err.Error(), "outcome(42)") {
+		t.Errorf("the refusal must name the outcome it saw, got: %v", err)
+	}
+	if _, ok := f.Files["/r/HEAD"]; ok {
+		t.Error("no HEAD was actually written; nothing may claim otherwise")
+	}
+}
+
+// TestWriteHEADNeverOverwritesExistingHEAD covers the Refused path (fix-round
+// coverage gap 1): CreateExclusive on an already-present HEAD reports Refused,
+// and WriteHEAD must adopt that — report Refused with no error — rather than
+// touching the existing content. Never-overwrite is the whole reason HEAD
+// uses CreateExclusive and not UpdateRevision.
+func TestWriteHEADNeverOverwritesExistingHEAD(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	f.Files["/r/HEAD"] = []byte("ref: refs/heads/existing\n")
+
+	out, err := WriteHEAD(f, "/r", "refs/heads/other")
+	if err != nil || out != transport.Refused {
+		t.Fatalf("WriteHEAD over an existing HEAD must report (Refused, nil), got %v %v", out, err)
+	}
+	if got := string(f.Files["/r/HEAD"]); got != "ref: refs/heads/existing\n" {
+		t.Errorf("the existing HEAD must be untouched, got %q", got)
+	}
+}
+
+// TestWriteHEADAmbiguousOutcomeIsReported covers the Ambiguous path (fix-round
+// coverage gap 2), using Fake.FailNext rather than a stub since Fake's own
+// CreateExclusive already reports Ambiguous once when FailNext is set. Set
+// AFTER Bootstrap: Bootstrap's own marker write is a CreateExclusive call too,
+// and FailNext only fires on the next mutation, so setting it any earlier
+// would consume it before WriteHEAD ever runs.
+func TestWriteHEADAmbiguousOutcomeIsReported(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	f.FailNext = "inject"
+
+	out, err := WriteHEAD(f, "/r", "refs/heads/main")
+	if err == nil || out != transport.Ambiguous {
+		t.Fatalf("an ambiguous CreateExclusive outcome must be reported as (Ambiguous, error), got %v %v", out, err)
+	}
+}
+
+// TestWriteHEADRefusesNonBranchTarget covers the not-a-branch guard
+// (fix-round coverage gap 3): WriteHEAD must reject a target outside
+// refs/heads/ before ever touching the transport, mirroring the guard
+// TestWriteRefRefusesNonSha already pins for WriteRef.
+func TestWriteHEADRefusesNonBranchTarget(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+
+	if out, err := WriteHEAD(f, "/r", "refs/tags/v1"); err == nil {
+		t.Errorf("WriteHEAD must refuse a non-branch target, got %v, nil error", out)
+	}
+	if _, ok := f.Files["/r/HEAD"]; ok {
+		t.Error("nothing must be written to the transport for a rejected target")
+	}
+}
+
+// TestReadHEADAcceptsCRLF covers the CRLF round-trip (fix-round coverage gap
+// 4). ReadHEAD's TrimRight("\r\n") already handles this; this test exists so a
+// future "simplification" that narrows the trim to "\n" only cannot silently
+// break a HEAD written or touched by a CRLF-writing tool.
+func TestReadHEADAcceptsCRLF(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	f.Files["/r/HEAD"] = []byte("ref: refs/heads/main\r\n")
+
+	branch, ok, err := ReadHEAD(f, "/r")
+	if err != nil || !ok {
+		t.Fatalf("ReadHEAD: %v %v", ok, err)
+	}
+	if branch != "refs/heads/main" {
+		t.Errorf("ReadHEAD = %q, want refs/heads/main", branch)
+	}
+}
