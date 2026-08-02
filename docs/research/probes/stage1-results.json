@@ -98,16 +98,25 @@
       }
     },
     "C15": {
-      "question": "Is `filesystem list` immediately consistent after a `trash`, or can it return a node that no longer exists?",
-      "answer": "IT CAN BE STALE. Immediately after trashing /my-files/GitRemotes, `list /my-files` still returned it while `info /my-files/GitRemotes` reported `Node not found` on the same machine seconds apart; a second `list` moments later showed only the four real folders. INFO IS AUTHORITATIVE; LIST IS NOT. Observed direction is DELETION staleness only - nothing here establishes whether `list` can also OMIT a just-created node, which is the direction that would hurt fetch discovery, and no probe covers it.",
+      "question": "Is `filesystem list` immediately consistent, or can it disagree with `info` about whether a node exists?",
+      "answer": "CREATION IS CONSISTENT - 11/11 trials, no misses. A node is visible to a `list` from a fresh CLI process as soon as the upload or create-folder returns. THIS IS THE DIRECTION THAT MATTERS for fetch discovery, and it tested clean. DELETION: one unexplained observation that DOES NOT REPRODUCE - 0/6 follow-up trials. The strong claim an earlier version of this entry made ('list can be stale, info is authoritative') was NOT SUPPORTED by the follow-up and has been withdrawn. See notes.",
       "evidence": {
-        "listAfterTrashIncludedTrashedNode": true,
-        "infoAfterTrashSaidNotFound": true,
-        "secondListWasCorrect": true,
-        "authoritative": "info",
-        "untestedDirection": "creation staleness (does list ever omit a node that exists?)",
-        "reachableToday": "YES, not only in Stage 3. `git push proton-v2 :main` then a fresh push: ListRefs lists refs/heads, a stale entry names a ref whose node is gone, readRef's download fails, and the push aborts with what reads like remote corruption. Bootstrap's emptiness test has the mirror exposure - a stale entry makes an initialisable folder look non-empty. Both fail closed and both self-heal on retry.",
-        "raisedBy": "Stage 2.1 Task 4 cleanup verification (controller)"
+        "creationTrialsFile": 6,
+        "creationTrialsFolder": 5,
+        "creationMisses": 0,
+        "deletionFollowUpTrialsEmptyFolder": 4,
+        "deletionFollowUpTrialsPopulatedTree": 2,
+        "deletionFollowUpStaleObservations": 0,
+        "originalObservation": "During Stage 2.1 Task 4 cleanup verification, `list /my-files` returned GitRemotes while `info /my-files/GitRemotes` reported `Node not found` in the same shell invocation; a later `list` showed only the four real folders. That observation is recorded as seen, not as a characterised property.",
+        "withdrawn": "The claim that list is generally stale after a trash, and that info is therefore authoritative over list. n=1, contradicted by 6 follow-up trials across two shapes (empty folder, populated tree with sub-folder and file).",
+        "candidateExplanationsUnresolved": [
+          "a rare transient the follow-up did not provoke",
+          "propagation time proportional to tree size - the original tree had ~6 nodes (marker, refs/heads/main, pack, idx, and their folders); the follow-up's populated tree had 2",
+          "a one-off local SQLite cache artifact in that CLI process"
+        ],
+        "practicalConsequence": "Stage 3's fetch cache is keyed on pack name and existence. The creation direction it depends on tested clean, so the cache design needs no change on this evidence. Do NOT design defensive re-listing around the deletion observation without reproducing it first.",
+        "note": "Recorded this way deliberately. A normative contract file asserting a property from a single observation is worse than one recording an anomaly honestly - the earlier wording would have sent Stage 3 designing around a hazard that may not exist.",
+        "raisedBy": "Stage 2.1 Task 4 cleanup verification; follow-up probe run before Stage 3 planning"
       }
     },
     "C10": {
