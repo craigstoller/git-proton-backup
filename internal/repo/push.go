@@ -32,7 +32,76 @@ func Push(t transport.Transport, root, gitDir string,
 	for _, u := range ups {
 		results = append(results, pushOne(t, root, gitDir, u, remote))
 	}
+
+	// Complete a missing HEAD. This is the same rule Bootstrap applies to a
+	// missing refs/ or packs/ — a partial initialisation is completed, not
+	// rejected — and it is why a repo pushed before this shipped is still
+	// clonable. An EXISTING HEAD is never touched: changing the default
+	// branch stays an explicit operation, out of scope for v2.
+	ensureHEAD(t, root, gitDir, ups, remote, results)
 	return results
+}
+
+// ensureHEAD writes HEAD when the remote has none. Failure is reported on
+// stderr and does not fail the push: the refs and objects are already
+// published and correct, and turning a successful push into an error because
+// a convenience symref could not be written would be the wrong trade.
+func ensureHEAD(t transport.Transport, root, gitDir string,
+	ups []protocol.RefUpdate, remote map[string]string, results []Result) {
+
+	if _, ok, err := ReadHEAD(t, root); err != nil {
+		fmt.Fprintf(os.Stderr, "git-remote-proton: cannot read remote HEAD: %v\n", err)
+		return
+	} else if ok {
+		return // never rewrite
+	}
+
+	// Candidates are every branch on the remote AFTER this push: those that
+	// were already there, plus those this push actually published. Taking
+	// only the published set would point HEAD at whatever happened to be in
+	// today's batch.
+	seen := map[string]bool{}
+	for ref := range remote {
+		seen[ref] = true
+	}
+	okNow := map[string]bool{}
+	for _, r := range results {
+		if r.OK {
+			okNow[r.Ref] = true
+		}
+	}
+	for _, u := range ups {
+		if u.Src == "" && okNow[u.Dst] {
+			delete(seen, u.Dst) // a successful delete removes a candidate
+			continue
+		}
+		if okNow[u.Dst] {
+			seen[u.Dst] = true
+		}
+	}
+	candidates := make([]string, 0, len(seen))
+	for ref := range seen {
+		candidates = append(candidates, ref)
+	}
+
+	clientHEAD, err := gitcmd.SymbolicRef(gitDir, "HEAD")
+	if err != nil {
+		// A detached HEAD is ("", nil), so this is a real failure. It only
+		// costs us the tie-break, so warn and continue.
+		fmt.Fprintf(os.Stderr, "git-remote-proton: cannot read local HEAD: %v\n", err)
+	}
+	branch, ok := DeriveHEAD(candidates, clientHEAD)
+	if !ok {
+		return // headless is a defined state
+	}
+	if out, err := WriteHEAD(t, root, branch); err != nil {
+		fmt.Fprintf(os.Stderr, "git-remote-proton: could not write remote HEAD (%s): %v\n", out, err)
+	}
+	// A (Refused, nil) outcome means a concurrent writer's HEAD is now in
+	// place and was correctly not overwritten — that is success-by-adoption,
+	// not a failure, so it falls through here with nothing to report. If the
+	// concurrent HEAD is corrupt, the next ReadHEAD (next push or next
+	// advertisement) reports it loudly; this path does not need to.
 }
 
 // pushOne applies a single ref update. Ordering is pack -> idx -> confirm

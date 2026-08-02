@@ -1397,3 +1397,76 @@ func TestReadHEADAcceptsCRLF(t *testing.T) {
 		t.Errorf("ReadHEAD = %q, want refs/heads/main", branch)
 	}
 }
+
+// RED. Push does not write HEAD at all today.
+func TestPushWritesHeadOnFirstPush(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	d := newGitRepoForPush(t)
+	head := headOfPushRepo(t, d)
+
+	res := Push(f, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/heads/main"}}, map[string]string{})
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("push: %+v", res)
+	}
+	if got := string(f.Files["/r/HEAD"]); got != "ref: refs/heads/main\n" {
+		t.Errorf("HEAD = %q, want ref: refs/heads/main", got)
+	}
+}
+
+// RED. Backfill: an existing repo with branches but no HEAD gets one, and the
+// candidate set is every remote branch — not just what this push published.
+func TestPushBackfillsHeadFromAllRemoteBranches(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	d := newGitRepoForPush(t)
+	head := headOfPushRepo(t, d)
+
+	// "alpha" is already on the remote from an earlier push; no HEAD exists.
+	if _, err := WriteRef(f, "/r", "refs/heads/alpha", head, false); err != nil {
+		t.Fatal(err)
+	}
+	remote := map[string]string{"refs/heads/alpha": head}
+
+	// Today we push "zeta" only.
+	res := Push(f, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/heads/zeta"}}, remote)
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("push: %+v", res)
+	}
+	if got := string(f.Files["/r/HEAD"]); got != "ref: refs/heads/alpha\n" {
+		t.Errorf("HEAD = %q — the candidate set must include branches this push did not touch", got)
+	}
+}
+
+// GUARD. An existing HEAD is never rewritten.
+func TestPushNeverRewritesAnExistingHead(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	d := newGitRepoForPush(t)
+	head := headOfPushRepo(t, d)
+	f.Files["/r/HEAD"] = []byte("ref: refs/heads/chosen\n")
+
+	res := Push(f, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/heads/main"}}, map[string]string{})
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("push: %+v", res)
+	}
+	if got := string(f.Files["/r/HEAD"]); got != "ref: refs/heads/chosen\n" {
+		t.Errorf("an existing HEAD must not be touched, got %q", got)
+	}
+}
+
+// GUARD. A tag-only push leaves the repo headless — a defined state.
+func TestPushTagOnlyLeavesRepoHeadless(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	d := newGitRepoForPush(t)
+	head := headOfPushRepo(t, d)
+
+	res := Push(f, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/tags/v1"}}, map[string]string{})
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("push: %+v", res)
+	}
+	if _, ok := f.Files["/r/HEAD"]; ok {
+		t.Error("a tag-only push must not write HEAD")
+	}
+}
