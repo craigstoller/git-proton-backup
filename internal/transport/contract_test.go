@@ -1,0 +1,211 @@
+package transport
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// liveEnv gates the *CLI half. CI never sets it, so `go test ./...` on a
+// runner exercises only the Fake and can never touch a real account.
+const liveEnv = "GPB_LIVE_ACCOUNT"
+
+// liveRoot is the only remote path the live half may write to.
+const liveRoot = "/my-files/_cas-probe/contract"
+
+// contractCase is one scenario, expressed against the interface alone.
+type contractCase struct {
+	name string
+	run  func(t *testing.T, tr Transport, root string, stage func(name, content string) string)
+}
+
+var contractCases = []contractCase{
+	{"stat absence is not an error", func(t *testing.T, tr Transport, root string, stage func(string, string) string) {
+		_, ok, err := tr.Stat(root + "/definitely-absent")
+		if err != nil {
+			t.Fatalf("absence must be (_, false, nil), got err %v", err)
+		}
+		if ok {
+			t.Error("a node that was never created must not exist")
+		}
+	}},
+
+	// C11: upload names the node after the LOCAL basename, so the caller
+	// contract is that the local basename equals the target leaf.
+	{"create names the node after the target leaf", func(t *testing.T, tr Transport, root string, stage func(string, string) string) {
+		local := stage("leafname.txt", "hello")
+		if out, err := tr.CreateExclusive(root+"/leafname.txt", local); err != nil || out != Committed {
+			t.Fatalf("create: %v %v", out, err)
+		}
+		if _, ok, err := tr.Stat(root + "/leafname.txt"); err != nil || !ok {
+			t.Fatalf("the node must exist under the target leaf: %v %v", ok, err)
+		}
+	}},
+
+	// A6: a second create of the same name is refused, not overwritten.
+	{"create refuses a name already taken", func(t *testing.T, tr Transport, root string, stage func(string, string) string) {
+		p := root + "/taken.txt"
+		if out, err := tr.CreateExclusive(p, stage("taken.txt", "first")); err != nil || out != Committed {
+			t.Fatalf("first create: %v %v", out, err)
+		}
+		out, err := tr.CreateExclusive(p, stage("taken.txt", "second"))
+		if err != nil {
+			t.Fatalf("second create errored: %v", err)
+		}
+		if out != Refused {
+			t.Errorf("a taken name must be Refused, got %v", out)
+		}
+	}},
+
+	// ReadTo's destination is a DIRECTORY, and the file lands under the
+	// node's own remote basename. The Fake and the CLI disagreed on this.
+	{"readTo lands under the remote basename in an existing dir", func(t *testing.T, tr Transport, root string, stage func(string, string) string) {
+		p := root + "/readback.txt"
+		if out, err := tr.CreateExclusive(p, stage("readback.txt", "payload")); err != nil || out != Committed {
+			t.Fatalf("create: %v %v", out, err)
+		}
+		dir := t.TempDir()
+		if err := tr.ReadTo(p, dir); err != nil {
+			t.Fatalf("ReadTo: %v", err)
+		}
+		got, err := os.ReadFile(filepath.Join(dir, "readback.txt"))
+		if err != nil {
+			t.Fatalf("the download must land under the remote basename: %v", err)
+		}
+		if string(got) != "payload" {
+			t.Errorf("content = %q, want payload", got)
+		}
+	}},
+
+	{"readTo into a missing directory errors and creates nothing", func(t *testing.T, tr Transport, root string, stage func(string, string) string) {
+		p := root + "/nodir.txt"
+		if out, err := tr.CreateExclusive(p, stage("nodir.txt", "x")); err != nil || out != Committed {
+			t.Fatalf("create: %v %v", out, err)
+		}
+		missing := filepath.Join(t.TempDir(), "not-created")
+		if err := tr.ReadTo(p, missing); err == nil {
+			t.Error("ReadTo must not create its destination directory")
+		}
+		if _, err := os.Stat(missing); !os.IsNotExist(err) {
+			t.Error("the destination directory must still not exist")
+		}
+	}},
+
+	// C4: trash on a missing target is Committed — the desired end state is
+	// "not there", and the CLI's own exit 1 is absorbed by the implementation.
+	{"trash on a missing target is committed", func(t *testing.T, tr Transport, root string, stage func(string, string) string) {
+		out, err := tr.Trash(root + "/never-existed.txt")
+		if err != nil {
+			t.Fatalf("trash of an absent node errored: %v", err)
+		}
+		if out != Committed {
+			t.Errorf("an already-absent node must be Committed, got %v", out)
+		}
+	}},
+
+	// C5 + the Fake's own gap: an EnsureDir'd empty folder must be visible
+	// to List. The Fake ignored f.Dirs and did not show it.
+	{"ensureDir is idempotent and its result is listable", func(t *testing.T, tr Transport, root string, stage func(string, string) string) {
+		d := root + "/emptydir"
+		if err := tr.EnsureDir(d); err != nil {
+			t.Fatalf("EnsureDir: %v", err)
+		}
+		if err := tr.EnsureDir(d); err != nil {
+			t.Fatalf("EnsureDir must be idempotent: %v", err)
+		}
+		nodes, err := tr.List(root)
+		if err != nil {
+			t.Fatalf("List: %v", err)
+		}
+		for _, n := range nodes {
+			if n.Name == "emptydir" {
+				if !n.IsDir {
+					t.Error("an EnsureDir'd node must list as a directory")
+				}
+				return
+			}
+		}
+		t.Error("an EnsureDir'd empty directory must appear in its parent listing")
+	}},
+
+	{"list of an empty directory is empty, not an error", func(t *testing.T, tr Transport, root string, stage func(string, string) string) {
+		d := root + "/emptylist"
+		if err := tr.EnsureDir(d); err != nil {
+			t.Fatalf("EnsureDir: %v", err)
+		}
+		nodes, err := tr.List(d)
+		if err != nil {
+			t.Fatalf("an empty listing must not be an error: %v", err)
+		}
+		if len(nodes) != 0 {
+			t.Errorf("want an empty listing, got %d nodes", len(nodes))
+		}
+	}},
+}
+
+// runContract executes the table against one implementation. root must already
+// exist and be empty; stage writes a local file under a given basename.
+func runContract(t *testing.T, newTransport func(t *testing.T) (Transport, string)) {
+	for _, c := range contractCases {
+		t.Run(c.name, func(t *testing.T) {
+			tr, root := newTransport(t)
+			dir := t.TempDir()
+			stage := func(name, content string) string {
+				p := filepath.Join(dir, name)
+				if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return p
+			}
+			c.run(t, tr, root, stage)
+		})
+	}
+}
+
+func TestContractFake(t *testing.T) {
+	runContract(t, func(t *testing.T) (Transport, string) {
+		f := NewFake()
+		root := "/r"
+		if err := f.EnsureDir(root); err != nil {
+			t.Fatal(err)
+		}
+		return f, root
+	})
+}
+
+func TestContractCLI(t *testing.T) {
+	if os.Getenv(liveEnv) == "" {
+		// LOUD, never silent. Stage 2.1 had a guard rot into a no-op skip,
+		// and a silent skip in the table that exists to prevent silent drift
+		// would be self-defeating.
+		t.Skipf("SKIPPING THE LIVE HALF of the Transport contract table. "+
+			"The *Fake half ran; *CLI did not, so fake/real drift is NOT covered by this run. "+
+			"Set %s=1 to run it. It writes only under %s and trashes that root afterwards.",
+			liveEnv, liveRoot)
+	}
+	runContract(t, func(t *testing.T) (Transport, string) {
+		c := NewCLI("")
+		v, err := c.Version()
+		if err != nil {
+			t.Fatalf("the live half needs a working proton-drive: %v", err)
+		}
+		if !IsCertified(v) {
+			t.Fatalf("live half refuses an uncertified CLI: got %q, certified is %s", v, CertifiedCLI)
+		}
+		// A per-test root so cases cannot see each other's nodes.
+		root := liveRoot + "/" + strings.ReplaceAll(t.Name(), "/", "_")
+		if err := c.EnsureDir(liveRoot); err != nil {
+			t.Fatalf("EnsureDir %s: %v", liveRoot, err)
+		}
+		if err := c.EnsureDir(root); err != nil {
+			t.Fatalf("EnsureDir %s: %v", root, err)
+		}
+		t.Cleanup(func() {
+			if out, err := c.Trash(root); err != nil {
+				t.Errorf("CLEANUP FAILED for %s (outcome %s): %v — remove it by hand", root, out, err)
+			}
+		})
+		return c, root
+	})
+}
