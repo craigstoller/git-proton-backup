@@ -1470,3 +1470,157 @@ func TestPushTagOnlyLeavesRepoHeadless(t *testing.T) {
 		t.Error("a tag-only push must not write HEAD")
 	}
 }
+
+// emptyGitRepo returns a repo with NO commits.
+//
+// It exists because newGitRepoForPush builds an identical commit every time —
+// same content "one", same message "c1", same author — and a git commit sha
+// covers the author and committer timestamps at one-second resolution. Two
+// such repos created inside the same second get the SAME sha, so a "fetch into
+// a repo that lacks the objects" test would silently be fetching into a repo
+// that already has them: RevListNewObjects returns nothing, Fetch returns
+// ("", nil), and the test fails for a reason unrelated to the code under test.
+// Flaky by the clock, which is worse than simply wrong.
+func emptyGitRepo(t *testing.T) string {
+	t.Helper()
+	d := t.TempDir()
+	for _, a := range [][]string{
+		{"init", "-qb", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"},
+	} {
+		if err := exec.Command("git", append([]string{"-C", d}, a...)...).Run(); err != nil {
+			t.Fatalf("git %v: %v", a, err)
+		}
+	}
+	return d
+}
+
+// plantRepoOnFake pushes a real repo's history into a Fake as a v2 remote:
+// marker, refs, and one pack pair under packs/.
+func plantRepoOnFake(t *testing.T, f *transport.Fake, root, gitDir, sha string) {
+	t.Helper()
+	if err := Bootstrap(f, root); err != nil {
+		t.Fatal(err)
+	}
+	packPath, idxPath, err := gitcmd.WritePack(gitDir, sha, nil, t.TempDir())
+	if err != nil || packPath == "" {
+		t.Fatalf("WritePack: %v", err)
+	}
+	for _, p := range []string{packPath, idxPath} {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.Files[root+"/packs/"+filepath.Base(p)] = b
+	}
+	if _, err := WriteRef(f, root, "refs/heads/main", sha, false); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// RED. Fetch does not exist. Real git on both ends, the Fake in between.
+func TestFetchInstallsTheClosure(t *testing.T) {
+	src := newGitRepoForPush(t)
+	sha := headOfPushRepo(t, src)
+	f := transport.NewFake()
+	plantRepoOnFake(t, f, "/r", src, sha)
+
+	dst := emptyGitRepo(t) // genuinely lacks src's objects — see emptyGitRepo
+	keep, err := Fetch(f, "/r", dst, []string{sha})
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if keep == "" {
+		t.Fatal("a fetch that installs objects must return a .keep path")
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Errorf(".keep must exist on disk: %v", err)
+	}
+	if !gitcmd.HasObject(dst, sha) {
+		t.Error("the wanted object must be present after a fetch")
+	}
+}
+
+// RED. A second fetch of the same want installs nothing — this is what
+// --not --all buys, and without it every fetch reinstalls all of history.
+func TestFetchIsIdempotentAndInstallsNothingWhenUpToDate(t *testing.T) {
+	src := newGitRepoForPush(t)
+	sha := headOfPushRepo(t, src)
+	f := transport.NewFake()
+	plantRepoOnFake(t, f, "/r", src, sha)
+
+	dst := emptyGitRepo(t)
+	if _, err := Fetch(f, "/r", dst, []string{sha}); err != nil {
+		t.Fatalf("first fetch: %v", err)
+	}
+	keep, err := Fetch(f, "/r", dst, []string{sha})
+	if err != nil {
+		t.Fatalf("second fetch: %v", err)
+	}
+	if keep != "" {
+		t.Errorf("an up-to-date fetch must install nothing, got keep %q", keep)
+	}
+}
+
+// RED. A corrupt remote pack must be fatal, and must leave the local store
+// untouched — fetch is the one path that can damage the user's own repo.
+func TestFetchRejectsACorruptPackAndInstallsNothing(t *testing.T) {
+	src := newGitRepoForPush(t)
+	sha := headOfPushRepo(t, src)
+	f := transport.NewFake()
+	plantRepoOnFake(t, f, "/r", src, sha)
+
+	for name, b := range f.Files {
+		if strings.HasSuffix(name, ".pack") {
+			c := append([]byte(nil), b...)
+			c[len(c)/2] ^= 0xff
+			f.Files[name] = c
+		}
+	}
+
+	dst := emptyGitRepo(t)
+	before := countInstalledPackFiles(t, dst)
+	if _, err := Fetch(f, "/r", dst, []string{sha}); err == nil {
+		t.Fatal("a corrupt remote pack must be fatal")
+	}
+	if got := countInstalledPackFiles(t, dst); got != before {
+		t.Errorf("a failed fetch must install nothing: pack count %d -> %d", before, got)
+	}
+}
+
+// RED. Fetch is read-only: no marker means refuse, never initialise.
+func TestFetchRefusesAnUnmarkedRemote(t *testing.T) {
+	f := transport.NewFake()
+	if err := f.EnsureDir("/r"); err != nil {
+		t.Fatal(err)
+	}
+	dst := emptyGitRepo(t)
+	if _, err := Fetch(f, "/r", dst, []string{"1111111111111111111111111111111111111111"}); err == nil {
+		t.Error("fetch must refuse a folder with no marker, not initialise it")
+	}
+	if _, ok := f.Files["/r/gpb-remote.json"]; ok {
+		t.Error("fetch must never create a marker")
+	}
+}
+
+// countInstalledPackFiles reports how many .pack files exist under gitDir's
+// OWN .git/objects/pack — the real, installed object store, as opposed to
+// countPackFiles above, which counts what a Fake holds under a remote root's
+// packs/. Named distinctly because both exist in this file for different
+// purposes: this one proves what Fetch actually installed locally.
+func countInstalledPackFiles(t *testing.T, gitDir string) int {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(gitDir, ".git", "objects", "pack"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0
+		}
+		t.Fatal(err)
+	}
+	n := 0
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".pack") {
+			n++
+		}
+	}
+	return n
+}
