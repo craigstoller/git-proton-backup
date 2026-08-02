@@ -1027,6 +1027,12 @@ git commit -m "feat(v2): complete a missing remote HEAD on push"
 
 ## Task 5 — fetch orchestration
 
+> **SUPERSEDED IN THREE PLACES BY EXECUTION (2026-08-02). The shipped `internal/repo/fetch.go` is authoritative over this section's code blocks.** Review found, and the fix rounds corrected, three defects in the code below — do not re-implement from this text:
+>
+> 1. **`Fetch` needs a presence-based short-circuit before touching the remote** (`ConnectivityOK(gitDir, "", wants)` → up to date). `RevListNewObjects`' `--not --all` excludes by REF-reachability, not store presence, and `Fetch` never writes refs — so without the short-circuit a second fetch before git updates refs reconsolidates the full history every time. This also implements the parent design's resume-safety clause.
+> 2. **The install path must come from `rev-parse --git-path objects/pack`, NOT `--git-dir` + join.** In a linked worktree `--git-dir` answers with the per-worktree ADMIN dir, which has no object store — the pack lands where git never looks, and `connectivity-ok` then makes git update refs to invisible objects. Fail-open.
+> 3. **`consolidateAndInstall` must not exec `pack-objects` itself** — that exec site lacked `WaitDelay` and the `ErrWaitDelay` guard. It routes through `gitcmd.PackObjectsFromList`, which `WritePack` also uses.
+
 **Files:**
 - Create: `internal/repo/fetch.go`
 - Modify: `internal/repo/repo_test.go`
