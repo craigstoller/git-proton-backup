@@ -54,6 +54,17 @@ func run() int {
 	os.Unsetenv("GIT_DIR")
 
 	t := transport.NewCLI("")
+	// Advisory only, and a knowing deviation from the design's "refuse to
+	// run" rule: a hard allowlist is a Stage 4 policy decision, because it
+	// breaks the user's tooling the day Proton ships a new build. But a
+	// silent behaviour change across CLI versions is what broke v1, so the
+	// mismatch is at least made visible. stderr, never stdout.
+	if v, err := t.Version(); err != nil {
+		warn(fmt.Errorf("could not determine the Proton CLI version: %w", err))
+	} else if !transport.IsCertified(v) {
+		warn(fmt.Errorf("Proton CLI reports %q but the transport contract is certified "+
+			"against %s; behaviour may differ", v, transport.CertifiedCLI))
+	}
 	in := bufio.NewScanner(os.Stdin)
 	out := bufio.NewWriter(os.Stdout)
 	defer out.Flush()
