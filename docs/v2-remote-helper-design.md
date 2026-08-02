@@ -293,7 +293,7 @@ directly. An earlier revision of this document attributed the 0.7.0 behaviour to
 0.7.0 is the current release, the hazard is real for the version users would install, which
 makes read-back verification more important rather than less. So `UpdateRevision` is not guaranteed to create a revision, and the decision is made from a digest Proton itself flags `sha1Verified: false`. Every mutable write is therefore followed by `ReadTo` and a byte comparison; equality by claimed digest is never accepted as proof. This is the one place the design cannot trust its transport, and it is why `Ambiguous` exists as a first-class outcome.
 
-**Immutable objects** (packs, indexes) use `CreateExclusive`. `Refused` there means only that **the name is already taken** — it is not evidence about the bytes behind it. It becomes success once Push's reconciliation rule has compared the remote member against the candidate and verified the pair; it is never success on the strength of the refusal alone.
+**Immutable objects** (packs, indexes) use `CreateExclusive`. `Refused` there means only that **the name is already taken** — it is not evidence about the bytes behind it, and it is never success on the strength of the refusal alone. It becomes success only after Push's reconciliation rule, which differs by member: a `.pack` is compared byte-for-byte against the candidate, because its name is its content checksum; a `.idx` is not, because its name is borrowed from its pack and more than one valid index can carry it. See Push for the full rule.
 
 ## Concurrency posture
 
@@ -416,7 +416,7 @@ This conformance is **Stage 2/3 work**, not Stage 4 — it is a correctness prop
 | Tag update | Requires force, matching git's rule; no ancestry check |
 | `refs/notes/*`, `refs/replace/*`, other valid namespaces | **NOT IMPLEMENTED IN STAGE 2 — rejected outright with a named reason.** See the v6.1 note below; the rule as written here is unimplementable while `ListRefs` is non-recursive |
 | Pseudorefs and unsupported destinations | Explicit rejection with a named reason |
-| First push to empty remote | Write the marker, then `HEAD` per the deterministic rules below |
+| First push to empty remote | **The marker is already written** — bootstrap creates it at `list for-push`, before the lock, per the normative initialisation ordering. This row previously said the push writes it, which contradicted that ordering. The push's only first-time responsibility is `HEAD`, per the deterministic rules below (deferred past Stage 2) |
 
 **The other-namespace rule is deliberately stricter than git.** Git's push rules are object-type aware outside `refs/heads/*` and `refs/tags/*`: some commit and tag fast-forwards are permitted without force, while tree and blob updates are refused. v2 requires force for any move in those namespaces. That is a **knowing deviation from the "proper git semantics" goal**, taken because the conservative rule cannot silently lose data and the permissive one needs object-type inspection this design has not specified. It is listed as future work rather than presented as equivalent to git.
 
@@ -439,9 +439,15 @@ This conformance is **Stage 2/3 work**, not Stage 4 — it is a correctness prop
 
 **`Stat` is sufficient confirmation only for a `Committed` upload. A `Refused` one must be reconciled, and this is where the design previously contradicted itself.** The transport contract says a refusal on an immutable object is success "after byte verification" — but the publication path specified only `CreateExclusive` then `Stat`, and a `Stat` proves a node exists at that path, nothing about what is in it. A remote `.idx` that is corrupt, truncated, or a legitimately different encoding of the same pack would satisfy it, and v2 would then publish a ref that no future client can fetch. That is precisely the outcome the pack→idx→confirm→ref ordering exists to prevent, so the gap is closed here rather than left to the reader:
 
-- **`Committed`** — `Stat` to confirm presence, and proceed. The bytes are the ones this push just sent.
-- **`Refused`** — download the remote member, and require **all** of: byte equality with the candidate this push built; the pack's recomputed content checksum equal to its basename; index version 2; and `index-pack --verify` passing on the pair. Any failure is fatal for that ref, reported as a corrupt remote object naming the path — **never** worked around by overwriting, because packs are immutable and an overwrite would invalidate every ref already pointing into that pack.
-- **`Ambiguous`** — as everywhere else: unknown, reconcile by reading remote state, never assumed either way.
+**The two members are checked differently, and conflating them produces rules that cannot be satisfied.** A `.pack` is named by its own content checksum; a `.idx` borrows that name and is not addressed by its own bytes. So:
+
+- **`Committed`, either member** — `Stat` to confirm presence, and proceed. The bytes are the ones this push just sent.
+- **`Refused` on the `.pack`** — download it and require **byte equality with the candidate this push built**, plus its recomputed content checksum equal to its basename. Byte equality is the right bar here precisely because the name *is* the content checksum: a matching name that does not match byte-for-byte means corruption or a tampered trailer, which is exactly what this catches.
+- **`Refused` on the `.idx`** — download it and require that it is a **valid index for the already-validated remote pack**, by `index-pack --verify` on the pair. **Do not require byte equality, and do not require version 2.** The v2 pin governs what this helper *writes*, so its own uploads are deterministic; it cannot govern what some other writer put there. Since this document already establishes that two byte-different indexes can legitimately index the same pack, demanding byte equality would make a legitimate remote index fatal — and unrecoverably so, because the object is immutable and cannot be replaced. The property that actually matters is that the remote index correctly indexes the remote pack, not that it matches ours.
+- **`Refused` on the `.pack` with no remote `.idx` present** — not an error. That is an orphan from a writer that crashed between the two uploads, and this push repairs it: the pack is verified as above, then this push's own `.idx` uploads normally and completes the pair. Worth stating because it is easy to lose: a future cleanup that deletes orphan packs would delete the thing this path repairs.
+- **`Ambiguous`, either member** — as everywhere else: unknown, reconcile by reading remote state, never assumed either way.
+
+Any failure of the checks above is fatal for that ref and reported as a corrupt remote object naming the path — **never** worked around by overwriting, because packs are immutable and an overwrite would invalidate every ref already pointing into that pack.
 
 **"One pack" is an assumption about the user's git config, not a guarantee, and v2 must not inherit it silently.** `pack.packSizeLimit` makes `pack-objects` split its output and print *several* names; `pack.compression`, delta and reuse settings change the bytes and therefore the name. Only the Proton CLI is version-pinned by this design — git is whatever the user has, configured however they configured it. So the helper **overrides the settings that would break the invariant on the `pack-objects` command line — `-c pack.packSizeLimit=0` and `--index-version=2` — and treats more than one emitted name as a hard error**. The size override must be the config form: `--max-pack-size=0` is read as *unset*, at which point git falls back to the very `pack.packSizeLimit` being overridden rather than parsing the first line and proceeding. Failing loudly here is cheap; a second pack silently dropped would publish a ref whose objects are half-uploaded, which is the exact failure the pack→idx→confirm→ref ordering exists to prevent.
 
@@ -459,8 +465,12 @@ The helper owns the closure. Git's `fetch` capability is defined as transferring
 
 1. Advertise refs plus `@refs/heads/<branch> HEAD`.
 2. Download `.idx` sidecars not already cached; build an object-to-pack map.
+
+   **The map builder must read every index version Push is willing to accept.** Push deliberately accepts a valid remote `.idx` it did not write, which may be version 1 even though this helper only ever writes version 2 — so a v2-only parser here would accept an index at push time and then be unable to fetch the repository it just wrote to. Build the map with git plumbing rather than a hand-rolled version-specific parser, so the accepted set is git's and cannot drift from it.
 3. Download packs containing wanted objects into a temp area.
 4. **Traverse.** An `.idx` maps object IDs to byte offsets and carries no connectivity data, so the object graph must be walked. Index each downloaded pack into a **temporary object directory** and expose it via `GIT_ALTERNATE_OBJECT_DIRECTORIES`, keeping unverified remote objects out of the real database until closure is proven.
+
+   **The temp directory must have git's own object layout, not a flat one.** An alternate is an *objects* directory, so packs are only found at `<tmp-objects>/pack/pack-<hash>.{pack,idx}`. Dropped flat into `<tmp-objects>/`, git silently does not see them — `rev-list` then reports every object missing, the loop downloads packs it already holds, and the no-progress rule below fires on what looks like a corrupt index mapping. The failure is loud but the cause is not, so the layout is normative rather than an implementation detail.
 
    **The walk uses git plumbing, not a hand-written parser.** `git cat-file --batch` decompresses and identifies objects but does *not* enumerate commit parents, tag targets, or tree entries — an earlier draft claimed it removed the need for a parser, which was wrong. Instead run `git rev-list --objects --missing=print <wants>` against the temp directory: git performs the traversal and reports missing OIDs prefixed with `?`. Feed those back through the object-to-pack map, download, repeat. This also handles gitlinks and malformed objects with git's own semantics rather than reimplemented ones.
 5. **Consolidate the closure into ONE pack, install it, and emit git's single `lock`.** Git's `transport-helper.c` retains only the **first** `lock <path>` response, so a multi-pack install cannot be protected by multiple protocol locks.
@@ -491,16 +501,16 @@ The helper owns the closure. Git's `fetch` capability is defined as transferring
 | `failedItems > 0` with exit code 0 | Treated as failure — never inferred from exit status |
 | Unparseable or unexpected `--json` shape | `Ambiguous`; reconcile against remote state before retry |
 | Mutation timed out after the remote may have committed | `Ambiguous`; read back before any retry |
-| Upload refused where creation was required | Contention, not success |
-| Pack present, `.idx` missing | Ref not published; orphan reported |
+| Upload refused where creation was required | **Depends on the object.** For a *mutable* name — a ref, the marker, the lock — contention, not success. For an *immutable* one — a pack or index — not a verdict at all: it becomes success or failure only after Push's per-member reconciliation |
 | Crash between pack and ref | Orphan pack, inert; retry reconciles first |
 | Ref already at desired sha on retry | Success, not conflict |
 | Missing or unrecognised format marker on a non-empty folder | Hard refusal; never guess |
 | Missing versus empty remote | Distinguished; empty is initialisable, missing is an error |
 | File/folder collision at an expected path | Fatal with the specific path |
 | Malformed ref name or ref-file contents | Fatal; never coerced |
-| Corrupt or mismatched `.pack`/`.idx` | **Both checks, on every downloaded pack, before install; either failure is fatal.** (1) Recompute the pack checksum and compare it to the basename — the name *is* that checksum (v6.2), and this is the only check that proves the file is the one the name claims. (2) `git index-pack --verify` — the only check that proves the pack is internally well-formed and agrees with its index |
-| Pack present, `.idx` missing, or `.idx` present with no pack | Incomplete pair: the ref is not published and the orphan is reported. A pair is only usable when both members are present and both checks above pass |
+| Corrupt or mismatched `.pack`/`.idx` | **Two checks, each run as early as it can be and always before the data it validates is trusted; either failure is fatal.** (1) **Checksum against basename**, immediately on downloading a `.pack` — it needs nothing else, and it is the only check proving the file is the one the name claims. (2) **`git index-pack --verify` on the pair**, as soon as both members are local — it is the only check proving the pack is well-formed and agrees with its index, and it necessarily cannot run on a member that arrives alone. Note fetch downloads `.idx` sidecars first, before their packs: that is permitted, because the lone index is used only to *plan* which packs to fetch, never as a source of truth about objects. **No object from a pack may be trusted until both checks have passed for that pack.** "Before install" would be the wrong gate — fetch never installs the downloaded packs, it consolidates them into a new one |
+| Pack present, `.idx` missing | Incomplete pair — the ref is not published. **Not necessarily an error to be reported and left:** a push that finds its own pack already there with no index completes the pair, repairing the orphan (see Push). Reported only when this push is not the one that can repair it |
+| `.idx` present with no pack | Incomplete pair, and the unrepairable direction — an index cannot be validated without its pack, and v2 never overwrites an immutable name. Reported, ref not published |
 | Valid `.pack`/`.idx` pair no ref points at | Orphan from a crash between upload and publication. Inert and left in place — v2 never deletes a pack, and collection waits for the compaction milestone |
 | Fetch made no progress in a round | Fatal — see Termination |
 | Incomplete closure after import | Fatal; fetch never reports success |
@@ -603,9 +613,25 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   it and treat multiple emitted names as a hard error. **Stage 2's shipped code does neither**,
   and neither does it reconcile a `Refused` upload — it `Stat`s. Those three are Stage 3 work,
   recorded so they are not mistaken for shipped behaviour.
-- Forcing one unlimited pack is now stated as a trade with an **unmeasured ceiling** — a
-  repository larger than local temp disk or Proton's biggest accepted file becomes unpushable
-  and unclonable. Certifying that bound is a Stage 4 item.
+- Forcing one unlimited pack is now stated as a trade with an **unmeasured ceiling**, and the
+  push and clone directions bind differently — a push is capped by Proton's largest accepted
+  upload as well as local disk, a clone by local disk alone. Certifying both bounds is a Stage 4
+  item.
+- **A second engine (Gemini) then found what three rounds of the first had not**, including one
+  contradiction those rounds had *caused*: the `Refused` reconciliation demanded byte equality on
+  the `.idx`, while the storage layout says in as many words that two byte-different indexes can
+  legitimately index the same pack. A legitimate remote index would therefore have been fatal —
+  and unrecoverably so, since the object is immutable. The rule is now split by member: byte
+  equality for the `.pack`, whose name *is* its content checksum, and validity-against-that-pack
+  for the `.idx`, whose name is borrowed. The same round found the check list was unsatisfiable
+  as written (index-version and pair checks applied to a refused *pack*, which may have no remote
+  index yet), that a refused pack with no remote index is an **orphan this push repairs** rather
+  than an error, that the error table's "before install" was wrong because fetch never installs
+  downloaded packs, that the ref-transition table still had the push writing the marker after v5
+  moved that to bootstrap, and that an alternate object directory must carry git's `pack/`
+  layout or the traversal silently sees nothing. Recorded because it is the clearest evidence on
+  this project for why the second engine exists: the two engines' misses were not the same
+  misses.
 - **Timing kept this cheap.** No Stage 3 code had been written against the old rule. A pack in
   the shipped naming did exist on the account during the Stage 2 gate, but that demo remote was
   trashed and no repository retains the old layout — so this is a correction, not a migration.
