@@ -97,6 +97,19 @@
         "raisedBy": "Task 4 review (cannot-verify item)"
       }
     },
+    "C15": {
+      "question": "Is `filesystem list` immediately consistent after a `trash`, or can it return a node that no longer exists?",
+      "answer": "IT CAN BE STALE. Immediately after trashing /my-files/GitRemotes, `list /my-files` still returned it while `info /my-files/GitRemotes` reported `Node not found` on the same machine seconds apart; a second `list` moments later showed only the four real folders. INFO IS AUTHORITATIVE; LIST IS NOT. Observed direction is DELETION staleness only - nothing here establishes whether `list` can also OMIT a just-created node, which is the direction that would hurt fetch discovery, and no probe covers it.",
+      "evidence": {
+        "listAfterTrashIncludedTrashedNode": true,
+        "infoAfterTrashSaidNotFound": true,
+        "secondListWasCorrect": true,
+        "authoritative": "info",
+        "untestedDirection": "creation staleness (does list ever omit a node that exists?)",
+        "reachableToday": "YES, not only in Stage 3. `git push proton-v2 :main` then a fresh push: ListRefs lists refs/heads, a stale entry names a ref whose node is gone, readRef's download fails, and the push aborts with what reads like remote corruption. Bootstrap's emptiness test has the mirror exposure - a stale entry makes an initialisable folder look non-empty. Both fail closed and both self-heal on retry.",
+        "raisedBy": "Stage 2.1 Task 4 cleanup verification (controller)"
+      }
+    },
     "C10": {
       "question": "What are the exact bytes of an EMPTY folder listing? (C6 established exit 0 + zero elements, but not the raw shape)",
       "answer": "`[\\r\\n\\r\\n]\\r\\n` - 8 bytes, exit 0. It is NOT empty output: a TrimSpace-is-empty guard never fires. An empty listing is valid JSON and parses to a zero-element array on the normal path. C6's `emptyRawLen: 6` was the same shape measured without the trailing CRLF.",

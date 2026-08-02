@@ -138,10 +138,22 @@ func Bootstrap(t transport.Transport, root string) error {
 	}
 	defer cleanup()
 
-	switch out, err := t.CreateExclusive(marker, staged); {
-	case err != nil:
+	out, err := t.CreateExclusive(marker, staged)
+	if err != nil {
 		return err
-	case out == transport.Refused:
+	}
+	// A value switch with an explicit arm per constant, not a boolean switch
+	// with two `out == ...` cases: the boolean form has no way to express
+	// "anything else", so an unrecognised Outcome fell through and was treated
+	// as Committed — the repo adopted as initialised on the strength of a
+	// value nobody recognised. Zero risk today, since Outcome is a closed
+	// three-constant set in this module, but publishPack and publishIdx are
+	// already guarded this way and leaving the same exposure here would make
+	// the pattern advisory rather than the rule.
+	switch out {
+	case transport.Committed:
+		// Our marker landed; ensureSubdirs below finishes initialisation.
+	case transport.Refused:
 		// A concurrent initialiser won. Adopting their repo means adopting
 		// THEIR marker, so it gets the same validation the marker-present
 		// path above applies — a racing writer from a future build that
@@ -149,8 +161,11 @@ func Bootstrap(t transport.Transport, root string) error {
 		if err := checkMarker(t, marker); err != nil {
 			return err
 		}
-	case out == transport.Ambiguous:
+	case transport.Ambiguous:
 		return fmt.Errorf("marker creation ambiguous for %s; re-run to reconcile", root)
+	default:
+		return fmt.Errorf("marker creation for %s returned an unrecognised outcome %s; "+
+			"refusing to guess whether this folder is an initialised repo", root, out)
 	}
 	return ensureSubdirs(t, root)
 }

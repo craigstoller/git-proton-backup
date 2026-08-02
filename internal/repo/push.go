@@ -1,8 +1,13 @@
 package repo
 
 import (
+	"bytes"
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/craigstoller/git-proton-backup/internal/gitcmd"
@@ -140,21 +145,17 @@ func pushOne(t transport.Transport, root, gitDir string,
 
 	if packPath != "" {
 		// Pack, then index, then CONFIRM BOTH before publishing the ref.
-		for _, f := range []string{packPath, idxPath} {
-			dst := root + "/packs/" + filepathBase(f)
-			out, err := t.CreateExclusive(dst, f)
-			if err != nil {
-				return fail("upload failed: " + err.Error())
-			}
-			if out == transport.Ambiguous {
-				return fail("upload outcome ambiguous; re-run to reconcile")
-			}
-			// Refused here means identical content already exists (pack/idx
-			// filenames are content-addressed) — that is success after
-			// presence verification, not an error.
-			if _, ok, _ := t.Stat(dst); !ok {
-				return fail("uploaded object is not readable back: " + dst)
-			}
+		// Confirmation is per member: a .pack is named by its own content
+		// checksum, a .idx borrows that name, so they cannot be checked the
+		// same way (design v6.2).
+		packDst := root + "/packs/" + filepathBase(packPath)
+		idxDst := root + "/packs/" + filepathBase(idxPath)
+
+		if err := publishPack(t, packDst, packPath); err != nil {
+			return fail(err.Error())
+		}
+		if err := publishIdx(t, idxDst, idxPath, packPath); err != nil {
+			return fail(err.Error())
 		}
 	}
 
@@ -246,4 +247,289 @@ func filepathBase(p string) string {
 		}
 	}
 	return p
+}
+
+// confirmPresent is the Committed path: the bytes are the ones we just sent,
+// so presence is all that remains to check.
+func confirmPresent(t transport.Transport, dst, what string) error {
+	if _, ok, err := t.Stat(dst); err != nil {
+		return fmt.Errorf("%s presence check failed: %w", what, err)
+	} else if !ok {
+		return fmt.Errorf("uploaded %s is not readable back: %s", what, dst)
+	}
+	return nil
+}
+
+// publishPack uploads a pack and confirms it. A Refused upload is NOT success
+// on the strength of the refusal: Stat proves a node exists at that path, not
+// what is in it, so a corrupt or truncated remote pack would otherwise be
+// accepted and a ref published that no client can ever fetch.
+func publishPack(t transport.Transport, dst, local string) error {
+	out, err := t.CreateExclusive(dst, local)
+	if err != nil {
+		return fmt.Errorf("pack upload failed: %w", err)
+	}
+	switch out {
+	case transport.Ambiguous:
+		// Reconciliation happens on the retry: the next run's CreateExclusive
+		// returns Refused and takes the verification path below. Reporting
+		// failure now is the fail-closed answer for THIS push.
+		return fmt.Errorf("pack upload outcome ambiguous; re-run to reconcile")
+	case transport.Committed:
+		return confirmPresent(t, dst, "pack")
+	case transport.Refused:
+		// Falls out of the switch into the verification path below — this is
+		// the safety-critical branch the whole task exists for, so it is
+		// named explicitly rather than left as an implicit fall-through.
+	default:
+		return fmt.Errorf("pack upload returned an unrecognised outcome %s; "+
+			"refusing to guess whether it is safe to publish", out)
+	}
+
+	dir, err := os.MkdirTemp("", "gpb-verify-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	if err := t.ReadTo(dst, dir); err != nil {
+		return fmt.Errorf("cannot read back the existing pack %s: %w", dst, err)
+	}
+	remote := filepath.Join(dir, filepathBase(dst))
+
+	same, err := filesEqual(remote, local)
+	if err != nil {
+		return fmt.Errorf("cannot compare the existing pack %s: %w", dst, err)
+	}
+	if !same {
+		return fmt.Errorf("remote pack %s has the same name but different bytes; "+
+			"it is corrupt or was written by something else, and an immutable "+
+			"object is never overwritten", dst)
+	}
+	return checkIdenticalPackChecksum(remote, dst)
+}
+
+// checkIdenticalPackChecksum is the last step of publishPack's Refused path,
+// and it is reached ONLY after filesEqual has proven the remote pack
+// byte-identical to the local one. That fact changes the diagnosis
+// completely, which is why this is a separate function with its own messages
+// rather than a shared checksum check.
+//
+// If these bytes do not hash to the name they are stored under, then BOTH
+// copies fail to — the remote one is an exact copy of what is on this
+// machine's disk. So the fault is that our own local git mis-named its own
+// output; the remote file is not corrupt and there is nothing to repair
+// there. The generic message ("this file is not what its name claims",
+// naming the remote path) pointed the operator at their live paid account to
+// remediate a file that is byte-for-byte what they already hold locally.
+// That is the same class as the fail-closed-path-with-a-misdirecting-
+// diagnosis finding from fix round 1, one step further down this function.
+func checkIdenticalPackChecksum(local, dst string) error {
+	const bothIdentical = "the remote pack %s is byte-identical to the pack git just built " +
+		"locally, so both copies are the same bytes and this is a LOCAL problem: "
+	got, err := packContentChecksum(local)
+	if err != nil {
+		return fmt.Errorf(bothIdentical+"its content checksum could not be recomputed (%v). "+
+			"Do not trash or replace the remote copy — it is not the faulty artifact", dst, err)
+	}
+	if want := packNameChecksum(filepathBase(dst)); got != want {
+		return fmt.Errorf(bothIdentical+"both recompute to %s rather than the %s their shared "+
+			"name claims, which means the local git that produced this pack mis-named its own "+
+			"output. Do not trash or replace the remote copy — it is not the faulty artifact",
+			dst, got, want)
+	}
+	return nil
+}
+
+// publishIdx uploads an index and confirms it. A Refused index is deliberately
+// NOT byte-compared: its name is borrowed from its pack, more than one valid
+// index can carry that name, and the v2 pin governs what WE write rather than
+// what another writer left there. Demanding byte equality would make a
+// legitimate remote index permanently fatal, since it cannot be replaced.
+// What matters is that it indexes the pack correctly.
+//
+// Verification runs against the LOCAL pack, not a second download. This is
+// safe on either path publishPack can have taken: on Committed, we uploaded
+// those exact bytes ourselves — confirmPresent only re-checks presence, but
+// the content was never in question because we just wrote it; on Refused,
+// publishPack has explicitly byte-compared the remote pack against the local
+// one and found them identical. Either way the remote pack is known to equal
+// the local pack, so downloading it a second time here to verify against
+// itself buys nothing — and packs can be gigabytes.
+func publishIdx(t transport.Transport, dst, local, localPack string) error {
+	out, err := t.CreateExclusive(dst, local)
+	if err != nil {
+		return fmt.Errorf("index upload failed: %w", err)
+	}
+	switch out {
+	case transport.Ambiguous:
+		return fmt.Errorf("index upload outcome ambiguous; re-run to reconcile")
+	case transport.Committed:
+		return confirmPresent(t, dst, "index")
+	case transport.Refused:
+		// Falls out of the switch into the verification path below — the
+		// same explicit-branch treatment as publishPack above.
+	default:
+		return fmt.Errorf("index upload returned an unrecognised outcome %s; "+
+			"refusing to guess whether it is safe to publish", out)
+	}
+
+	dir, err := os.MkdirTemp("", "gpb-verify-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	if err := t.ReadTo(dst, dir); err != nil {
+		return fmt.Errorf("cannot read back the existing index %s: %w", dst, err)
+	}
+	// index-pack --verify needs the pair adjacent under one stem.
+	packSide := filepath.Join(dir, filepathBase(localPack))
+	if err := linkOrCopy(localPack, packSide); err != nil {
+		return err
+	}
+	if err := gitcmd.IndexPackVerify(packSide); err != nil {
+		return fmt.Errorf("remote index %s does not verify against its pack: %w", dst, err)
+	}
+	return nil
+}
+
+// filesEqual streams both files. Packs can be gigabytes; never read one whole.
+func filesEqual(a, b string) (bool, error) {
+	fa, err := os.Open(a)
+	if err != nil {
+		return false, err
+	}
+	defer fa.Close()
+	fb, err := os.Open(b)
+	if err != nil {
+		return false, err
+	}
+	defer fb.Close()
+
+	sa, err := fa.Stat()
+	if err != nil {
+		return false, err
+	}
+	sb, err := fb.Stat()
+	if err != nil {
+		return false, err
+	}
+	if sa.Size() != sb.Size() {
+		return false, nil
+	}
+	return readersEqual(fa, fb)
+}
+
+// isCleanEOF reports whether e is io.ReadFull's normal end-of-stream signal
+// (io.EOF with nothing read this call, or io.ErrUnexpectedEOF with a short
+// final read) rather than a genuine I/O failure.
+func isCleanEOF(e error) bool { return e == io.EOF || e == io.ErrUnexpectedEOF }
+
+// readersEqual streams ra and rb 64KiB at a time and reports whether their
+// content is identical. Split out of filesEqual so the read loop's error
+// handling can be driven directly with a synthetic io.Reader in tests: a
+// genuine (non-EOF) I/O error is not reliably reproducible by opening real
+// files portably (Windows and POSIX fail mid-read very differently, if at
+// all, for the same fault), whereas a fake reader can return a canned error
+// deterministically on any platform. This is the exact loop filesEqual uses.
+//
+// Error checks run BEFORE the length/content comparison — this was fix-round
+// 1's finding: a short read carrying a genuine (non-EOF) error must surface
+// as that error, never as a false "the bytes differ". publishPack turns a
+// "not equal" result into a permanent, unrecoverable remote-corruption
+// diagnosis ("an immutable object is never overwritten"); a transient local
+// read failure must never produce that diagnosis. The clean-EOF case is
+// unchanged: equal-size inputs reach EOF/ErrUnexpectedEOF on the same
+// iteration (io.ReadFull requests the same 64KiB from both, and the sizes
+// were already confirmed equal by the caller), a zero-byte pair returns true
+// on the very first pass, and the loop only ever exits by one of the three
+// explicit returns below, never open-ended.
+func readersEqual(ra, rb io.Reader) (bool, error) {
+	ba, bb := make([]byte, 64*1024), make([]byte, 64*1024)
+	for {
+		na, ea := io.ReadFull(ra, ba)
+		nb, eb := io.ReadFull(rb, bb)
+
+		if ea != nil && !isCleanEOF(ea) {
+			return false, ea
+		}
+		if eb != nil && !isCleanEOF(eb) {
+			return false, eb
+		}
+		if na != nb || !bytes.Equal(ba[:na], bb[:nb]) {
+			return false, nil
+		}
+		if isCleanEOF(ea) && isCleanEOF(eb) {
+			return true, nil
+		}
+	}
+}
+
+// packContentChecksum recomputes a pack's content hash. git hashes every byte
+// EXCEPT the trailing 20, and stores the result in those 20 — so this is what
+// the basename is supposed to be, and it proves the body is what the name
+// claims. It cannot detect a change confined to the trailer itself; the byte
+// comparison in publishPack and index-pack --verify are what cover that.
+//
+// SHA-1 only: this design supports SHA-1 repositories, and refs.go rejects
+// anything that is not 40 hex.
+//
+// It returns a digest, never a verdict, and it never names a remote path. The
+// CALLER composes the failure message, because on the one path that reaches
+// it the correct diagnosis is not the obvious one — see
+// checkIdenticalPackChecksum.
+func packContentChecksum(path string) (string, error) {
+	const trailer = 20
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	if st.Size() < trailer {
+		return "", fmt.Errorf("it is %d bytes, shorter than the %d-byte trailing checksum "+
+			"every pack ends with", st.Size(), trailer)
+	}
+	h := sha1.New()
+	if _, err := io.CopyN(h, f, st.Size()-trailer); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// packNameChecksum is the content checksum a pack's basename claims to be.
+func packNameChecksum(base string) string {
+	return strings.TrimSuffix(strings.TrimPrefix(base, "pack-"), ".pack")
+}
+
+// linkOrCopy places src at dst, preferring a hard link so a large pack is not
+// duplicated on disk just to sit beside an index for verification.
+func linkOrCopy(src, dst string) error {
+	if err := os.Link(src, dst); err == nil {
+		return nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	// Closed EXACTLY ONCE on each path, with no `defer out.Close()` alongside.
+	// There used to be both: the deferred call fired second, got os.ErrClosed,
+	// and discarded it. Harmless as long as the defer stays bare — and a
+	// silent breakage the moment someone adds error handling to it, at which
+	// point every successful copy would start reporting "file already closed".
+	// The explicit form is kept rather than the deferred one because Close's
+	// error is worth returning: on a filesystem that defers write errors it is
+	// the only place a failed flush surfaces at all.
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close() // best effort; the copy error is the one worth reporting
+		return err
+	}
+	return out.Close()
 }

@@ -1,8 +1,12 @@
 package gitcmd
 
 import (
+	"bytes"
+	"crypto/rand"
+	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -171,4 +175,124 @@ func TestWritePack(t *testing.T) {
 			t.Fatalf("want empty paths when there is nothing to send, got pack=%q idx=%q", packPath, idxPath)
 		}
 	})
+}
+
+// bigRepo builds a repo with enough INCOMPRESSIBLE data to exceed git's
+// minimum pack-size limit. git clamps pack.packSizeLimit to 1 MiB, so a small
+// repo cannot demonstrate the pin at all — the first draft of this test set
+// 512 bytes and proved nothing.
+func bigRepo(t *testing.T) string {
+	t.Helper()
+	d := newRepo(t)
+	for i := 0; i < 4; i++ {
+		buf := make([]byte, 1<<20) // 1 MiB, random => no compression
+		if _, err := rand.Read(buf); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, fmt.Sprintf("blob%d.bin", i)), buf, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, a := range [][]string{{"add", "."}, {"commit", "-qm", "big"}} {
+		if err := exec.Command("git", append([]string{"-C", d}, a...)...).Run(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return d
+}
+
+func countPacks(t *testing.T, dir string) int {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".pack") {
+			n++
+		}
+	}
+	return n
+}
+
+// RED. Without the -c pack.packSizeLimit=0 pin, a configured limit splits the
+// output and WritePack's single-name parse produces a path that does not exist.
+func TestWritePackIgnoresAHostilePackSizeLimit(t *testing.T) {
+	d := bigRepo(t)
+	head := headOf(t, d)
+	if err := exec.Command("git", "-C", d, "config", "pack.packSizeLimit", "1m").Run(); err != nil {
+		t.Fatal(err)
+	}
+	out := t.TempDir()
+	packPath, _, err := WritePack(d, head, nil, out)
+	if err != nil {
+		t.Fatalf("WritePack must survive a configured packSizeLimit: %v", err)
+	}
+	if packPath == "" {
+		t.Fatal("expected a pack")
+	}
+	if got := countPacks(t, out); got != 1 {
+		t.Errorf("want exactly 1 pack despite packSizeLimit, got %d", got)
+	}
+}
+
+// RED. Without --index-version=2, a configured pack.indexVersion=1 wins.
+func TestWritePackPinsIndexVersion2(t *testing.T) {
+	d := newRepo(t)
+	head := headOf(t, d)
+	if err := exec.Command("git", "-C", d, "config", "pack.indexVersion", "1").Run(); err != nil {
+		t.Fatal(err)
+	}
+	out := t.TempDir()
+	_, idxPath, err := WritePack(d, head, nil, out)
+	if err != nil {
+		t.Fatalf("WritePack: %v", err)
+	}
+	raw, err := os.ReadFile(idxPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A v2 index starts with the magic \377tOc then a 4-byte version 2.
+	// A v1 index has no magic at all — it starts straight into the fanout.
+	want := []byte{0xff, 0x74, 0x4f, 0x63, 0, 0, 0, 2}
+	if len(raw) < 8 || !bytes.Equal(raw[:8], want) {
+		t.Errorf("idx does not start with the v2 header; got % x", raw[:min(8, len(raw))])
+	}
+}
+
+// RED. IndexPackVerify does not exist yet.
+func TestIndexPackVerifyAcceptsGoodPairRejectsCorrupt(t *testing.T) {
+	d := newRepo(t)
+	head := headOf(t, d)
+	out := t.TempDir()
+	packPath, idxPath, err := WritePack(d, head, nil, out)
+	if err != nil || packPath == "" {
+		t.Fatalf("WritePack: %v", err)
+	}
+	if err := IndexPackVerify(packPath); err != nil {
+		t.Fatalf("a freshly written pair must verify: %v", err)
+	}
+
+	// Same index, a pack corrupted in its body.
+	bad := t.TempDir()
+	raw, err := os.ReadFile(packPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[len(raw)/2] ^= 0xff
+	badPack := filepath.Join(bad, filepath.Base(packPath))
+	if err := os.WriteFile(badPack, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	idxRaw, err := os.ReadFile(idxPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bad, filepath.Base(idxPath)), idxRaw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := IndexPackVerify(badPack); err == nil {
+		t.Error("a corrupted pack must not verify")
+	}
 }

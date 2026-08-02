@@ -1,5 +1,7 @@
 package transport
 
+import "fmt"
+
 // Outcome is what a mutation is known to have done. A NON-NIL ERROR ALWAYS
 // DOMINATES THE OUTCOME: every method here returns (Outcome, error), and the
 // Outcome is meaningful only when err == nil. Implementations return Ambiguous
@@ -14,14 +16,25 @@ const (
 	Ambiguous                // unknown; MUST be reconciled by reading remote state
 )
 
+// String names the outcome. An UNKNOWN value must not render as any of the
+// three real ones — least of all "ambiguous", which used to be the default
+// arm. Every caller that prints an Outcome does so precisely because it did
+// not recognise the value: repo.publishPack and repo.publishIdx say "upload
+// returned an unrecognised outcome %s", and with the old default that read
+// "an unrecognised outcome ambiguous", which is self-contradictory and hides
+// the very thing the message exists to report. lock.Release's "Trash reported
+// %s" and pushOne's "delete failed: outcome %s" have the same exposure.
+// Printing the numeric value is the only answer that is never a lie.
 func (o Outcome) String() string {
 	switch o {
 	case Committed:
 		return "committed"
 	case Refused:
 		return "refused"
-	default:
+	case Ambiguous:
 		return "ambiguous"
+	default:
+		return fmt.Sprintf("outcome(%d)", int(o))
 	}
 }
 

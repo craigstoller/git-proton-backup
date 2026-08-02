@@ -2,10 +2,41 @@ package transport
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
+
+// waitDelay bounds how long Wait may block draining the child's output pipes
+// AFTER the child itself has already exited. It is not a command timeout.
+//
+// MECHANISM (documented os/exec behaviour, not speculation). CombinedOutput
+// sets Stdout/Stderr to a *bytes.Buffer, which is not an *os.File, so os/exec
+// creates an os.Pipe(), hands the write end to the child, and copies from the
+// read end on a goroutine. Wait does not return until that goroutine sees EOF,
+// and EOF requires EVERY holder of the write end to close it — not just the
+// direct child. proton-drive is a Node program; a Node process that spawns a
+// worker or keeps a helper alive passes the inherited handle to a grandchild,
+// and we block forever. WaitDelay makes os/exec close the pipe and give up
+// instead (go.dev/issue/23019).
+//
+// This was OBSERVED during the Stage 2.1 live gate: the first `git push` hung
+// past a two-minute timeout AFTER its success output had already been
+// captured, with the remote state correct and no leftover .lock — the child
+// ran, wrote, exited, and only then did the process fail to exit. Two later
+// pushes did not reproduce it, which fits a timing-dependent grandchild.
+//
+// It is a var, not a const, only so the test can shrink it; nothing in
+// production writes to it.
+//
+// LIMIT, stated plainly: with no Context set, the WaitDelay timer starts when
+// Wait observes the child has exited. A child that never exits at all is NOT
+// bounded by this. That is the correct scope — the observed hang was after the
+// child exited, and a real command timeout is a separate, unrelated decision.
+var waitDelay = 30 * time.Second
 
 type CLI struct{ Exe string }
 
@@ -18,7 +49,23 @@ func NewCLI(exe string) *CLI {
 
 func (c *CLI) run(args ...string) (string, int, error) {
 	cmd := exec.Command(c.Exe, args...)
+	// Bounds the post-exit pipe drain so a grandchild holding the inherited
+	// write end cannot hang the helper forever. See waitDelay: DO NOT DELETE
+	// this as unnecessary — the hang it prevents is invisible when it happens.
+	cmd.WaitDelay = waitDelay
 	out, err := cmd.CombinedOutput()
+	if errors.Is(err, exec.ErrWaitDelay) {
+		// The command itself SUCCEEDED. os/exec substitutes ErrWaitDelay for a
+		// nil error only when the process exited with a successful status
+		// (exec.go: `if err == nil { err = goroutineErr }`), and ProcessState
+		// is set, so the exit code returned below is the real one and every
+		// caller here — all of which branch on code != 0 first — flows through
+		// as the success it is. Warn so a recurrence is diagnosable instead of
+		// invisible. stderr, never stdout: stdout is protocol-only.
+		fmt.Fprintf(os.Stderr, "git-remote-proton: %s exited but something still held its "+
+			"output pipe open after %s; the pipe was abandoned and the command's result used "+
+			"as-is (output may be truncated)\n", c.Exe, waitDelay)
+	}
 	// If the executable never started (not on PATH, permission denied, etc.),
 	// cmd.ProcessState is nil and ExitCode() would panic. Fail closed instead:
 	// report a non-zero code and the start error.
@@ -49,7 +96,22 @@ func parseNodeJSON(b []byte) (Node, error) {
 	if err := json.Unmarshal(b, &w); err != nil {
 		return Node{}, err
 	}
-	n := Node{Name: w.Name.Value, IsDir: w.Type == "folder"}
+	// C9 pins these two values, identical in `info --json` and `list --json`.
+	// A third value means the CLI changed under us: guessing would make every
+	// folder read as a file, and ListRefs would then try to read each
+	// subdirectory as a ref file. Fail closed and name what we saw.
+	var isDir bool
+	switch w.Type {
+	case "folder":
+		isDir = true
+	case "file":
+		isDir = false
+	default:
+		return Node{}, fmt.Errorf("unrecognised node type %q (expected \"folder\" or \"file\"); "+
+			"the CLI may have changed - the transport contract is certified against %s",
+			w.Type, CertifiedCLI)
+	}
+	n := Node{Name: w.Name.Value, IsDir: isDir}
 	if len(w.ActiveRevision) > 0 {
 		var r revWire
 		// 0.7.0: unwrapped.
@@ -297,4 +359,32 @@ func dirOf(p string) string {
 		return p[:i]
 	}
 	return "/"
+}
+
+// CertifiedCLI is the exact build docs/research/probes/stage1-results.json was
+// certified against. Support is an allowlist, not a floor: 0.4.6 and 0.7.0
+// differ in the activeRevision payload shape and in whether a byte-identical
+// rewrite is skipped, so a floor would admit a build that breaks verification
+// silently.
+const CertifiedCLI = "cli-drive@0.7.0+5174900c"
+
+// IsCertified reports whether a --version line names the certified build.
+// It is containment, not equality: the CLI prints the build id inside a
+// longer line ("Proton Drive CLI cli-drive@0.7.0+5174900c"), so an equality
+// check would flag the certified build as uncertified.
+func IsCertified(versionLine string) bool {
+	return strings.Contains(versionLine, CertifiedCLI)
+}
+
+// Version returns the first line of `proton-drive --version`.
+func (c *CLI) Version() (string, error) {
+	out, code, err := c.run("--version")
+	if code != 0 {
+		if err != nil {
+			return "", fmt.Errorf("proton-drive --version failed: %s: %w", strings.TrimSpace(out), err)
+		}
+		return "", fmt.Errorf("proton-drive --version failed: %s", strings.TrimSpace(out))
+	}
+	line, _, _ := strings.Cut(strings.TrimSpace(out), "\n")
+	return strings.TrimSpace(line), nil
 }
