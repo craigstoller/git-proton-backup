@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -39,9 +40,10 @@ func run() int {
 		warn(err)
 		return 1
 	}
-	gitDir := os.Getenv("GIT_DIR")
-	if gitDir == "" {
-		gitDir = "."
+	gitDir, err := resolveGitDir()
+	if err != nil {
+		warn(err)
+		return 1
 	}
 	// git sets GIT_DIR (commonly a RELATIVE path, e.g. ".git") in this
 	// process's own environment before spawning the helper. internal/gitcmd
@@ -50,8 +52,9 @@ func run() int {
 	// this, the child git ALSO sees GIT_DIR=".git" and resolves it relative
 	// to the working directory -C already changed to, producing ".git/.git"
 	// and failing every gitcmd call with "not a git repository". gitDir is
-	// already captured above and passed explicitly to every gitcmd call, so
-	// clearing the inherited env var here is safe and necessary.
+	// already captured above (and resolved to an absolute path by
+	// resolveGitDir — see its doc) and passed explicitly to every gitcmd
+	// call, so clearing the inherited env var here is safe and necessary.
 	os.Unsetenv("GIT_DIR")
 
 	t := transport.NewCLI("")
@@ -71,6 +74,46 @@ func run() int {
 	defer out.Flush()
 
 	return loop(t, root, gitDir, in, out)
+}
+
+// resolveGitDir captures GIT_DIR from the environment and resolves it to an
+// ABSOLUTE path immediately, before anything else can see it.
+//
+// Not optional hygiene: git commonly sets GIT_DIR to a RELATIVE path — ".git"
+// is git's own default — relative to THIS PROCESS's cwd. internal/repo's
+// fetch install path (consolidateAndInstall) shells out to git with
+// `-C gitDir` more than once while installing a new pack, and asks git
+// itself where the pack belongs via `rev-parse --git-path objects/pack` — an
+// answer that, for a relative gitDir, comes back relative too. That answer
+// then gets handed as an argument to a SECOND `-C gitDir`-scoped subprocess
+// (pack-objects), which resolves relative ARGUMENTS again, relative to
+// gitDir this time — a path built for one resolution context, resolved a
+// second time in another, doubling the relative prefix. Observed live on
+// Windows exactly this way (Stage 3a gate, task 7): every ordinary
+// incremental `git fetch` failed with "unable to write file
+// .git\objects\pack\pack-....pack: No such file or directory", because git
+// invokes this helper with GIT_DIR=.git by default — the common case, not an
+// edge case.
+//
+// Resolving here, once, at the source, means every downstream `-C gitDir`
+// subprocess and every relative path git hands back through one of them gets
+// resolved exactly once, unambiguously. filepath.Abs resolves relative to
+// this process's own cwd, which is exactly what a relative GIT_DIR is
+// relative to. (internal/repo/fetch.go's consolidateAndInstall also resolves
+// its own realPack absolutely as a second, independent line of defence —
+// fetch.go is a library entry point in its own right, and its own tests call
+// Fetch directly, so the fix there must not silently depend on this
+// function's hygiene either.)
+func resolveGitDir() (string, error) {
+	gitDir := os.Getenv("GIT_DIR")
+	if gitDir == "" {
+		gitDir = "."
+	}
+	abs, err := filepath.Abs(gitDir)
+	if err != nil {
+		return "", fmt.Errorf("cannot resolve GIT_DIR %q to an absolute path: %w", gitDir, err)
+	}
+	return abs, nil
 }
 
 // loop runs the git-remote-helper command exchange over in/out. Split out

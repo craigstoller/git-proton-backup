@@ -220,6 +220,28 @@ func consolidateAndInstall(gitDir, altObjects, objs string) (string, error) {
 	if !filepath.IsAbs(realPack) {
 		realPack = filepath.Join(gitDir, realPack)
 	}
+	// ALWAYS resolved to absolute from here on, regardless of whether gitDir
+	// itself arrived absolute or relative — confirmed live (Stage 3a gate,
+	// task 7) that this cannot be left to the caller's hygiene. git commonly
+	// invokes this helper with a RELATIVE GIT_DIR (".git" is its own
+	// default), and when gitDir is relative, realPack above is only correct
+	// relative to THIS PROCESS's cwd. PackObjectsFromList below hands it as
+	// an argument to a SECOND `git -C gitDir ...` subprocess — and -C changes
+	// the effective cwd for resolving relative ARGUMENTS too, so that second
+	// subprocess would resolve the already-gitDir-relative realPack a SECOND
+	// time, relative to gitDir again, doubling the prefix
+	// (".git/.git/objects/pack/..."). filepath.Abs resolves relative to this
+	// process's own cwd — the same resolution realPack already implicitly
+	// depends on — so it cannot change realPack's MEANING, only make that
+	// meaning unambiguous to a subprocess that resolves paths in a different
+	// context. Fetch.go is a library entry point, not merely main.go's
+	// caller, and this package's own tests call Fetch directly with a
+	// relative gitDir, so this must not silently depend on main.go having
+	// already resolved gitDir to absolute upstream.
+	realPack, err = filepath.Abs(realPack)
+	if err != nil {
+		return "", fmt.Errorf("cannot resolve pack directory %s to an absolute path: %w", realPack, err)
+	}
 	if err := os.MkdirAll(realPack, 0o700); err != nil {
 		return "", err
 	}

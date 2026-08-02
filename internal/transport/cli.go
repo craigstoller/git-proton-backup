@@ -186,7 +186,23 @@ func (c *CLI) List(p string) ([]Node, error) {
 	return nodes, nil
 }
 
+// ReadTo ENFORCES the documented "localDir must already exist" contract by
+// stat-ing it before ever invoking the CLI. The underlying `proton-drive
+// filesystem download` binary does NOT enforce this itself — confirmed live
+// (Stage 3a gate, task 7): given a missing destination it silently creates
+// the directory and succeeds, contradicting both the Transport interface
+// comment and the contract test as they stood before this fix. Rather than
+// loosen the contract to match the CLI binary, the wrapper closes the gap:
+// every caller in this codebase creates its temp dir with os.MkdirTemp
+// before calling ReadTo, so a missing or non-directory localDir here always
+// indicates a caller bug, and silently creating a directory nobody asked for
+// would paper over exactly that bug instead of surfacing it.
 func (c *CLI) ReadTo(p, localDir string) error {
+	if st, err := os.Stat(localDir); err != nil {
+		return fmt.Errorf("download destination %s: %w", localDir, err)
+	} else if !st.IsDir() {
+		return fmt.Errorf("download destination %s is not a directory", localDir)
+	}
 	out, code, err := c.run("filesystem", "download", p, localDir)
 	if code != 0 {
 		if err != nil {

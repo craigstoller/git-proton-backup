@@ -1759,6 +1759,79 @@ func TestFetchIntoALinkedWorktreeInstallsWhereGitLooks(t *testing.T) {
 	}
 }
 
+// chdirForTest changes the process's working directory to dir for the
+// duration of the test and restores it afterward via t.Cleanup.
+//
+// Not testing.Chdir: that requires Go 1.24, and this module's go.mod
+// deliberately floors at go 1.22 (documented there — chosen for
+// per-iteration loop variables; the floor was never meant to gate on
+// testing.Chdir, and bumping the module's declared floor for one test's
+// convenience is a bigger decision than this fix belongs to). No test in
+// this package calls t.Parallel(), so the process-wide cwd this mutates is
+// not at risk of a concurrent sibling test reading it mid-change; if that
+// ever stops being true, this helper (and the test using it) must move to a
+// serial-only subset or be reworked.
+func chdirForTest(t *testing.T, dir string) {
+	t.Helper()
+	orig, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("Chdir(%s): %v", dir, err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(orig); err != nil {
+			t.Fatalf("restore Chdir(%s): %v", orig, err)
+		}
+	})
+}
+
+// RED (fix round 3, live-gate finding 2, task 7). Reproduces the exact shape
+// git actually uses when it spawns this helper: GIT_DIR is set RELATIVE
+// (".git" is git's own default) while the process cwd is the worktree root —
+// the ORDINARY case, not an edge case. Every other Fetch test in this file
+// passes an ABSOLUTE t.TempDir()-derived gitDir, which is exactly why none of
+// them could catch this.
+//
+// Before the fix, consolidateAndInstall's `git -C gitDir rev-parse
+// --git-path objects/pack` answer came back relative (e.g. "objects/pack"),
+// got joined onto gitDir to make it relative to the ORIGINAL process cwd
+// (correctly, at that point), and was then handed as an outStem to a SECOND
+// `git -C gitDir pack-objects ...` invocation. -C changes the effective
+// working directory for resolving relative ARGUMENTS too, so that second
+// subprocess resolved the already-gitDir-relative path a SECOND time,
+// relative to gitDir again — doubling the prefix into
+// "<gitDir>/<gitDir>/objects/pack/...", which does not exist. Observed live
+// on Windows exactly this way (Stage 3a gate, task 7): "pack-objects: error:
+// unable to write file .git\objects\pack\pack-....pack: No such file or
+// directory" / "unable to rename temporary file to
+// '.git\objects\pack\pack-....pack'" — and proton-v2/main never advanced.
+func TestFetchWithARelativeGitDirInstallsCorrectly(t *testing.T) {
+	src := newGitRepoForPush(t)
+	sha := headOfPushRepo(t, src)
+	f := transport.NewFake()
+	plantRepoOnFake(t, f, "/r", src, sha)
+
+	dst := emptyGitRepo(t)
+	chdirForTest(t, dst) // the process cwd IS the worktree — exactly what git sets up
+
+	keep, err := Fetch(f, "/r", ".git", []string{sha}) // RELATIVE gitDir, the live shape
+	if err != nil {
+		t.Fatalf("Fetch with a relative gitDir: %v", err)
+	}
+	if keep == "" {
+		t.Fatal("a fetch that installs objects must return a .keep path")
+	}
+	if !gitcmd.HasObject(".git", sha) {
+		t.Error("the wanted object must be present after a fetch with a relative gitDir")
+	}
+	wantDir := filepath.Join(dst, ".git", "objects", "pack")
+	if got := filepath.Dir(keep); got != wantDir {
+		t.Errorf(".keep must live in %s, got %s", wantDir, got)
+	}
+}
+
 // RED (fix round 2, I2 revised). validateObjectsPackPath does not exist yet —
 // it replaces fix round 1's validateGitDirOutput now that consolidateAndInstall
 // asks `--git-path objects/pack` instead of `--git-dir` (see the linked-

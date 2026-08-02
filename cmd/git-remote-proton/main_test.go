@@ -178,6 +178,91 @@ func TestRun_RefusesUnsupportedAddress(t *testing.T) {
 	}
 }
 
+// chdirForTest changes the process's working directory to dir for the
+// duration of the test and restores it afterward via t.Cleanup.
+//
+// Not testing.Chdir: that requires Go 1.24, and this module's go.mod
+// deliberately floors at go 1.22 (documented there — chosen for
+// per-iteration loop variables; the floor was never meant to gate on
+// testing.Chdir, and bumping the module's declared floor for one test's
+// convenience is a bigger decision than this fix belongs to). No test in
+// this package calls t.Parallel(), so the process-wide cwd this mutates is
+// not at risk of a concurrent sibling test reading it mid-change.
+func chdirForTest(t *testing.T, dir string) {
+	t.Helper()
+	orig, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("Chdir(%s): %v", dir, err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(orig); err != nil {
+			t.Fatalf("restore Chdir(%s): %v", orig, err)
+		}
+	})
+}
+
+// TestResolveGitDirMakesARelativeGITDIRAbsolute covers the Stage 3a live-gate
+// finding (task 7): git commonly sets GIT_DIR to a RELATIVE path (".git" is
+// its own default), and every incremental fetch failed live because a
+// relative gitDir got resolved TWICE by two separate `-C gitDir` subprocess
+// invocations inside the fetch install path (see resolveGitDir's doc in
+// main.go for the full mechanism). resolveGitDir must turn a relative
+// GIT_DIR into an absolute path anchored at the process's cwd, exactly once,
+// at the source, before anything downstream ever sees it.
+func TestResolveGitDirMakesARelativeGITDIRAbsolute(t *testing.T) {
+	wt := t.TempDir()
+	chdirForTest(t, wt)
+	t.Setenv("GIT_DIR", ".git")
+
+	got, err := resolveGitDir()
+	if err != nil {
+		t.Fatalf("resolveGitDir: %v", err)
+	}
+	if !filepath.IsAbs(got) {
+		t.Fatalf("resolveGitDir() = %q, want an absolute path", got)
+	}
+	if want := filepath.Join(wt, ".git"); got != want {
+		t.Errorf("resolveGitDir() = %q, want %q", got, want)
+	}
+}
+
+// TestResolveGitDirDefaultsToAbsoluteCwdWhenUnset mirrors run()'s
+// pre-existing "" -> "." default, and pins that the default is ALSO resolved
+// to absolute — the bug this fix round closes did not care whether GIT_DIR
+// was explicitly ".git" or defaulted there; either way it was relative.
+func TestResolveGitDirDefaultsToAbsoluteCwdWhenUnset(t *testing.T) {
+	wt := t.TempDir()
+	chdirForTest(t, wt)
+	os.Unsetenv("GIT_DIR")
+
+	got, err := resolveGitDir()
+	if err != nil {
+		t.Fatalf("resolveGitDir: %v", err)
+	}
+	if got != wt {
+		t.Errorf("resolveGitDir() = %q, want %q", got, wt)
+	}
+}
+
+// Deliberately NOT testing resolveGitDir's wiring into run() end to end:
+// run() reaches gitDir capture only AFTER CanonicalRoot accepts the address,
+// and the very next thing run() does after that is construct a *CLI and call
+// Version() on it — an unconditional real `proton-drive --version` spawn.
+// Driving run() with an address CanonicalRoot accepts to reach the gitDir
+// line would therefore invoke the real CLI binary, which this fix round is
+// expressly forbidden from doing (and would also need os.Stdin faked to
+// avoid loop() blocking on a read that will never come). resolveGitDir is
+// therefore covered directly, by the two tests above, and main.go's call
+// site (`gitDir, err := resolveGitDir()`) is a one-line substitution for the
+// two-line block it replaced — reviewable by inspection, not something that
+// needs an unsafe end-to-end harness to justify. The actual end-to-end proof
+// that the fix works lives in internal/repo's
+// TestFetchWithARelativeGitDirInstallsCorrectly, which reproduces the exact
+// live failure and error text against Fetch directly.
+
 // Finding 2 (bonus coverage, same harness): a poisoned batch's error lines
 // must carry a single well-formed ref token, produced by the same
 // protocol.ParsePushBatch used on the non-poisoned path — not a hand-rolled

@@ -528,6 +528,58 @@ func TestCLIRefusesBasenameMismatchBeforeUpload(t *testing.T) {
 	}
 }
 
+// TestCLIReadToRefusesAMissingDestinationBeforeInvokingTheCLI covers the
+// Stage 3a live-gate finding (task 7): the real proton-drive CLI's
+// `filesystem download` silently CREATES a missing destination directory and
+// succeeds, contradicting the documented Transport contract and the Fake's
+// own behaviour — a genuine fake/real divergence caught for the first time
+// by a live run. Decided to enforce the documented contract in the wrapper
+// rather than loosen it to match the CLI binary: every caller in this
+// codebase creates its temp dir with os.MkdirTemp before calling ReadTo, so
+// a missing destination always indicates a caller bug, and *CLI now stats
+// localDir itself and refuses before ever invoking the CLI.
+//
+// The exe under test does not exist, which is how this proves the guard
+// fires BEFORE any process is spawned, without a real binary: if ReadTo ever
+// reached c.run, the returned error would carry the exec start-failure
+// signature seen in TestCLIUploadStartFailureIsAmbiguous (naming exe) instead
+// of the plain os.Stat error asserted below — the same technique
+// TestCLIRefusesBasenameMismatchBeforeUpload above uses for CreateExclusive.
+func TestCLIReadToRefusesAMissingDestinationBeforeInvokingTheCLI(t *testing.T) {
+	const exe = "nonexistent-xyz-binary-git-proton-backup-test"
+	c := NewCLI(exe)
+
+	t.Run("missing directory", func(t *testing.T) {
+		missing := filepath.Join(t.TempDir(), "not-created")
+		err := c.ReadTo("/remote/path.txt", missing)
+		if err == nil {
+			t.Fatal("want a non-nil error for a missing destination")
+		}
+		if strings.Contains(err.Error(), exe) {
+			t.Errorf("error must not carry the exec start-failure signature — the guard must "+
+				"fire before any process is spawned, got %q", err)
+		}
+		if _, statErr := os.Stat(missing); !os.IsNotExist(statErr) {
+			t.Error("ReadTo must not have created the destination directory")
+		}
+	})
+
+	t.Run("destination exists but is a file, not a directory", func(t *testing.T) {
+		file := filepath.Join(t.TempDir(), "not-a-dir")
+		if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		err := c.ReadTo("/remote/path.txt", file)
+		if err == nil {
+			t.Fatal("want a non-nil error when localDir is a file, not a directory")
+		}
+		if strings.Contains(err.Error(), exe) {
+			t.Errorf("error must not carry the exec start-failure signature — the guard must "+
+				"fire before any process is spawned, got %q", err)
+		}
+	})
+}
+
 // RED. parseNodeJSON currently does IsDir: w.Type == "folder", so an
 // unrecognised type silently yields a FILE.
 func TestParseNodeJSONRejectsUnknownType(t *testing.T) {
