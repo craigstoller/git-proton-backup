@@ -61,6 +61,13 @@ func AcquireLock(t transport.Transport, root string) (*Lock, error) {
 		return nil, err
 	}
 	switch out {
+	case transport.Committed:
+		// Falls out of the switch into the read-back verification below.
+		// Named rather than left implicit so the default arm can exist at all:
+		// without it, an unrecognised Outcome reached that verification and,
+		// if the remote happened to hold a lock with our nonce, would be
+		// reported as a lock we hold on the strength of a value nobody
+		// recognised.
 	case transport.Refused:
 		// Coherent per presence, not a fallthrough: a corrupt lock is not the
 		// same situation as a healthy one or a lock that vanished mid-race,
@@ -80,6 +87,9 @@ func AcquireLock(t transport.Transport, root string) (*Lock, error) {
 		}
 	case transport.Ambiguous:
 		return nil, fmt.Errorf("lock acquisition ambiguous; re-run to reconcile")
+	default:
+		return nil, fmt.Errorf("lock acquisition for %s returned an unrecognised outcome %s; "+
+			"refusing to guess whether the lock is held", p, out)
 	}
 
 	// Verify by read-back: a byte-identical write is silently skipped by the

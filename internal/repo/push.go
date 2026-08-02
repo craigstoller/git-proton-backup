@@ -282,7 +282,7 @@ func publishPack(t transport.Transport, dst, local string) error {
 		// the safety-critical branch the whole task exists for, so it is
 		// named explicitly rather than left as an implicit fall-through.
 	default:
-		return fmt.Errorf("pack upload returned an unrecognised outcome %v; "+
+		return fmt.Errorf("pack upload returned an unrecognised outcome %s; "+
 			"refusing to guess whether it is safe to publish", out)
 	}
 
@@ -305,7 +305,39 @@ func publishPack(t transport.Transport, dst, local string) error {
 			"it is corrupt or was written by something else, and an immutable "+
 			"object is never overwritten", dst)
 	}
-	return checkPackChecksum(remote, filepathBase(dst))
+	return checkIdenticalPackChecksum(remote, dst)
+}
+
+// checkIdenticalPackChecksum is the last step of publishPack's Refused path,
+// and it is reached ONLY after filesEqual has proven the remote pack
+// byte-identical to the local one. That fact changes the diagnosis
+// completely, which is why this is a separate function with its own messages
+// rather than a shared checksum check.
+//
+// If these bytes do not hash to the name they are stored under, then BOTH
+// copies fail to — the remote one is an exact copy of what is on this
+// machine's disk. So the fault is that our own local git mis-named its own
+// output; the remote file is not corrupt and there is nothing to repair
+// there. The generic message ("this file is not what its name claims",
+// naming the remote path) pointed the operator at their live paid account to
+// remediate a file that is byte-for-byte what they already hold locally.
+// That is the same class as the fail-closed-path-with-a-misdirecting-
+// diagnosis finding from fix round 1, one step further down this function.
+func checkIdenticalPackChecksum(local, dst string) error {
+	const bothIdentical = "the remote pack %s is byte-identical to the pack git just built " +
+		"locally, so both copies are the same bytes and this is a LOCAL problem: "
+	got, err := packContentChecksum(local)
+	if err != nil {
+		return fmt.Errorf(bothIdentical+"its content checksum could not be recomputed (%v). "+
+			"Do not trash or replace the remote copy — it is not the faulty artifact", dst, err)
+	}
+	if want := packNameChecksum(filepathBase(dst)); got != want {
+		return fmt.Errorf(bothIdentical+"both recompute to %s rather than the %s their shared "+
+			"name claims, which means the local git that produced this pack mis-named its own "+
+			"output. Do not trash or replace the remote copy — it is not the faulty artifact",
+			dst, got, want)
+	}
+	return nil
 }
 
 // publishIdx uploads an index and confirms it. A Refused index is deliberately
@@ -337,7 +369,7 @@ func publishIdx(t transport.Transport, dst, local, localPack string) error {
 		// Falls out of the switch into the verification path below — the
 		// same explicit-branch treatment as publishPack above.
 	default:
-		return fmt.Errorf("index upload returned an unrecognised outcome %v; "+
+		return fmt.Errorf("index upload returned an unrecognised outcome %s; "+
 			"refusing to guess whether it is safe to publish", out)
 	}
 
@@ -432,38 +464,44 @@ func readersEqual(ra, rb io.Reader) (bool, error) {
 	}
 }
 
-// checkPackChecksum recomputes the pack's content hash and compares it to the
-// basename. git hashes every byte EXCEPT the trailing 20, and stores the
-// result in those 20 — so this proves the body is what the name claims. It
-// cannot detect a change confined to the trailer itself; the byte comparison
-// in publishPack and index-pack --verify are what cover that.
+// packContentChecksum recomputes a pack's content hash. git hashes every byte
+// EXCEPT the trailing 20, and stores the result in those 20 — so this is what
+// the basename is supposed to be, and it proves the body is what the name
+// claims. It cannot detect a change confined to the trailer itself; the byte
+// comparison in publishPack and index-pack --verify are what cover that.
 //
 // SHA-1 only: this design supports SHA-1 repositories, and refs.go rejects
 // anything that is not 40 hex.
-func checkPackChecksum(path, base string) error {
+//
+// It returns a digest, never a verdict, and it never names a remote path. The
+// CALLER composes the failure message, because on the one path that reaches
+// it the correct diagnosis is not the obvious one — see
+// checkIdenticalPackChecksum.
+func packContentChecksum(path string) (string, error) {
 	const trailer = 20
 	f, err := os.Open(path)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer f.Close()
 	st, err := f.Stat()
 	if err != nil {
-		return err
+		return "", err
 	}
 	if st.Size() < trailer {
-		return fmt.Errorf("remote pack %s is truncated", base)
+		return "", fmt.Errorf("it is %d bytes, shorter than the %d-byte trailing checksum "+
+			"every pack ends with", st.Size(), trailer)
 	}
 	h := sha1.New()
 	if _, err := io.CopyN(h, f, st.Size()-trailer); err != nil {
-		return err
+		return "", err
 	}
-	name := strings.TrimSuffix(strings.TrimPrefix(base, "pack-"), ".pack")
-	if got := hex.EncodeToString(h.Sum(nil)); got != name {
-		return fmt.Errorf("remote pack %s recomputes to %s; the name is the content "+
-			"checksum, so this file is not what its name claims", base, got)
-	}
-	return nil
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// packNameChecksum is the content checksum a pack's basename claims to be.
+func packNameChecksum(base string) string {
+	return strings.TrimSuffix(strings.TrimPrefix(base, "pack-"), ".pack")
 }
 
 // linkOrCopy places src at dst, preferring a hard link so a large pack is not
@@ -481,8 +519,16 @@ func linkOrCopy(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	// Closed EXACTLY ONCE on each path, with no `defer out.Close()` alongside.
+	// There used to be both: the deferred call fired second, got os.ErrClosed,
+	// and discarded it. Harmless as long as the defer stays bare — and a
+	// silent breakage the moment someone adds error handling to it, at which
+	// point every successful copy would start reporting "file already closed".
+	// The explicit form is kept rather than the deferred one because Close's
+	// error is worth returning: on a filesystem that defers write errors it is
+	// the only place a failed flush surfaces at all.
 	if _, err := io.Copy(out, in); err != nil {
+		out.Close() // best effort; the copy error is the one worth reporting
 		return err
 	}
 	return out.Close()

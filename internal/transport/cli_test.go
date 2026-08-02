@@ -293,6 +293,35 @@ func TestCLIStatStartFailureIsNotConfirmedAbsence(t *testing.T) {
 	}
 }
 
+// TestOutcomeString pins the rule that an UNRECOGNISED Outcome never renders
+// as one of the three real ones. The default arm used to return "ambiguous",
+// which turned repo.publishPack's fail-closed guard into "pack upload returned
+// an unrecognised outcome ambiguous" — a message that contradicts itself and
+// withholds the one fact it exists to report. The unknown values here are
+// deliberately out of range; Outcome is a closed set today, and that is
+// exactly why nothing else would catch a regression in this function.
+func TestOutcomeString(t *testing.T) {
+	cases := map[Outcome]string{
+		Committed:    "committed",
+		Refused:      "refused",
+		Ambiguous:    "ambiguous",
+		Outcome(3):   "outcome(3)",
+		Outcome(-1):  "outcome(-1)",
+		Outcome(999): "outcome(999)",
+	}
+	for o, want := range cases {
+		if got := o.String(); got != want {
+			t.Errorf("Outcome(%d).String() = %q, want %q", int(o), got, want)
+		}
+	}
+	// The point of the change, stated as an assertion rather than a comment.
+	for _, o := range []Outcome{Outcome(3), Outcome(-1), Outcome(999)} {
+		if s := o.String(); s == "ambiguous" || s == "committed" || s == "refused" {
+			t.Errorf("an unrecognised Outcome must not impersonate a real one, got %q", s)
+		}
+	}
+}
+
 func TestClassifyUpload(t *testing.T) {
 	cases := []struct {
 		t, s, f int

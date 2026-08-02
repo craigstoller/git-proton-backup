@@ -2,6 +2,8 @@ package repo
 
 import (
 	"bytes"
+	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"os"
 	"os/exec"
@@ -992,7 +994,33 @@ func TestPushRefusedValidButDifferentIdxIsAccepted(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := exec.Command("git", "index-pack", "--index-version=1", packCopy).Run(); err != nil {
-		t.Skipf("this git cannot write a v1 index: %v", err)
+		// FATAL, deliberately, and NOT a skip. This test is the only
+		// mechanical defence against a future change reintroducing byte
+		// equality on the .idx — the single most peer-reviewed decision in
+		// design v6.2, where demanding equality makes a legitimate remote
+		// index PERMANENTLY fatal: immutable objects are never overwritten,
+		// so the repo would be bricked for that client with no way out.
+		//
+		// Task 1 of this stage made that tightening more tempting by pinning
+		// --index-version=2, which turned "our indexes are v2" from a
+		// convention into an enforced invariant; the natural next thought
+		// reading publishIdx is "so a remote index that is not v2 is suspect
+		// — assert it". On any machine where this skipped, that change landed
+		// green. There is also no cheap toolchain-independent replacement: a
+		// second v2 index over the same pack is byte-IDENTICAL, because git
+		// is deterministic there, so v1 is the only easy vehicle for "valid
+		// but byte-different".
+		//
+		// A red suite is the correct signal if a future git drops v1 index
+		// writing. That is precisely the moment a human should decide what
+		// replaces the vehicle, rather than the suite quietly going green
+		// with the guard gone.
+		t.Fatalf("this git cannot write a v1 index (%v), so the guard cannot be satisfied "+
+			"on this toolchain. It is NOT safe to skip: this test is the only thing stopping "+
+			"publishIdx from being tightened into byte equality on the .idx, which design "+
+			"v6.2 rejects because it would make a legitimate remote index permanently fatal "+
+			"— immutable objects are never overwritten. Find another way to produce a valid "+
+			"but byte-different index before weakening this test", err)
 	}
 	v1, err := os.ReadFile(strings.TrimSuffix(packCopy, ".pack") + ".idx")
 	if err != nil {
@@ -1075,5 +1103,127 @@ func TestReadersEqualSurfacesGenuineReadError(t *testing.T) {
 	}
 	if !errors.Is(err, wantErr) {
 		t.Errorf("got error %v, want it to be (or wrap) %v", err, wantErr)
+	}
+}
+
+// --- M1: a checksum failure after filesEqual blames the right file ---------
+
+// TestIdenticalPackChecksumFailureBlamesTheLocalGit covers the finding that
+// this path's DIAGNOSIS pointed at the wrong artifact. It is reached only
+// after filesEqual has proven the remote pack byte-identical to the local
+// one, so a checksum mismatch there means BOTH copies recompute wrong — our
+// own git mis-named its output. The old message ("remote pack %s recomputes
+// to %s; ... this file is not what its name claims") sent the operator to
+// their live paid account to remediate a file that is byte-for-byte what they
+// already hold on disk.
+//
+// Driven directly rather than through Push: reaching it end to end would need
+// git to mis-name a pack it just wrote, which is not something a test can ask
+// it to do. This is the exact function and the exact input publishPack hands
+// it on that path.
+func TestIdenticalPackChecksumFailureBlamesTheLocalGit(t *testing.T) {
+	body := bytes.Repeat([]byte("nonsense-pack-body"), 8)
+	content := append(append([]byte(nil), body...), make([]byte, 20)...) // + a 20-byte trailer
+	local := filepath.Join(t.TempDir(), "pack-"+strings.Repeat("0", 40)+".pack")
+	if err := os.WriteFile(local, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha1.Sum(body)
+	wantDigest := hex.EncodeToString(sum[:])
+
+	err := checkIdenticalPackChecksum(local, "/r/packs/pack-"+strings.Repeat("0", 40)+".pack")
+	if err == nil {
+		t.Fatal("a pack whose body does not hash to its name must be refused")
+	}
+	msg := err.Error()
+
+	// It must say the two copies are the same and that the fault is local.
+	for _, want := range []string{"byte-identical", "LOCAL problem", "mis-named its own output",
+		"Do not trash or replace the remote copy", wantDigest} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message must contain %q, got: %s", want, msg)
+		}
+	}
+	// And it must NOT be the old message, which diagnosed the remote file.
+	if strings.Contains(msg, "this file is not what its name claims") {
+		t.Errorf("the diagnosis must not point at the remote artifact: %s", msg)
+	}
+}
+
+// TestIdenticalPackChecksumUnreadableAlsoBlamesLocally is the same rule for
+// the other failure this path can produce: a pack too short to have a
+// trailer. filesEqual compares sizes first, so if the remote copy is that
+// short the local one is too — again a local problem, not a remote one.
+func TestIdenticalPackChecksumUnreadableAlsoBlamesLocally(t *testing.T) {
+	local := filepath.Join(t.TempDir(), "pack-short.pack")
+	if err := os.WriteFile(local, []byte("tiny"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := checkIdenticalPackChecksum(local, "/r/packs/pack-short.pack")
+	if err == nil {
+		t.Fatal("a pack shorter than its trailer must be refused")
+	}
+	for _, want := range []string{"byte-identical", "LOCAL problem", "Do not trash or replace"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("message must contain %q, got: %s", want, err)
+		}
+	}
+}
+
+// --- M3: the fail-closed default arms on the two remaining switches --------
+
+// unknownOutcomeTransport wraps a Fake but returns an Outcome that is not one
+// of the three constants for CreateExclusive on a chosen path. Outcome is a
+// closed set inside this module, so nothing else can produce this value —
+// which is exactly why only a stub can prove the default arms fail closed
+// rather than falling through and being read as Committed.
+type unknownOutcomeTransport struct {
+	*transport.Fake
+	forPath string
+}
+
+func (u unknownOutcomeTransport) CreateExclusive(p, local string) (transport.Outcome, error) {
+	if p == u.forPath {
+		return transport.Outcome(42), nil
+	}
+	return u.Fake.CreateExclusive(p, local)
+}
+
+// TestBootstrapFailsClosedOnUnrecognisedMarkerOutcome: before the default arm,
+// Bootstrap's boolean switch had no way to express "anything else", so an
+// unrecognised Outcome fell through and the repo was adopted as initialised
+// on the strength of a value nobody recognised.
+func TestBootstrapFailsClosedOnUnrecognisedMarkerOutcome(t *testing.T) {
+	f := transport.NewFake()
+	tr := unknownOutcomeTransport{Fake: f, forPath: "/my-files/r/" + MarkerName}
+
+	err := Bootstrap(tr, "/my-files/r")
+	if err == nil {
+		t.Fatal("Bootstrap must fail closed on an unrecognised marker-creation outcome")
+	}
+	if !strings.Contains(err.Error(), "outcome(42)") {
+		t.Errorf("the refusal must name the outcome it saw, got: %v", err)
+	}
+	if _, ok := f.Files["/my-files/r/"+MarkerName]; ok {
+		t.Error("no marker was actually written; nothing may claim otherwise")
+	}
+}
+
+// TestAcquireLockFailsClosedOnUnrecognisedOutcome: same exposure on the lock.
+// Falling through reached the read-back verification, which would have
+// reported a held lock had the remote happened to carry our nonce.
+func TestAcquireLockFailsClosedOnUnrecognisedOutcome(t *testing.T) {
+	f := transport.NewFake()
+	tr := unknownOutcomeTransport{Fake: f, forPath: "/my-files/r/" + LockName}
+
+	l, err := AcquireLock(tr, "/my-files/r")
+	if err == nil {
+		t.Fatal("AcquireLock must fail closed on an unrecognised outcome")
+	}
+	if l != nil {
+		t.Error("no Lock may be handed back when the outcome was not recognised")
+	}
+	if !strings.Contains(err.Error(), "outcome(42)") {
+		t.Errorf("the refusal must name the outcome it saw, got: %v", err)
 	}
 }
