@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/craigstoller/git-proton-backup/internal/protocol"
@@ -239,10 +240,19 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 		case strings.HasPrefix(line, "fetch "):
 			var wants []string
 			for l := line; ; {
-				sp := strings.Fields(l)
-				if len(sp) >= 2 {
-					wants = append(wants, sp[1]) // "fetch <sha> <name>"
+				sha, perr := parseFetchLine(l)
+				if perr != nil {
+					// Fail closed rather than silently drop or misparse the
+					// line: a malformed line that got silently dropped could
+					// leave wants empty, and repo.Fetch reports an empty
+					// wants list as ("", nil) — its legitimate "up to date"
+					// signal — which would then surface as a FALSE
+					// connectivity-ok, vouching for a closure nothing ever
+					// verified.
+					warn(perr)
+					return 1
 				}
+				wants = append(wants, sha)
 				if !in.Scan() {
 					break
 				}
@@ -250,6 +260,17 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 				if l == "" {
 					break
 				}
+			}
+			if len(wants) == 0 {
+				// Defence in depth: parseFetchLine above already fails
+				// closed on every line it sees, so this should be
+				// unreachable. It is asserted explicitly anyway, because the
+				// invariant it protects — an empty batch must never reach
+				// Fetch, whose own ("", nil) "up to date" signal would then
+				// be trusted on the strength of a closure nothing verified —
+				// is exactly the one this fix exists for.
+				warn(fmt.Errorf("fetch batch contained no wants"))
+				return 1
 			}
 			keep, err := repo.Fetch(t, root, gitDir, wants)
 			if err != nil {
@@ -288,6 +309,34 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 		return 1
 	}
 	return 0
+}
+
+// fetchShaRe matches a fetch batch line's <sha> field: 40 lowercase hex, the
+// same grammar internal/repo enforces on every ref it writes. Duplicated
+// rather than exported from repo — validating protocol INPUT is main's job,
+// not repo's.
+var fetchShaRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+// parseFetchLine validates one line of a "fetch" batch against exactly
+// "fetch <sha> <name>" — not merely "starts with fetch and has a plausible
+// second field". A batch git never sends malformed cannot be relied on to
+// stay that way (a hand-crafted or corrupted stream is exactly the case
+// fail-closed exists for): the previous, permissive scan silently dropped
+// any line with fewer than two fields and accepted whatever token sat second
+// on any line with two or more, so a batch of nothing but malformed lines
+// left `wants` empty without ever reporting an error. repo.Fetch reports an
+// empty wants list as ("", nil) — its legitimate "up to date" signal — and
+// with checkConnectivity on, that reached the caller as connectivity-ok for
+// a closure nothing had ever verified. This mirrors the push side's
+// protocol.ParsePushBatch: one strict parser per line, not a permissive scan
+// with the lock/connectivity decision bolted on after.
+func parseFetchLine(l string) (sha string, err error) {
+	sp := strings.Fields(l)
+	if len(sp) != 3 || sp[0] != "fetch" || !fetchShaRe.MatchString(sp[1]) {
+		return "", fmt.Errorf("malformed fetch batch line %q: want \"fetch <sha> <name>\" "+
+			"with a 40-lowercase-hex sha", l)
+	}
+	return sp[1], nil
 }
 
 func warn(err error) {

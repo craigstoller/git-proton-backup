@@ -564,3 +564,150 @@ func TestLoop_FetchBatch_UpToDateEmitsNoLock(t *testing.T) {
 			"even when the fetch was already up to date", stdout)
 	}
 }
+
+// --- Fix round 1: the fetch batch parser must fail closed, never producing
+// a false connectivity-ok ---
+//
+// The reviewer's finding: the original batch loop accepted any line with
+// two or more whitespace fields as a want (treating field 1 as the sha, with
+// no check that the line even started with "fetch "), and silently DROPPED
+// any line with fewer than two fields — no error, nothing added to `wants`.
+// A batch whose lines are all malformed therefore left `wants` completely
+// empty with no error ever reported. repo.Fetch treats an empty wants list
+// as ("", nil) — its legitimate "the local store already had everything"
+// signal — and when checkConnectivity was on, that signal reached the
+// caller as connectivity-ok: a false vouching for a closure that was never
+// actually verified, on exactly the path where git skips its OWN check
+// because the helper claimed to have done it.
+
+// TestLoop_FetchBatch_MalformedContinuationLineFailsClosed pins the "silently
+// dropped" half of the gap. The first line is a genuine, well-formed fetch
+// line (so a permissive parser would seed `wants` with one real sha and go
+// on to actually fetch); the second line has only one field and is not a
+// "fetch ..." line at all. Under the pre-fix parser this line was silently
+// ignored, the real want from line 1 still went through, and the fetch
+// SUCCEEDED — got 0, with both a lock line and connectivity-ok in stdout —
+// even though the batch as sent was malformed. The fix must instead fail the
+// whole session on the malformed line, before repo.Fetch is ever called with
+// a partial, silently-repaired batch.
+//
+// RED (pre-fix, run against the code as committed for Task 6): loop()
+// returned 0, not 1 — the "got != 1" assertion fired.
+func TestLoop_FetchBatch_MalformedContinuationLineFailsClosed(t *testing.T) {
+	src := newGitRepoWithCommit(t)
+	sha := headOf(t, src)
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	pushViaLoop(t, ft, root, src)
+
+	dst := emptyGitRepo(t)
+	script := "option check-connectivity true\n" +
+		"fetch " + sha + " refs/heads/main\n" +
+		"bogus-line\n" +
+		"\n"
+	in := bufio.NewScanner(strings.NewReader(script))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(ft, root, dst, in, out) })
+	out.Flush()
+	stdout := outBuf.String()
+
+	if got != 1 {
+		t.Fatalf("loop() = %d, want 1: a fetch batch with a malformed continuation line must "+
+			"fail closed, not silently ignore the bad line and fetch anyway (stdout=%q)", got, stdout)
+	}
+	if stderr == "" {
+		t.Error("a malformed fetch batch must report why on stderr")
+	}
+	if strings.Contains(stdout, "connectivity-ok") {
+		t.Errorf("stdout = %q, must NOT contain connectivity-ok: the batch was malformed, so "+
+			"nothing about the closure was actually verified", stdout)
+	}
+	if strings.Contains(stdout, "lock ") {
+		t.Errorf("stdout = %q, must NOT contain a lock line: a malformed batch must install nothing", stdout)
+	}
+}
+
+// TestLoop_FetchBatch_DegenerateFirstLineFailsClosed pins the "empty wants
+// reaches Fetch" half of the gap directly: a lone "fetch " line (matching the
+// outer switch's bare strings.HasPrefix check, but with no sha and no name
+// at all) as the WHOLE batch. Under the pre-fix parser, strings.Fields("fetch
+// ") produced a single-element slice, failed the old "len(sp) >= 2" test, and
+// was silently dropped — leaving `wants` completely empty with no error.
+// root is a genuinely bootstrapped/marked repo (via repo.Bootstrap directly
+// on the Fake, no real git needed) so that repo.Fetch's marker check passes
+// and its empty-wants short-circuit is what actually gets exercised — this
+// is the exact shape that produced a FALSE connectivity-ok pre-fix.
+//
+// RED (pre-fix): loop() returned 0 and stdout contained "connectivity-ok" —
+// both the "got != 1" and the "Contains(stdout, connectivity-ok)" assertions
+// fired.
+func TestLoop_FetchBatch_DegenerateFirstLineFailsClosed(t *testing.T) {
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	if err := repo.Bootstrap(ft, root); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	script := "option check-connectivity true\nfetch \n\n"
+	in := bufio.NewScanner(strings.NewReader(script))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(ft, root, ".", in, out) })
+	out.Flush()
+	stdout := outBuf.String()
+
+	if got != 1 {
+		t.Fatalf("loop() = %d, want 1: a degenerate \"fetch \" line with no sha and no name "+
+			"must fail closed, not silently produce an empty want list (stdout=%q)", got, stdout)
+	}
+	if stderr == "" {
+		t.Error("a degenerate fetch line must report why on stderr")
+	}
+	if strings.Contains(stdout, "connectivity-ok") {
+		t.Errorf("stdout = %q, must NOT contain connectivity-ok: an empty want list must never "+
+			"reach repo.Fetch, whose up-to-date signal would then falsely vouch for a closure "+
+			"nothing verified", stdout)
+	}
+	if strings.Contains(stdout, "lock ") {
+		t.Errorf("stdout = %q, must NOT contain a lock line", stdout)
+	}
+}
+
+// TestLoop_FetchBatch_CheckConnectivityFalse_NoConnectivityOk is the minor
+// fold-in: the negative branch of the option was correct by construction
+// (checkConnectivity defaults false, and the "if checkConnectivity" guard
+// already existed) but had no direct test. Not a RED — it already passed
+// against the code as committed for Task 6, since fix round 1 only tightens
+// batch-line parsing and does not touch the option-false path.
+func TestLoop_FetchBatch_CheckConnectivityFalse_NoConnectivityOk(t *testing.T) {
+	src := newGitRepoWithCommit(t)
+	sha := headOf(t, src)
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	pushViaLoop(t, ft, root, src)
+
+	dst := emptyGitRepo(t)
+	script := "fetch " + sha + " refs/heads/main\n\n" // no "option check-connectivity" at all
+	in := bufio.NewScanner(strings.NewReader(script))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	got := loop(ft, root, dst, in, out)
+	out.Flush()
+	stdout := outBuf.String()
+
+	if got != 0 {
+		t.Fatalf("loop() = %d, want 0: stdout=%q", got, stdout)
+	}
+	if !strings.Contains(stdout, "lock ") {
+		t.Errorf("stdout = %q, want a lock line: the fetch itself must still succeed", stdout)
+	}
+	if strings.Contains(stdout, "connectivity-ok") {
+		t.Errorf("stdout = %q, must NOT contain connectivity-ok: the option was never turned on", stdout)
+	}
+}
