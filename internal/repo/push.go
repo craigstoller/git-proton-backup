@@ -277,6 +277,13 @@ func publishPack(t transport.Transport, dst, local string) error {
 		return fmt.Errorf("pack upload outcome ambiguous; re-run to reconcile")
 	case transport.Committed:
 		return confirmPresent(t, dst, "pack")
+	case transport.Refused:
+		// Falls out of the switch into the verification path below — this is
+		// the safety-critical branch the whole task exists for, so it is
+		// named explicitly rather than left as an implicit fall-through.
+	default:
+		return fmt.Errorf("pack upload returned an unrecognised outcome %v; "+
+			"refusing to guess whether it is safe to publish", out)
 	}
 
 	dir, err := os.MkdirTemp("", "gpb-verify-*")
@@ -308,9 +315,14 @@ func publishPack(t transport.Transport, dst, local string) error {
 // legitimate remote index permanently fatal, since it cannot be replaced.
 // What matters is that it indexes the pack correctly.
 //
-// Verification runs against the LOCAL pack, not a second download: publishPack
-// has already established the remote pack is byte-identical to it, and packs
-// can be gigabytes.
+// Verification runs against the LOCAL pack, not a second download. This is
+// safe on either path publishPack can have taken: on Committed, we uploaded
+// those exact bytes ourselves — confirmPresent only re-checks presence, but
+// the content was never in question because we just wrote it; on Refused,
+// publishPack has explicitly byte-compared the remote pack against the local
+// one and found them identical. Either way the remote pack is known to equal
+// the local pack, so downloading it a second time here to verify against
+// itself buys nothing — and packs can be gigabytes.
 func publishIdx(t transport.Transport, dst, local, localPack string) error {
 	out, err := t.CreateExclusive(dst, local)
 	if err != nil {
@@ -321,6 +333,12 @@ func publishIdx(t transport.Transport, dst, local, localPack string) error {
 		return fmt.Errorf("index upload outcome ambiguous; re-run to reconcile")
 	case transport.Committed:
 		return confirmPresent(t, dst, "index")
+	case transport.Refused:
+		// Falls out of the switch into the verification path below — the
+		// same explicit-branch treatment as publishPack above.
+	default:
+		return fmt.Errorf("index upload returned an unrecognised outcome %v; "+
+			"refusing to guess whether it is safe to publish", out)
 	}
 
 	dir, err := os.MkdirTemp("", "gpb-verify-*")
@@ -366,22 +384,50 @@ func filesEqual(a, b string) (bool, error) {
 	if sa.Size() != sb.Size() {
 		return false, nil
 	}
+	return readersEqual(fa, fb)
+}
+
+// isCleanEOF reports whether e is io.ReadFull's normal end-of-stream signal
+// (io.EOF with nothing read this call, or io.ErrUnexpectedEOF with a short
+// final read) rather than a genuine I/O failure.
+func isCleanEOF(e error) bool { return e == io.EOF || e == io.ErrUnexpectedEOF }
+
+// readersEqual streams ra and rb 64KiB at a time and reports whether their
+// content is identical. Split out of filesEqual so the read loop's error
+// handling can be driven directly with a synthetic io.Reader in tests: a
+// genuine (non-EOF) I/O error is not reliably reproducible by opening real
+// files portably (Windows and POSIX fail mid-read very differently, if at
+// all, for the same fault), whereas a fake reader can return a canned error
+// deterministically on any platform. This is the exact loop filesEqual uses.
+//
+// Error checks run BEFORE the length/content comparison — this was fix-round
+// 1's finding: a short read carrying a genuine (non-EOF) error must surface
+// as that error, never as a false "the bytes differ". publishPack turns a
+// "not equal" result into a permanent, unrecoverable remote-corruption
+// diagnosis ("an immutable object is never overwritten"); a transient local
+// read failure must never produce that diagnosis. The clean-EOF case is
+// unchanged: equal-size inputs reach EOF/ErrUnexpectedEOF on the same
+// iteration (io.ReadFull requests the same 64KiB from both, and the sizes
+// were already confirmed equal by the caller), a zero-byte pair returns true
+// on the very first pass, and the loop only ever exits by one of the three
+// explicit returns below, never open-ended.
+func readersEqual(ra, rb io.Reader) (bool, error) {
 	ba, bb := make([]byte, 64*1024), make([]byte, 64*1024)
 	for {
-		na, ea := io.ReadFull(fa, ba)
-		nb, eb := io.ReadFull(fb, bb)
+		na, ea := io.ReadFull(ra, ba)
+		nb, eb := io.ReadFull(rb, bb)
+
+		if ea != nil && !isCleanEOF(ea) {
+			return false, ea
+		}
+		if eb != nil && !isCleanEOF(eb) {
+			return false, eb
+		}
 		if na != nb || !bytes.Equal(ba[:na], bb[:nb]) {
 			return false, nil
 		}
-		if ea != nil || eb != nil {
-			done := func(e error) bool { return e == io.EOF || e == io.ErrUnexpectedEOF }
-			if done(ea) && done(eb) {
-				return true, nil
-			}
-			if ea != nil && !done(ea) {
-				return false, ea
-			}
-			return false, eb
+		if isCleanEOF(ea) && isCleanEOF(eb) {
+			return true, nil
 		}
 	}
 }

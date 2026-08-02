@@ -1,6 +1,8 @@
 package repo
 
 import (
+	"bytes"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1024,5 +1026,54 @@ func TestPushRefusedPackWithNoRemoteIdxRepairsTheOrphan(t *testing.T) {
 	}
 	if _, ok := f.Files["/r/packs/"+idxName]; !ok {
 		t.Error("the orphan's index must have been uploaded")
+	}
+}
+
+// errAfterReader returns some bytes of zero-value content, then errAfter on
+// every following Read call — a synthetic reader standing in for a genuine
+// (non-EOF) I/O error partway through a stream. Provoking a real, non-EOF
+// read error from an actual file is not reliably portable (Windows and POSIX
+// fail mid-read very differently, if at all, for the same underlying fault),
+// so this drives readersEqual's loop deterministically on any platform
+// instead of reaching for the filesystem.
+type errAfterReader struct {
+	remaining int
+	errAfter  error
+}
+
+func (r *errAfterReader) Read(p []byte) (int, error) {
+	if r.remaining <= 0 {
+		return 0, r.errAfter
+	}
+	if len(p) > r.remaining {
+		p = p[:r.remaining]
+	}
+	r.remaining -= len(p)
+	return len(p), nil
+}
+
+// TestReadersEqualSurfacesGenuineReadError covers the fix-round-1 finding: a
+// genuine (non-EOF) read error on one side, while the other side still has a
+// full chunk of data ready (no error yet), must be returned as that error —
+// never reported as (false, nil), i.e. "the bytes differ". Before the fix,
+// the length/content comparison ran BEFORE the error checks: the errored
+// side's short read (na=0) against the healthy side's full chunk (nb=65536)
+// made na != nb fire first, so the function returned (false, nil) without
+// ever looking at the error. publishPack turns a "not equal" result into a
+// permanent, unrecoverable "the remote pack is corrupt" diagnosis — so a
+// transient local read failure must never be able to produce that message.
+func TestReadersEqualSurfacesGenuineReadError(t *testing.T) {
+	wantErr := errors.New("simulated disk read failure")
+	// ra fails immediately with a genuine error; rb has a full 64KiB chunk of
+	// real data ready and no error yet.
+	ra := &errAfterReader{remaining: 0, errAfter: wantErr}
+	rb := bytes.NewReader(make([]byte, 64*1024))
+
+	_, err := readersEqual(ra, rb)
+	if err == nil {
+		t.Fatal("a genuine read error must be returned, not swallowed into a false 'not equal'")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Errorf("got error %v, want it to be (or wrap) %v", err, wantErr)
 	}
 }
