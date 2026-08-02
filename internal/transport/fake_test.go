@@ -161,9 +161,17 @@ func TestFakeReadToLandsUnderRemoteBasenameInAnExistingDir(t *testing.T) {
 
 // TestFakeReadToIntoMissingDirectoryErrors covers the other half of the
 // ReadTo contract: local must already be a directory, and implementations do
-// not create it on the caller's behalf, because the real CLI does not either.
-// A missing (or non-directory) destination must surface as the error it
-// naturally is, not be silently papered over.
+// not create it on the caller's behalf. A missing (or non-directory)
+// destination must surface as the error it naturally is, not be silently
+// papered over.
+//
+// This comment used to justify that with "because the real CLI does not
+// create it either", which the Stage 3a live gate disproved — the binary DOES
+// create it and succeed (probe C16). The contract survived the correction on
+// its own merits: every caller here creates its temp dir with os.MkdirTemp
+// first, so a missing destination always indicates a caller bug, and *CLI now
+// stats the destination itself rather than the contract being loosened to
+// match the binary. Both implementations therefore still owe this behaviour.
 func TestFakeReadToIntoMissingDirectoryErrors(t *testing.T) {
 	f := NewFake()
 	local := writeTemp(t, "cc", "x")

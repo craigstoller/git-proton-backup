@@ -1,6 +1,6 @@
 # git-remote-proton — v2 design
 
-**Status:** design v6.2, revised 2026-08-01 during and after Stage 2 implementation. v5 was settled after four rounds of Codex + Gemini peer review; v6, v6.1 and v6.2 each change exactly one mechanism, and each only because implementation proved the original unimplementable, unenforceable, or worse than what shipped — see the revision history.
+**Status:** design v6.3, revised 2026-08-02 during and after Stage 3a implementation. v5 was settled after four rounds of Codex + Gemini peer review; v6, v6.1, v6.2 and v6.3 each change exactly one mechanism, and each only because implementation proved the original unimplementable, unenforceable, or worse than what shipped — see the revision history.
 **Relates to:** [issue #3](https://github.com/craigstoller/git-proton-backup/issues/3).
 **Depends on:** [`docs/research/remote-helper-prior-art.md`](research/remote-helper-prior-art.md) — read first; assumed, not repeated.
 **Pinned to:** Proton Drive CLI **`cli-drive@0.7.0`** (SDK `js@0.20.0`) — Stage 1 was certified
@@ -486,7 +486,7 @@ The helper owns the closure. Git's `fetch` capability is defined as transferring
    **Naming is normative:** git recognises a `.keep` only when its stem exactly matches the adjacent pack (`packfile.c:368-384`). The installed files are `pack-<git-pack-hash>.{pack,idx,keep}` using git's own naming from `index-pack`.
 
    **What v6.2's shared naming does and does not remove.** A pack *downloaded unchanged* keeps its name locally, because `index-pack` recomputes the same checksum from the same bytes — so no rename or translation is needed for it. It does **not** remove the object-to-pack map: that is built from the downloaded `.idx` sidecars and is what discovery runs on regardless of naming. Nor does it apply to the **consolidated** pack this step installs, which is a new pack built from many, whose checksum legitimately matches none of the remote names it was derived from. Shared naming is a convenience at the edges, not an end-to-end identity.
-6. **Verify connectivity against the exact requested wants**, after all imports and before reporting success — an explicit missing-object-fatal traversal rooted at the wants, not a generic `fsck`, since the wants are not yet referenced by any ref.
+6. **Verify connectivity against the exact requested wants**, against the downloaded packs in the temp area **BEFORE the consolidated pack of step 5 is installed**, and before reporting success — an explicit missing-object-fatal traversal rooted at the wants, not a generic `fsck`, since the wants are not yet referenced by any ref. **Verifying before the install, rather than after it, is deliberate:** a failure discovered after the install has already written the pack and its `.keep` leaves that pack protected by a `.keep` no git operation will ever remove — an unreclaimable residue costing disk until a human deletes the file — whereas a failure in the temp area leaves the local object store untouched. This reverses the ordering an earlier draft of this step specified; see the v6.3 entry.
 
 **Termination is explicit.** The loop maintains a set of already-downloaded packs and a set of still-missing OIDs. Each round must either download a pack not previously downloaded, or resolve at least one missing OID. **A round that does neither is fatal** — that is the signature of a stale or corrupt index mapping a missing OID into a pack already held, and without this check the loop runs forever.
 
@@ -575,6 +575,23 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
 ---
 
 ## Revision history
+
+**v6.3, 2026-08-02 — Fetch verifies connectivity BEFORE the install, not after it.**
+
+- Fetch step 6 said the connectivity check runs "after all imports and before reporting
+  success". Stage 3a's shipped `internal/repo/fetch.go` runs it **before** `consolidateAndInstall`
+  writes anything into the local object store, and does so deliberately. The step now says so.
+- The reason is the `.keep`. Step 5's install writes `pack-<hash>.{pack,idx,keep}`, and git removes
+  that `.keep` only after it has updated refs on the strength of a successful fetch. A verification
+  failure discovered *after* the install therefore leaves a pack nothing references and a `.keep`
+  nothing will ever remove — an unreclaimable residue costing disk until a human deletes the file.
+  Verified first, the same failure leaves the local store untouched, which is what the step's own
+  "keeping unverified remote objects out of the real database until closure is proven" (step 4)
+  was always aiming at.
+- Nothing else moves: the steps keep their numbers, the traversal is still rooted at the exact
+  wants rather than being a generic `fsck`, and the install is still one consolidated pack with
+  one protocol `lock`. Recorded because a normative document that disagrees with shipped, gated
+  code is how the *next* implementer reintroduces the defect — the same reason v6.2 exists.
 
 **v6.2, 2026-08-01 — pack naming is git's; and the first draft of this entry was wrong.**
 

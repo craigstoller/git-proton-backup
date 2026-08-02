@@ -74,9 +74,34 @@ Add to `internal/gitcmd/gitcmd_test.go`:
 
 ```go
 // twoCommitRepo returns a repo with two commits and the sha of each.
+//
+// Its FIRST commit must have content distinct from newRepo's, and this is
+// load-bearing: a commit sha covers the author and committer timestamps at
+// one-second resolution, so two repos built from identical inputs inside the
+// same second produce the SAME sha. The connectivity test below compares this
+// repo against a fresh newRepo destination — if their root commits collided,
+// --not --all would mark the "missing" parent uninteresting from the
+// destination's own store and the incomplete-closure assertion would see
+// exit 0. The test would then fail (or silently prove nothing) depending on
+// how fast the machine is. Reproduced with pinned GIT_COMMITTER_DATE.
 func twoCommitRepo(t *testing.T) (dir, first, second string) {
 	t.Helper()
-	d := newRepo(t) // one commit already
+	d := t.TempDir()
+	for _, a := range [][]string{
+		{"init", "-qb", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"},
+	} {
+		if err := exec.Command("git", append([]string{"-C", d}, a...)...).Run(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(d, "a.txt"), []byte("src-one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range [][]string{{"add", "."}, {"commit", "-qm", "src c1"}} {
+		if err := exec.Command("git", append([]string{"-C", d}, a...)...).Run(); err != nil {
+			t.Fatal(err)
+		}
+	}
 	first = headOf(t, d)
 	if err := os.WriteFile(filepath.Join(d, "b.txt"), []byte("two"), 0o644); err != nil {
 		t.Fatal(err)
@@ -317,6 +342,13 @@ git commit -m "feat(v2): symbolic-ref, connectivity check, and the new-object li
 ---
 
 ## Task 2 — the shared Transport contract table
+
+> **SUPERSEDED IN TWO PLACES BY EXECUTION (2026-08-02). The shipped `internal/transport/contract_test.go`, `cli.go` and `fake.go` are authoritative over this section's code blocks.** Do not re-implement the table from this text:
+>
+> 1. **The C11 guard is enforced in BOTH implementations, not just the Fake.** This section's text says the Fake is where the caller contract gets checked. Task 2 review round 1 found `*CLI` passing `localFile` straight through to `filesystem upload`, so a violating caller would have written to the wrong remote name live while the suite stayed green — `checkUploadBasename` is now called from `CLI.CreateExclusive` and `CLI.UpdateRevision` as well.
+> 2. **The C11 case must stage under a MISMATCHED name.** The `create names the node after the target leaf` case below stages under the SAME name as the target leaf, so it cannot distinguish "names after the target leaf" from "names after the local basename" and stays green with `checkUploadBasename` deleted entirely — decorative coverage. The shipped table splits it: `create refuses a local basename that mismatches the target leaf (C11)` is the discriminating case, and `create lands at the target leaf when basenames agree` is the honest happy path beside it.
+>
+> Separately, and not a defect in this section: the live half of this table did not run until Stage 3a task 7, and when it did it found probe **C16** — `filesystem download` silently creates a missing destination directory, contradicting the `readTo into a missing directory errors and creates nothing` case's premise. The case was kept and `*CLI.ReadTo` now enforces the contract by stat-ing before spawn. See `docs/research/probes/stage1-results.json`.
 
 **Files:**
 - Create: `internal/transport/contract_test.go`
@@ -566,6 +598,12 @@ git commit -m "test(v2): shared Transport contract table, live half opt-in"
 ---
 
 ## Task 3 — HEAD: derive, write, read
+
+> **SUPERSEDED IN ONE PLACE BY EXECUTION (2026-08-02). The shipped `internal/repo/head.go` is authoritative over this section's code blocks.**
+>
+> 1. **`WriteHEAD`'s outcome switch must have an arm per constant and a fail-closed `default:`.** The `switch out` below handles only `Ambiguous` and `Refused`, so any value it does not recognise — including a future fourth `Outcome` — falls through into the read-back and can be reported as `Committed` on the strength of a value nobody recognised. The shipped version has explicit `Committed` (falls through to the read-back), `Refused` and `Ambiguous` arms plus a `default:` that refuses to guess whether the write landed, matching `Bootstrap`, `AcquireLock`, `publishPack` and `publishIdx`.
+>
+> Separately, and NOT a defect in this section's code: nothing on the DELETE path knew about remote HEAD, so an ordinary `push :refs/heads/main` could leave HEAD naming a branch that no longer exists — permanently, since `ensureHEAD` returns early whenever a HEAD is present. Stage 3a's final review fixed that in two places outside this task: a delete refusal in `repo.pushOne` (the design's normative "refuse to delete the branch `HEAD` points at" row) and an advertisement guard in `cmd/git-remote-proton`'s plain `list` arm, which emits the `@... HEAD` symref only when the branch it names is in the ref list.
 
 **Files:**
 - Create: `internal/repo/head.go`
@@ -1002,6 +1040,13 @@ git commit -m "feat(v2): complete a missing remote HEAD on push"
 
 ## Task 5 — fetch orchestration
 
+> **SUPERSEDED IN THREE PLACES BY EXECUTION (2026-08-02). The shipped `internal/repo/fetch.go` is authoritative over this section's code blocks.** Review found, and the fix rounds corrected, three defects in the code below — do not re-implement from this text:
+>
+> 1. **`Fetch` needs a presence-based short-circuit before touching the remote** (`ConnectivityOK(gitDir, "", wants)` → up to date). `RevListNewObjects`' `--not --all` excludes by REF-reachability, not store presence, and `Fetch` never writes refs — so without the short-circuit a second fetch before git updates refs reconsolidates the full history every time. This also implements the parent design's resume-safety clause.
+> 2. **The install path must come from `rev-parse --git-path objects/pack`, NOT `--git-dir` + join.** In a linked worktree `--git-dir` answers with the per-worktree ADMIN dir, which has no object store — the pack lands where git never looks, and `connectivity-ok` then makes git update refs to invisible objects. Fail-open.
+> 3. **`consolidateAndInstall` must not exec `pack-objects` itself** — that exec site lacked `WaitDelay` and the `ErrWaitDelay` guard. It routes through `gitcmd.PackObjectsFromList`, which `WritePack` also uses.
+> 4. **`requireMarker` no longer lives in `fetch.go`** — the final fix wave moved it to `marker.go` as the exported `repo.RequireMarker`, because plain `list` needs the same refusal (an `ls-remote` against a non-repo folder must refuse with the named reason, not a raw List error). The "refusing to fetch from" text below is also stale; the shipped message says "refusing to read".
+
 **Files:**
 - Create: `internal/repo/fetch.go`
 - Modify: `internal/repo/repo_test.go`
@@ -1407,6 +1452,11 @@ git commit -m "feat(v2): fetch every pack, verify, then install one consolidated
 ---
 
 ## Task 6 — wire the protocol: `fetch` capability, `list`, the batch
+
+> **SUPERSEDED IN TWO PLACES BY EXECUTION (2026-08-02). The shipped `cmd/git-remote-proton/main.go` is authoritative over this section's code blocks.** Do not re-implement from this text:
+>
+> 1. **Step 4's fetch-batch scan is FAIL-OPEN and must not be reused.** `sp := strings.Fields(l); if len(sp) >= 2 { wants = append(wants, sp[1]) }` never checks that the line begins with `fetch `, accepts whatever token sits second on any line with two or more fields, and SILENTLY DROPS any line with fewer. A batch whose lines are all malformed therefore leaves `wants` empty with no error reported — and `repo.Fetch` reads an empty `wants` as `("", nil)`, its legitimate "already up to date" signal, which with `check-connectivity` on reached git as **`connectivity-ok` for a closure nothing ever verified**, on precisely the path where git skips its own check because the helper claimed to have done it. The shipped code validates EVERY line strictly against `fetch <40-lowercase-hex> <name>` (`parseFetchLine`), fails the session closed on the first violation, and asserts a non-empty `wants` afterwards as defence in depth.
+> 2. **Step 3's plain `list` arm needs two guards this text does not have.** It must call `repo.RequireMarker` first, so `ls-remote` against a folder that is not one of our repos refuses with the named reason instead of advertising an empty repo; and it must emit the `@<branch> HEAD` symref line **only when `<branch>` is in the ref list it just advertised**, so a remote whose HEAD outlived its branch presents as headless (a defined state) rather than sending a clone to check out a ref that is not advertised.
 
 **Files:**
 - Modify: `cmd/git-remote-proton/main.go`

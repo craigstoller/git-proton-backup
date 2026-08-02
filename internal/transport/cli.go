@@ -186,7 +186,23 @@ func (c *CLI) List(p string) ([]Node, error) {
 	return nodes, nil
 }
 
+// ReadTo ENFORCES the documented "localDir must already exist" contract by
+// stat-ing it before ever invoking the CLI. The underlying `proton-drive
+// filesystem download` binary does NOT enforce this itself — confirmed live
+// (Stage 3a gate, task 7): given a missing destination it silently creates
+// the directory and succeeds, contradicting both the Transport interface
+// comment and the contract test as they stood before this fix. Rather than
+// loosen the contract to match the CLI binary, the wrapper closes the gap:
+// every caller in this codebase creates its temp dir with os.MkdirTemp
+// before calling ReadTo, so a missing or non-directory localDir here always
+// indicates a caller bug, and silently creating a directory nobody asked for
+// would paper over exactly that bug instead of surfacing it.
 func (c *CLI) ReadTo(p, localDir string) error {
+	if st, err := os.Stat(localDir); err != nil {
+		return fmt.Errorf("download destination %s: %w", localDir, err)
+	} else if !st.IsDir() {
+		return fmt.Errorf("download destination %s is not a directory", localDir)
+	}
 	out, code, err := c.run("filesystem", "download", p, localDir)
 	if code != 0 {
 		if err != nil {
@@ -293,8 +309,16 @@ func (c *CLI) upload(strategy, remoteDir, localFile string) (Outcome, error) {
 // because `filesystem upload` takes a PARENT path and has no --name flag: the
 // remote node is named after localFile's OWN basename (probe C11). CALLER
 // CONTRACT: filepath.Base(localFile) MUST equal the leaf of p, or the write
-// lands under the wrong remote name. repo.stagedFile is what guarantees it.
+// lands under the wrong remote name. repo.stagedFile is what guarantees it,
+// and checkUploadBasename (below) is the second, mechanical line of defence:
+// Task 2 review round 1 found that only the Fake enforced this contract — the
+// CLI passed localFile straight through, so a caller that violated it against
+// the live CLI would silently write to the wrong remote name, which is
+// exactly the C11 failure class this whole check exists to prevent.
 func (c *CLI) CreateExclusive(p, localFile string) (Outcome, error) {
+	if err := checkUploadBasename(p, localFile); err != nil {
+		return Ambiguous, err
+	}
 	return c.upload("skip", dirOf(p), localFile)
 }
 
@@ -303,10 +327,13 @@ func (c *CLI) CreateExclusive(p, localFile string) (Outcome, error) {
 // that does not yet exist (Stage 1 C8: exit 0, transferred=1), so no prior
 // existence check is needed for correctness. NOT `replace`, which trashes
 // the node before creating the new one and can destroy a ref on a crash.
-// Subject to the same caller contract as CreateExclusive, above: localFile's
-// basename must equal p's leaf (probe C11), or the revision lands under the
-// wrong remote name.
+// Subject to the same caller contract as CreateExclusive, above, and checked
+// the same way: localFile's basename must equal p's leaf (probe C11), or the
+// revision lands under the wrong remote name.
 func (c *CLI) UpdateRevision(p, localFile string) (Outcome, error) {
+	if err := checkUploadBasename(p, localFile); err != nil {
+		return Ambiguous, err
+	}
 	return c.upload("merge", dirOf(p), localFile)
 }
 

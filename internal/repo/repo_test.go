@@ -569,6 +569,29 @@ func headOfPushRepo(t *testing.T, dir string) string {
 	return sha
 }
 
+// commitOnPushRepo adds a second commit (file=content) on top of whatever
+// HEAD dir currently has, and returns the new HEAD sha.
+//
+// Added in fix round 1 for TestFetchRejectsACorruptPackAndInstallsNothing:
+// once that test primes dst with a genuine first fetch (so `before` is a real
+// 1, not 0 by construction), re-fetching the SAME want would let Fetch's
+// up-to-date short-circuit return before the corrupt pack under test is ever
+// downloaded — the corruption would never be read, and the test would pass
+// for the wrong reason. A second, not-yet-fetched commit gives the corrupted
+// second fetch an actual want to chase.
+func commitOnPushRepo(t *testing.T, dir, file, content string) string {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, file), []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", file, err)
+	}
+	for _, a := range [][]string{{"add", "."}, {"commit", "-qm", "c2"}} {
+		if err := exec.Command("git", append([]string{"-C", dir}, a...)...).Run(); err != nil {
+			t.Fatalf("git %v: %v", a, err)
+		}
+	}
+	return headOfPushRepo(t, dir)
+}
+
 // refusingUploadTransport reports Refused for a chosen remote suffix, leaving
 // whatever bytes the test planted at that path untouched.
 type refusingUploadTransport struct {
@@ -1226,4 +1249,806 @@ func TestAcquireLockFailsClosedOnUnrecognisedOutcome(t *testing.T) {
 	if !strings.Contains(err.Error(), "outcome(42)") {
 		t.Errorf("the refusal must name the outcome it saw, got: %v", err)
 	}
+}
+
+// RED. DeriveHEAD does not exist. A pure function — no transport needed.
+func TestDeriveHEAD(t *testing.T) {
+	cases := []struct {
+		name       string
+		candidates []string
+		clientHEAD string
+		want       string
+		wantOK     bool
+	}{
+		{"none", nil, "refs/heads/main", "", false},
+		{"single wins outright", []string{"refs/heads/only"}, "refs/heads/other", "refs/heads/only", true},
+		{"client HEAD breaks the tie",
+			[]string{"refs/heads/zeta", "refs/heads/alpha", "refs/heads/main"},
+			"refs/heads/main", "refs/heads/main", true},
+		{"lexicographically first when the client HEAD is absent",
+			[]string{"refs/heads/zeta", "refs/heads/alpha"},
+			"refs/heads/nowhere", "refs/heads/alpha", true},
+		{"lexicographically first when the client is detached",
+			[]string{"refs/heads/zeta", "refs/heads/alpha"},
+			"", "refs/heads/alpha", true},
+		{"non-branches are not candidates", []string{"refs/tags/v1"}, "", "", false},
+	}
+	for _, c := range cases {
+		got, ok := DeriveHEAD(c.candidates, c.clientHEAD)
+		if got != c.want || ok != c.wantOK {
+			t.Errorf("%s: DeriveHEAD = (%q, %v), want (%q, %v)", c.name, got, ok, c.want, c.wantOK)
+		}
+	}
+}
+
+// RED. WriteHEAD/ReadHEAD do not exist.
+func TestWriteAndReadHEAD(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+
+	if _, ok, err := ReadHEAD(f, "/r"); err != nil || ok {
+		t.Fatalf("a fresh repo has no HEAD: %v %v", ok, err)
+	}
+	if out, err := WriteHEAD(f, "/r", "refs/heads/main"); err != nil || out != transport.Committed {
+		t.Fatalf("WriteHEAD: %v %v", out, err)
+	}
+	if got := string(f.Files["/r/HEAD"]); got != "ref: refs/heads/main\n" {
+		t.Errorf("HEAD content = %q", got)
+	}
+	branch, ok, err := ReadHEAD(f, "/r")
+	if err != nil || !ok {
+		t.Fatalf("ReadHEAD: %v %v", ok, err)
+	}
+	if branch != "refs/heads/main" {
+		t.Errorf("ReadHEAD = %q, want refs/heads/main", branch)
+	}
+}
+
+// RED. A symref payload must not be forced through WriteRef's 40-hex rule,
+// and a garbage HEAD must be fatal rather than coerced.
+func TestReadHEADRejectsCorruptContent(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	f.Files["/r/HEAD"] = []byte("1111111111111111111111111111111111111111\n")
+	if _, _, err := ReadHEAD(f, "/r"); err == nil {
+		t.Error("a detached-OID HEAD is not a symref and must be refused, not coerced")
+	}
+	f.Files["/r/HEAD"] = []byte("ref: refs/tags/v1\n")
+	if _, _, err := ReadHEAD(f, "/r"); err == nil {
+		t.Error("HEAD must point at a branch")
+	}
+}
+
+// TestWriteHEADFailsClosedOnUnrecognisedOutcome covers fix-round-1's Important
+// finding: before the fix, WriteHEAD's outcome switch handled only Ambiguous
+// and Refused, and let everything else — including a value nobody
+// recognises — fall through into the read-back verification, where it would
+// have been reported as Committed if the read-back happened to match. That is
+// the same exposure AcquireLock, Bootstrap, publishPack and publishIdx are all
+// already guarded against (each with its own default arm and test); WriteHEAD
+// was the one CreateExclusive caller without it. Reuses
+// unknownOutcomeTransport (defined above for the Bootstrap/AcquireLock
+// variants of this exact test) rather than inventing a second stub, since the
+// shape — force CreateExclusive to an out-of-range Outcome for one chosen
+// path — is identical.
+func TestWriteHEADFailsClosedOnUnrecognisedOutcome(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	tr := unknownOutcomeTransport{Fake: f, forPath: "/r/" + HeadName}
+
+	out, err := WriteHEAD(tr, "/r", "refs/heads/main")
+	if err == nil {
+		t.Fatal("WriteHEAD must fail closed on an unrecognised outcome")
+	}
+	if out != transport.Ambiguous {
+		t.Errorf("an unrecognised outcome must be reported as Ambiguous, got %v", out)
+	}
+	if !strings.Contains(err.Error(), "outcome(42)") {
+		t.Errorf("the refusal must name the outcome it saw, got: %v", err)
+	}
+	if _, ok := f.Files["/r/HEAD"]; ok {
+		t.Error("no HEAD was actually written; nothing may claim otherwise")
+	}
+}
+
+// TestWriteHEADNeverOverwritesExistingHEAD covers the Refused path (fix-round
+// coverage gap 1): CreateExclusive on an already-present HEAD reports Refused,
+// and WriteHEAD must adopt that — report Refused with no error — rather than
+// touching the existing content. Never-overwrite is the whole reason HEAD
+// uses CreateExclusive and not UpdateRevision.
+func TestWriteHEADNeverOverwritesExistingHEAD(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	f.Files["/r/HEAD"] = []byte("ref: refs/heads/existing\n")
+
+	out, err := WriteHEAD(f, "/r", "refs/heads/other")
+	if err != nil || out != transport.Refused {
+		t.Fatalf("WriteHEAD over an existing HEAD must report (Refused, nil), got %v %v", out, err)
+	}
+	if got := string(f.Files["/r/HEAD"]); got != "ref: refs/heads/existing\n" {
+		t.Errorf("the existing HEAD must be untouched, got %q", got)
+	}
+}
+
+// TestWriteHEADAmbiguousOutcomeIsReported covers the Ambiguous path (fix-round
+// coverage gap 2), using Fake.FailNext rather than a stub since Fake's own
+// CreateExclusive already reports Ambiguous once when FailNext is set. Set
+// AFTER Bootstrap: Bootstrap's own marker write is a CreateExclusive call too,
+// and FailNext only fires on the next mutation, so setting it any earlier
+// would consume it before WriteHEAD ever runs.
+func TestWriteHEADAmbiguousOutcomeIsReported(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	f.FailNext = "inject"
+
+	out, err := WriteHEAD(f, "/r", "refs/heads/main")
+	if err == nil || out != transport.Ambiguous {
+		t.Fatalf("an ambiguous CreateExclusive outcome must be reported as (Ambiguous, error), got %v %v", out, err)
+	}
+}
+
+// TestWriteHEADRefusesNonBranchTarget covers the not-a-branch guard
+// (fix-round coverage gap 3): WriteHEAD must reject a target outside
+// refs/heads/ before ever touching the transport, mirroring the guard
+// TestWriteRefRefusesNonSha already pins for WriteRef.
+func TestWriteHEADRefusesNonBranchTarget(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+
+	if out, err := WriteHEAD(f, "/r", "refs/tags/v1"); err == nil {
+		t.Errorf("WriteHEAD must refuse a non-branch target, got %v, nil error", out)
+	}
+	if _, ok := f.Files["/r/HEAD"]; ok {
+		t.Error("nothing must be written to the transport for a rejected target")
+	}
+}
+
+// TestReadHEADAcceptsCRLF covers the CRLF round-trip (fix-round coverage gap
+// 4). ReadHEAD's TrimRight("\r\n") already handles this; this test exists so a
+// future "simplification" that narrows the trim to "\n" only cannot silently
+// break a HEAD written or touched by a CRLF-writing tool.
+func TestReadHEADAcceptsCRLF(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	f.Files["/r/HEAD"] = []byte("ref: refs/heads/main\r\n")
+
+	branch, ok, err := ReadHEAD(f, "/r")
+	if err != nil || !ok {
+		t.Fatalf("ReadHEAD: %v %v", ok, err)
+	}
+	if branch != "refs/heads/main" {
+		t.Errorf("ReadHEAD = %q, want refs/heads/main", branch)
+	}
+}
+
+// RED. Push does not write HEAD at all today.
+func TestPushWritesHeadOnFirstPush(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	d := newGitRepoForPush(t)
+	head := headOfPushRepo(t, d)
+
+	res := Push(f, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/heads/main"}}, map[string]string{})
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("push: %+v", res)
+	}
+	if got := string(f.Files["/r/HEAD"]); got != "ref: refs/heads/main\n" {
+		t.Errorf("HEAD = %q, want ref: refs/heads/main", got)
+	}
+}
+
+// RED. Backfill: an existing repo with branches but no HEAD gets one, and the
+// candidate set is every remote branch — not just what this push published.
+func TestPushBackfillsHeadFromAllRemoteBranches(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	d := newGitRepoForPush(t)
+	head := headOfPushRepo(t, d)
+
+	// "alpha" is already on the remote from an earlier push; no HEAD exists.
+	if _, err := WriteRef(f, "/r", "refs/heads/alpha", head, false); err != nil {
+		t.Fatal(err)
+	}
+	remote := map[string]string{"refs/heads/alpha": head}
+
+	// Today we push "zeta" only.
+	res := Push(f, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/heads/zeta"}}, remote)
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("push: %+v", res)
+	}
+	if got := string(f.Files["/r/HEAD"]); got != "ref: refs/heads/alpha\n" {
+		t.Errorf("HEAD = %q — the candidate set must include branches this push did not touch", got)
+	}
+}
+
+// GUARD. An existing HEAD is never rewritten.
+func TestPushNeverRewritesAnExistingHead(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	d := newGitRepoForPush(t)
+	head := headOfPushRepo(t, d)
+	f.Files["/r/HEAD"] = []byte("ref: refs/heads/chosen\n")
+
+	res := Push(f, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/heads/main"}}, map[string]string{})
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("push: %+v", res)
+	}
+	if got := string(f.Files["/r/HEAD"]); got != "ref: refs/heads/chosen\n" {
+		t.Errorf("an existing HEAD must not be touched, got %q", got)
+	}
+}
+
+// GUARD. A tag-only push leaves the repo headless — a defined state.
+func TestPushTagOnlyLeavesRepoHeadless(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	d := newGitRepoForPush(t)
+	head := headOfPushRepo(t, d)
+
+	res := Push(f, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/tags/v1"}}, map[string]string{})
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("push: %+v", res)
+	}
+	if _, ok := f.Files["/r/HEAD"]; ok {
+		t.Error("a tag-only push must not write HEAD")
+	}
+}
+
+// RED. The design's ref-transition table is normative on this row: "Delete
+// (`push :dst`) | Trash; refuse to delete the branch HEAD points at". Nothing
+// implemented it, so an ordinary `git push proton-v2 --delete main` against a
+// remote whose HEAD names main trashed the ref and left HEAD dangling — a
+// state a later clone cannot recover from, because ensureHEAD returns early
+// whenever a HEAD exists and v2 never rewrites one.
+//
+// The refusal is per-ref, not per-batch: other updates in the same push are
+// unaffected, which is why it is expressed as a failed Result rather than an
+// error out of Push.
+func TestPushRefusesToDeleteTheBranchHeadPointsAt(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	sha := "2222222222222222222222222222222222222222"
+	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := WriteHEAD(f, "/r", "refs/heads/main"); err != nil {
+		t.Fatal(err)
+	}
+
+	ups := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/main"}}
+	res := Push(f, "/r", t.TempDir(), ups, map[string]string{"refs/heads/main": sha})
+
+	if len(res) != 1 {
+		t.Fatalf("want one result, got %+v", res)
+	}
+	if res[0].OK {
+		t.Fatalf("deleting the branch HEAD points at must be refused, got OK: %+v", res[0])
+	}
+	if !strings.Contains(res[0].Err, "HEAD points at") {
+		t.Errorf("reason = %q, want it to name why the delete was refused", res[0].Err)
+	}
+	if _, ok := f.Files["/r/refs/heads/main"]; !ok {
+		t.Error("the ref file must survive a refused delete")
+	}
+	if got := string(f.Files["/r/HEAD"]); got != "ref: refs/heads/main\n" {
+		t.Errorf("HEAD = %q, must be left alone", got)
+	}
+}
+
+// GUARD. The refusal must be scoped to the branch HEAD actually names — a
+// delete of any OTHER branch still succeeds. Without this, "refuse every
+// delete" would pass the test above.
+func TestPushDeletesABranchHeadDoesNotPointAt(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	sha := "2222222222222222222222222222222222222222"
+	for _, ref := range []string{"refs/heads/main", "refs/heads/dev"} {
+		if _, err := WriteRef(f, "/r", ref, sha, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := WriteHEAD(f, "/r", "refs/heads/main"); err != nil {
+		t.Fatal(err)
+	}
+
+	ups := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/dev"}}
+	res := Push(f, "/r", t.TempDir(), ups,
+		map[string]string{"refs/heads/main": sha, "refs/heads/dev": sha})
+
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("deleting a branch HEAD does not point at must succeed: %+v", res)
+	}
+	if _, ok := f.Files["/r/refs/heads/dev"]; ok {
+		t.Error("the ref file must be gone")
+	}
+}
+
+// RED. A HEAD that cannot be read is not licence to delete. ReadHEAD treats
+// content that is not a branch symref as fatal (never coerced), and a delete
+// taken on the strength of an unreadable HEAD could be exactly the delete the
+// rule above exists to refuse.
+func TestPushDeleteFailsClosedOnAnUnreadableHead(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	sha := "2222222222222222222222222222222222222222"
+	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	f.Files["/r/HEAD"] = []byte("this is not a symref\n")
+
+	ups := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/main"}}
+	res := Push(f, "/r", t.TempDir(), ups, map[string]string{"refs/heads/main": sha})
+
+	if len(res) != 1 {
+		t.Fatalf("want one result, got %+v", res)
+	}
+	if res[0].OK {
+		t.Fatalf("a delete must fail closed when HEAD cannot be read, got OK: %+v", res[0])
+	}
+	if !strings.Contains(res[0].Err, "HEAD") {
+		t.Errorf("reason = %q, want it to name the HEAD read failure", res[0].Err)
+	}
+	if _, ok := f.Files["/r/refs/heads/main"]; !ok {
+		t.Error("the ref file must survive a delete that failed closed")
+	}
+}
+
+// GUARD (ensureHEAD delete arithmetic). A batch that deletes a branch and
+// recreates it must leave that branch in the candidate set: the delete removes
+// it from `seen`, and the recreate in the same batch has to put it back.
+// Getting the arithmetic wrong here would leave a repo headless that has a
+// perfectly good branch on it.
+func TestPushDeleteThenRecreateInOneBatchStillDerivesHead(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	d := newGitRepoForPush(t)
+	head := headOfPushRepo(t, d)
+	if _, err := WriteRef(f, "/r", "refs/heads/main", head, false); err != nil {
+		t.Fatal(err)
+	}
+	// No HEAD on the remote: this is the backfill case, and it is also why
+	// the delete refusal above does not fire here.
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/main"},
+		{Src: head, Dst: "refs/heads/main"},
+	}
+	res := Push(f, "/r", d, ups, map[string]string{"refs/heads/main": head})
+	for _, r := range res {
+		if !r.OK {
+			t.Fatalf("both updates must succeed: %+v", res)
+		}
+	}
+	if got := string(f.Files["/r/HEAD"]); got != "ref: refs/heads/main\n" {
+		t.Errorf("HEAD = %q, want ref: refs/heads/main — a branch deleted and recreated in "+
+			"one batch is still a candidate", got)
+	}
+}
+
+// GUARD (ensureHEAD delete arithmetic). Deleting the only branch leaves no
+// candidates at all, and headless is a DEFINED state: no HEAD is written, and
+// nothing fails.
+func TestPushDeleteOfTheOnlyBranchLeavesTheRepoHeadless(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	sha := "2222222222222222222222222222222222222222"
+	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	// No HEAD, so the delete is permitted and ensureHEAD's backfill runs
+	// against an empty candidate set afterwards.
+
+	ups := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/main"}}
+	res := Push(f, "/r", t.TempDir(), ups, map[string]string{"refs/heads/main": sha})
+
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("delete should succeed when no HEAD points at the branch: %+v", res)
+	}
+	if _, ok := f.Files["/r/HEAD"]; ok {
+		t.Errorf("HEAD = %q, want none: deleting the only branch leaves the repo headless, "+
+			"which is a defined state", f.Files["/r/HEAD"])
+	}
+}
+
+// emptyGitRepo returns a repo with NO commits.
+//
+// It exists because newGitRepoForPush builds an identical commit every time —
+// same content "one", same message "c1", same author — and a git commit sha
+// covers the author and committer timestamps at one-second resolution. Two
+// such repos created inside the same second get the SAME sha, so a "fetch into
+// a repo that lacks the objects" test would silently be fetching into a repo
+// that already has them: Fetch's up-to-date short-circuit (ConnectivityOK
+// against gitDir alone, no alternate — see fetch.go) would see the object
+// already present and return ("", nil), and the test fails for a reason
+// unrelated to the code under test. Flaky by the clock, which is worse than
+// simply wrong.
+func emptyGitRepo(t *testing.T) string {
+	t.Helper()
+	d := t.TempDir()
+	for _, a := range [][]string{
+		{"init", "-qb", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"},
+	} {
+		if err := exec.Command("git", append([]string{"-C", d}, a...)...).Run(); err != nil {
+			t.Fatalf("git %v: %v", a, err)
+		}
+	}
+	return d
+}
+
+// plantRepoOnFake pushes a real repo's history into a Fake as a v2 remote:
+// marker, refs, and one pack pair under packs/.
+func plantRepoOnFake(t *testing.T, f *transport.Fake, root, gitDir, sha string) {
+	t.Helper()
+	if err := Bootstrap(f, root); err != nil {
+		t.Fatal(err)
+	}
+	packPath, idxPath, err := gitcmd.WritePack(gitDir, sha, nil, t.TempDir())
+	if err != nil || packPath == "" {
+		t.Fatalf("WritePack: %v", err)
+	}
+	for _, p := range []string{packPath, idxPath} {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.Files[root+"/packs/"+filepath.Base(p)] = b
+	}
+	if _, err := WriteRef(f, root, "refs/heads/main", sha, false); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// RED. Fetch does not exist. Real git on both ends, the Fake in between.
+func TestFetchInstallsTheClosure(t *testing.T) {
+	src := newGitRepoForPush(t)
+	sha := headOfPushRepo(t, src)
+	f := transport.NewFake()
+	plantRepoOnFake(t, f, "/r", src, sha)
+
+	dst := emptyGitRepo(t) // genuinely lacks src's objects — see emptyGitRepo
+	keep, err := Fetch(f, "/r", dst, []string{sha})
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if keep == "" {
+		t.Fatal("a fetch that installs objects must return a .keep path")
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Errorf(".keep must exist on disk: %v", err)
+	}
+	if !gitcmd.HasObject(dst, sha) {
+		t.Error("the wanted object must be present after a fetch")
+	}
+
+	// Fix round 1 test strengthening: pin the one-pack invariant the caller's
+	// single lock response depends on (consolidateAndInstall must produce
+	// exactly ONE pack, never one per downloaded remote pack), and pin that
+	// .keep lands beside it in the REAL object store — not in the temp
+	// alt-objects area, and not anywhere filepath.IsAbs's fallback join could
+	// misplace it (I2, fix round 1).
+	if n := countInstalledPackFiles(t, dst); n != 1 {
+		t.Errorf("want exactly 1 installed pack, got %d", n)
+	}
+	wantDir := filepath.Join(dst, ".git", "objects", "pack")
+	if got := filepath.Dir(keep); got != wantDir {
+		t.Errorf(".keep must live in %s, got %s", wantDir, got)
+	}
+}
+
+// RED. A second fetch of the same want installs nothing. This is what
+// Fetch's up-to-date short-circuit buys (ConnectivityOK against gitDir alone,
+// no alternate — see fetch.go's comment on it), NOT what RevListNewObjects's
+// own --not --all buys by itself: that flag excludes by ref reachability, and
+// Fetch never writes local refs (git's own porcelain does that, after this
+// helper exits), so on a destination like dst below — the object physically
+// present, no ref reaching it — --not --all alone would recompute and
+// reinstall the full closure on every call.
+//
+// Fix round 1 test strengthening: the packs are deleted from the Fake before
+// the second call, so this proves BOTH that "present but unreferenced"
+// converges to ("", nil) AND that a genuinely up-to-date fetch never touches
+// the remote — before this change the test passed identically with the
+// short-circuit deleted, since the packs were still there to redownload.
+func TestFetchIsIdempotentAndInstallsNothingWhenUpToDate(t *testing.T) {
+	src := newGitRepoForPush(t)
+	sha := headOfPushRepo(t, src)
+	f := transport.NewFake()
+	plantRepoOnFake(t, f, "/r", src, sha)
+
+	dst := emptyGitRepo(t)
+	if _, err := Fetch(f, "/r", dst, []string{sha}); err != nil {
+		t.Fatalf("first fetch: %v", err)
+	}
+
+	// Remove every pack/idx from the remote. If the second Fetch call had to
+	// redownload anything, it would fail outright (downloadAllPacks refuses
+	// an empty packs/ folder) rather than merely reinstalling redundantly —
+	// so this also proves the remote is never touched once up to date.
+	for name := range f.Files {
+		if strings.HasSuffix(name, ".pack") || strings.HasSuffix(name, ".idx") {
+			delete(f.Files, name)
+		}
+	}
+
+	keep, err := Fetch(f, "/r", dst, []string{sha})
+	if err != nil {
+		t.Fatalf("second fetch: %v", err)
+	}
+	if keep != "" {
+		t.Errorf("an up-to-date fetch must install nothing, got keep %q", keep)
+	}
+}
+
+// RED. A corrupt remote pack must be fatal, and must leave the local store
+// untouched — fetch is the one path that can damage the user's own repo.
+//
+// Fix round 1 test strengthening: a genuine first fetch runs BEFORE the
+// corruption is injected, so `before` is a real 1 (a pack this test proves
+// was actually installed), not merely 0 by construction. Before this change
+// `before == after == 0` would have passed even if verifyDownloadedPacks were
+// entirely deleted, since dst never had a pack to lose either way.
+func TestFetchRejectsACorruptPackAndInstallsNothing(t *testing.T) {
+	src := newGitRepoForPush(t)
+	sha := headOfPushRepo(t, src)
+	f := transport.NewFake()
+	plantRepoOnFake(t, f, "/r", src, sha)
+
+	dst := emptyGitRepo(t)
+	if _, err := Fetch(f, "/r", dst, []string{sha}); err != nil {
+		t.Fatalf("priming fetch: %v", err)
+	}
+	before := countInstalledPackFiles(t, dst)
+	if before != 1 {
+		t.Fatalf("priming fetch must have installed exactly 1 pack, got %d", before)
+	}
+
+	// A second, distinct want, so the corrupted pack is actually needed —
+	// otherwise the up-to-date short-circuit would return ("", nil) before
+	// ever downloading (and therefore before ever reading) the corrupt pack,
+	// and this test would pass without exercising verifyDownloadedPacks at
+	// all. plantRepoOnFake already wrote one pack pair for `sha`; a second
+	// commit on src, packed and planted under a second remote name, gives
+	// Fetch a want whose closure is not yet satisfied locally.
+	second := commitOnPushRepo(t, src, "b.txt", "two")
+	packPath, idxPath, err := gitcmd.WritePack(src, second, []string{sha}, t.TempDir())
+	if err != nil || packPath == "" {
+		t.Fatalf("WritePack: %v", err)
+	}
+	for _, p := range []string{packPath, idxPath} {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.Files["/r/packs/"+filepath.Base(p)] = b
+	}
+
+	for name, b := range f.Files {
+		if strings.HasSuffix(name, ".pack") {
+			c := append([]byte(nil), b...)
+			c[len(c)/2] ^= 0xff
+			f.Files[name] = c
+		}
+	}
+
+	if _, err := Fetch(f, "/r", dst, []string{second}); err == nil {
+		t.Fatal("a corrupt remote pack must be fatal")
+	}
+	if got := countInstalledPackFiles(t, dst); got != before {
+		t.Errorf("a failed fetch must install nothing: pack count %d -> %d", before, got)
+	}
+}
+
+// RED. Fetch is read-only: no marker means refuse, never initialise.
+func TestFetchRefusesAnUnmarkedRemote(t *testing.T) {
+	f := transport.NewFake()
+	if err := f.EnsureDir("/r"); err != nil {
+		t.Fatal(err)
+	}
+	dst := emptyGitRepo(t)
+	if _, err := Fetch(f, "/r", dst, []string{"1111111111111111111111111111111111111111"}); err == nil {
+		t.Error("fetch must refuse a folder with no marker, not initialise it")
+	}
+	if _, ok := f.Files["/r/gpb-remote.json"]; ok {
+		t.Error("fetch must never create a marker")
+	}
+}
+
+// linkedWorktree creates a linked worktree (`git worktree add`) off mainRepo
+// and returns its checkout path. mainRepo needs no commits — worktree add
+// works fine off an unborn HEAD (confirmed empirically) — which is exactly
+// why TestFetchIntoALinkedWorktreeInstallsWhereGitLooks below builds mainRepo
+// with emptyGitRepo rather than newGitRepoForPush: two independently created
+// newGitRepoForPush commits can collide on sha within the same wall-clock
+// second (see emptyGitRepo's own doc), and a colliding mainRepo would already
+// share the fetch's wanted object before Fetch ever ran, defeating the test.
+// emptyGitRepo has no commit to collide with anything.
+func linkedWorktree(t *testing.T, mainRepo string) string {
+	t.Helper()
+	wt := filepath.Join(t.TempDir(), "wt")
+	if err := exec.Command("git", "-C", mainRepo, "worktree", "add", "-q", wt, "-b", "wt-branch").Run(); err != nil {
+		t.Fatalf("git worktree add: %v", err)
+	}
+	return wt
+}
+
+// RED (fix round 2, confirmed gap). A linked worktree's `git rev-parse
+// --git-dir` answers with the per-worktree ADMIN directory
+// (<main>/.git/worktrees/<name>), which holds HEAD and the index but has NO
+// object store of its own — git resolves objects through the worktree's
+// COMMON dir instead (<main>/.git/objects) and never looks in the admin
+// dir's objects/ at all. Before this fix, consolidateAndInstall asked
+// --git-dir and packed into "<admin-dir>/objects/pack": Fetch reported
+// success and a real .keep existed on disk, but every object it installed
+// was invisible to git — with check-connectivity, the caller would skip its
+// own check (connectivity-ok) and update refs anyway, producing refs that
+// point at objects git can never see. Confirmed this exact failure mode by
+// hand against real git before writing this test (see the fix report).
+//
+// Empirically verified (see the fix report) that `git rev-parse --git-path
+// objects/pack` resolves through the commondir indirection correctly in
+// every layout tested — ordinary repo, bare repo, and linked worktree — which
+// is what the fix below asks instead.
+func TestFetchIntoALinkedWorktreeInstallsWhereGitLooks(t *testing.T) {
+	src := newGitRepoForPush(t)
+	sha := headOfPushRepo(t, src)
+	f := transport.NewFake()
+	plantRepoOnFake(t, f, "/r", src, sha)
+
+	main := emptyGitRepo(t) // no commits — see linkedWorktree for why
+	wt := linkedWorktree(t, main)
+
+	keep, err := Fetch(f, "/r", wt, []string{sha})
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if keep == "" {
+		t.Fatal("a fetch that installs objects must return a .keep path")
+	}
+	if !gitcmd.HasObject(wt, sha) {
+		t.Error("the wanted object must be visible to git FROM THE WORKTREE — installing " +
+			"into the worktree's admin dir instead of its common dir would make the pack " +
+			"invisible to every git command, even though Fetch reported success")
+	}
+	wantDir := filepath.Join(main, ".git", "objects", "pack")
+	if got := filepath.Dir(keep); got != wantDir {
+		t.Errorf(".keep must live in the MAIN repo's real object store %s, got %s", wantDir, got)
+	}
+}
+
+// chdirForTest changes the process's working directory to dir for the
+// duration of the test and restores it afterward via t.Cleanup.
+//
+// Not testing.Chdir: that requires Go 1.24, and this module's go.mod
+// deliberately floors at go 1.22 (documented there — chosen for
+// per-iteration loop variables; the floor was never meant to gate on
+// testing.Chdir, and bumping the module's declared floor for one test's
+// convenience is a bigger decision than this fix belongs to). No test in
+// this package calls t.Parallel(), so the process-wide cwd this mutates is
+// not at risk of a concurrent sibling test reading it mid-change; if that
+// ever stops being true, this helper (and the test using it) must move to a
+// serial-only subset or be reworked.
+func chdirForTest(t *testing.T, dir string) {
+	t.Helper()
+	orig, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("Chdir(%s): %v", dir, err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(orig); err != nil {
+			t.Fatalf("restore Chdir(%s): %v", orig, err)
+		}
+	})
+}
+
+// RED (fix round 3, live-gate finding 2, task 7). Reproduces the exact shape
+// git actually uses when it spawns this helper: GIT_DIR is set RELATIVE
+// (".git" is git's own default) while the process cwd is the worktree root —
+// the ORDINARY case, not an edge case. Every other Fetch test in this file
+// passes an ABSOLUTE t.TempDir()-derived gitDir, which is exactly why none of
+// them could catch this.
+//
+// Before the fix, consolidateAndInstall's `git -C gitDir rev-parse
+// --git-path objects/pack` answer came back relative (e.g. "objects/pack"),
+// got joined onto gitDir to make it relative to the ORIGINAL process cwd
+// (correctly, at that point), and was then handed as an outStem to a SECOND
+// `git -C gitDir pack-objects ...` invocation. -C changes the effective
+// working directory for resolving relative ARGUMENTS too, so that second
+// subprocess resolved the already-gitDir-relative path a SECOND time,
+// relative to gitDir again — doubling the prefix into
+// "<gitDir>/<gitDir>/objects/pack/...", which does not exist. Observed live
+// on Windows exactly this way (Stage 3a gate, task 7): "pack-objects: error:
+// unable to write file .git\objects\pack\pack-....pack: No such file or
+// directory" / "unable to rename temporary file to
+// '.git\objects\pack\pack-....pack'" — and proton-v2/main never advanced.
+func TestFetchWithARelativeGitDirInstallsCorrectly(t *testing.T) {
+	src := newGitRepoForPush(t)
+	sha := headOfPushRepo(t, src)
+	f := transport.NewFake()
+	plantRepoOnFake(t, f, "/r", src, sha)
+
+	dst := emptyGitRepo(t)
+	chdirForTest(t, dst) // the process cwd IS the worktree — exactly what git sets up
+
+	keep, err := Fetch(f, "/r", ".git", []string{sha}) // RELATIVE gitDir, the live shape
+	if err != nil {
+		t.Fatalf("Fetch with a relative gitDir: %v", err)
+	}
+	if keep == "" {
+		t.Fatal("a fetch that installs objects must return a .keep path")
+	}
+	if !gitcmd.HasObject(".git", sha) {
+		t.Error("the wanted object must be present after a fetch with a relative gitDir")
+	}
+	wantDir := filepath.Join(dst, ".git", "objects", "pack")
+	if got := filepath.Dir(keep); got != wantDir {
+		t.Errorf(".keep must live in %s, got %s", wantDir, got)
+	}
+}
+
+// RED (fix round 2, I2 revised). validateObjectsPackPath does not exist yet —
+// it replaces fix round 1's validateGitDirOutput now that consolidateAndInstall
+// asks `--git-path objects/pack` instead of `--git-dir` (see the linked-
+// worktree test above for why). RevParse's result is still git()'s COMBINED
+// stdout+stderr (trimmed), so the same untrusted-output hazard applies: a
+// single git warning merged in alongside a genuine answer must never be
+// trusted as a filesystem path outright.
+//
+// Unlike the old --git-dir check, there is no "confirm it already exists as
+// a directory" fallback for a relative answer here: this function's whole
+// caller exists to MkdirAll objects/pack, which — on a repo that has never
+// held a pack — does not exist yet by definition. The shape check instead
+// requires the value to actually look like an objects/pack answer: either
+// the literal "objects/pack" (a bare repo, whose git dir IS its own root) or
+// a path ending in "/objects/pack" (every other layout).
+func TestValidateObjectsPackPathRejectsUntrustedCombinedOutput(t *testing.T) {
+	cases := []struct {
+		name    string
+		v       string
+		wantErr bool
+	}{
+		{"bare-repo shape", "objects/pack", false},
+		{"ordinary-repo shape", ".git/objects/pack", false},
+		{"worktree absolute shape", "C:/somewhere/main/.git/objects/pack", false},
+		{"a warning merged in before a real answer", "warning: something\nobjects/pack", true},
+		{"a warning merged in after a real answer", "objects/pack\nwarning: something", true},
+		{"does not look like an objects/pack answer at all", "not-a-real-path", true},
+		{"close but wrong — trailing s", "objects/packs", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := validateObjectsPackPath(c.v)
+			if c.wantErr && err == nil {
+				t.Errorf("validateObjectsPackPath(%q) = nil, want an error", c.v)
+			}
+			if !c.wantErr && err != nil {
+				t.Errorf("validateObjectsPackPath(%q) = %v, want nil", c.v, err)
+			}
+		})
+	}
+}
+
+// countInstalledPackFiles reports how many .pack files exist under gitDir's
+// OWN .git/objects/pack — the real, installed object store, as opposed to
+// countPackFiles above, which counts what a Fake holds under a remote root's
+// packs/. Named distinctly because both exist in this file for different
+// purposes: this one proves what Fetch actually installed locally.
+func countInstalledPackFiles(t *testing.T, gitDir string) int {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(gitDir, ".git", "objects", "pack"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0
+		}
+		t.Fatal(err)
+	}
+	n := 0
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".pack") {
+			n++
+		}
+	}
+	return n
 }

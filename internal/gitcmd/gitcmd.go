@@ -58,6 +58,17 @@ func warnWaitDelay(what string) {
 // ran", and the cause must survive even when combined output is empty.
 func git(gitDir string, args ...string) (string, int, error) {
 	cmd := exec.Command("git", append([]string{"-C", gitDir}, args...)...)
+	// Scrubbed for the same reason main.go unsets the inherited GIT_DIR: Go's
+	// exec.Command inherits this process's environment by default, so a
+	// GIT_ALTERNATE_OBJECT_DIRECTORIES set here would otherwise leak into
+	// every git() call — including WritePack's rev-list step, which would
+	// then enumerate objects reachable only through an alternate that
+	// PackObjectsFromList's own explicit override (altObjects="" for
+	// WritePack) cannot read, producing a pack request for objects it cannot
+	// actually pack. Fail-closed either way, but this makes rev-list and
+	// pack-objects agree on the same (alternate-free) world instead of
+	// disagreeing on it.
+	cmd.Env = append(os.Environ(), "GIT_ALTERNATE_OBJECT_DIRECTORIES=")
 	// Bounds the post-exit pipe drain so an fsmonitor daemon (or any other
 	// grandchild) holding the inherited write end cannot hang the helper
 	// forever. See waitDelay: DO NOT DELETE as unnecessary.
@@ -134,14 +145,22 @@ func IsAncestor(gitDir, old, new string) (bool, error) {
 	}
 }
 
-// RevParse resolves rev (a ref name, HEAD, or any other `git rev-parse`
-// input) to its sha. It returns the trimmed output, the raw exit code, and
-// any start/run error, the same three-value shape git() itself returns:
-// callers (Task 10's resolve()) decide what counts as success themselves,
-// the same way IsAncestor and WritePack above interpret git's exit codes
-// rather than collapsing them into a single bool.
-func RevParse(gitDir, rev string) (string, int, error) {
-	out, code, err := git(gitDir, "rev-parse", rev)
+// RevParse runs `git rev-parse <args...>` and returns the trimmed output,
+// the raw exit code, and any start/run error, the same three-value shape
+// git() itself returns: callers (Task 10's resolve(), repo.consolidateAndInstall)
+// decide what counts as success themselves, the same way IsAncestor and
+// WritePack above interpret git's exit codes rather than collapsing them
+// into a single bool.
+//
+// Variadic (fix round 2) rather than a single `rev` string: `--git-path
+// <path>` needs the path as a SEPARATE argv element — confirmed empirically
+// that rev-parse does not accept the `--flag=value` form for it, so
+// "--git-path=objects/pack" is not recognised as a flag at all and is
+// echoed back as a literal string rather than resolved. The single-rev
+// shape every existing caller (resolve()'s RevParse(gitDir, src)) already
+// uses still compiles unchanged: a lone variadic argument is the same call.
+func RevParse(gitDir string, args ...string) (string, int, error) {
+	out, code, err := git(gitDir, append([]string{"rev-parse"}, args...)...)
 	return out, code, err
 }
 
@@ -159,7 +178,31 @@ func RevParse(gitDir, rev string) (string, int, error) {
 // When rev-list finds nothing to send (want is already covered by haves),
 // WritePack returns ("", "", nil): a legitimate, distinct outcome, not an
 // error.
+//
+// outDir is resolved to an ABSOLUTE path first, and the returned paths are
+// absolute as a result. This is the untreated twin of the path-doubling bug
+// the Stage 3a live gate found in repo.consolidateAndInstall: outDir becomes
+// PackObjectsFromList's outStem, which is an ARGUMENT to a `git -C gitDir ...`
+// subprocess, and -C changes the directory relative arguments resolve against
+// too — so a relative outDir would be resolved against gitDir by the child
+// while this function's own os.Stat guards below resolve it against the
+// process cwd. Every current caller happens to pass an absolute temp dir, so
+// the hazard is latent and fails closed (pack-objects errors on a directory
+// that does not exist) rather than silently misplacing a pack. It is fixed
+// anyway because PackObjectsFromList is now a SHARED exec site with two
+// callers holding different path disciplines, and "latent" is a property of
+// today's callers, not of the function.
 func WritePack(gitDir, want string, haves []string, outDir string) (string, string, error) {
+	absOut, err := filepath.Abs(outDir)
+	if err != nil {
+		return "", "", fmt.Errorf("cannot resolve pack output directory %q to an absolute "+
+			"path: %w", outDir, err)
+	}
+	// Assigned only AFTER the error check: on failure filepath.Abs returns "",
+	// and overwriting outDir first would make the message above name an empty
+	// path instead of the one the caller actually passed.
+	outDir = absOut
+
 	revArgs := []string{"rev-list", "--objects", want}
 	for _, h := range haves {
 		revArgs = append(revArgs, "^"+h)
@@ -186,52 +229,11 @@ func WritePack(gitDir, want string, haves []string, outDir string) (string, stri
 		return "", "", nil // nothing to send
 	}
 
-	// pack-objects writes the pack hash to stdout, which is then parsed into
-	// a filename below. stdout must not be mixed with stderr here (unlike
-	// the git() helper above) — any warning git writes to stderr would
-	// corrupt the parsed name and produce a path that does not exist. stdout
-	// is captured alone for parsing; stderr is kept separately and folded
-	// into the error message on failure so diagnostics still surface.
-	// Both pins are normative (design v6.2). packSizeLimit must be overridden
-	// as CONFIG, not as --max-pack-size=0: git reads 0 there as "unset" and
-	// falls back to the very config being overridden. The index-version pin
-	// must be on the command line too, because pack.indexVersion is
-	// user-configurable and `index-pack --verify` validates an index in
-	// whatever version it already is.
-	cmd := exec.Command("git", "-C", gitDir,
-		"-c", "pack.packSizeLimit=0",
-		"pack-objects", "--no-thin", "--index-version=2", "-q",
-		filepath.Join(outDir, "pack"))
-	cmd.Stdin = strings.NewReader(objs + "\n")
-	var stdout, stderr strings.Builder
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	// Same exposure as git() above, for the same reason: *strings.Builder is
-	// not an *os.File, so these are pipes a grandchild can hold open past the
-	// child's exit. See waitDelay: DO NOT DELETE as unnecessary.
-	cmd.WaitDelay = waitDelay
-	if err := cmd.Run(); err != nil {
-		// ErrWaitDelay means pack-objects itself exited 0 but the pipe was
-		// abandoned, so stdout — which is the pack NAME this function parses a
-		// filename out of — may be short. A truncated hash yields a path that
-		// does not exist, and the os.Stat guards below would report that as a
-		// missing pack, blaming the wrong thing. Name the real cause instead.
-		if errors.Is(err, exec.ErrWaitDelay) {
-			return "", "", fmt.Errorf("pack-objects exited but something still held its output "+
-				"pipe open after %s, so the pack name it printed cannot be trusted to be "+
-				"complete; refusing to guess which pack it wrote", waitDelay)
-		}
-		return "", "", fmt.Errorf("pack-objects: %s: %w", strings.TrimSpace(stderr.String()), err)
-	}
-	name := strings.TrimSpace(stdout.String())
-
-	// One pack is an invariant the whole publication path rests on: a second
-	// pack silently dropped would publish a ref whose objects are only
-	// half-uploaded. The size pin above should make this unreachable, so
-	// treat it as a hard error rather than parsing the first line.
-	if strings.ContainsAny(name, " \t\r\n") {
-		return "", "", fmt.Errorf("pack-objects emitted more than one pack (%q); "+
-			"the one-pack invariant is broken", name)
+	// No alternate: WritePack packs purely from gitDir's own store, which is
+	// exactly what an empty altObjects means to PackObjectsFromList below.
+	name, err := PackObjectsFromList(gitDir, "", objs, filepath.Join(outDir, "pack"))
+	if err != nil {
+		return "", "", err
 	}
 	base := filepath.Join(outDir, "pack-"+name)
 	packPath, idxPath := base+".pack", base+".idx"
@@ -248,6 +250,199 @@ func WritePack(gitDir, want string, haves []string, outDir string) (string, stri
 		return "", "", fmt.Errorf("pack-objects reported %s but the idx file is missing: %w", idxPath, err)
 	}
 	return packPath, idxPath, nil
+}
+
+// PackObjectsFromList runs `git pack-objects` against objs — a newline-
+// separated object list, as rev-list --objects produces — writing the result
+// under outStem (pack-objects appends "-<hash>.{pack,idx}" itself) and
+// returning that hash.
+//
+// outStem MUST BE ABSOLUTE. It is passed as an argument to `git -C gitDir
+// pack-objects`, and -C changes the directory relative arguments resolve
+// against, so a relative stem is resolved against gitDir by this subprocess —
+// not against the cwd the caller built it from. Both callers absolutise
+// before calling (WritePack's outDir, consolidateAndInstall's realPack), each
+// for a reason recorded at its own site; this is the shared contract those two
+// independently satisfy. Not enforced here, because the failure is a
+// caller-side path-discipline bug and a check here would only rediscover it
+// one frame later, with less context about which discipline was violated.
+//
+// altObjects, when non-empty, is spliced in as an alternate object store via
+// GIT_ALTERNATE_OBJECT_DIRECTORIES — the same mechanism revListWithAlt above
+// uses. An empty altObjects means gitDir's own store only (the same contract
+// ConnectivityOK's doc states), and the variable is set to that empty value
+// explicitly rather than left unset, so a value already present in the
+// calling process's own environment can never leak in unnoticed.
+//
+// This is WritePack's own exec site, extracted (fix round 1, I1) so a second
+// caller — repo.consolidateAndInstall, which packs the alt-objects closure a
+// fetch downloads — gets the same WaitDelay / ErrWaitDelay /
+// multi-pack-rejection guards WritePack already had, rather than a second,
+// easily-drifting copy of them missing all three (which is exactly what
+// consolidateAndInstall had before this extraction: a hang after the pack was
+// already written into the user's live object store, unkept and unknown to
+// git, plus no defence against a truncated pack name). See waitDelay: DO NOT
+// DELETE as unnecessary.
+//
+// pack-objects writes the pack hash to stdout, which is then parsed into a
+// name below. stdout must not be mixed with stderr here (unlike the git()
+// helper above) — any warning git writes to stderr would corrupt the parsed
+// name and produce a path that does not exist. stdout is captured alone for
+// parsing; stderr is kept separately and folded into the error message on
+// failure so diagnostics still surface. (This is a distinct hazard from I2's
+// RevParse fix, restored here after round 1's extraction dropped it: the
+// same class of bug — untrusted subprocess output trusted as data without
+// being kept clean of stderr — should not have to be rediscovered twice.)
+//
+// Both pins are normative (design v6.2). packSizeLimit must be overridden as
+// CONFIG, not as --max-pack-size=0: git reads 0 there as "unset" and falls
+// back to the very config being overridden. The index-version pin must be on
+// the command line too, because pack.indexVersion is user-configurable and
+// `index-pack --verify` validates an index in whatever version it already is.
+func PackObjectsFromList(gitDir, altObjects, objs, outStem string) (string, error) {
+	cmd := exec.Command("git", "-C", gitDir,
+		"-c", "pack.packSizeLimit=0",
+		"pack-objects", "--no-thin", "--index-version=2", "-q", outStem)
+	cmd.Env = append(os.Environ(), "GIT_ALTERNATE_OBJECT_DIRECTORIES="+altObjects)
+	// A trailing newline is required, and at most one is wanted: rev-list's
+	// own untrimmed output (RevListNewObjects, fed here unmodified by
+	// repo.consolidateAndInstall) already ends with one, while git()'s
+	// trimmed output (fed here by WritePack above) does not. TrimRight then
+	// re-adding exactly one normalises either caller's input the same way.
+	cmd.Stdin = strings.NewReader(strings.TrimRight(objs, "\r\n") + "\n")
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	// Same exposure as git() above, for the same reason: *strings.Builder is
+	// not an *os.File, so these are pipes a grandchild can hold open past the
+	// child's exit. See waitDelay: DO NOT DELETE as unnecessary.
+	cmd.WaitDelay = waitDelay
+	if err := cmd.Run(); err != nil {
+		// ErrWaitDelay means pack-objects itself exited 0 but the pipe was
+		// abandoned, so stdout — which is the pack NAME this function parses a
+		// filename out of — may be short. A truncated hash yields a path that
+		// does not exist, and a caller's os.Stat guard would report that as a
+		// missing pack, blaming the wrong thing. Name the real cause instead.
+		if errors.Is(err, exec.ErrWaitDelay) {
+			return "", fmt.Errorf("pack-objects exited but something still held its output "+
+				"pipe open after %s, so the pack name it printed cannot be trusted to be "+
+				"complete; refusing to guess which pack it wrote", waitDelay)
+		}
+		return "", fmt.Errorf("pack-objects: %s: %w", strings.TrimSpace(stderr.String()), err)
+	}
+	name := strings.TrimSpace(stdout.String())
+
+	// One pack is an invariant every caller's ordering guarantee rests on: a
+	// second pack silently dropped would mean a caller trusts a name it never
+	// actually got — a ref published against half-uploaded objects on the
+	// push side, or an untracked pack in the live object store on the fetch
+	// side. The size pin above should make this unreachable, so treat it as a
+	// hard error rather than parsing the first line.
+	if strings.ContainsAny(name, " \t\r\n") {
+		return "", fmt.Errorf("pack-objects emitted more than one pack (%q); "+
+			"the one-pack invariant is broken", name)
+	}
+	return name, nil
+}
+
+// SymbolicRef returns the ref a symbolic ref points at — "refs/heads/main" for
+// HEAD in an ordinary checkout. It exists because git never tells a remote
+// helper what the client's own HEAD is, and the deterministic HEAD rules need
+// it to break a multi-branch tie.
+//
+// A detached HEAD is not a failure: `symbolic-ref --quiet` exits 1 for "this
+// is not a symbolic ref", and that is reported as ("", nil).
+func SymbolicRef(gitDir, name string) (string, error) {
+	out, code, err := git(gitDir, "symbolic-ref", "--quiet", name)
+	switch code {
+	case 0:
+		return out, nil
+	case 1:
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("symbolic-ref %s: %s: %w", name, out, err)
+	}
+	return "", fmt.Errorf("symbolic-ref %s: %s", name, out)
+}
+
+// revListWithAlt runs rev-list against gitDir with altObjects spliced in as an
+// alternate object store, feeding the wants on stdin. The wants are passed
+// explicitly rather than discovered from refs because at fetch time nothing
+// references them yet.
+//
+// altObjects is an OBJECTS directory: git looks for packs at
+// <altObjects>/pack/pack-<hash>.{pack,idx} and silently ignores them anywhere
+// else, which presents downstream as "every object is missing".
+func revListWithAlt(gitDir, altObjects string, wants []string, args ...string) (string, int, error) {
+	cmd := exec.Command("git", append([]string{"-C", gitDir, "rev-list"}, args...)...)
+	cmd.Env = append(os.Environ(), "GIT_ALTERNATE_OBJECT_DIRECTORIES="+altObjects)
+	cmd.Stdin = strings.NewReader(strings.Join(wants, "\n") + "\n")
+	// See waitDelay: DO NOT DELETE as unnecessary.
+	cmd.WaitDelay = waitDelay
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	code := -1
+	if cmd.ProcessState != nil {
+		code = cmd.ProcessState.ExitCode()
+	}
+	if errors.Is(err, exec.ErrWaitDelay) {
+		// rev-list itself exited 0 but a grandchild held the pipe. stdout may
+		// be truncated, and here stdout IS the object list, so refusing to
+		// guess is the only safe answer.
+		return "", -1, fmt.Errorf("rev-list output was abandoned after %s; refusing to "+
+			"act on a possibly truncated object list", waitDelay)
+	}
+	if code != 0 {
+		if err != nil {
+			return "", code, fmt.Errorf("rev-list %s: %s: %w", strings.Join(args, " "),
+				strings.TrimSpace(stderr.String()), err)
+		}
+		return "", code, fmt.Errorf("rev-list %s: %s", strings.Join(args, " "),
+			strings.TrimSpace(stderr.String()))
+	}
+	return stdout.String(), 0, nil
+}
+
+// ConnectivityOK reports whether every object reachable from wants is present,
+// counting gitDir's own store plus altObjects. A nil return means the closure
+// is complete. An empty altObjects means no alternate is spliced in at all —
+// gitDir's own store only — which is the contract repo.Fetch's up-to-date
+// short-circuit relies on: calling this with altObjects="" asks purely
+// whether gitDir already has the closure, with nothing downloaded yet.
+//
+// This is a traversal, not an fsck: the wants are not referenced by any ref, so
+// fsck would never reach them. --quiet suppresses the object list; the exit
+// code is the answer.
+func ConnectivityOK(gitDir, altObjects string, wants []string) error {
+	if len(wants) == 0 {
+		return nil
+	}
+	if _, _, err := revListWithAlt(gitDir, altObjects, wants,
+		"--objects", "--stdin", "--not", "--all", "--quiet"); err != nil {
+		return fmt.Errorf("closure is incomplete for the requested objects: %w", err)
+	}
+	return nil
+}
+
+// RevListNewObjects returns the objects reachable from wants that gitDir does
+// not already have, one per line, ready to feed to pack-objects.
+//
+// --not --all is load-bearing: without it an incremental fetch reconsolidates
+// the entire history into a fresh pack and installs it, silently doubling
+// local disk every time.
+func RevListNewObjects(gitDir, altObjects string, wants []string) (string, error) {
+	if len(wants) == 0 {
+		return "", nil
+	}
+	out, _, err := revListWithAlt(gitDir, altObjects, wants,
+		"--objects", "--stdin", "--not", "--all")
+	if err != nil {
+		return "", err
+	}
+	return out, nil
 }
 
 // IndexPackVerify runs `git index-pack --verify` on packPath, whose .idx must

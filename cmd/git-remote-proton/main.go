@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/craigstoller/git-proton-backup/internal/protocol"
@@ -38,9 +40,18 @@ func run() int {
 		warn(err)
 		return 1
 	}
-	gitDir := os.Getenv("GIT_DIR")
-	if gitDir == "" {
-		gitDir = "."
+	gitDir, err := resolveGitDir()
+	if err != nil {
+		warn(err)
+		return 1
+	}
+	// The rest of GIT_DIR's class, resolved at the same point and for the same
+	// reason. See resolveGitDir's doc for which variables are covered, which
+	// is deliberately left alone, and why unsetting them would be fail-open
+	// rather than safe.
+	if err := absolutizeInheritedGitPaths(); err != nil {
+		warn(err)
+		return 1
 	}
 	// git sets GIT_DIR (commonly a RELATIVE path, e.g. ".git") in this
 	// process's own environment before spawning the helper. internal/gitcmd
@@ -49,8 +60,9 @@ func run() int {
 	// this, the child git ALSO sees GIT_DIR=".git" and resolves it relative
 	// to the working directory -C already changed to, producing ".git/.git"
 	// and failing every gitcmd call with "not a git repository". gitDir is
-	// already captured above and passed explicitly to every gitcmd call, so
-	// clearing the inherited env var here is safe and necessary.
+	// already captured above (and resolved to an absolute path by
+	// resolveGitDir — see its doc) and passed explicitly to every gitcmd
+	// call, so clearing the inherited env var here is safe and necessary.
 	os.Unsetenv("GIT_DIR")
 
 	t := transport.NewCLI("")
@@ -72,6 +84,117 @@ func run() int {
 	return loop(t, root, gitDir, in, out)
 }
 
+// resolveGitDir captures GIT_DIR from the environment and resolves it to an
+// ABSOLUTE path immediately, before anything else can see it.
+//
+// Not optional hygiene: git commonly sets GIT_DIR to a RELATIVE path — ".git"
+// is git's own default — relative to THIS PROCESS's cwd. internal/repo's
+// fetch install path (consolidateAndInstall) shells out to git with
+// `-C gitDir` more than once while installing a new pack, and asks git
+// itself where the pack belongs via `rev-parse --git-path objects/pack` — an
+// answer that, for a relative gitDir, comes back relative too. That answer
+// then gets handed as an argument to a SECOND `-C gitDir`-scoped subprocess
+// (pack-objects), which resolves relative ARGUMENTS again, relative to
+// gitDir this time — a path built for one resolution context, resolved a
+// second time in another, doubling the relative prefix. Observed live on
+// Windows exactly this way (Stage 3a gate, task 7): every ordinary
+// incremental `git fetch` failed with "unable to write file
+// .git\objects\pack\pack-....pack: No such file or directory", because git
+// invokes this helper with GIT_DIR=.git by default — the common case, not an
+// edge case.
+//
+// Resolving here, once, at the source, means every downstream `-C gitDir`
+// subprocess and every relative path git hands back through one of them gets
+// resolved exactly once, unambiguously. filepath.Abs resolves relative to
+// this process's own cwd, which is exactly what a relative GIT_DIR is
+// relative to. (internal/repo/fetch.go's consolidateAndInstall also resolves
+// its own realPack absolutely as a second, independent line of defence —
+// fetch.go is a library entry point in its own right, and its own tests call
+// Fetch directly, so the fix there must not silently depend on this
+// function's hygiene either.)
+//
+// GIT_DIR IS NOT THE ONLY ENVIRONMENT VARIABLE IN THIS CLASS, and the class is
+// NOT closed by this function. Three others can be relative and can change
+// where objects live:
+//
+//   - GIT_COMMON_DIR and GIT_OBJECT_DIRECTORY are handled — see
+//     absolutizeInheritedGitPaths below, which resolves them at capture and
+//     re-exports the absolute forms. A relative GIT_COMMON_DIR is the sharpest
+//     case: re-resolved inside a `-C`-scoped child it yields an install path
+//     that PASSES validateObjectsPackPath (it still ends in "/objects/pack")
+//     yet points somewhere git never reads — fail-OPEN, since the objects are
+//     invisible and connectivity-ok is reported anyway.
+//   - GIT_WORK_TREE is deliberately NOT handled. It names the working tree,
+//     not the object store, so it cannot move where a pack is installed or
+//     where git looks for one; this helper never reads or writes worktree
+//     files. Absolutising it would be churn with no failure mode behind it.
+//
+// Blanket-unsetting the object-placement pair would be WRONG, which is why
+// none of this is "just unset them like GIT_DIR". GIT_DIR can be unset for the
+// children because gitDir is passed explicitly to every gitcmd call, so the
+// child is told the same answer by another route. GIT_OBJECT_DIRECTORY has no
+// such route: unsetting it would make this helper pack into the DEFAULT object
+// database while the calling git reads the one it nominated — objects written
+// where nobody looks, reported as a successful fetch. That is the same
+// fail-open shape the relative-path bug produces, arrived at deliberately.
+// Absolutising preserves the caller's meaning and only removes the ambiguity.
+//
+// Reachability is narrow and stated plainly: git does not export any of these
+// to a spawned remote helper, so they arrive only if the USER exported them in
+// their own shell. That is why this is hardening, not a fix for an observed
+// failure — unlike the relative GIT_DIR above, which git sets on every
+// ordinary invocation and which broke the live gate.
+func resolveGitDir() (string, error) {
+	gitDir := os.Getenv("GIT_DIR")
+	if gitDir == "" {
+		gitDir = "."
+	}
+	abs, err := filepath.Abs(gitDir)
+	if err != nil {
+		return "", fmt.Errorf("cannot resolve GIT_DIR %q to an absolute path: %w", gitDir, err)
+	}
+	return abs, nil
+}
+
+// objectPlacementEnv are the inherited variables, other than GIT_DIR, that can
+// relocate where git reads and writes objects. Listed as data so the set is
+// one thing to audit rather than two open-coded blocks. GIT_WORK_TREE is
+// absent on purpose — see resolveGitDir's doc for why it does not belong here.
+var objectPlacementEnv = []string{"GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY"}
+
+// absolutizeInheritedGitPaths re-exports each of objectPlacementEnv as an
+// ABSOLUTE path, resolved against THIS process's cwd — the same treatment, for
+// the same reason, that resolveGitDir gives GIT_DIR.
+//
+// A relative value here means one thing to this process and another to every
+// `git -C <gitDir> ...` child the helper spawns, because -C changes the
+// directory relative paths resolve against. Resolving once at the source
+// cannot change what the value MEANS (filepath.Abs anchors it to exactly the
+// cwd it was already implicitly relative to); it only makes that meaning
+// survive being read in a different context.
+//
+// Unset and empty values are left alone: an empty GIT_OBJECT_DIRECTORY is not
+// a relative path, and turning it into the cwd would invent an object store
+// the caller never asked for. A value that cannot be resolved is fatal rather
+// than passed through, because passing it through is the fail-open case this
+// exists to prevent.
+func absolutizeInheritedGitPaths() error {
+	for _, name := range objectPlacementEnv {
+		v := os.Getenv(name)
+		if v == "" || filepath.IsAbs(v) {
+			continue
+		}
+		abs, err := filepath.Abs(v)
+		if err != nil {
+			return fmt.Errorf("cannot resolve %s %q to an absolute path: %w", name, v, err)
+		}
+		if err := os.Setenv(name, abs); err != nil {
+			return fmt.Errorf("cannot re-export %s as an absolute path: %w", name, err)
+		}
+	}
+	return nil
+}
+
 // loop runs the git-remote-helper command exchange over in/out. Split out
 // from run so the fail-closed exit-code paths can be exercised directly with
 // an in-memory transport.Fake and buffered io.Reader/io.Writer in tests — no
@@ -79,6 +202,7 @@ func run() int {
 func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bufio.Writer) int {
 	var opts protocol.Options
 	var lock *repo.Lock
+	var checkConnectivity bool
 	defer func() {
 		if lock != nil {
 			// Release on EVERY exit path; a leak wedges the repo. Its error is
@@ -106,12 +230,75 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 		line := in.Text()
 		switch {
 		case line == "capabilities":
-			fmt.Fprint(out, "option\npush\n\n")
+			// check-connectivity is advertised as well as accepted: git only
+			// recognises a connectivity-ok response from a helper that
+			// advertised the capability.
+			fmt.Fprint(out, "option\npush\nfetch\ncheck-connectivity\n\n")
 			out.Flush()
 
 		case strings.HasPrefix(line, "option "):
+			// check-connectivity is HONOURED, not poisoned: poison exists for
+			// options git ignores our rejection of, and this is the opposite.
+			if v, ok := strings.CutPrefix(line, "option check-connectivity "); ok {
+				checkConnectivity = strings.TrimSpace(v) == "true"
+				fmt.Fprint(out, "ok\n")
+				out.Flush()
+				continue
+			}
 			opts.Observe(line)
 			fmt.Fprint(out, "unsupported\n") // advisory only; poison flag is the real defence
+			out.Flush()
+
+		case line == "list":
+			// The FETCH-side advertisement. Read-only: no Bootstrap, no lock.
+			// A fetch must never bring a repository into existence, and a
+			// lock here would wedge the repo for every reader if we crashed.
+			//
+			// RequireMarker is the read-only half of Bootstrap's check, and it
+			// runs FIRST. Without it, `git ls-remote proton::/my-files/anything`
+			// listed a folder that is not one of our repos and reported an
+			// empty ref set: ListRefs on a folder with no refs/ namespace is
+			// not necessarily an error, so "this is not a git-remote-proton
+			// repo" presented as "a repo with no refs". repo.Fetch has always
+			// applied the same check; the advertisement is the other read-side
+			// entry point and had nothing.
+			if err := repo.RequireMarker(t, root); err != nil {
+				warn(err)
+				return 1
+			}
+			refs, err := repo.ListRefs(t, root)
+			if err != nil {
+				warn(err)
+				return 1
+			}
+			for name, sha := range refs {
+				fmt.Fprintf(out, "%s %s\n", sha, name)
+			}
+			if branch, ok, err := repo.ReadHEAD(t, root); err != nil {
+				warn(err)
+				return 1
+			} else if _, listed := refs[branch]; ok && listed {
+				// The symref line is what lets clone check something out — and
+				// it is emitted ONLY when the branch it names is in the ref
+				// list we just advertised.
+				//
+				// A remote can hold a HEAD pointing at a branch that no longer
+				// exists: v2 never rewrites an existing HEAD, so any remote
+				// that lost its default branch before the delete refusal in
+				// repo.pushOne shipped is stuck that way permanently. Advertised
+				// verbatim, that symref makes clone fetch every object and then
+				// check out nothing — which the design names as a failure.
+				// Suppressing the line instead presents the remote as HEADLESS,
+				// which IS a defined state: clone reports that no default branch
+				// exists rather than silently producing an empty worktree.
+				//
+				// Checked against the just-listed refs rather than by a second
+				// remote read, so the advertisement is internally consistent by
+				// construction: the symref cannot name something the same
+				// response failed to advertise.
+				fmt.Fprintf(out, "@%s HEAD\n", branch)
+			}
+			fmt.Fprint(out, "\n")
 			out.Flush()
 
 		case line == "list for-push":
@@ -202,6 +389,59 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 			fmt.Fprint(out, "\n")
 			out.Flush()
 
+		case strings.HasPrefix(line, "fetch "):
+			var wants []string
+			for l := line; ; {
+				sha, perr := parseFetchLine(l)
+				if perr != nil {
+					// Fail closed rather than silently drop or misparse the
+					// line: a malformed line that got silently dropped could
+					// leave wants empty, and repo.Fetch reports an empty
+					// wants list as ("", nil) — its legitimate "up to date"
+					// signal — which would then surface as a FALSE
+					// connectivity-ok, vouching for a closure nothing ever
+					// verified.
+					warn(perr)
+					return 1
+				}
+				wants = append(wants, sha)
+				if !in.Scan() {
+					break
+				}
+				l = in.Text()
+				if l == "" {
+					break
+				}
+			}
+			if len(wants) == 0 {
+				// Defence in depth: parseFetchLine above already fails
+				// closed on every line it sees, so this should be
+				// unreachable. It is asserted explicitly anyway, because the
+				// invariant it protects — an empty batch must never reach
+				// Fetch, whose own ("", nil) "up to date" signal would then
+				// be trusted on the strength of a closure nothing verified —
+				// is exactly the one this fix exists for.
+				warn(fmt.Errorf("fetch batch contained no wants"))
+				return 1
+			}
+			keep, err := repo.Fetch(t, root, gitDir, wants)
+			if err != nil {
+				warn(err)
+				return 1
+			}
+			if keep != "" {
+				// Git retains only the FIRST lock, which is why the closure
+				// is consolidated into one pack.
+				fmt.Fprintf(out, "lock %s\n", keep)
+			}
+			if checkConnectivity {
+				// Only after Fetch verified it. Fetch returns an error
+				// otherwise, so reaching here means the closure is complete.
+				fmt.Fprint(out, "connectivity-ok\n")
+			}
+			fmt.Fprint(out, "\n")
+			out.Flush()
+
 		case line == "":
 			return 0
 		default:
@@ -221,6 +461,34 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 		return 1
 	}
 	return 0
+}
+
+// fetchShaRe matches a fetch batch line's <sha> field: 40 lowercase hex, the
+// same grammar internal/repo enforces on every ref it writes. Duplicated
+// rather than exported from repo — validating protocol INPUT is main's job,
+// not repo's.
+var fetchShaRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+// parseFetchLine validates one line of a "fetch" batch against exactly
+// "fetch <sha> <name>" — not merely "starts with fetch and has a plausible
+// second field". A batch git never sends malformed cannot be relied on to
+// stay that way (a hand-crafted or corrupted stream is exactly the case
+// fail-closed exists for): the previous, permissive scan silently dropped
+// any line with fewer than two fields and accepted whatever token sat second
+// on any line with two or more, so a batch of nothing but malformed lines
+// left `wants` empty without ever reporting an error. repo.Fetch reports an
+// empty wants list as ("", nil) — its legitimate "up to date" signal — and
+// with checkConnectivity on, that reached the caller as connectivity-ok for
+// a closure nothing had ever verified. This mirrors the push side's
+// protocol.ParsePushBatch: one strict parser per line, not a permissive scan
+// with the lock/connectivity decision bolted on after.
+func parseFetchLine(l string) (sha string, err error) {
+	sp := strings.Fields(l)
+	if len(sp) != 3 || sp[0] != "fetch" || !fetchShaRe.MatchString(sp[1]) {
+		return "", fmt.Errorf("malformed fetch batch line %q: want \"fetch <sha> <name>\" "+
+			"with a 40-lowercase-hex sha", l)
+	}
+	return sp[1], nil
 }
 
 func warn(err error) {

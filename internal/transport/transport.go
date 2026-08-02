@@ -51,11 +51,19 @@ type Transport interface {
 	List(path string) ([]Node, error)
 	Stat(path string) (Node, bool, error) // absence is (_, false, nil), never an error
 	// ReadTo downloads the node at path into the existing local directory
-	// localPath, landing as a file named after path's own remote basename —
-	// this mirrors `filesystem download path... localFolder` exactly.
-	// localPath is a directory, never a destination file path; implementations
-	// do not create it, and a missing or non-directory localPath must surface
-	// as the error it naturally is.
+	// localPath, landing as a file named after path's own remote basename.
+	// localPath is a directory, never a destination file path.
+	//
+	// A missing or non-directory localPath must surface as the error it
+	// naturally is — implementations do not create it. This is an ENFORCED
+	// contract, not an incidental property of `filesystem download`: the real
+	// CLI binary does NOT behave this way on its own (confirmed live, Stage
+	// 3a gate task 7 — given a missing destination it silently creates the
+	// directory and succeeds), so *CLI's ReadTo stats localPath itself and
+	// refuses before ever invoking the CLI. Every caller in this codebase
+	// creates its temp dir with os.MkdirTemp first, so a missing destination
+	// always indicates a caller bug, and an implementation that auto-created
+	// the directory would hide that bug rather than surface it.
 	ReadTo(path, localPath string) error
 	CreateExclusive(path, localPath string) (Outcome, error)
 	UpdateRevision(path, localPath string) (Outcome, error)

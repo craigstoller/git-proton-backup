@@ -4,10 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/craigstoller/git-proton-backup/internal/repo"
 	"github.com/craigstoller/git-proton-backup/internal/transport"
 )
 
@@ -174,6 +178,162 @@ func TestRun_RefusesUnsupportedAddress(t *testing.T) {
 	}
 }
 
+// chdirForTest changes the process's working directory to dir for the
+// duration of the test and restores it afterward via t.Cleanup.
+//
+// Not testing.Chdir: that requires Go 1.24, and this module's go.mod
+// deliberately floors at go 1.22 (documented there — chosen for
+// per-iteration loop variables; the floor was never meant to gate on
+// testing.Chdir, and bumping the module's declared floor for one test's
+// convenience is a bigger decision than this fix belongs to). No test in
+// this package calls t.Parallel(), so the process-wide cwd this mutates is
+// not at risk of a concurrent sibling test reading it mid-change.
+func chdirForTest(t *testing.T, dir string) {
+	t.Helper()
+	orig, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("Chdir(%s): %v", dir, err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(orig); err != nil {
+			t.Fatalf("restore Chdir(%s): %v", orig, err)
+		}
+	})
+}
+
+// TestResolveGitDirMakesARelativeGITDIRAbsolute covers the Stage 3a live-gate
+// finding (task 7): git commonly sets GIT_DIR to a RELATIVE path (".git" is
+// its own default), and every incremental fetch failed live because a
+// relative gitDir got resolved TWICE by two separate `-C gitDir` subprocess
+// invocations inside the fetch install path (see resolveGitDir's doc in
+// main.go for the full mechanism). resolveGitDir must turn a relative
+// GIT_DIR into an absolute path anchored at the process's cwd, exactly once,
+// at the source, before anything downstream ever sees it.
+func TestResolveGitDirMakesARelativeGITDIRAbsolute(t *testing.T) {
+	wt := t.TempDir()
+	chdirForTest(t, wt)
+	t.Setenv("GIT_DIR", ".git")
+
+	got, err := resolveGitDir()
+	if err != nil {
+		t.Fatalf("resolveGitDir: %v", err)
+	}
+	if !filepath.IsAbs(got) {
+		t.Fatalf("resolveGitDir() = %q, want an absolute path", got)
+	}
+	if want := filepath.Join(wt, ".git"); got != want {
+		t.Errorf("resolveGitDir() = %q, want %q", got, want)
+	}
+}
+
+// TestResolveGitDirDefaultsToAbsoluteCwdWhenUnset mirrors run()'s
+// pre-existing "" -> "." default, and pins that the default is ALSO resolved
+// to absolute — the bug this fix round closes did not care whether GIT_DIR
+// was explicitly ".git" or defaulted there; either way it was relative.
+func TestResolveGitDirDefaultsToAbsoluteCwdWhenUnset(t *testing.T) {
+	wt := t.TempDir()
+	chdirForTest(t, wt)
+	// t.Setenv, not os.Unsetenv: os.Unsetenv LEAKS — it mutates the process
+	// environment for every test that runs after this one in the same binary,
+	// with no restore. t.Setenv registers the restore automatically, and an
+	// empty GIT_DIR is what resolveGitDir's own "" -> "." default keys on, so
+	// it exercises the same branch.
+	t.Setenv("GIT_DIR", "")
+
+	got, err := resolveGitDir()
+	if err != nil {
+		t.Fatalf("resolveGitDir: %v", err)
+	}
+	if got != wt {
+		t.Errorf("resolveGitDir() = %q, want %q", got, wt)
+	}
+}
+
+// TestAbsolutizeInheritedGitPaths covers the rest of GIT_DIR's class. A
+// relative GIT_COMMON_DIR or GIT_OBJECT_DIRECTORY means one directory to this
+// process and a different one to every `git -C <gitDir> ...` child, and for
+// GIT_COMMON_DIR the resulting install path still ENDS in "/objects/pack", so
+// validateObjectsPackPath passes it — objects written where git never reads,
+// with connectivity-ok reported anyway. Fail-open, which is why absolutising
+// (rather than unsetting, which for GIT_OBJECT_DIRECTORY would be fail-open in
+// its own right) is the fix. See resolveGitDir's doc.
+func TestAbsolutizeInheritedGitPaths(t *testing.T) {
+	wt := t.TempDir()
+	chdirForTest(t, wt)
+
+	t.Setenv("GIT_COMMON_DIR", "../main/.git")
+	t.Setenv("GIT_OBJECT_DIRECTORY", "objects")
+	// Left alone deliberately: GIT_WORK_TREE cannot move where objects live.
+	t.Setenv("GIT_WORK_TREE", "../tree")
+
+	if err := absolutizeInheritedGitPaths(); err != nil {
+		t.Fatalf("absolutizeInheritedGitPaths: %v", err)
+	}
+
+	for _, name := range []string{"GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY"} {
+		got := os.Getenv(name)
+		if !filepath.IsAbs(got) {
+			t.Errorf("%s = %q, want an absolute path", name, got)
+		}
+	}
+	if want := filepath.Join(filepath.Dir(wt), "main", ".git"); os.Getenv("GIT_COMMON_DIR") != want {
+		t.Errorf("GIT_COMMON_DIR = %q, want %q — resolution must be anchored at this "+
+			"process's cwd, the same cwd the relative value was already implicitly "+
+			"relative to", os.Getenv("GIT_COMMON_DIR"), want)
+	}
+	if want := filepath.Join(wt, "objects"); os.Getenv("GIT_OBJECT_DIRECTORY") != want {
+		t.Errorf("GIT_OBJECT_DIRECTORY = %q, want %q", os.Getenv("GIT_OBJECT_DIRECTORY"), want)
+	}
+	if got := os.Getenv("GIT_WORK_TREE"); got != "../tree" {
+		t.Errorf("GIT_WORK_TREE = %q, want it untouched: it names the working tree, not the "+
+			"object store, so it cannot move where a pack is installed", got)
+	}
+}
+
+// TestAbsolutizeInheritedGitPathsLeavesUnsetAndAbsoluteValuesAlone is the
+// companion guard. An UNSET variable must stay unset — inventing a value would
+// nominate an object store the caller never asked for, which is the fail-open
+// case this whole function exists to avoid — and an already-absolute value
+// must pass through byte-identical rather than being rewritten by Abs's
+// cleaning rules.
+func TestAbsolutizeInheritedGitPathsLeavesUnsetAndAbsoluteValuesAlone(t *testing.T) {
+	chdirForTest(t, t.TempDir())
+
+	abs := filepath.Join(t.TempDir(), "odb")
+	t.Setenv("GIT_OBJECT_DIRECTORY", abs)
+	t.Setenv("GIT_COMMON_DIR", "")
+
+	if err := absolutizeInheritedGitPaths(); err != nil {
+		t.Fatalf("absolutizeInheritedGitPaths: %v", err)
+	}
+	if got := os.Getenv("GIT_OBJECT_DIRECTORY"); got != abs {
+		t.Errorf("GIT_OBJECT_DIRECTORY = %q, want it unchanged at %q", got, abs)
+	}
+	if got := os.Getenv("GIT_COMMON_DIR"); got != "" {
+		t.Errorf("GIT_COMMON_DIR = %q, want it left empty: an empty value is not a relative "+
+			"path, and turning it into the cwd would invent an object store", got)
+	}
+}
+
+// Deliberately NOT testing resolveGitDir's wiring into run() end to end:
+// run() reaches gitDir capture only AFTER CanonicalRoot accepts the address,
+// and the very next thing run() does after that is construct a *CLI and call
+// Version() on it — an unconditional real `proton-drive --version` spawn.
+// Driving run() with an address CanonicalRoot accepts to reach the gitDir
+// line would therefore invoke the real CLI binary, which this fix round is
+// expressly forbidden from doing (and would also need os.Stdin faked to
+// avoid loop() blocking on a read that will never come). resolveGitDir is
+// therefore covered directly, by the two tests above, and main.go's call
+// site (`gitDir, err := resolveGitDir()`) is a one-line substitution for the
+// two-line block it replaced — reviewable by inspection, not something that
+// needs an unsafe end-to-end harness to justify. The actual end-to-end proof
+// that the fix works lives in internal/repo's
+// TestFetchWithARelativeGitDirInstallsCorrectly, which reproduces the exact
+// live failure and error text against Fetch directly.
+
 // Finding 2 (bonus coverage, same harness): a poisoned batch's error lines
 // must carry a single well-formed ref token, produced by the same
 // protocol.ParsePushBatch used on the non-poisoned path — not a hand-rolled
@@ -253,5 +413,591 @@ func TestLoop_PoisonedBatch_ColonlessPushLineFailsClosed(t *testing.T) {
 	}
 	if _, ok := ft.Files["/remote/root/refs/heads/main"]; ok {
 		t.Error("a malformed batch must not write the ref")
+	}
+}
+
+// --- Task 6: fetch capability, plain `list`, and the fetch batch ---
+
+// TestLoop_Capabilities_AdvertisesFetchAndCheckConnectivity is RED against the
+// pre-Task-6 block ("option\npush\n\n"), which advertises neither. Git only
+// recognises a connectivity-ok response from a helper that advertised
+// check-connectivity, and clone/fetch depend on fetch being advertised at
+// all — so both must be present, not merely accepted as options.
+func TestLoop_Capabilities_AdvertisesFetchAndCheckConnectivity(t *testing.T) {
+	in := bufio.NewScanner(strings.NewReader("capabilities\n\n"))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	got := loop(transport.NewFake(), "/remote/root", ".", in, out)
+	out.Flush()
+
+	if got != 0 {
+		t.Fatalf("loop() = %d, want 0", got)
+	}
+	stdout := outBuf.String()
+	for _, want := range []string{"option", "push", "fetch", "check-connectivity"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("capabilities = %q, want it to advertise %q", stdout, want)
+		}
+	}
+}
+
+// TestLoop_PlainList_AdvertisesRefsAndHeadReadOnly seeds a marked repo with one
+// ref and a HEAD directly in the Fake (no push involved — plain `list` only
+// reads), then proves the advertisement is right and that reading it takes no
+// lock. RED before Task 6: "list" (with no "for-push" suffix) hits the
+// default case and fails closed with no output at all.
+func TestLoop_PlainList_AdvertisesRefsAndHeadReadOnly(t *testing.T) {
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	if err := repo.Bootstrap(ft, root); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	sha := "1111111111111111111111111111111111111111"
+	if _, err := repo.WriteRef(ft, root, "refs/heads/main", sha, false); err != nil {
+		t.Fatalf("WriteRef: %v", err)
+	}
+	if _, err := repo.WriteHEAD(ft, root, "refs/heads/main"); err != nil {
+		t.Fatalf("WriteHEAD: %v", err)
+	}
+
+	in := bufio.NewScanner(strings.NewReader("list\n\n"))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	got := loop(ft, root, ".", in, out)
+	out.Flush()
+
+	if got != 0 {
+		t.Fatalf("loop() = %d, want 0: stdout=%q", got, outBuf.String())
+	}
+	want := sha + " refs/heads/main\n@refs/heads/main HEAD\n\n"
+	if outBuf.String() != want {
+		t.Fatalf("stdout = %q, want %q", outBuf.String(), want)
+	}
+	if _, ok := ft.Files[root+"/"+repo.LockName]; ok {
+		t.Error("plain list must never take the lock: found .lock in the fake transport")
+	}
+}
+
+// TestLoop_PlainList_OmitsTheSymrefWhenHeadPointsAtAnAbsentBranch is the
+// advertisement half of the dangling-HEAD fix.
+//
+// Nothing on the delete path knew about remote HEAD when this branch shipped
+// it, so an ordinary sequence — push `main` (HEAD is backfilled to it), push
+// `dev`, then `git push proton-v2 --delete main` — left the remote
+// advertising `@refs/heads/main HEAD` with no `refs/heads/main` in the ref
+// list. A clone against that advertisement fetches the objects and then
+// checks out nothing, which the design names as a failure. The state is also
+// PERMANENT: ensureHEAD returns early because a HEAD exists, and v2 never
+// rewrites an existing HEAD.
+//
+// The delete refusal (repo.pushOne) stops NEW remotes from reaching this
+// state; this guard is what makes an ALREADY-broken remote behave as the
+// defined headless state instead of advertising a symref that resolves to
+// nothing. Both are needed — the second is the only thing that helps a remote
+// already in the wild.
+//
+// RED before the fix: the arm emitted the `@` line whenever ReadHEAD reported
+// a HEAD at all, without checking the ref list it had just built, so stdout
+// carried "@refs/heads/main HEAD" for a branch that is not advertised.
+func TestLoop_PlainList_OmitsTheSymrefWhenHeadPointsAtAnAbsentBranch(t *testing.T) {
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	if err := repo.Bootstrap(ft, root); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	sha := "1111111111111111111111111111111111111111"
+	if _, err := repo.WriteRef(ft, root, "refs/heads/dev", sha, false); err != nil {
+		t.Fatalf("WriteRef: %v", err)
+	}
+	// HEAD points at a branch that is NOT in the ref list — exactly what a
+	// pre-fix `--delete main` left behind.
+	if _, err := repo.WriteHEAD(ft, root, "refs/heads/main"); err != nil {
+		t.Fatalf("WriteHEAD: %v", err)
+	}
+
+	in := bufio.NewScanner(strings.NewReader("list\n\n"))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	got := loop(ft, root, ".", in, out)
+	out.Flush()
+	stdout := outBuf.String()
+
+	if got != 0 {
+		t.Fatalf("loop() = %d, want 0: a dangling HEAD is the defined headless state, not a fatal error: stdout=%q", got, stdout)
+	}
+	if strings.Contains(stdout, "@") {
+		t.Errorf("stdout = %q, must advertise no symref at all: HEAD names refs/heads/main, "+
+			"which is not in the ref list, and a clone told to check out an unadvertised "+
+			"branch checks out nothing", stdout)
+	}
+	if want := sha + " refs/heads/dev\n\n"; stdout != want {
+		t.Errorf("stdout = %q, want %q", stdout, want)
+	}
+}
+
+// TestLoop_PlainList_AdvertisesTheSymrefWhenHeadResolves is the companion
+// guard: the fix must not silence a LEGITIMATE symref. Without this, deleting
+// the `@` line entirely would pass the test above.
+func TestLoop_PlainList_AdvertisesTheSymrefWhenHeadResolves(t *testing.T) {
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	if err := repo.Bootstrap(ft, root); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	sha := "1111111111111111111111111111111111111111"
+	if _, err := repo.WriteRef(ft, root, "refs/heads/main", sha, false); err != nil {
+		t.Fatalf("WriteRef: %v", err)
+	}
+	if _, err := repo.WriteHEAD(ft, root, "refs/heads/main"); err != nil {
+		t.Fatalf("WriteHEAD: %v", err)
+	}
+
+	in := bufio.NewScanner(strings.NewReader("list\n\n"))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	got := loop(ft, root, ".", in, out)
+	out.Flush()
+
+	if got != 0 {
+		t.Fatalf("loop() = %d, want 0: stdout=%q", got, outBuf.String())
+	}
+	if !strings.Contains(outBuf.String(), "@refs/heads/main HEAD\n") {
+		t.Errorf("stdout = %q, want the symref line: HEAD resolves to an advertised ref, "+
+			"and without it a clone checks out nothing", outBuf.String())
+	}
+}
+
+// TestLoop_PlainList_UnmarkedRootRefusesWithTheMarkerReason pins M4: the plain
+// `list` arm must apply the same marker check the fetch path already applies,
+// so `git ls-remote` against a folder that is not one of our repos refuses
+// with the named reason rather than succeeding vacuously.
+//
+// RED before the fix: with a plain Fake (no List error to hide behind),
+// ListRefs on an unmarked root returns an empty map, ReadHEAD reports no HEAD,
+// and the arm printed a bare terminator and exited 0 — advertising a repo that
+// does not exist. Its sibling test above uses listErrTransport and so could
+// never catch this: it fails inside ListRefs before the gap is reachable.
+func TestLoop_PlainList_UnmarkedRootRefusesWithTheMarkerReason(t *testing.T) {
+	ft := transport.NewFake()
+	root := "/my-files/not-a-repo"
+	if err := ft.EnsureDir(root); err != nil {
+		t.Fatalf("EnsureDir: %v", err)
+	}
+
+	in := bufio.NewScanner(strings.NewReader("list\n\n"))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(ft, root, ".", in, out) })
+	out.Flush()
+
+	if got != 1 {
+		t.Fatalf("loop() = %d, want 1: listing a folder with no marker must refuse, not "+
+			"advertise an empty repo (stdout=%q)", got, outBuf.String())
+	}
+	if !strings.Contains(stderr, repo.MarkerName) {
+		t.Errorf("stderr = %q, want the refusal to name %s", stderr, repo.MarkerName)
+	}
+	if !strings.Contains(stderr, "not a git-remote-proton repo") {
+		t.Errorf("stderr = %q, want the named reason, not a raw listing error", stderr)
+	}
+	if _, ok := ft.Files[root+"/"+repo.MarkerName]; ok {
+		t.Error("a refused list must never create the marker")
+	}
+	if outBuf.Len() != 0 {
+		t.Errorf("stdout = %q, want no protocol output at all for a refused list", outBuf.String())
+	}
+}
+
+// listErrTransport makes List fail for the refs namespaces specifically,
+// standing in for what the real CLI reports when it lists a folder that does
+// not exist. The Fake's own List never errors — an untouched path just comes
+// back as an empty slice — which would let ListRefs succeed vacuously on a
+// totally unmarked root and mask the thing this test needs to prove: that a
+// list which genuinely cannot read the remote fails closed rather than
+// silently advertising nothing.
+//
+// Only refs/heads and refs/tags are intercepted; List(root) itself (what
+// Bootstrap's own emptiness check would call) is passed straight through and
+// would still succeed. That is deliberate: it is what makes "no marker
+// afterward" a real, discriminating assertion below rather than a tautology —
+// an implementation that (wrongly) called Bootstrap before ListRefs would
+// still have written the marker here, since Bootstrap would have completed
+// before ListRefs' own List call ever fails.
+type listErrTransport struct{ *transport.Fake }
+
+func (l listErrTransport) List(p string) ([]transport.Node, error) {
+	if strings.HasSuffix(p, "/refs/heads") || strings.HasSuffix(p, "/refs/tags") {
+		return nil, fmt.Errorf("no such folder: %s", p)
+	}
+	return l.Fake.List(p)
+}
+
+// TestLoop_PlainList_UnmarkedRootFailsWithoutBootstrapping is the read-only
+// half of rule 3: a fetch-side list must never bring a repository into
+// existence, even when it cannot read the remote it was pointed at. RED
+// before Task 6 for the same reason as the test above (no "list" case yet);
+// it stays meaningful after Task 6 because the assertions pin the read-only
+// contract, not merely a non-zero exit code.
+func TestLoop_PlainList_UnmarkedRootFailsWithoutBootstrapping(t *testing.T) {
+	ft := transport.NewFake()
+	root := "/my-files/unmarked"
+	lt := listErrTransport{ft}
+
+	in := bufio.NewScanner(strings.NewReader("list\n\n"))
+	out := bufio.NewWriter(&bytes.Buffer{})
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(lt, root, ".", in, out) })
+
+	if got != 1 {
+		t.Fatalf("loop() = %d, want 1: a list that cannot read the remote must fail closed", got)
+	}
+	if stderr == "" {
+		t.Error("a failed list must report why on stderr")
+	}
+	if _, ok := ft.Files[root+"/"+repo.MarkerName]; ok {
+		t.Error("plain list must never bootstrap: found a marker after a failed list")
+	}
+	if ft.Dirs[root+"/refs"] {
+		t.Error("plain list must never bootstrap: found refs/ created after a failed list")
+	}
+}
+
+// newGitRepoWithCommit creates a real local git repository with one commit.
+// Fetch and Push both shell out to real git via internal/gitcmd, so the
+// fetch-batch tests below need a genuine local repository on each side — the
+// Fake only stands in for the REMOTE half of the transport. Mirrors the
+// pattern internal/repo's own tests (newGitRepoForPush) use for the same
+// reason; that helper is unexported in a different package, so it cannot be
+// reused directly here.
+func newGitRepoWithCommit(t *testing.T) string {
+	t.Helper()
+	d := t.TempDir()
+	for _, a := range [][]string{
+		{"init", "-qb", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"},
+	} {
+		if err := exec.Command("git", append([]string{"-C", d}, a...)...).Run(); err != nil {
+			t.Fatalf("git %v: %v", a, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(d, "a.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatalf("write a.txt: %v", err)
+	}
+	if err := exec.Command("git", "-C", d, "add", ".").Run(); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if err := exec.Command("git", "-C", d, "commit", "-qm", "c1").Run(); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+	return d
+}
+
+// emptyGitRepo creates a real local git repository with no commits — a fetch
+// DESTINATION that genuinely lacks the source's objects, unlike reusing the
+// source repo itself (which would make Fetch's up-to-date short-circuit fire
+// immediately, since the object would already be present in that store).
+func emptyGitRepo(t *testing.T) string {
+	t.Helper()
+	d := t.TempDir()
+	for _, a := range [][]string{
+		{"init", "-qb", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"},
+	} {
+		if err := exec.Command("git", append([]string{"-C", d}, a...)...).Run(); err != nil {
+			t.Fatalf("git %v: %v", a, err)
+		}
+	}
+	return d
+}
+
+func headOf(t *testing.T, d string) string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", d, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	sha := strings.TrimSpace(string(out))
+	if len(sha) != 40 {
+		t.Fatalf("rev-parse returned %q", sha)
+	}
+	return sha
+}
+
+// pushViaLoop drives loop() through a real "list for-push" + "push" exchange
+// to seed a Fake with a genuine marker, ref, and pack pair built from gitDir's
+// real history — the "seed via a real push first" pattern the fetch-batch
+// tests below need, since Fetch requires an actual pack on the remote and an
+// actual object closure to verify, neither of which a hand-planted Fake
+// state could produce without duplicating repo.Push itself.
+func pushViaLoop(t *testing.T, ft *transport.Fake, root, gitDir string) {
+	t.Helper()
+	script := "list for-push\npush refs/heads/main:refs/heads/main\n\n"
+	in := bufio.NewScanner(strings.NewReader(script))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	got := loop(ft, root, gitDir, in, out)
+	out.Flush()
+
+	if got != 0 {
+		t.Fatalf("seeding push failed: loop() = %d, stdout=%q", got, outBuf.String())
+	}
+	if !strings.Contains(outBuf.String(), "ok refs/heads/main") {
+		t.Fatalf("seeding push did not report ok: stdout=%q", outBuf.String())
+	}
+}
+
+// TestLoop_FetchBatch_InstallsAndReportsConnectivity is RED before Task 6:
+// "fetch <sha> <name>" hits the default case and fails closed instead of
+// installing anything. After Task 6 it pins the whole batch contract: a
+// fetch that actually installs objects reports a real "lock <keepPath>" line,
+// and connectivity-ok follows it — never precedes it, since emitting
+// connectivity-ok is only correct once Fetch's own verification (which IS the
+// connectivity check per rule 1) has already succeeded.
+func TestLoop_FetchBatch_InstallsAndReportsConnectivity(t *testing.T) {
+	src := newGitRepoWithCommit(t)
+	sha := headOf(t, src)
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	pushViaLoop(t, ft, root, src)
+
+	dst := emptyGitRepo(t)
+	script := "option check-connectivity true\nfetch " + sha + " refs/heads/main\n\n"
+	in := bufio.NewScanner(strings.NewReader(script))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	got := loop(ft, root, dst, in, out)
+	out.Flush()
+	stdout := outBuf.String()
+
+	if got != 0 {
+		t.Fatalf("loop() = %d, want 0: stdout=%q", got, stdout)
+	}
+	lockIdx := strings.Index(stdout, "lock ")
+	connIdx := strings.Index(stdout, "connectivity-ok")
+	if lockIdx == -1 {
+		t.Fatalf("stdout = %q, want a \"lock \" line naming the installed .keep", stdout)
+	}
+	if connIdx == -1 {
+		t.Fatalf("stdout = %q, want a connectivity-ok line", stdout)
+	}
+	if lockIdx > connIdx {
+		t.Fatalf("stdout = %q, want the lock line before connectivity-ok", stdout)
+	}
+	if !strings.HasSuffix(stdout, "connectivity-ok\n\n") {
+		t.Fatalf("stdout = %q, want it to end with connectivity-ok immediately followed by "+
+			"the terminating blank line", stdout)
+	}
+
+	var lockLine string
+	for _, l := range strings.Split(stdout, "\n") {
+		if strings.HasPrefix(l, "lock ") {
+			lockLine = l
+			break
+		}
+	}
+	keep := strings.TrimPrefix(lockLine, "lock ")
+	if _, err := os.Stat(keep); err != nil {
+		t.Errorf(".keep at %q reported by the lock line must exist on disk: %v", keep, err)
+	}
+}
+
+// TestLoop_FetchBatch_UpToDateEmitsNoLock covers rule 5: an up-to-date fetch
+// (("", nil) from repo.Fetch) is a legitimate outcome, not an error, and must
+// emit no "lock" line at all — while still answering connectivity-ok, because
+// Fetch returning a nil error is what makes closure verification true
+// regardless of whether anything new had to be installed. RED before Task 6
+// for the same reason as the sibling test above.
+func TestLoop_FetchBatch_UpToDateEmitsNoLock(t *testing.T) {
+	src := newGitRepoWithCommit(t)
+	sha := headOf(t, src)
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	pushViaLoop(t, ft, root, src)
+
+	dst := emptyGitRepo(t)
+	script := "option check-connectivity true\nfetch " + sha + " refs/heads/main\n\n"
+
+	in1 := bufio.NewScanner(strings.NewReader(script))
+	var out1Buf bytes.Buffer
+	out1 := bufio.NewWriter(&out1Buf)
+	got1 := loop(ft, root, dst, in1, out1)
+	out1.Flush()
+	if got1 != 0 {
+		t.Fatalf("priming fetch: loop() = %d, stdout=%q", got1, out1Buf.String())
+	}
+	if !strings.Contains(out1Buf.String(), "lock ") {
+		t.Fatalf("priming fetch must install and report a lock: stdout=%q", out1Buf.String())
+	}
+
+	in2 := bufio.NewScanner(strings.NewReader(script))
+	var out2Buf bytes.Buffer
+	out2 := bufio.NewWriter(&out2Buf)
+	got2 := loop(ft, root, dst, in2, out2)
+	out2.Flush()
+	stdout := out2Buf.String()
+
+	if got2 != 0 {
+		t.Fatalf("loop() = %d, want 0: stdout=%q", got2, stdout)
+	}
+	if strings.Contains(stdout, "lock ") {
+		t.Errorf("stdout = %q, an up-to-date fetch must emit no lock line", stdout)
+	}
+	if !strings.Contains(stdout, "connectivity-ok") {
+		t.Errorf("stdout = %q, connectivity-ok must still be reported when the option is on, "+
+			"even when the fetch was already up to date", stdout)
+	}
+}
+
+// --- Fix round 1: the fetch batch parser must fail closed, never producing
+// a false connectivity-ok ---
+//
+// The reviewer's finding: the original batch loop accepted any line with
+// two or more whitespace fields as a want (treating field 1 as the sha, with
+// no check that the line even started with "fetch "), and silently DROPPED
+// any line with fewer than two fields — no error, nothing added to `wants`.
+// A batch whose lines are all malformed therefore left `wants` completely
+// empty with no error ever reported. repo.Fetch treats an empty wants list
+// as ("", nil) — its legitimate "the local store already had everything"
+// signal — and when checkConnectivity was on, that signal reached the
+// caller as connectivity-ok: a false vouching for a closure that was never
+// actually verified, on exactly the path where git skips its OWN check
+// because the helper claimed to have done it.
+
+// TestLoop_FetchBatch_MalformedContinuationLineFailsClosed pins the "silently
+// dropped" half of the gap. The first line is a genuine, well-formed fetch
+// line (so a permissive parser would seed `wants` with one real sha and go
+// on to actually fetch); the second line has only one field and is not a
+// "fetch ..." line at all. Under the pre-fix parser this line was silently
+// ignored, the real want from line 1 still went through, and the fetch
+// SUCCEEDED — got 0, with both a lock line and connectivity-ok in stdout —
+// even though the batch as sent was malformed. The fix must instead fail the
+// whole session on the malformed line, before repo.Fetch is ever called with
+// a partial, silently-repaired batch.
+//
+// RED (pre-fix, run against the code as committed for Task 6): loop()
+// returned 0, not 1 — the "got != 1" assertion fired.
+func TestLoop_FetchBatch_MalformedContinuationLineFailsClosed(t *testing.T) {
+	src := newGitRepoWithCommit(t)
+	sha := headOf(t, src)
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	pushViaLoop(t, ft, root, src)
+
+	dst := emptyGitRepo(t)
+	script := "option check-connectivity true\n" +
+		"fetch " + sha + " refs/heads/main\n" +
+		"bogus-line\n" +
+		"\n"
+	in := bufio.NewScanner(strings.NewReader(script))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(ft, root, dst, in, out) })
+	out.Flush()
+	stdout := outBuf.String()
+
+	if got != 1 {
+		t.Fatalf("loop() = %d, want 1: a fetch batch with a malformed continuation line must "+
+			"fail closed, not silently ignore the bad line and fetch anyway (stdout=%q)", got, stdout)
+	}
+	if stderr == "" {
+		t.Error("a malformed fetch batch must report why on stderr")
+	}
+	if strings.Contains(stdout, "connectivity-ok") {
+		t.Errorf("stdout = %q, must NOT contain connectivity-ok: the batch was malformed, so "+
+			"nothing about the closure was actually verified", stdout)
+	}
+	if strings.Contains(stdout, "lock ") {
+		t.Errorf("stdout = %q, must NOT contain a lock line: a malformed batch must install nothing", stdout)
+	}
+}
+
+// TestLoop_FetchBatch_DegenerateFirstLineFailsClosed pins the "empty wants
+// reaches Fetch" half of the gap directly: a lone "fetch " line (matching the
+// outer switch's bare strings.HasPrefix check, but with no sha and no name
+// at all) as the WHOLE batch. Under the pre-fix parser, strings.Fields("fetch
+// ") produced a single-element slice, failed the old "len(sp) >= 2" test, and
+// was silently dropped — leaving `wants` completely empty with no error.
+// root is a genuinely bootstrapped/marked repo (via repo.Bootstrap directly
+// on the Fake, no real git needed) so that repo.Fetch's marker check passes
+// and its empty-wants short-circuit is what actually gets exercised — this
+// is the exact shape that produced a FALSE connectivity-ok pre-fix.
+//
+// RED (pre-fix): loop() returned 0 and stdout contained "connectivity-ok" —
+// both the "got != 1" and the "Contains(stdout, connectivity-ok)" assertions
+// fired.
+func TestLoop_FetchBatch_DegenerateFirstLineFailsClosed(t *testing.T) {
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	if err := repo.Bootstrap(ft, root); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	script := "option check-connectivity true\nfetch \n\n"
+	in := bufio.NewScanner(strings.NewReader(script))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(ft, root, ".", in, out) })
+	out.Flush()
+	stdout := outBuf.String()
+
+	if got != 1 {
+		t.Fatalf("loop() = %d, want 1: a degenerate \"fetch \" line with no sha and no name "+
+			"must fail closed, not silently produce an empty want list (stdout=%q)", got, stdout)
+	}
+	if stderr == "" {
+		t.Error("a degenerate fetch line must report why on stderr")
+	}
+	if strings.Contains(stdout, "connectivity-ok") {
+		t.Errorf("stdout = %q, must NOT contain connectivity-ok: an empty want list must never "+
+			"reach repo.Fetch, whose up-to-date signal would then falsely vouch for a closure "+
+			"nothing verified", stdout)
+	}
+	if strings.Contains(stdout, "lock ") {
+		t.Errorf("stdout = %q, must NOT contain a lock line", stdout)
+	}
+}
+
+// TestLoop_FetchBatch_CheckConnectivityFalse_NoConnectivityOk is the minor
+// fold-in: the negative branch of the option was correct by construction
+// (checkConnectivity defaults false, and the "if checkConnectivity" guard
+// already existed) but had no direct test. Not a RED — it already passed
+// against the code as committed for Task 6, since fix round 1 only tightens
+// batch-line parsing and does not touch the option-false path.
+func TestLoop_FetchBatch_CheckConnectivityFalse_NoConnectivityOk(t *testing.T) {
+	src := newGitRepoWithCommit(t)
+	sha := headOf(t, src)
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	pushViaLoop(t, ft, root, src)
+
+	dst := emptyGitRepo(t)
+	script := "fetch " + sha + " refs/heads/main\n\n" // no "option check-connectivity" at all
+	in := bufio.NewScanner(strings.NewReader(script))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	got := loop(ft, root, dst, in, out)
+	out.Flush()
+	stdout := outBuf.String()
+
+	if got != 0 {
+		t.Fatalf("loop() = %d, want 0: stdout=%q", got, stdout)
+	}
+	if !strings.Contains(stdout, "lock ") {
+		t.Errorf("stdout = %q, want a lock line: the fetch itself must still succeed", stdout)
+	}
+	if strings.Contains(stdout, "connectivity-ok") {
+		t.Errorf("stdout = %q, must NOT contain connectivity-ok: the option was never turned on", stdout)
 	}
 }

@@ -451,6 +451,14 @@ func TestCLITrashStartFailureIsAmbiguous(t *testing.T) {
 // cause was lost, which is the worst possible diagnostic for the case an
 // operator is most likely to hit — the CLI not being installed. The start
 // error must survive into the returned error.
+//
+// The local and remote basenames below MUST agree ("path.txt" both sides):
+// Task 2 review round 1 added a basename guard ahead of the upload call
+// (checkUploadBasename, shared with the Fake), and a mismatch here would be
+// refused by that guard before ever reaching c.run — exercising the C11 path
+// this test is not about, and never reaching the start failure this test
+// exists to pin. See TestCLIRefusesBasenameMismatchBeforeUpload for the
+// mismatch case.
 func TestCLIUploadStartFailureIsAmbiguous(t *testing.T) {
 	const exe = "nonexistent-xyz-binary-git-proton-backup-test"
 	c := NewCLI(exe)
@@ -461,7 +469,7 @@ func TestCLIUploadStartFailureIsAmbiguous(t *testing.T) {
 	}
 	for name, fn := range fns {
 		t.Run(name, func(t *testing.T) {
-			got, err := fn("/some/path.txt", "local.txt")
+			got, err := fn("/some/path.txt", "path.txt")
 			if err == nil {
 				t.Fatalf("want a non-nil error, got outcome=%v err=nil", got)
 			}
@@ -478,6 +486,98 @@ func TestCLIUploadStartFailureIsAmbiguous(t *testing.T) {
 			}
 		})
 	}
+}
+
+// RED (Task 2 review round 1). CLI.CreateExclusive and CLI.UpdateRevision
+// pass localFile straight to `upload` without ever consulting p's leaf, so a
+// caller that violates the C11 caller contract (local basename must equal
+// the remote leaf) writes to the WRONG REMOTE NAME live — the Fake catches
+// this via checkUploadBasename, but the CLI does not. The exe under test does
+// not exist, which is how this proves the guard fires BEFORE any process is
+// spawned, without a real binary: if CreateExclusive/UpdateRevision ever
+// reached c.run, the returned error would carry the exec start-failure
+// signature seen in TestCLIUploadStartFailureIsAmbiguous (naming exe, e.g.
+// "exited -1" or exec.ErrNotFound) instead of the C11 message asserted below.
+func TestCLIRefusesBasenameMismatchBeforeUpload(t *testing.T) {
+	const exe = "nonexistent-xyz-binary-git-proton-backup-test"
+	c := NewCLI(exe)
+
+	fns := map[string]func(string, string) (Outcome, error){
+		"CreateExclusive": c.CreateExclusive,
+		"UpdateRevision":  c.UpdateRevision,
+	}
+	for name, fn := range fns {
+		t.Run(name, func(t *testing.T) {
+			got, err := fn("/remote/dir/target-leaf.txt", "local-mismatch.txt")
+			if err == nil {
+				t.Fatalf("want a non-nil error for a basename mismatch, got outcome=%v err=nil", got)
+			}
+			if got != Ambiguous {
+				t.Fatalf("want Ambiguous, got %v", got)
+			}
+			if !strings.Contains(err.Error(), "C11") {
+				t.Errorf("error must cite probe C11, got %q", err)
+			}
+			if !strings.Contains(err.Error(), "local-mismatch.txt") || !strings.Contains(err.Error(), "target-leaf.txt") {
+				t.Errorf("error must name both the local basename and the target leaf, got %q", err)
+			}
+			if strings.Contains(err.Error(), exe) {
+				t.Errorf("error must not carry the exec start-failure signature — the guard must fire before any process is spawned, got %q", err)
+			}
+		})
+	}
+}
+
+// TestCLIReadToRefusesAMissingDestinationBeforeInvokingTheCLI covers the
+// Stage 3a live-gate finding (task 7): the real proton-drive CLI's
+// `filesystem download` silently CREATES a missing destination directory and
+// succeeds, contradicting the documented Transport contract and the Fake's
+// own behaviour — a genuine fake/real divergence caught for the first time
+// by a live run. Decided to enforce the documented contract in the wrapper
+// rather than loosen it to match the CLI binary: every caller in this
+// codebase creates its temp dir with os.MkdirTemp before calling ReadTo, so
+// a missing destination always indicates a caller bug, and *CLI now stats
+// localDir itself and refuses before ever invoking the CLI.
+//
+// The exe under test does not exist, which is how this proves the guard
+// fires BEFORE any process is spawned, without a real binary: if ReadTo ever
+// reached c.run, the returned error would carry the exec start-failure
+// signature seen in TestCLIUploadStartFailureIsAmbiguous (naming exe) instead
+// of the plain os.Stat error asserted below — the same technique
+// TestCLIRefusesBasenameMismatchBeforeUpload above uses for CreateExclusive.
+func TestCLIReadToRefusesAMissingDestinationBeforeInvokingTheCLI(t *testing.T) {
+	const exe = "nonexistent-xyz-binary-git-proton-backup-test"
+	c := NewCLI(exe)
+
+	t.Run("missing directory", func(t *testing.T) {
+		missing := filepath.Join(t.TempDir(), "not-created")
+		err := c.ReadTo("/remote/path.txt", missing)
+		if err == nil {
+			t.Fatal("want a non-nil error for a missing destination")
+		}
+		if strings.Contains(err.Error(), exe) {
+			t.Errorf("error must not carry the exec start-failure signature — the guard must "+
+				"fire before any process is spawned, got %q", err)
+		}
+		if _, statErr := os.Stat(missing); !os.IsNotExist(statErr) {
+			t.Error("ReadTo must not have created the destination directory")
+		}
+	})
+
+	t.Run("destination exists but is a file, not a directory", func(t *testing.T) {
+		file := filepath.Join(t.TempDir(), "not-a-dir")
+		if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		err := c.ReadTo("/remote/path.txt", file)
+		if err == nil {
+			t.Fatal("want a non-nil error when localDir is a file, not a directory")
+		}
+		if strings.Contains(err.Error(), exe) {
+			t.Errorf("error must not carry the exec start-failure signature — the guard must "+
+				"fire before any process is spawned, got %q", err)
+		}
+	})
 }
 
 // RED. parseNodeJSON currently does IsDir: w.Type == "folder", so an

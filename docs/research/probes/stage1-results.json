@@ -177,6 +177,22 @@
         "skipped": 0,
         "failed": 0
       }
+    },
+    "C16": {
+      "question": "Does `filesystem download` require its destination directory to already exist? (Transport.ReadTo is documented as 'localPath must be an existing directory; implementations do not create it', and Stage 2's contract text justified that by asserting the real CLI does not create it either)",
+      "answer": "NO - IT SILENTLY CREATES THE MISSING DESTINATION AND SUCCEEDS. Given a destination directory that does not exist, `filesystem download <remotePath> <missingDir>` creates it, lands the file inside it, and exits 0. THE EARLIER CLAIM IS WITHDRAWN: 'the real CLI does not create it' was written into Stage 2's Transport contract comment and repeated in the Fake's own doc comments, and it was wrong. It was never probed - it was inferred, and no test could catch it because only the Fake (which genuinely does not create it, via os.WriteFile) ran in CI. THE CONTRACT WAS KEPT, NOT LOOSENED: `*CLI.ReadTo` now stats localDir itself and refuses before ever spawning the CLI, so the documented directory-must-exist behaviour is enforced by the WRAPPER rather than inherited from the binary. Rationale: every caller in this codebase creates its temp dir with os.MkdirTemp before calling ReadTo, so a missing destination always indicates a caller bug, and a transport that silently created the directory would hide that bug instead of surfacing it. This is also the first genuine Fake/CLI divergence the shared contract table (Task 2) failed to catch on its own - it was found only because the live half finally ran.",
+      "evidence": {
+        "command": "filesystem download <remotePath> <destinationThatDoesNotExist>",
+        "destinationExistedBefore": false,
+        "destinationCreatedByCLI": true,
+        "exit": 0,
+        "fileLandedUnderRemoteBasename": true,
+        "fakeBehaviour": "errors (os.WriteFile into a missing directory), which is what the contract requires",
+        "resolution": "enforced in the *CLI wrapper by an os.Stat on localDir before spawn; the contract text in transport.go, cli.go and fake.go was corrected to say the wrapper enforces it, not the binary",
+        "observedDuring": "Stage 3a live gate, task 7 (clone and incremental fetch against the real account)",
+        "cli": "cli-drive@0.7.0+5174900c",
+        "raisedBy": "Stage 3a final whole-branch review (I5: the withdrawn claim was still asserted in fake.go after the code had already been fixed)"
+      }
     }
   }
 }

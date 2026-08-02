@@ -93,8 +93,18 @@ func (f *Fake) Stat(p string) (Node, bool, error) {
 // ReadTo mirrors the real CLI's folder-destination download: local must
 // already be a directory, and the file lands under path's own remote
 // basename (path.Base, not filepath.Base — remote paths are always POSIX
-// regardless of host OS). A missing or non-directory local is not created
-// on the caller's behalf; os.WriteFile reports it as the error it is.
+// regardless of host OS). A missing or non-directory local is not created on
+// the caller's behalf; os.WriteFile reports it as the error it is.
+//
+// "Not created on the caller's behalf" is the WRAPPER's contract, not the
+// binary's, and this comment used to claim otherwise. The Stage 3a live gate
+// (task 7, cli-drive@0.7.0) found that `filesystem download` given a missing
+// destination silently CREATES the directory and succeeds — probe C16. The
+// contract was kept and enforced rather than loosened, because every caller
+// here creates its temp dir with os.MkdirTemp first, so a missing destination
+// always means a caller bug that auto-creation would hide: *CLI.ReadTo now
+// stats localDir and refuses before spawning anything, and this Fake agrees
+// with the wrapper, not with the raw binary.
 func (f *Fake) ReadTo(p, local string) error {
 	b, ok := f.Files[p]
 	if !ok {
@@ -103,15 +113,21 @@ func (f *Fake) ReadTo(p, local string) error {
 	return os.WriteFile(filepath.Join(local, path.Base(p)), b, 0o644)
 }
 
-// checkUploadBasename mechanically enforces the caller contract cli.go states
-// in capitals but cannot itself verify: `filesystem upload` takes a PARENT
-// path and has no --name flag, so the real CLI names the remote node after the
-// LOCAL file's basename (probe C11). Both Fake write methods used to read
-// local purely for its bytes and key on p, which meant a caller staging under
-// a neutral name passed the entire suite and then wrote to the wrong remote
-// name live — the defect that already reached this branch once and cost a
-// design revision. The Fake is the only place that can catch it before a live
-// push, so it catches it here.
+// checkUploadBasename mechanically enforces the caller contract: `filesystem
+// upload` takes a PARENT path and has no --name flag, so the remote node is
+// named after the LOCAL file's basename (probe C11). Both Fake write methods
+// used to read local purely for its bytes and key on p, which meant a caller
+// staging under a neutral name passed the entire suite and then wrote to the
+// wrong remote name live — the defect that already reached this branch once
+// and cost a design revision.
+//
+// It is shared by BOTH implementations and lives here only because this file
+// is where it was first written. An earlier version of this comment said "the
+// Fake is the only place that can catch it before a live push"; that stopped
+// being true in Task 2, when review found *CLI passing localFile straight
+// through to the binary and the guard was wired into CreateExclusive and
+// UpdateRevision there as well. Enforcing it in one implementation only would
+// have meant the suite certified a contract the live transport did not apply.
 //
 // The asymmetry in the two Base calls is deliberate, not a copy-paste slip:
 // local is a HOST path, where the separator is whatever the OS uses, so it
@@ -125,10 +141,13 @@ func checkUploadBasename(p, local string) error {
 	if got == want {
 		return nil
 	}
+	// Phrased from neither implementation's point of view, since both raise
+	// it: "the real CLI would name the node after the local file" read oddly
+	// coming from inside the real CLI's own wrapper.
 	return fmt.Errorf("caller contract violated (probe C11): local basename %q must equal "+
-		"the remote leaf %q of %s — `filesystem upload` has no --name flag, so the real CLI "+
-		"would name the node after the local file and the write would land at the wrong "+
-		"remote path", got, want, p)
+		"the remote leaf %q of %s — `filesystem upload` takes a PARENT path and has no "+
+		"--name flag, so the uploaded node is named after the LOCAL file and this write "+
+		"would land under the wrong remote name", got, want, p)
 }
 
 func (f *Fake) CreateExclusive(p, local string) (Outcome, error) {
