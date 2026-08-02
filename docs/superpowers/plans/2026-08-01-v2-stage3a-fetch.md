@@ -74,9 +74,34 @@ Add to `internal/gitcmd/gitcmd_test.go`:
 
 ```go
 // twoCommitRepo returns a repo with two commits and the sha of each.
+//
+// Its FIRST commit must have content distinct from newRepo's, and this is
+// load-bearing: a commit sha covers the author and committer timestamps at
+// one-second resolution, so two repos built from identical inputs inside the
+// same second produce the SAME sha. The connectivity test below compares this
+// repo against a fresh newRepo destination — if their root commits collided,
+// --not --all would mark the "missing" parent uninteresting from the
+// destination's own store and the incomplete-closure assertion would see
+// exit 0. The test would then fail (or silently prove nothing) depending on
+// how fast the machine is. Reproduced with pinned GIT_COMMITTER_DATE.
 func twoCommitRepo(t *testing.T) (dir, first, second string) {
 	t.Helper()
-	d := newRepo(t) // one commit already
+	d := t.TempDir()
+	for _, a := range [][]string{
+		{"init", "-qb", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"},
+	} {
+		if err := exec.Command("git", append([]string{"-C", d}, a...)...).Run(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(d, "a.txt"), []byte("src-one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range [][]string{{"add", "."}, {"commit", "-qm", "src c1"}} {
+		if err := exec.Command("git", append([]string{"-C", d}, a...)...).Run(); err != nil {
+			t.Fatal(err)
+		}
+	}
 	first = headOf(t, d)
 	if err := os.WriteFile(filepath.Join(d, "b.txt"), []byte("two"), 0o644); err != nil {
 		t.Fatal(err)
