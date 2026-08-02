@@ -1227,3 +1227,71 @@ func TestAcquireLockFailsClosedOnUnrecognisedOutcome(t *testing.T) {
 		t.Errorf("the refusal must name the outcome it saw, got: %v", err)
 	}
 }
+
+// RED. DeriveHEAD does not exist. A pure function — no transport needed.
+func TestDeriveHEAD(t *testing.T) {
+	cases := []struct {
+		name       string
+		candidates []string
+		clientHEAD string
+		want       string
+		wantOK     bool
+	}{
+		{"none", nil, "refs/heads/main", "", false},
+		{"single wins outright", []string{"refs/heads/only"}, "refs/heads/other", "refs/heads/only", true},
+		{"client HEAD breaks the tie",
+			[]string{"refs/heads/zeta", "refs/heads/alpha", "refs/heads/main"},
+			"refs/heads/main", "refs/heads/main", true},
+		{"lexicographically first when the client HEAD is absent",
+			[]string{"refs/heads/zeta", "refs/heads/alpha"},
+			"refs/heads/nowhere", "refs/heads/alpha", true},
+		{"lexicographically first when the client is detached",
+			[]string{"refs/heads/zeta", "refs/heads/alpha"},
+			"", "refs/heads/alpha", true},
+		{"non-branches are not candidates", []string{"refs/tags/v1"}, "", "", false},
+	}
+	for _, c := range cases {
+		got, ok := DeriveHEAD(c.candidates, c.clientHEAD)
+		if got != c.want || ok != c.wantOK {
+			t.Errorf("%s: DeriveHEAD = (%q, %v), want (%q, %v)", c.name, got, ok, c.want, c.wantOK)
+		}
+	}
+}
+
+// RED. WriteHEAD/ReadHEAD do not exist.
+func TestWriteAndReadHEAD(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+
+	if _, ok, err := ReadHEAD(f, "/r"); err != nil || ok {
+		t.Fatalf("a fresh repo has no HEAD: %v %v", ok, err)
+	}
+	if out, err := WriteHEAD(f, "/r", "refs/heads/main"); err != nil || out != transport.Committed {
+		t.Fatalf("WriteHEAD: %v %v", out, err)
+	}
+	if got := string(f.Files["/r/HEAD"]); got != "ref: refs/heads/main\n" {
+		t.Errorf("HEAD content = %q", got)
+	}
+	branch, ok, err := ReadHEAD(f, "/r")
+	if err != nil || !ok {
+		t.Fatalf("ReadHEAD: %v %v", ok, err)
+	}
+	if branch != "refs/heads/main" {
+		t.Errorf("ReadHEAD = %q, want refs/heads/main", branch)
+	}
+}
+
+// RED. A symref payload must not be forced through WriteRef's 40-hex rule,
+// and a garbage HEAD must be fatal rather than coerced.
+func TestReadHEADRejectsCorruptContent(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	f.Files["/r/HEAD"] = []byte("1111111111111111111111111111111111111111\n")
+	if _, _, err := ReadHEAD(f, "/r"); err == nil {
+		t.Error("a detached-OID HEAD is not a symref and must be refused, not coerced")
+	}
+	f.Files["/r/HEAD"] = []byte("ref: refs/tags/v1\n")
+	if _, _, err := ReadHEAD(f, "/r"); err == nil {
+		t.Error("HEAD must point at a branch")
+	}
+}
