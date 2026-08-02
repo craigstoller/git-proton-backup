@@ -135,7 +135,15 @@ func WritePack(gitDir, want string, haves []string, outDir string) (string, stri
 	// corrupt the parsed name and produce a path that does not exist. stdout
 	// is captured alone for parsing; stderr is kept separately and folded
 	// into the error message on failure so diagnostics still surface.
-	cmd := exec.Command("git", "-C", gitDir, "pack-objects", "--no-thin", "-q",
+	// Both pins are normative (design v6.2). packSizeLimit must be overridden
+	// as CONFIG, not as --max-pack-size=0: git reads 0 there as "unset" and
+	// falls back to the very config being overridden. The index-version pin
+	// must be on the command line too, because pack.indexVersion is
+	// user-configurable and `index-pack --verify` validates an index in
+	// whatever version it already is.
+	cmd := exec.Command("git", "-C", gitDir,
+		"-c", "pack.packSizeLimit=0",
+		"pack-objects", "--no-thin", "--index-version=2", "-q",
 		filepath.Join(outDir, "pack"))
 	cmd.Stdin = strings.NewReader(objs + "\n")
 	var stdout, stderr strings.Builder
@@ -145,6 +153,15 @@ func WritePack(gitDir, want string, haves []string, outDir string) (string, stri
 		return "", "", fmt.Errorf("pack-objects: %s: %w", strings.TrimSpace(stderr.String()), err)
 	}
 	name := strings.TrimSpace(stdout.String())
+
+	// One pack is an invariant the whole publication path rests on: a second
+	// pack silently dropped would publish a ref whose objects are only
+	// half-uploaded. The size pin above should make this unreachable, so
+	// treat it as a hard error rather than parsing the first line.
+	if strings.ContainsAny(name, " \t\r\n") {
+		return "", "", fmt.Errorf("pack-objects emitted more than one pack (%q); "+
+			"the one-pack invariant is broken", name)
+	}
 	base := filepath.Join(outDir, "pack-"+name)
 	packPath, idxPath := base+".pack", base+".idx"
 
@@ -160,4 +177,22 @@ func WritePack(gitDir, want string, haves []string, outDir string) (string, stri
 		return "", "", fmt.Errorf("pack-objects reported %s but the idx file is missing: %w", idxPath, err)
 	}
 	return packPath, idxPath, nil
+}
+
+// IndexPackVerify runs `git index-pack --verify` on packPath, whose .idx must
+// sit beside it under the same stem. It is the only check that proves a pack
+// is internally well-formed and agrees with its index; a basename/checksum
+// comparison is the only check that proves the file is the one the name
+// claims. Neither substitutes for the other (design v6.2, error table).
+//
+// It verifies an index in whatever version that index already is, which is
+// why it cannot be the enforcement point for the index-version pin.
+func IndexPackVerify(packPath string) error {
+	cmd := exec.Command("git", "index-pack", "--verify", packPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("index-pack --verify %s: %s: %w",
+			packPath, strings.TrimSpace(string(out)), err)
+	}
+	return nil
 }
