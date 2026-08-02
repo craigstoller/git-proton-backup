@@ -23,7 +23,7 @@ import (
 // --no-thin and self-contained, so their union is a superset of any closure.
 // Selective discovery is Stage 3b.
 func Fetch(t transport.Transport, root, gitDir string, wants []string) (string, error) {
-	if err := requireMarker(t, root); err != nil {
+	if err := RequireMarker(t, root); err != nil {
 		return "", err
 	}
 	if len(wants) == 0 {
@@ -91,23 +91,25 @@ func Fetch(t transport.Transport, root, gitDir string, wants []string) (string, 
 	return consolidateAndInstall(gitDir, altObjects, objs)
 }
 
-// requireMarker is the read-only half of Bootstrap's check: the marker must be
-// present AND recognised. Absent or unrecognised is a hard refusal — the
-// helper never guesses whether a folder is one of its repos, and a fetch is
-// certainly not licence to initialise one.
-func requireMarker(t transport.Transport, root string) error {
-	marker := root + "/" + MarkerName
-	if _, ok, err := t.Stat(marker); err != nil {
-		return fmt.Errorf("stat %s: %w", marker, err)
-	} else if !ok {
-		return fmt.Errorf("refusing to fetch from %s: no %s — it is not a git-remote-proton repo",
-			root, MarkerName)
-	}
-	// checkMarker takes the marker's own PATH, not the repo root — passing the
-	// root would try to download a directory.
-	return checkMarker(t, marker)
-}
-
+// downloadAllPacks downloads every `.pack` and `.idx` under <root>/packs into
+// packDir. Two rules here are normative, not incidental:
+//
+// EVERY pack, not a selected subset. Stage 3a does no discovery: each pack
+// this helper writes is --no-thin and self-contained, so the union of all of
+// them is a superset of any closure, and taking the union is correct by
+// construction. Selective download (Stage 3b) requires the object-to-pack map
+// built from the `.idx` sidecars, which does not exist yet — a subset chosen
+// on any weaker basis could omit a delta base and produce an install that
+// verifies locally and is unusable later.
+//
+// An EMPTY packs/ is fatal, never an empty success. A marked repo always has
+// at least one pack (a ref cannot be published without one), so no packs means
+// the remote is incomplete or was tampered with — and reporting that as a
+// successful download of nothing would let the connectivity check downstream
+// pass or fail on an object store the remote never actually provided.
+// Directories and any other file type are skipped rather than refused: packs/
+// is the helper's own namespace, but a stray node there is not evidence the
+// packs are wrong.
 func downloadAllPacks(t transport.Transport, root, packDir string) error {
 	nodes, err := t.List(root + "/packs")
 	if err != nil {
@@ -238,10 +240,15 @@ func consolidateAndInstall(gitDir, altObjects, objs string) (string, error) {
 	// caller, and this package's own tests call Fetch directly with a
 	// relative gitDir, so this must not silently depend on main.go having
 	// already resolved gitDir to absolute upstream.
-	realPack, err = filepath.Abs(realPack)
+	//
+	// Assigned only AFTER the error check: filepath.Abs returns "" on failure,
+	// so assigning straight into realPack would make the message below name an
+	// empty path rather than the one that could not be resolved.
+	absPack, err := filepath.Abs(realPack)
 	if err != nil {
 		return "", fmt.Errorf("cannot resolve pack directory %s to an absolute path: %w", realPack, err)
 	}
+	realPack = absPack
 	if err := os.MkdirAll(realPack, 0o700); err != nil {
 		return "", err
 	}
@@ -265,6 +272,21 @@ func consolidateAndInstall(gitDir, altObjects, objs string) (string, error) {
 			return "", fmt.Errorf("pack-objects reported %s but %s is missing: %w", name, stem+ext, err)
 		}
 	}
+	// The .keep lands AFTER the pack it protects, and that ordering leaves a
+	// window: a `git gc` running concurrently, between pack-objects writing
+	// the pack and this write completing, sees a pack no ref reaches and no
+	// .keep protects, and may reclaim it. The fetch would then report success
+	// for objects that are gone.
+	//
+	// It is not expressible any other way with pack-objects, which chooses the
+	// pack's name itself (the name is its content checksum) and only prints it
+	// once the pack is on disk — so there is no name to write a .keep under
+	// beforehand. index-pack --stdin has a --keep flag that closes this, but
+	// it takes a pack on stdin rather than building one from an object list,
+	// which is the whole job here. The window is narrow, requires a concurrent
+	// gc in the destination repo, and the failure is loud (git reports the
+	// missing objects) rather than silent corruption — recorded so it is
+	// understood as an accepted cost rather than mistaken for an oversight.
 	keep := stem + ".keep"
 	if err := os.WriteFile(keep, []byte("git-remote-proton fetch\n"), 0o644); err != nil {
 		return "", fmt.Errorf("cannot write %s: %w", keep, err)

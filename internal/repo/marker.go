@@ -170,6 +170,30 @@ func Bootstrap(t transport.Transport, root string) error {
 	return ensureSubdirs(t, root)
 }
 
+// RequireMarker is the READ-ONLY half of Bootstrap's check: the marker must be
+// present AND recognised. Absent or unrecognised is a hard refusal — the
+// helper never guesses whether a folder is one of its repos, and a read is
+// certainly not licence to initialise one.
+//
+// Exported because both read-side entry points need it and neither may
+// Bootstrap: repo.Fetch, and the plain `list` advertisement in
+// cmd/git-remote-proton. Without it there, `git ls-remote` against an
+// arbitrary folder listed cleanly and reported an empty repo — ListRefs on a
+// folder with no refs/ namespace is not necessarily an error, so "no marker"
+// presented as "a repo with no refs" rather than as the refusal it is.
+func RequireMarker(t transport.Transport, root string) error {
+	marker := root + "/" + MarkerName
+	if _, ok, err := t.Stat(marker); err != nil {
+		return fmt.Errorf("stat %s: %w", marker, err)
+	} else if !ok {
+		return fmt.Errorf("refusing to read %s: no %s — it is not a git-remote-proton repo",
+			root, MarkerName)
+	}
+	// checkMarker takes the marker's own PATH, not the repo root — passing the
+	// root would try to download a directory.
+	return checkMarker(t, marker)
+}
+
 // checkMarker downloads the marker and validates its CONTENT. It uses the same
 // download-then-read shape as readRef and readLock: the CLI's `download` takes
 // a destination FOLDER, so the file lands under whatever name it has remotely.

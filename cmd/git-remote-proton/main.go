@@ -45,6 +45,14 @@ func run() int {
 		warn(err)
 		return 1
 	}
+	// The rest of GIT_DIR's class, resolved at the same point and for the same
+	// reason. See resolveGitDir's doc for which variables are covered, which
+	// is deliberately left alone, and why unsetting them would be fail-open
+	// rather than safe.
+	if err := absolutizeInheritedGitPaths(); err != nil {
+		warn(err)
+		return 1
+	}
 	// git sets GIT_DIR (commonly a RELATIVE path, e.g. ".git") in this
 	// process's own environment before spawning the helper. internal/gitcmd
 	// invokes `git -C <gitDir> ...` as a subprocess, and Go's exec.Command
@@ -104,6 +112,38 @@ func run() int {
 // fetch.go is a library entry point in its own right, and its own tests call
 // Fetch directly, so the fix there must not silently depend on this
 // function's hygiene either.)
+//
+// GIT_DIR IS NOT THE ONLY ENVIRONMENT VARIABLE IN THIS CLASS, and the class is
+// NOT closed by this function. Three others can be relative and can change
+// where objects live:
+//
+//   - GIT_COMMON_DIR and GIT_OBJECT_DIRECTORY are handled — see
+//     absolutizeInheritedGitPaths below, which resolves them at capture and
+//     re-exports the absolute forms. A relative GIT_COMMON_DIR is the sharpest
+//     case: re-resolved inside a `-C`-scoped child it yields an install path
+//     that PASSES validateObjectsPackPath (it still ends in "/objects/pack")
+//     yet points somewhere git never reads — fail-OPEN, since the objects are
+//     invisible and connectivity-ok is reported anyway.
+//   - GIT_WORK_TREE is deliberately NOT handled. It names the working tree,
+//     not the object store, so it cannot move where a pack is installed or
+//     where git looks for one; this helper never reads or writes worktree
+//     files. Absolutising it would be churn with no failure mode behind it.
+//
+// Blanket-unsetting the object-placement pair would be WRONG, which is why
+// none of this is "just unset them like GIT_DIR". GIT_DIR can be unset for the
+// children because gitDir is passed explicitly to every gitcmd call, so the
+// child is told the same answer by another route. GIT_OBJECT_DIRECTORY has no
+// such route: unsetting it would make this helper pack into the DEFAULT object
+// database while the calling git reads the one it nominated — objects written
+// where nobody looks, reported as a successful fetch. That is the same
+// fail-open shape the relative-path bug produces, arrived at deliberately.
+// Absolutising preserves the caller's meaning and only removes the ambiguity.
+//
+// Reachability is narrow and stated plainly: git does not export any of these
+// to a spawned remote helper, so they arrive only if the USER exported them in
+// their own shell. That is why this is hardening, not a fix for an observed
+// failure — unlike the relative GIT_DIR above, which git sets on every
+// ordinary invocation and which broke the live gate.
 func resolveGitDir() (string, error) {
 	gitDir := os.Getenv("GIT_DIR")
 	if gitDir == "" {
@@ -114,6 +154,45 @@ func resolveGitDir() (string, error) {
 		return "", fmt.Errorf("cannot resolve GIT_DIR %q to an absolute path: %w", gitDir, err)
 	}
 	return abs, nil
+}
+
+// objectPlacementEnv are the inherited variables, other than GIT_DIR, that can
+// relocate where git reads and writes objects. Listed as data so the set is
+// one thing to audit rather than two open-coded blocks. GIT_WORK_TREE is
+// absent on purpose — see resolveGitDir's doc for why it does not belong here.
+var objectPlacementEnv = []string{"GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY"}
+
+// absolutizeInheritedGitPaths re-exports each of objectPlacementEnv as an
+// ABSOLUTE path, resolved against THIS process's cwd — the same treatment, for
+// the same reason, that resolveGitDir gives GIT_DIR.
+//
+// A relative value here means one thing to this process and another to every
+// `git -C <gitDir> ...` child the helper spawns, because -C changes the
+// directory relative paths resolve against. Resolving once at the source
+// cannot change what the value MEANS (filepath.Abs anchors it to exactly the
+// cwd it was already implicitly relative to); it only makes that meaning
+// survive being read in a different context.
+//
+// Unset and empty values are left alone: an empty GIT_OBJECT_DIRECTORY is not
+// a relative path, and turning it into the cwd would invent an object store
+// the caller never asked for. A value that cannot be resolved is fatal rather
+// than passed through, because passing it through is the fail-open case this
+// exists to prevent.
+func absolutizeInheritedGitPaths() error {
+	for _, name := range objectPlacementEnv {
+		v := os.Getenv(name)
+		if v == "" || filepath.IsAbs(v) {
+			continue
+		}
+		abs, err := filepath.Abs(v)
+		if err != nil {
+			return fmt.Errorf("cannot resolve %s %q to an absolute path: %w", name, v, err)
+		}
+		if err := os.Setenv(name, abs); err != nil {
+			return fmt.Errorf("cannot re-export %s as an absolute path: %w", name, err)
+		}
+	}
+	return nil
 }
 
 // loop runs the git-remote-helper command exchange over in/out. Split out
@@ -174,6 +253,19 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 			// The FETCH-side advertisement. Read-only: no Bootstrap, no lock.
 			// A fetch must never bring a repository into existence, and a
 			// lock here would wedge the repo for every reader if we crashed.
+			//
+			// RequireMarker is the read-only half of Bootstrap's check, and it
+			// runs FIRST. Without it, `git ls-remote proton::/my-files/anything`
+			// listed a folder that is not one of our repos and reported an
+			// empty ref set: ListRefs on a folder with no refs/ namespace is
+			// not necessarily an error, so "this is not a git-remote-proton
+			// repo" presented as "a repo with no refs". repo.Fetch has always
+			// applied the same check; the advertisement is the other read-side
+			// entry point and had nothing.
+			if err := repo.RequireMarker(t, root); err != nil {
+				warn(err)
+				return 1
+			}
 			refs, err := repo.ListRefs(t, root)
 			if err != nil {
 				warn(err)
@@ -185,8 +277,25 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 			if branch, ok, err := repo.ReadHEAD(t, root); err != nil {
 				warn(err)
 				return 1
-			} else if ok {
-				// The symref line is what lets clone check something out.
+			} else if _, listed := refs[branch]; ok && listed {
+				// The symref line is what lets clone check something out — and
+				// it is emitted ONLY when the branch it names is in the ref
+				// list we just advertised.
+				//
+				// A remote can hold a HEAD pointing at a branch that no longer
+				// exists: v2 never rewrites an existing HEAD, so any remote
+				// that lost its default branch before the delete refusal in
+				// repo.pushOne shipped is stuck that way permanently. Advertised
+				// verbatim, that symref makes clone fetch every object and then
+				// check out nothing — which the design names as a failure.
+				// Suppressing the line instead presents the remote as HEADLESS,
+				// which IS a defined state: clone reports that no default branch
+				// exists rather than silently producing an empty worktree.
+				//
+				// Checked against the just-listed refs rather than by a second
+				// remote read, so the advertisement is internally consistent by
+				// construction: the symref cannot name something the same
+				// response failed to advertise.
 				fmt.Fprintf(out, "@%s HEAD\n", branch)
 			}
 			fmt.Fprint(out, "\n")

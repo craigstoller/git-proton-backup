@@ -139,6 +139,34 @@ func pushOne(t transport.Transport, root, gitDir string,
 		if !exists {
 			return Result{Ref: u.Dst, OK: true} // already absent
 		}
+		// The design's ref-transition table is normative here: "Delete
+		// (`push :dst`) | Trash; refuse to delete the branch HEAD points at".
+		//
+		// It is not politeness. v2 never rewrites an existing HEAD (ensureHEAD
+		// returns early the moment one is present), so a delete that leaves
+		// HEAD naming a ref that no longer exists is PERMANENT: the remote
+		// goes on advertising a symref to nothing, and a clone fetches the
+		// objects and checks out nothing. Ordinary commands reach it — push
+		// main (HEAD is backfilled to it), push dev, delete main. The plain
+		// `list` arm in cmd/git-remote-proton has the matching guard, which is
+		// what rescues a remote already in that state; this one is what stops
+		// any new remote from entering it.
+		//
+		// An unreadable HEAD fails the delete closed rather than proceeding.
+		// ReadHEAD treats anything that is not a branch symref as fatal and
+		// never coerces it, so "cannot read" genuinely means we do not know
+		// what HEAD names — and the ref about to be trashed may be exactly the
+		// one this rule protects. This is per-ref, so other updates in the
+		// same batch are unaffected.
+		head, hasHead, err := ReadHEAD(t, root)
+		if err != nil {
+			return fail(fmt.Sprintf("refusing to delete %s: remote HEAD could not be read, "+
+				"so it is unknown whether HEAD points at this branch: %v", u.Dst, err))
+		}
+		if hasHead && head == u.Dst {
+			return fail(fmt.Sprintf("refusing to delete the branch HEAD points at (%s); "+
+				"change the default branch first", u.Dst))
+		}
 		out, err := t.Trash(root + "/" + u.Dst)
 		if err != nil {
 			return fail(fmt.Sprintf("delete failed: %v", err))

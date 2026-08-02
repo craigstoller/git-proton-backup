@@ -236,7 +236,12 @@ func TestResolveGitDirMakesARelativeGITDIRAbsolute(t *testing.T) {
 func TestResolveGitDirDefaultsToAbsoluteCwdWhenUnset(t *testing.T) {
 	wt := t.TempDir()
 	chdirForTest(t, wt)
-	os.Unsetenv("GIT_DIR")
+	// t.Setenv, not os.Unsetenv: os.Unsetenv LEAKS — it mutates the process
+	// environment for every test that runs after this one in the same binary,
+	// with no restore. t.Setenv registers the restore automatically, and an
+	// empty GIT_DIR is what resolveGitDir's own "" -> "." default keys on, so
+	// it exercises the same branch.
+	t.Setenv("GIT_DIR", "")
 
 	got, err := resolveGitDir()
 	if err != nil {
@@ -244,6 +249,72 @@ func TestResolveGitDirDefaultsToAbsoluteCwdWhenUnset(t *testing.T) {
 	}
 	if got != wt {
 		t.Errorf("resolveGitDir() = %q, want %q", got, wt)
+	}
+}
+
+// TestAbsolutizeInheritedGitPaths covers the rest of GIT_DIR's class. A
+// relative GIT_COMMON_DIR or GIT_OBJECT_DIRECTORY means one directory to this
+// process and a different one to every `git -C <gitDir> ...` child, and for
+// GIT_COMMON_DIR the resulting install path still ENDS in "/objects/pack", so
+// validateObjectsPackPath passes it — objects written where git never reads,
+// with connectivity-ok reported anyway. Fail-open, which is why absolutising
+// (rather than unsetting, which for GIT_OBJECT_DIRECTORY would be fail-open in
+// its own right) is the fix. See resolveGitDir's doc.
+func TestAbsolutizeInheritedGitPaths(t *testing.T) {
+	wt := t.TempDir()
+	chdirForTest(t, wt)
+
+	t.Setenv("GIT_COMMON_DIR", "../main/.git")
+	t.Setenv("GIT_OBJECT_DIRECTORY", "objects")
+	// Left alone deliberately: GIT_WORK_TREE cannot move where objects live.
+	t.Setenv("GIT_WORK_TREE", "../tree")
+
+	if err := absolutizeInheritedGitPaths(); err != nil {
+		t.Fatalf("absolutizeInheritedGitPaths: %v", err)
+	}
+
+	for _, name := range []string{"GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY"} {
+		got := os.Getenv(name)
+		if !filepath.IsAbs(got) {
+			t.Errorf("%s = %q, want an absolute path", name, got)
+		}
+	}
+	if want := filepath.Join(filepath.Dir(wt), "main", ".git"); os.Getenv("GIT_COMMON_DIR") != want {
+		t.Errorf("GIT_COMMON_DIR = %q, want %q — resolution must be anchored at this "+
+			"process's cwd, the same cwd the relative value was already implicitly "+
+			"relative to", os.Getenv("GIT_COMMON_DIR"), want)
+	}
+	if want := filepath.Join(wt, "objects"); os.Getenv("GIT_OBJECT_DIRECTORY") != want {
+		t.Errorf("GIT_OBJECT_DIRECTORY = %q, want %q", os.Getenv("GIT_OBJECT_DIRECTORY"), want)
+	}
+	if got := os.Getenv("GIT_WORK_TREE"); got != "../tree" {
+		t.Errorf("GIT_WORK_TREE = %q, want it untouched: it names the working tree, not the "+
+			"object store, so it cannot move where a pack is installed", got)
+	}
+}
+
+// TestAbsolutizeInheritedGitPathsLeavesUnsetAndAbsoluteValuesAlone is the
+// companion guard. An UNSET variable must stay unset — inventing a value would
+// nominate an object store the caller never asked for, which is the fail-open
+// case this whole function exists to avoid — and an already-absolute value
+// must pass through byte-identical rather than being rewritten by Abs's
+// cleaning rules.
+func TestAbsolutizeInheritedGitPathsLeavesUnsetAndAbsoluteValuesAlone(t *testing.T) {
+	chdirForTest(t, t.TempDir())
+
+	abs := filepath.Join(t.TempDir(), "odb")
+	t.Setenv("GIT_OBJECT_DIRECTORY", abs)
+	t.Setenv("GIT_COMMON_DIR", "")
+
+	if err := absolutizeInheritedGitPaths(); err != nil {
+		t.Fatalf("absolutizeInheritedGitPaths: %v", err)
+	}
+	if got := os.Getenv("GIT_OBJECT_DIRECTORY"); got != abs {
+		t.Errorf("GIT_OBJECT_DIRECTORY = %q, want it unchanged at %q", got, abs)
+	}
+	if got := os.Getenv("GIT_COMMON_DIR"); got != "" {
+		t.Errorf("GIT_COMMON_DIR = %q, want it left empty: an empty value is not a relative "+
+			"path, and turning it into the cwd would invent an object store", got)
 	}
 }
 
@@ -406,6 +477,140 @@ func TestLoop_PlainList_AdvertisesRefsAndHeadReadOnly(t *testing.T) {
 	}
 	if _, ok := ft.Files[root+"/"+repo.LockName]; ok {
 		t.Error("plain list must never take the lock: found .lock in the fake transport")
+	}
+}
+
+// TestLoop_PlainList_OmitsTheSymrefWhenHeadPointsAtAnAbsentBranch is the
+// advertisement half of the dangling-HEAD fix.
+//
+// Nothing on the delete path knew about remote HEAD when this branch shipped
+// it, so an ordinary sequence — push `main` (HEAD is backfilled to it), push
+// `dev`, then `git push proton-v2 --delete main` — left the remote
+// advertising `@refs/heads/main HEAD` with no `refs/heads/main` in the ref
+// list. A clone against that advertisement fetches the objects and then
+// checks out nothing, which the design names as a failure. The state is also
+// PERMANENT: ensureHEAD returns early because a HEAD exists, and v2 never
+// rewrites an existing HEAD.
+//
+// The delete refusal (repo.pushOne) stops NEW remotes from reaching this
+// state; this guard is what makes an ALREADY-broken remote behave as the
+// defined headless state instead of advertising a symref that resolves to
+// nothing. Both are needed — the second is the only thing that helps a remote
+// already in the wild.
+//
+// RED before the fix: the arm emitted the `@` line whenever ReadHEAD reported
+// a HEAD at all, without checking the ref list it had just built, so stdout
+// carried "@refs/heads/main HEAD" for a branch that is not advertised.
+func TestLoop_PlainList_OmitsTheSymrefWhenHeadPointsAtAnAbsentBranch(t *testing.T) {
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	if err := repo.Bootstrap(ft, root); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	sha := "1111111111111111111111111111111111111111"
+	if _, err := repo.WriteRef(ft, root, "refs/heads/dev", sha, false); err != nil {
+		t.Fatalf("WriteRef: %v", err)
+	}
+	// HEAD points at a branch that is NOT in the ref list — exactly what a
+	// pre-fix `--delete main` left behind.
+	if _, err := repo.WriteHEAD(ft, root, "refs/heads/main"); err != nil {
+		t.Fatalf("WriteHEAD: %v", err)
+	}
+
+	in := bufio.NewScanner(strings.NewReader("list\n\n"))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	got := loop(ft, root, ".", in, out)
+	out.Flush()
+	stdout := outBuf.String()
+
+	if got != 0 {
+		t.Fatalf("loop() = %d, want 0: a dangling HEAD is the defined headless state, not a fatal error: stdout=%q", got, stdout)
+	}
+	if strings.Contains(stdout, "@") {
+		t.Errorf("stdout = %q, must advertise no symref at all: HEAD names refs/heads/main, "+
+			"which is not in the ref list, and a clone told to check out an unadvertised "+
+			"branch checks out nothing", stdout)
+	}
+	if want := sha + " refs/heads/dev\n\n"; stdout != want {
+		t.Errorf("stdout = %q, want %q", stdout, want)
+	}
+}
+
+// TestLoop_PlainList_AdvertisesTheSymrefWhenHeadResolves is the companion
+// guard: the fix must not silence a LEGITIMATE symref. Without this, deleting
+// the `@` line entirely would pass the test above.
+func TestLoop_PlainList_AdvertisesTheSymrefWhenHeadResolves(t *testing.T) {
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	if err := repo.Bootstrap(ft, root); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	sha := "1111111111111111111111111111111111111111"
+	if _, err := repo.WriteRef(ft, root, "refs/heads/main", sha, false); err != nil {
+		t.Fatalf("WriteRef: %v", err)
+	}
+	if _, err := repo.WriteHEAD(ft, root, "refs/heads/main"); err != nil {
+		t.Fatalf("WriteHEAD: %v", err)
+	}
+
+	in := bufio.NewScanner(strings.NewReader("list\n\n"))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	got := loop(ft, root, ".", in, out)
+	out.Flush()
+
+	if got != 0 {
+		t.Fatalf("loop() = %d, want 0: stdout=%q", got, outBuf.String())
+	}
+	if !strings.Contains(outBuf.String(), "@refs/heads/main HEAD\n") {
+		t.Errorf("stdout = %q, want the symref line: HEAD resolves to an advertised ref, "+
+			"and without it a clone checks out nothing", outBuf.String())
+	}
+}
+
+// TestLoop_PlainList_UnmarkedRootRefusesWithTheMarkerReason pins M4: the plain
+// `list` arm must apply the same marker check the fetch path already applies,
+// so `git ls-remote` against a folder that is not one of our repos refuses
+// with the named reason rather than succeeding vacuously.
+//
+// RED before the fix: with a plain Fake (no List error to hide behind),
+// ListRefs on an unmarked root returns an empty map, ReadHEAD reports no HEAD,
+// and the arm printed a bare terminator and exited 0 — advertising a repo that
+// does not exist. Its sibling test above uses listErrTransport and so could
+// never catch this: it fails inside ListRefs before the gap is reachable.
+func TestLoop_PlainList_UnmarkedRootRefusesWithTheMarkerReason(t *testing.T) {
+	ft := transport.NewFake()
+	root := "/my-files/not-a-repo"
+	if err := ft.EnsureDir(root); err != nil {
+		t.Fatalf("EnsureDir: %v", err)
+	}
+
+	in := bufio.NewScanner(strings.NewReader("list\n\n"))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(ft, root, ".", in, out) })
+	out.Flush()
+
+	if got != 1 {
+		t.Fatalf("loop() = %d, want 1: listing a folder with no marker must refuse, not "+
+			"advertise an empty repo (stdout=%q)", got, outBuf.String())
+	}
+	if !strings.Contains(stderr, repo.MarkerName) {
+		t.Errorf("stderr = %q, want the refusal to name %s", stderr, repo.MarkerName)
+	}
+	if !strings.Contains(stderr, "not a git-remote-proton repo") {
+		t.Errorf("stderr = %q, want the named reason, not a raw listing error", stderr)
+	}
+	if _, ok := ft.Files[root+"/"+repo.MarkerName]; ok {
+		t.Error("a refused list must never create the marker")
+	}
+	if outBuf.Len() != 0 {
+		t.Errorf("stdout = %q, want no protocol output at all for a refused list", outBuf.String())
 	}
 }
 

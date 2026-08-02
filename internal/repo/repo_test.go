@@ -1494,6 +1494,162 @@ func TestPushTagOnlyLeavesRepoHeadless(t *testing.T) {
 	}
 }
 
+// RED. The design's ref-transition table is normative on this row: "Delete
+// (`push :dst`) | Trash; refuse to delete the branch HEAD points at". Nothing
+// implemented it, so an ordinary `git push proton-v2 --delete main` against a
+// remote whose HEAD names main trashed the ref and left HEAD dangling — a
+// state a later clone cannot recover from, because ensureHEAD returns early
+// whenever a HEAD exists and v2 never rewrites one.
+//
+// The refusal is per-ref, not per-batch: other updates in the same push are
+// unaffected, which is why it is expressed as a failed Result rather than an
+// error out of Push.
+func TestPushRefusesToDeleteTheBranchHeadPointsAt(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	sha := "2222222222222222222222222222222222222222"
+	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := WriteHEAD(f, "/r", "refs/heads/main"); err != nil {
+		t.Fatal(err)
+	}
+
+	ups := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/main"}}
+	res := Push(f, "/r", t.TempDir(), ups, map[string]string{"refs/heads/main": sha})
+
+	if len(res) != 1 {
+		t.Fatalf("want one result, got %+v", res)
+	}
+	if res[0].OK {
+		t.Fatalf("deleting the branch HEAD points at must be refused, got OK: %+v", res[0])
+	}
+	if !strings.Contains(res[0].Err, "HEAD points at") {
+		t.Errorf("reason = %q, want it to name why the delete was refused", res[0].Err)
+	}
+	if _, ok := f.Files["/r/refs/heads/main"]; !ok {
+		t.Error("the ref file must survive a refused delete")
+	}
+	if got := string(f.Files["/r/HEAD"]); got != "ref: refs/heads/main\n" {
+		t.Errorf("HEAD = %q, must be left alone", got)
+	}
+}
+
+// GUARD. The refusal must be scoped to the branch HEAD actually names — a
+// delete of any OTHER branch still succeeds. Without this, "refuse every
+// delete" would pass the test above.
+func TestPushDeletesABranchHeadDoesNotPointAt(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	sha := "2222222222222222222222222222222222222222"
+	for _, ref := range []string{"refs/heads/main", "refs/heads/dev"} {
+		if _, err := WriteRef(f, "/r", ref, sha, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := WriteHEAD(f, "/r", "refs/heads/main"); err != nil {
+		t.Fatal(err)
+	}
+
+	ups := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/dev"}}
+	res := Push(f, "/r", t.TempDir(), ups,
+		map[string]string{"refs/heads/main": sha, "refs/heads/dev": sha})
+
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("deleting a branch HEAD does not point at must succeed: %+v", res)
+	}
+	if _, ok := f.Files["/r/refs/heads/dev"]; ok {
+		t.Error("the ref file must be gone")
+	}
+}
+
+// RED. A HEAD that cannot be read is not licence to delete. ReadHEAD treats
+// content that is not a branch symref as fatal (never coerced), and a delete
+// taken on the strength of an unreadable HEAD could be exactly the delete the
+// rule above exists to refuse.
+func TestPushDeleteFailsClosedOnAnUnreadableHead(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	sha := "2222222222222222222222222222222222222222"
+	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	f.Files["/r/HEAD"] = []byte("this is not a symref\n")
+
+	ups := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/main"}}
+	res := Push(f, "/r", t.TempDir(), ups, map[string]string{"refs/heads/main": sha})
+
+	if len(res) != 1 {
+		t.Fatalf("want one result, got %+v", res)
+	}
+	if res[0].OK {
+		t.Fatalf("a delete must fail closed when HEAD cannot be read, got OK: %+v", res[0])
+	}
+	if !strings.Contains(res[0].Err, "HEAD") {
+		t.Errorf("reason = %q, want it to name the HEAD read failure", res[0].Err)
+	}
+	if _, ok := f.Files["/r/refs/heads/main"]; !ok {
+		t.Error("the ref file must survive a delete that failed closed")
+	}
+}
+
+// GUARD (ensureHEAD delete arithmetic). A batch that deletes a branch and
+// recreates it must leave that branch in the candidate set: the delete removes
+// it from `seen`, and the recreate in the same batch has to put it back.
+// Getting the arithmetic wrong here would leave a repo headless that has a
+// perfectly good branch on it.
+func TestPushDeleteThenRecreateInOneBatchStillDerivesHead(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	d := newGitRepoForPush(t)
+	head := headOfPushRepo(t, d)
+	if _, err := WriteRef(f, "/r", "refs/heads/main", head, false); err != nil {
+		t.Fatal(err)
+	}
+	// No HEAD on the remote: this is the backfill case, and it is also why
+	// the delete refusal above does not fire here.
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/main"},
+		{Src: head, Dst: "refs/heads/main"},
+	}
+	res := Push(f, "/r", d, ups, map[string]string{"refs/heads/main": head})
+	for _, r := range res {
+		if !r.OK {
+			t.Fatalf("both updates must succeed: %+v", res)
+		}
+	}
+	if got := string(f.Files["/r/HEAD"]); got != "ref: refs/heads/main\n" {
+		t.Errorf("HEAD = %q, want ref: refs/heads/main — a branch deleted and recreated in "+
+			"one batch is still a candidate", got)
+	}
+}
+
+// GUARD (ensureHEAD delete arithmetic). Deleting the only branch leaves no
+// candidates at all, and headless is a DEFINED state: no HEAD is written, and
+// nothing fails.
+func TestPushDeleteOfTheOnlyBranchLeavesTheRepoHeadless(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	sha := "2222222222222222222222222222222222222222"
+	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	// No HEAD, so the delete is permitted and ensureHEAD's backfill runs
+	// against an empty candidate set afterwards.
+
+	ups := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/main"}}
+	res := Push(f, "/r", t.TempDir(), ups, map[string]string{"refs/heads/main": sha})
+
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("delete should succeed when no HEAD points at the branch: %+v", res)
+	}
+	if _, ok := f.Files["/r/HEAD"]; ok {
+		t.Errorf("HEAD = %q, want none: deleting the only branch leaves the repo headless, "+
+			"which is a defined state", f.Files["/r/HEAD"])
+	}
+}
+
 // emptyGitRepo returns a repo with NO commits.
 //
 // It exists because newGitRepoForPush builds an identical commit every time —
