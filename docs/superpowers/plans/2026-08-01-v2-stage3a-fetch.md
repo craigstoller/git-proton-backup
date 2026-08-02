@@ -1045,6 +1045,7 @@ git commit -m "feat(v2): complete a missing remote HEAD on push"
 > 1. **`Fetch` needs a presence-based short-circuit before touching the remote** (`ConnectivityOK(gitDir, "", wants)` → up to date). `RevListNewObjects`' `--not --all` excludes by REF-reachability, not store presence, and `Fetch` never writes refs — so without the short-circuit a second fetch before git updates refs reconsolidates the full history every time. This also implements the parent design's resume-safety clause.
 > 2. **The install path must come from `rev-parse --git-path objects/pack`, NOT `--git-dir` + join.** In a linked worktree `--git-dir` answers with the per-worktree ADMIN dir, which has no object store — the pack lands where git never looks, and `connectivity-ok` then makes git update refs to invisible objects. Fail-open.
 > 3. **`consolidateAndInstall` must not exec `pack-objects` itself** — that exec site lacked `WaitDelay` and the `ErrWaitDelay` guard. It routes through `gitcmd.PackObjectsFromList`, which `WritePack` also uses.
+> 4. **`requireMarker` no longer lives in `fetch.go`** — the final fix wave moved it to `marker.go` as the exported `repo.RequireMarker`, because plain `list` needs the same refusal (an `ls-remote` against a non-repo folder must refuse with the named reason, not a raw List error). The "refusing to fetch from" text below is also stale; the shipped message says "refusing to read".
 
 **Files:**
 - Create: `internal/repo/fetch.go`
