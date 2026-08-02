@@ -31,9 +31,33 @@ var contractCases = []contractCase{
 		}
 	}},
 
-	// C11: upload names the node after the LOCAL basename, so the caller
-	// contract is that the local basename equals the target leaf.
-	{"create names the node after the target leaf", func(t *testing.T, tr Transport, root string, stage func(string, string) string) {
+	// C11 (Task 2 review round 1): upload names the node after the LOCAL
+	// basename, so the caller contract is that the local basename equals the
+	// target leaf. Staging under a DIFFERENT name than the target leaf is
+	// what actually exercises the guard — the review found that the original
+	// version of this case staged under the SAME name as the leaf, so it
+	// could not distinguish "names after the target leaf" from "names after
+	// the local basename" and stayed green even with checkUploadBasename
+	// deleted entirely. This version must go red if either implementation's
+	// guard is removed.
+	{"create refuses a local basename that mismatches the target leaf (C11)", func(t *testing.T, tr Transport, root string, stage func(string, string) string) {
+		local := stage("wrong-name.txt", "hello")
+		out, err := tr.CreateExclusive(root+"/target-leaf.txt", local)
+		if err == nil {
+			t.Fatalf("a basename mismatch must be refused with a non-nil error, got outcome=%v err=nil", out)
+		}
+		if out == Committed {
+			t.Errorf("a basename mismatch must not be Committed, got %v", out)
+		}
+		if _, ok, statErr := tr.Stat(root + "/target-leaf.txt"); statErr != nil || ok {
+			t.Errorf("a refused mismatch must not create the node at the target leaf: ok=%v err=%v", ok, statErr)
+		}
+	}},
+
+	// The honest happy path, split out from the case above: this one CAN
+	// fail (e.g. if create silently landed at the wrong leaf), unlike its
+	// predecessor which could not fail no matter what checkUploadBasename did.
+	{"create lands at the target leaf when basenames agree", func(t *testing.T, tr Transport, root string, stage func(string, string) string) {
 		local := stage("leafname.txt", "hello")
 		if out, err := tr.CreateExclusive(root+"/leafname.txt", local); err != nil || out != Committed {
 			t.Fatalf("create: %v %v", out, err)
