@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/craigstoller/git-proton-backup/internal/gitcmd"
 	"github.com/craigstoller/git-proton-backup/internal/protocol"
 	"github.com/craigstoller/git-proton-backup/internal/transport"
 )
@@ -551,6 +552,53 @@ func newGitRepoForPush(t *testing.T) string {
 	return d
 }
 
+func headOfPushRepo(t *testing.T, dir string) string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	sha := strings.TrimSpace(string(out))
+	if len(sha) != 40 {
+		t.Fatalf("rev-parse returned %q", sha)
+	}
+	return sha
+}
+
+// refusingUploadTransport reports Refused for a chosen remote suffix, leaving
+// whatever bytes the test planted at that path untouched.
+type refusingUploadTransport struct {
+	*transport.Fake
+	refuseSuffix string
+}
+
+func (r *refusingUploadTransport) CreateExclusive(p, local string) (transport.Outcome, error) {
+	if strings.HasSuffix(p, r.refuseSuffix) {
+		return transport.Refused, nil
+	}
+	return r.Fake.CreateExclusive(p, local)
+}
+
+// plantPack builds the pack this push will produce and returns its remote
+// paths plus the local files, so a test can seed the fake with variations.
+func plantPack(t *testing.T, gitDir, head string) (packName, idxName string, packBytes, idxBytes []byte) {
+	t.Helper()
+	tmp := t.TempDir()
+	packPath, idxPath, err := gitcmd.WritePack(gitDir, head, nil, tmp)
+	if err != nil || packPath == "" {
+		t.Fatalf("WritePack: %v", err)
+	}
+	pb, err := os.ReadFile(packPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ib, err := os.ReadFile(idxPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Base(packPath), filepath.Base(idxPath), pb, ib
+}
+
 // headOf returns the full HEAD sha of the repo at d, failing the test loudly
 // (rather than silently misbehaving on a short slice) if rev-parse errors or
 // returns something other than a 40-char sha.
@@ -875,5 +923,106 @@ func TestPushReportsFailureWhenRefCreateLosesConcurrentRace(t *testing.T) {
 	}
 	if _, ok := f.Files["/r/refs/heads/main"]; ok {
 		t.Error("our sha must not be treated as published when we lost the create race")
+	}
+}
+
+// RED. Unpatched, Stat sees the corrupt pack and the ref is published.
+func TestPushRefusedCorruptPackIsRejected(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	d := newGitRepoForPush(t)
+	head := headOfPushRepo(t, d)
+	packName, _, packBytes, _ := plantPack(t, d, head)
+
+	corrupt := append([]byte(nil), packBytes...)
+	corrupt[len(corrupt)/2] ^= 0xff
+	f.Files["/r/packs/"+packName] = corrupt // same NAME, different bytes
+
+	tr := &refusingUploadTransport{Fake: f, refuseSuffix: ".pack"}
+	res := Push(tr, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/heads/main"}}, map[string]string{})
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("a refused pack whose bytes differ must fail: %+v", res)
+	}
+	if _, ok := f.Files["/r/refs/heads/main"]; ok {
+		t.Error("no ref may be published when the remote pack does not verify")
+	}
+}
+
+// RED. Unpatched, Stat sees the corrupt index and the ref is published.
+func TestPushRefusedCorruptIdxIsRejected(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	d := newGitRepoForPush(t)
+	head := headOfPushRepo(t, d)
+	packName, idxName, packBytes, idxBytes := plantPack(t, d, head)
+
+	f.Files["/r/packs/"+packName] = packBytes
+	corrupt := append([]byte(nil), idxBytes...)
+	corrupt[len(corrupt)/2] ^= 0xff
+	f.Files["/r/packs/"+idxName] = corrupt
+
+	tr := &refusingUploadTransport{Fake: f, refuseSuffix: ".idx"}
+	res := Push(tr, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/heads/main"}}, map[string]string{})
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("a refused index that does not verify must fail: %+v", res)
+	}
+	if _, ok := f.Files["/r/refs/heads/main"]; ok {
+		t.Error("no ref may be published when the remote index does not verify")
+	}
+}
+
+// GUARD (passes before and after). This pins the deliberate asymmetry: a
+// remote index that is VALID but not byte-identical to ours must be accepted.
+// Requiring byte equality here would make a legitimate remote object
+// permanently fatal, since immutable objects are never overwritten. If a
+// future change tightens publishIdx, this test is what catches it.
+func TestPushRefusedValidButDifferentIdxIsAccepted(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	d := newGitRepoForPush(t)
+	head := headOfPushRepo(t, d)
+	packName, idxName, packBytes, _ := plantPack(t, d, head)
+
+	// A v1 index for the same pack: valid, verifies, different bytes.
+	tmp := t.TempDir()
+	packCopy := filepath.Join(tmp, packName)
+	if err := os.WriteFile(packCopy, packBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.Command("git", "index-pack", "--index-version=1", packCopy).Run(); err != nil {
+		t.Skipf("this git cannot write a v1 index: %v", err)
+	}
+	v1, err := os.ReadFile(strings.TrimSuffix(packCopy, ".pack") + ".idx")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f.Files["/r/packs/"+packName] = packBytes
+	f.Files["/r/packs/"+idxName] = v1
+
+	tr := &refusingUploadTransport{Fake: f, refuseSuffix: ".idx"}
+	res := Push(tr, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/heads/main"}}, map[string]string{})
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("a valid but byte-different remote index must be accepted: %+v", res)
+	}
+}
+
+// GUARD. A refused pack with no remote index is an orphan this push repairs.
+func TestPushRefusedPackWithNoRemoteIdxRepairsTheOrphan(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	d := newGitRepoForPush(t)
+	head := headOfPushRepo(t, d)
+	packName, idxName, packBytes, _ := plantPack(t, d, head)
+
+	f.Files["/r/packs/"+packName] = packBytes // pack only
+
+	tr := &refusingUploadTransport{Fake: f, refuseSuffix: ".pack"}
+	res := Push(tr, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/heads/main"}}, map[string]string{})
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("a refused pack with no remote idx must be repaired: %+v", res)
+	}
+	if _, ok := f.Files["/r/packs/"+idxName]; !ok {
+		t.Error("the orphan's index must have been uploaded")
 	}
 }
