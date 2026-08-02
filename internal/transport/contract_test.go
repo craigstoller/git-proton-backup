@@ -21,6 +21,13 @@ type contractCase struct {
 }
 
 var contractCases = []contractCase{
+	// No probe ID: this is the Transport INTERFACE's own contract line
+	// ("absence is (_, false, nil), never an error"), not an observed CLI
+	// behaviour. The two implementations reach it differently — *CLI absorbs
+	// `filesystem info`'s non-zero exit for a missing node while carefully
+	// NOT absorbing a CLI that never started (see CLI.Stat's code == -1
+	// guard), and the Fake reports a map miss — so the case pins the shape
+	// both must present, which is exactly what the shared table is for.
 	{"stat absence is not an error", func(t *testing.T, tr Transport, root string, stage func(string, string) string) {
 		_, ok, err := tr.Stat(root + "/definitely-absent")
 		if err != nil {
@@ -153,6 +160,12 @@ var contractCases = []contractCase{
 		t.Error("an EnsureDir'd empty directory must appear in its parent listing")
 	}},
 
+	// C6 + C10: an empty listing is exit 0 with zero parsed elements (C6), and
+	// C10 pinned the literal bytes behind that — `[\r\n\r\n]\r\n`, 8 bytes,
+	// which survives TrimSpace and parses as a zero-element array on the
+	// normal path. So "empty" must present as an empty slice and a nil error,
+	// never as a failure and never via CLI.List's truly-empty-output fallback,
+	// which C10 showed is a defensive branch the real CLI does not reach.
 	{"list of an empty directory is empty, not an error", func(t *testing.T, tr Transport, root string, stage func(string, string) string) {
 		d := root + "/emptylist"
 		if err := tr.EnsureDir(d); err != nil {
