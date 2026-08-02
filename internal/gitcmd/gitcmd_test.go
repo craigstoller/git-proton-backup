@@ -262,10 +262,42 @@ func TestWritePackPinsIndexVersion2(t *testing.T) {
 }
 
 // twoCommitRepo returns a repo with two commits and the sha of each.
+//
+// The first commit deliberately does NOT reuse newRepo(t): newRepo's content
+// and message ("a.txt" = "one", "c1") are fixed, so two independently created
+// newRepo commits share the same tree, parent (none), author, and message —
+// they can differ ONLY in commit timestamp, and git records that at
+// one-second resolution. Two newRepo calls landing in the same wall-clock
+// second are therefore byte-identical and produce the SAME sha.
+// TestConnectivityOKDetectsAnIncompleteClosure builds this repo's `first`
+// commit alongside a separate `newRepo(t)` destination ("empty"); if the two
+// collided, "empty" would already contain what it thinks is the missing
+// parent, the walk would never need the alt pack at all, and the fail-closed
+// half of that test would pass for the wrong reason — on a genuinely broken
+// implementation. Giving this commit distinguishing file content and message
+// makes that collision structurally impossible rather than merely unlikely
+// on a slow-enough machine. (The same one-second-resolution hazard applies to
+// emptyGitRepo in a later task.)
 func twoCommitRepo(t *testing.T) (dir, first, second string) {
 	t.Helper()
-	d := newRepo(t) // one commit already
+	d := t.TempDir()
+	for _, a := range [][]string{
+		{"init", "-qb", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"},
+	} {
+		if err := exec.Command("git", append([]string{"-C", d}, a...)...).Run(); err != nil {
+			t.Fatalf("git %v: %v", a, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(d, "a.txt"), []byte("src-one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range [][]string{{"add", "."}, {"commit", "-qm", "src c1"}} {
+		if err := exec.Command("git", append([]string{"-C", d}, a...)...).Run(); err != nil {
+			t.Fatal(err)
+		}
+	}
 	first = headOf(t, d)
+
 	if err := os.WriteFile(filepath.Join(d, "b.txt"), []byte("two"), 0o644); err != nil {
 		t.Fatal(err)
 	}

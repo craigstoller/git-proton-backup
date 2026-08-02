@@ -301,6 +301,10 @@ func revListWithAlt(gitDir, altObjects string, wants []string, args ...string) (
 			"act on a possibly truncated object list", waitDelay)
 	}
 	if code != 0 {
+		if err != nil {
+			return "", code, fmt.Errorf("rev-list %s: %s: %w", strings.Join(args, " "),
+				strings.TrimSpace(stderr.String()), err)
+		}
 		return "", code, fmt.Errorf("rev-list %s: %s", strings.Join(args, " "),
 			strings.TrimSpace(stderr.String()))
 	}
@@ -330,7 +334,7 @@ func ConnectivityOK(gitDir, altObjects string, wants []string) error {
 //
 // --not --all is load-bearing: without it an incremental fetch reconsolidates
 // the entire history into a fresh pack and installs it, silently doubling
-// local disk every time. It works perfectly on a two-commit test repo.
+// local disk every time.
 func RevListNewObjects(gitDir, altObjects string, wants []string) (string, error) {
 	if len(wants) == 0 {
 		return "", nil
