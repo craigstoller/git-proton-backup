@@ -250,6 +250,99 @@ func WritePack(gitDir, want string, haves []string, outDir string) (string, stri
 	return packPath, idxPath, nil
 }
 
+// SymbolicRef returns the ref a symbolic ref points at — "refs/heads/main" for
+// HEAD in an ordinary checkout. It exists because git never tells a remote
+// helper what the client's own HEAD is, and the deterministic HEAD rules need
+// it to break a multi-branch tie.
+//
+// A detached HEAD is not a failure: `symbolic-ref --quiet` exits 1 for "this
+// is not a symbolic ref", and that is reported as ("", nil).
+func SymbolicRef(gitDir, name string) (string, error) {
+	out, code, err := git(gitDir, "symbolic-ref", "--quiet", name)
+	switch code {
+	case 0:
+		return out, nil
+	case 1:
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("symbolic-ref %s: %s: %w", name, out, err)
+	}
+	return "", fmt.Errorf("symbolic-ref %s: %s", name, out)
+}
+
+// revListWithAlt runs rev-list against gitDir with altObjects spliced in as an
+// alternate object store, feeding the wants on stdin. The wants are passed
+// explicitly rather than discovered from refs because at fetch time nothing
+// references them yet.
+//
+// altObjects is an OBJECTS directory: git looks for packs at
+// <altObjects>/pack/pack-<hash>.{pack,idx} and silently ignores them anywhere
+// else, which presents downstream as "every object is missing".
+func revListWithAlt(gitDir, altObjects string, wants []string, args ...string) (string, int, error) {
+	cmd := exec.Command("git", append([]string{"-C", gitDir, "rev-list"}, args...)...)
+	cmd.Env = append(os.Environ(), "GIT_ALTERNATE_OBJECT_DIRECTORIES="+altObjects)
+	cmd.Stdin = strings.NewReader(strings.Join(wants, "\n") + "\n")
+	// See waitDelay: DO NOT DELETE as unnecessary.
+	cmd.WaitDelay = waitDelay
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	code := -1
+	if cmd.ProcessState != nil {
+		code = cmd.ProcessState.ExitCode()
+	}
+	if errors.Is(err, exec.ErrWaitDelay) {
+		// rev-list itself exited 0 but a grandchild held the pipe. stdout may
+		// be truncated, and here stdout IS the object list, so refusing to
+		// guess is the only safe answer.
+		return "", -1, fmt.Errorf("rev-list output was abandoned after %s; refusing to "+
+			"act on a possibly truncated object list", waitDelay)
+	}
+	if code != 0 {
+		return "", code, fmt.Errorf("rev-list %s: %s", strings.Join(args, " "),
+			strings.TrimSpace(stderr.String()))
+	}
+	return stdout.String(), 0, nil
+}
+
+// ConnectivityOK reports whether every object reachable from wants is present,
+// counting gitDir's own store plus altObjects. A nil return means the closure
+// is complete.
+//
+// This is a traversal, not an fsck: the wants are not referenced by any ref, so
+// fsck would never reach them. --quiet suppresses the object list; the exit
+// code is the answer.
+func ConnectivityOK(gitDir, altObjects string, wants []string) error {
+	if len(wants) == 0 {
+		return nil
+	}
+	if _, _, err := revListWithAlt(gitDir, altObjects, wants,
+		"--objects", "--stdin", "--not", "--all", "--quiet"); err != nil {
+		return fmt.Errorf("closure is incomplete for the requested objects: %w", err)
+	}
+	return nil
+}
+
+// RevListNewObjects returns the objects reachable from wants that gitDir does
+// not already have, one per line, ready to feed to pack-objects.
+//
+// --not --all is load-bearing: without it an incremental fetch reconsolidates
+// the entire history into a fresh pack and installs it, silently doubling
+// local disk every time. It works perfectly on a two-commit test repo.
+func RevListNewObjects(gitDir, altObjects string, wants []string) (string, error) {
+	if len(wants) == 0 {
+		return "", nil
+	}
+	out, _, err := revListWithAlt(gitDir, altObjects, wants,
+		"--objects", "--stdin", "--not", "--all")
+	if err != nil {
+		return "", err
+	}
+	return out, nil
+}
+
 // IndexPackVerify runs `git index-pack --verify` on packPath, whose .idx must
 // sit beside it under the same stem. It is the only check that proves a pack
 // is internally well-formed and agrees with its index; a basename/checksum

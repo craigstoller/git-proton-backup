@@ -261,6 +261,122 @@ func TestWritePackPinsIndexVersion2(t *testing.T) {
 	}
 }
 
+// twoCommitRepo returns a repo with two commits and the sha of each.
+func twoCommitRepo(t *testing.T) (dir, first, second string) {
+	t.Helper()
+	d := newRepo(t) // one commit already
+	first = headOf(t, d)
+	if err := os.WriteFile(filepath.Join(d, "b.txt"), []byte("two"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range [][]string{{"add", "."}, {"commit", "-qm", "c2"}} {
+		if err := exec.Command("git", append([]string{"-C", d}, a...)...).Run(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return d, first, headOf(t, d)
+}
+
+// altObjectsWith builds an alternate object directory in git's own layout and
+// places the given pack (and its .idx) inside it.
+func altObjectsWith(t *testing.T, packPath string) string {
+	t.Helper()
+	alt := filepath.Join(t.TempDir(), "objects")
+	packDir := filepath.Join(alt, "pack")
+	if err := os.MkdirAll(packDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, src := range []string{packPath, strings.TrimSuffix(packPath, ".pack") + ".idx"} {
+		b, err := os.ReadFile(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(packDir, filepath.Base(src)), b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return alt
+}
+
+// RED. ConnectivityOK does not exist. It must PASS on a complete closure and
+// FAIL on an incomplete one — the failing half is the whole point.
+func TestConnectivityOKDetectsAnIncompleteClosure(t *testing.T) {
+	src, first, second := twoCommitRepo(t)
+
+	// A pack of only the SECOND commit: its parent is deliberately absent.
+	partial, _, err := WritePack(src, second, []string{first}, t.TempDir())
+	if err != nil || partial == "" {
+		t.Fatalf("WritePack partial: %v", err)
+	}
+	// A pack of the whole history.
+	full, _, err := WritePack(src, second, nil, t.TempDir())
+	if err != nil || full == "" {
+		t.Fatalf("WritePack full: %v", err)
+	}
+
+	empty := newRepo(t) // a repo that shares no objects with src
+
+	if err := ConnectivityOK(empty, altObjectsWith(t, partial), []string{second}); err == nil {
+		t.Error("a pack missing the want's parent must NOT report connectivity ok")
+	}
+	if err := ConnectivityOK(empty, altObjectsWith(t, full), []string{second}); err != nil {
+		t.Errorf("a complete closure must report connectivity ok: %v", err)
+	}
+}
+
+// RED. RevListNewObjects does not exist. --not --all is what stops an
+// incremental fetch reconsolidating history the repo already has.
+func TestRevListNewObjectsExcludesWhatTheRepoAlreadyHas(t *testing.T) {
+	src, _, second := twoCommitRepo(t)
+	full, _, err := WritePack(src, second, nil, t.TempDir())
+	if err != nil || full == "" {
+		t.Fatalf("WritePack: %v", err)
+	}
+	alt := altObjectsWith(t, full)
+
+	// Into an empty repo: everything is new.
+	empty := newRepo(t)
+	objs, err := RevListNewObjects(empty, alt, []string{second})
+	if err != nil {
+		t.Fatalf("RevListNewObjects: %v", err)
+	}
+	if !strings.Contains(objs, second) {
+		t.Error("an empty repo must be told about the want itself")
+	}
+
+	// Into the source repo, which already holds every object: nothing is new.
+	objs, err = RevListNewObjects(src, alt, []string{second})
+	if err != nil {
+		t.Fatalf("RevListNewObjects: %v", err)
+	}
+	if strings.TrimSpace(objs) != "" {
+		t.Errorf("a repo that already has everything must yield no new objects, got:\n%s", objs)
+	}
+}
+
+// RED. SymbolicRef does not exist. A detached HEAD is ordinary, not an error.
+func TestSymbolicRef(t *testing.T) {
+	d := newRepo(t)
+	got, err := SymbolicRef(d, "HEAD")
+	if err != nil {
+		t.Fatalf("SymbolicRef: %v", err)
+	}
+	if got != "refs/heads/main" {
+		t.Errorf("HEAD = %q, want refs/heads/main", got)
+	}
+
+	if err := exec.Command("git", "-C", d, "checkout", "-q", "--detach").Run(); err != nil {
+		t.Fatal(err)
+	}
+	got, err = SymbolicRef(d, "HEAD")
+	if err != nil {
+		t.Errorf("a detached HEAD must not be an error: %v", err)
+	}
+	if got != "" {
+		t.Errorf("a detached HEAD must yield \"\", got %q", got)
+	}
+}
+
 // RED. IndexPackVerify does not exist yet.
 func TestIndexPackVerifyAcceptsGoodPairRejectsCorrupt(t *testing.T) {
 	d := newRepo(t)
