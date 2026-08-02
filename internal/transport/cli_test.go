@@ -207,6 +207,61 @@ func TestCLIUploadStartFailureIsAmbiguous(t *testing.T) {
 	}
 }
 
+// RED. parseNodeJSON currently does IsDir: w.Type == "folder", so an
+// unrecognised type silently yields a FILE.
+func TestParseNodeJSONRejectsUnknownType(t *testing.T) {
+	for _, payload := range []string{
+		`{"uid":"u1","name":{"ok":true,"value":"x"},"type":"directory"}`, // renamed
+		`{"uid":"u1","name":{"ok":true,"value":"x"}}`,                    // absent
+		`{"uid":"u1","name":{"ok":true,"value":"x"},"type":""}`,          // empty
+	} {
+		if _, err := parseNodeJSON([]byte(payload)); err == nil {
+			t.Errorf("%s: an unrecognised type must be an error, not a silent IsDir:false", payload)
+		}
+	}
+	// C9 pins these two, and they must still map correctly.
+	for payload, wantDir := range map[string]bool{
+		`{"uid":"u1","name":{"ok":true,"value":"d"},"type":"folder"}`: true,
+		`{"uid":"u1","name":{"ok":true,"value":"f"},"type":"file"}`:   false,
+	} {
+		n, err := parseNodeJSON([]byte(payload))
+		if err != nil {
+			t.Fatalf("%s: %v", payload, err)
+		}
+		if n.IsDir != wantDir {
+			t.Errorf("%s: IsDir = %v, want %v", payload, n.IsDir, wantDir)
+		}
+	}
+}
+
+// RED. IsCertified does not exist. The first case is the one that matters:
+// the real --version line embeds the build id, so equality would reject the
+// certified build itself.
+func TestIsCertifiedMatchesTheRealVersionLine(t *testing.T) {
+	if !IsCertified("Proton Drive CLI " + CertifiedCLI) {
+		t.Error("the real --version line must be recognised as certified")
+	}
+	if !IsCertified(CertifiedCLI) {
+		t.Error("a bare build id must also be recognised")
+	}
+	for _, bad := range []string{
+		"Proton Drive CLI cli-drive@0.7.1+deadbeef",
+		"Proton Drive CLI cli-drive@0.4.6+abc",
+		"",
+	} {
+		if IsCertified(bad) {
+			t.Errorf("%q must not be recognised as certified", bad)
+		}
+	}
+}
+
+// RED. Version does not exist.
+func TestVersionSurfacesStartFailure(t *testing.T) {
+	if _, err := NewCLI("nonexistent-xyz-binary-gpb-test").Version(); err == nil {
+		t.Error("Version must report a CLI that cannot start")
+	}
+}
+
 // TestDirOf pins the real behaviour of dirOf, the function the Task 5
 // review round 1 finding (C11) turned on: CreateExclusive/UpdateRevision
 // pass only dirOf(p) to the CLI, so the CLI process's target directory

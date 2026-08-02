@@ -49,7 +49,22 @@ func parseNodeJSON(b []byte) (Node, error) {
 	if err := json.Unmarshal(b, &w); err != nil {
 		return Node{}, err
 	}
-	n := Node{Name: w.Name.Value, IsDir: w.Type == "folder"}
+	// C9 pins these two values, identical in `info --json` and `list --json`.
+	// A third value means the CLI changed under us: guessing would make every
+	// folder read as a file, and ListRefs would then try to read each
+	// subdirectory as a ref file. Fail closed and name what we saw.
+	var isDir bool
+	switch w.Type {
+	case "folder":
+		isDir = true
+	case "file":
+		isDir = false
+	default:
+		return Node{}, fmt.Errorf("unrecognised node type %q (expected \"folder\" or \"file\"); "+
+			"the CLI may have changed - the transport contract is certified against %s",
+			w.Type, CertifiedCLI)
+	}
+	n := Node{Name: w.Name.Value, IsDir: isDir}
 	if len(w.ActiveRevision) > 0 {
 		var r revWire
 		// 0.7.0: unwrapped.
@@ -297,4 +312,32 @@ func dirOf(p string) string {
 		return p[:i]
 	}
 	return "/"
+}
+
+// CertifiedCLI is the exact build docs/research/probes/stage1-results.json was
+// certified against. Support is an allowlist, not a floor: 0.4.6 and 0.7.0
+// differ in the activeRevision payload shape and in whether a byte-identical
+// rewrite is skipped, so a floor would admit a build that breaks verification
+// silently.
+const CertifiedCLI = "cli-drive@0.7.0+5174900c"
+
+// IsCertified reports whether a --version line names the certified build.
+// It is containment, not equality: the CLI prints the build id inside a
+// longer line ("Proton Drive CLI cli-drive@0.7.0+5174900c"), so an equality
+// check would flag the certified build as uncertified.
+func IsCertified(versionLine string) bool {
+	return strings.Contains(versionLine, CertifiedCLI)
+}
+
+// Version returns the first line of `proton-drive --version`.
+func (c *CLI) Version() (string, error) {
+	out, code, err := c.run("--version")
+	if code != 0 {
+		if err != nil {
+			return "", fmt.Errorf("proton-drive --version failed: %s: %w", strings.TrimSpace(out), err)
+		}
+		return "", fmt.Errorf("proton-drive --version failed: %s", strings.TrimSpace(out))
+	}
+	line, _, _ := strings.Cut(strings.TrimSpace(out), "\n")
+	return strings.TrimSpace(line), nil
 }
