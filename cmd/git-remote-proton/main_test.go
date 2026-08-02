@@ -4,10 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/craigstoller/git-proton-backup/internal/repo"
 	"github.com/craigstoller/git-proton-backup/internal/transport"
 )
 
@@ -253,5 +257,310 @@ func TestLoop_PoisonedBatch_ColonlessPushLineFailsClosed(t *testing.T) {
 	}
 	if _, ok := ft.Files["/remote/root/refs/heads/main"]; ok {
 		t.Error("a malformed batch must not write the ref")
+	}
+}
+
+// --- Task 6: fetch capability, plain `list`, and the fetch batch ---
+
+// TestLoop_Capabilities_AdvertisesFetchAndCheckConnectivity is RED against the
+// pre-Task-6 block ("option\npush\n\n"), which advertises neither. Git only
+// recognises a connectivity-ok response from a helper that advertised
+// check-connectivity, and clone/fetch depend on fetch being advertised at
+// all — so both must be present, not merely accepted as options.
+func TestLoop_Capabilities_AdvertisesFetchAndCheckConnectivity(t *testing.T) {
+	in := bufio.NewScanner(strings.NewReader("capabilities\n\n"))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	got := loop(transport.NewFake(), "/remote/root", ".", in, out)
+	out.Flush()
+
+	if got != 0 {
+		t.Fatalf("loop() = %d, want 0", got)
+	}
+	stdout := outBuf.String()
+	for _, want := range []string{"option", "push", "fetch", "check-connectivity"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("capabilities = %q, want it to advertise %q", stdout, want)
+		}
+	}
+}
+
+// TestLoop_PlainList_AdvertisesRefsAndHeadReadOnly seeds a marked repo with one
+// ref and a HEAD directly in the Fake (no push involved — plain `list` only
+// reads), then proves the advertisement is right and that reading it takes no
+// lock. RED before Task 6: "list" (with no "for-push" suffix) hits the
+// default case and fails closed with no output at all.
+func TestLoop_PlainList_AdvertisesRefsAndHeadReadOnly(t *testing.T) {
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	if err := repo.Bootstrap(ft, root); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	sha := "1111111111111111111111111111111111111111"
+	if _, err := repo.WriteRef(ft, root, "refs/heads/main", sha, false); err != nil {
+		t.Fatalf("WriteRef: %v", err)
+	}
+	if _, err := repo.WriteHEAD(ft, root, "refs/heads/main"); err != nil {
+		t.Fatalf("WriteHEAD: %v", err)
+	}
+
+	in := bufio.NewScanner(strings.NewReader("list\n\n"))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	got := loop(ft, root, ".", in, out)
+	out.Flush()
+
+	if got != 0 {
+		t.Fatalf("loop() = %d, want 0: stdout=%q", got, outBuf.String())
+	}
+	want := sha + " refs/heads/main\n@refs/heads/main HEAD\n\n"
+	if outBuf.String() != want {
+		t.Fatalf("stdout = %q, want %q", outBuf.String(), want)
+	}
+	if _, ok := ft.Files[root+"/"+repo.LockName]; ok {
+		t.Error("plain list must never take the lock: found .lock in the fake transport")
+	}
+}
+
+// listErrTransport makes List fail for the refs namespaces specifically,
+// standing in for what the real CLI reports when it lists a folder that does
+// not exist. The Fake's own List never errors — an untouched path just comes
+// back as an empty slice — which would let ListRefs succeed vacuously on a
+// totally unmarked root and mask the thing this test needs to prove: that a
+// list which genuinely cannot read the remote fails closed rather than
+// silently advertising nothing.
+//
+// Only refs/heads and refs/tags are intercepted; List(root) itself (what
+// Bootstrap's own emptiness check would call) is passed straight through and
+// would still succeed. That is deliberate: it is what makes "no marker
+// afterward" a real, discriminating assertion below rather than a tautology —
+// an implementation that (wrongly) called Bootstrap before ListRefs would
+// still have written the marker here, since Bootstrap would have completed
+// before ListRefs' own List call ever fails.
+type listErrTransport struct{ *transport.Fake }
+
+func (l listErrTransport) List(p string) ([]transport.Node, error) {
+	if strings.HasSuffix(p, "/refs/heads") || strings.HasSuffix(p, "/refs/tags") {
+		return nil, fmt.Errorf("no such folder: %s", p)
+	}
+	return l.Fake.List(p)
+}
+
+// TestLoop_PlainList_UnmarkedRootFailsWithoutBootstrapping is the read-only
+// half of rule 3: a fetch-side list must never bring a repository into
+// existence, even when it cannot read the remote it was pointed at. RED
+// before Task 6 for the same reason as the test above (no "list" case yet);
+// it stays meaningful after Task 6 because the assertions pin the read-only
+// contract, not merely a non-zero exit code.
+func TestLoop_PlainList_UnmarkedRootFailsWithoutBootstrapping(t *testing.T) {
+	ft := transport.NewFake()
+	root := "/my-files/unmarked"
+	lt := listErrTransport{ft}
+
+	in := bufio.NewScanner(strings.NewReader("list\n\n"))
+	out := bufio.NewWriter(&bytes.Buffer{})
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(lt, root, ".", in, out) })
+
+	if got != 1 {
+		t.Fatalf("loop() = %d, want 1: a list that cannot read the remote must fail closed", got)
+	}
+	if stderr == "" {
+		t.Error("a failed list must report why on stderr")
+	}
+	if _, ok := ft.Files[root+"/"+repo.MarkerName]; ok {
+		t.Error("plain list must never bootstrap: found a marker after a failed list")
+	}
+	if ft.Dirs[root+"/refs"] {
+		t.Error("plain list must never bootstrap: found refs/ created after a failed list")
+	}
+}
+
+// newGitRepoWithCommit creates a real local git repository with one commit.
+// Fetch and Push both shell out to real git via internal/gitcmd, so the
+// fetch-batch tests below need a genuine local repository on each side — the
+// Fake only stands in for the REMOTE half of the transport. Mirrors the
+// pattern internal/repo's own tests (newGitRepoForPush) use for the same
+// reason; that helper is unexported in a different package, so it cannot be
+// reused directly here.
+func newGitRepoWithCommit(t *testing.T) string {
+	t.Helper()
+	d := t.TempDir()
+	for _, a := range [][]string{
+		{"init", "-qb", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"},
+	} {
+		if err := exec.Command("git", append([]string{"-C", d}, a...)...).Run(); err != nil {
+			t.Fatalf("git %v: %v", a, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(d, "a.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatalf("write a.txt: %v", err)
+	}
+	if err := exec.Command("git", "-C", d, "add", ".").Run(); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if err := exec.Command("git", "-C", d, "commit", "-qm", "c1").Run(); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+	return d
+}
+
+// emptyGitRepo creates a real local git repository with no commits — a fetch
+// DESTINATION that genuinely lacks the source's objects, unlike reusing the
+// source repo itself (which would make Fetch's up-to-date short-circuit fire
+// immediately, since the object would already be present in that store).
+func emptyGitRepo(t *testing.T) string {
+	t.Helper()
+	d := t.TempDir()
+	for _, a := range [][]string{
+		{"init", "-qb", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"},
+	} {
+		if err := exec.Command("git", append([]string{"-C", d}, a...)...).Run(); err != nil {
+			t.Fatalf("git %v: %v", a, err)
+		}
+	}
+	return d
+}
+
+func headOf(t *testing.T, d string) string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", d, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	sha := strings.TrimSpace(string(out))
+	if len(sha) != 40 {
+		t.Fatalf("rev-parse returned %q", sha)
+	}
+	return sha
+}
+
+// pushViaLoop drives loop() through a real "list for-push" + "push" exchange
+// to seed a Fake with a genuine marker, ref, and pack pair built from gitDir's
+// real history — the "seed via a real push first" pattern the fetch-batch
+// tests below need, since Fetch requires an actual pack on the remote and an
+// actual object closure to verify, neither of which a hand-planted Fake
+// state could produce without duplicating repo.Push itself.
+func pushViaLoop(t *testing.T, ft *transport.Fake, root, gitDir string) {
+	t.Helper()
+	script := "list for-push\npush refs/heads/main:refs/heads/main\n\n"
+	in := bufio.NewScanner(strings.NewReader(script))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	got := loop(ft, root, gitDir, in, out)
+	out.Flush()
+
+	if got != 0 {
+		t.Fatalf("seeding push failed: loop() = %d, stdout=%q", got, outBuf.String())
+	}
+	if !strings.Contains(outBuf.String(), "ok refs/heads/main") {
+		t.Fatalf("seeding push did not report ok: stdout=%q", outBuf.String())
+	}
+}
+
+// TestLoop_FetchBatch_InstallsAndReportsConnectivity is RED before Task 6:
+// "fetch <sha> <name>" hits the default case and fails closed instead of
+// installing anything. After Task 6 it pins the whole batch contract: a
+// fetch that actually installs objects reports a real "lock <keepPath>" line,
+// and connectivity-ok follows it — never precedes it, since emitting
+// connectivity-ok is only correct once Fetch's own verification (which IS the
+// connectivity check per rule 1) has already succeeded.
+func TestLoop_FetchBatch_InstallsAndReportsConnectivity(t *testing.T) {
+	src := newGitRepoWithCommit(t)
+	sha := headOf(t, src)
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	pushViaLoop(t, ft, root, src)
+
+	dst := emptyGitRepo(t)
+	script := "option check-connectivity true\nfetch " + sha + " refs/heads/main\n\n"
+	in := bufio.NewScanner(strings.NewReader(script))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	got := loop(ft, root, dst, in, out)
+	out.Flush()
+	stdout := outBuf.String()
+
+	if got != 0 {
+		t.Fatalf("loop() = %d, want 0: stdout=%q", got, stdout)
+	}
+	lockIdx := strings.Index(stdout, "lock ")
+	connIdx := strings.Index(stdout, "connectivity-ok")
+	if lockIdx == -1 {
+		t.Fatalf("stdout = %q, want a \"lock \" line naming the installed .keep", stdout)
+	}
+	if connIdx == -1 {
+		t.Fatalf("stdout = %q, want a connectivity-ok line", stdout)
+	}
+	if lockIdx > connIdx {
+		t.Fatalf("stdout = %q, want the lock line before connectivity-ok", stdout)
+	}
+	if !strings.HasSuffix(stdout, "connectivity-ok\n\n") {
+		t.Fatalf("stdout = %q, want it to end with connectivity-ok immediately followed by "+
+			"the terminating blank line", stdout)
+	}
+
+	var lockLine string
+	for _, l := range strings.Split(stdout, "\n") {
+		if strings.HasPrefix(l, "lock ") {
+			lockLine = l
+			break
+		}
+	}
+	keep := strings.TrimPrefix(lockLine, "lock ")
+	if _, err := os.Stat(keep); err != nil {
+		t.Errorf(".keep at %q reported by the lock line must exist on disk: %v", keep, err)
+	}
+}
+
+// TestLoop_FetchBatch_UpToDateEmitsNoLock covers rule 5: an up-to-date fetch
+// (("", nil) from repo.Fetch) is a legitimate outcome, not an error, and must
+// emit no "lock" line at all — while still answering connectivity-ok, because
+// Fetch returning a nil error is what makes closure verification true
+// regardless of whether anything new had to be installed. RED before Task 6
+// for the same reason as the sibling test above.
+func TestLoop_FetchBatch_UpToDateEmitsNoLock(t *testing.T) {
+	src := newGitRepoWithCommit(t)
+	sha := headOf(t, src)
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	pushViaLoop(t, ft, root, src)
+
+	dst := emptyGitRepo(t)
+	script := "option check-connectivity true\nfetch " + sha + " refs/heads/main\n\n"
+
+	in1 := bufio.NewScanner(strings.NewReader(script))
+	var out1Buf bytes.Buffer
+	out1 := bufio.NewWriter(&out1Buf)
+	got1 := loop(ft, root, dst, in1, out1)
+	out1.Flush()
+	if got1 != 0 {
+		t.Fatalf("priming fetch: loop() = %d, stdout=%q", got1, out1Buf.String())
+	}
+	if !strings.Contains(out1Buf.String(), "lock ") {
+		t.Fatalf("priming fetch must install and report a lock: stdout=%q", out1Buf.String())
+	}
+
+	in2 := bufio.NewScanner(strings.NewReader(script))
+	var out2Buf bytes.Buffer
+	out2 := bufio.NewWriter(&out2Buf)
+	got2 := loop(ft, root, dst, in2, out2)
+	out2.Flush()
+	stdout := out2Buf.String()
+
+	if got2 != 0 {
+		t.Fatalf("loop() = %d, want 0: stdout=%q", got2, stdout)
+	}
+	if strings.Contains(stdout, "lock ") {
+		t.Errorf("stdout = %q, an up-to-date fetch must emit no lock line", stdout)
+	}
+	if !strings.Contains(stdout, "connectivity-ok") {
+		t.Errorf("stdout = %q, connectivity-ok must still be reported when the option is on, "+
+			"even when the fetch was already up to date", stdout)
 	}
 }

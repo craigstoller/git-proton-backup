@@ -79,6 +79,7 @@ func run() int {
 func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bufio.Writer) int {
 	var opts protocol.Options
 	var lock *repo.Lock
+	var checkConnectivity bool
 	defer func() {
 		if lock != nil {
 			// Release on EVERY exit path; a leak wedges the repo. Its error is
@@ -106,12 +107,45 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 		line := in.Text()
 		switch {
 		case line == "capabilities":
-			fmt.Fprint(out, "option\npush\n\n")
+			// check-connectivity is advertised as well as accepted: git only
+			// recognises a connectivity-ok response from a helper that
+			// advertised the capability.
+			fmt.Fprint(out, "option\npush\nfetch\ncheck-connectivity\n\n")
 			out.Flush()
 
 		case strings.HasPrefix(line, "option "):
+			// check-connectivity is HONOURED, not poisoned: poison exists for
+			// options git ignores our rejection of, and this is the opposite.
+			if v, ok := strings.CutPrefix(line, "option check-connectivity "); ok {
+				checkConnectivity = strings.TrimSpace(v) == "true"
+				fmt.Fprint(out, "ok\n")
+				out.Flush()
+				continue
+			}
 			opts.Observe(line)
 			fmt.Fprint(out, "unsupported\n") // advisory only; poison flag is the real defence
+			out.Flush()
+
+		case line == "list":
+			// The FETCH-side advertisement. Read-only: no Bootstrap, no lock.
+			// A fetch must never bring a repository into existence, and a
+			// lock here would wedge the repo for every reader if we crashed.
+			refs, err := repo.ListRefs(t, root)
+			if err != nil {
+				warn(err)
+				return 1
+			}
+			for name, sha := range refs {
+				fmt.Fprintf(out, "%s %s\n", sha, name)
+			}
+			if branch, ok, err := repo.ReadHEAD(t, root); err != nil {
+				warn(err)
+				return 1
+			} else if ok {
+				// The symref line is what lets clone check something out.
+				fmt.Fprintf(out, "@%s HEAD\n", branch)
+			}
+			fmt.Fprint(out, "\n")
 			out.Flush()
 
 		case line == "list for-push":
@@ -198,6 +232,39 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 				} else {
 					fmt.Fprintf(out, "error %s %s\n", r.Ref, r.Err)
 				}
+			}
+			fmt.Fprint(out, "\n")
+			out.Flush()
+
+		case strings.HasPrefix(line, "fetch "):
+			var wants []string
+			for l := line; ; {
+				sp := strings.Fields(l)
+				if len(sp) >= 2 {
+					wants = append(wants, sp[1]) // "fetch <sha> <name>"
+				}
+				if !in.Scan() {
+					break
+				}
+				l = in.Text()
+				if l == "" {
+					break
+				}
+			}
+			keep, err := repo.Fetch(t, root, gitDir, wants)
+			if err != nil {
+				warn(err)
+				return 1
+			}
+			if keep != "" {
+				// Git retains only the FIRST lock, which is why the closure
+				// is consolidated into one pack.
+				fmt.Fprintf(out, "lock %s\n", keep)
+			}
+			if checkConnectivity {
+				// Only after Fetch verified it. Fetch returns an error
+				// otherwise, so reaching here means the closure is complete.
+				fmt.Fprint(out, "connectivity-ok\n")
 			}
 			fmt.Fprint(out, "\n")
 			out.Flush()
