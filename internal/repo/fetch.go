@@ -177,36 +177,49 @@ func verifyDownloadedPacks(packDir string) error {
 // remains and nothing will reclaim the pack — an inert residue that costs
 // disk until a human removes the file.
 func consolidateAndInstall(gitDir, altObjects, objs string) (string, error) {
-	// Ask git where its object store is rather than guessing from the presence
-	// of a .git directory. Guessing misfires on a bare repo, on a worktree
-	// whose .git is a file, and on a normal repo that happens to have no
-	// objects/pack yet — in that last case it would create one in the WORKING
-	// TREE, which is silently wrong.
-	out, code, err := gitcmd.RevParse(gitDir, "--git-dir")
+	// Ask git where its PACKS actually belong — not merely where its git dir
+	// is. Those are the same question in an ordinary repo, but NOT in a
+	// LINKED WORKTREE (`git worktree add`): there, --git-dir answers with the
+	// per-worktree ADMIN directory (<main>/.git/worktrees/<name>), which
+	// holds HEAD and the index but has NO object store of its own — git
+	// resolves objects through the worktree's COMMON dir instead
+	// (<main>/.git/objects), and never looks in the admin dir's objects/ at
+	// all. Asking --git-dir and packing into "<admin-dir>/objects/pack" (what
+	// this function used to do) would therefore report a successful fetch
+	// while writing objects nowhere git will ever look — with
+	// check-connectivity, connectivity-ok tells the calling git to skip its
+	// own check and update refs anyway, producing refs that point at objects
+	// git cannot see: fail-OPEN, exactly the class of bug this task's whole
+	// verify-before-install posture exists to prevent. --git-path objects/pack
+	// asks the right question instead: confirmed empirically (see the fix
+	// report) that it resolves through the commondir indirection and returns
+	// the correct location in every layout — ordinary repo, bare repo, and
+	// linked worktree alike.
+	out, code, err := gitcmd.RevParse(gitDir, "--git-path", "objects/pack")
 	if err != nil {
-		return "", fmt.Errorf("cannot locate the git directory for %s: %w", gitDir, err)
+		return "", fmt.Errorf("cannot locate the pack directory for %s: %w", gitDir, err)
 	}
 	if code != 0 {
-		return "", fmt.Errorf("cannot locate the git directory for %s: rev-parse --git-dir "+
-			"exited %d: %s", gitDir, code, out)
+		return "", fmt.Errorf("cannot locate the pack directory for %s: rev-parse "+
+			"--git-path objects/pack exited %d: %s", gitDir, code, out)
 	}
 	// RevParse's result is git()'s COMBINED stdout+stderr (trimmed), not
 	// stdout alone. A single warning line merged in alongside a genuinely
-	// successful "--git-dir" answer — an inaccessible ~/.gitconfig, a broken
-	// ref notice — would otherwise be trusted as part of the path outright:
-	// filepath.IsAbs sees false on "warning: ...\n.git", the join below lands
-	// inside gitDir, and MkdirAll creates a real pack in the user's WORKING
-	// TREE — precisely the outcome asking git instead of guessing was
-	// supposed to prevent. Refuse anything that does not look like a genuine
-	// --git-dir answer before trusting it as a path at all.
-	if err := validateGitDirOutput(gitDir, out); err != nil {
-		return "", fmt.Errorf("cannot locate the git directory for %s: %w", gitDir, err)
+	// successful answer — an inaccessible ~/.gitconfig, a broken ref notice —
+	// would otherwise be trusted as part of the path outright. See
+	// validateObjectsPackPath for the shape this must match instead.
+	if err := validateObjectsPackPath(out); err != nil {
+		return "", fmt.Errorf("cannot locate the pack directory for %s: %w", gitDir, err)
 	}
-	gitDirAbs := out
-	if !filepath.IsAbs(gitDirAbs) {
-		gitDirAbs = filepath.Join(gitDir, gitDirAbs)
+	// Relative answers (an ordinary or bare repo) resolve against the -C
+	// directory RevParse ran with, i.e. gitDir itself — confirmed empirically
+	// (see the fix report). A linked worktree's answer is already absolute
+	// (it points into the MAIN repo, not gitDir), so this join is a no-op
+	// for that case.
+	realPack := out
+	if !filepath.IsAbs(realPack) {
+		realPack = filepath.Join(gitDir, realPack)
 	}
-	realPack := filepath.Join(gitDirAbs, "objects", "pack")
 	if err := os.MkdirAll(realPack, 0o700); err != nil {
 		return "", err
 	}
@@ -237,27 +250,35 @@ func consolidateAndInstall(gitDir, altObjects, objs string) (string, error) {
 	return keep, nil
 }
 
-// validateGitDirOutput guards the untrusted combined-output value RevParse
+// validateObjectsPackPath guards the untrusted combined-output value RevParse
 // hands back before consolidateAndInstall treats it as a filesystem path (see
 // the comment at its call site for the mechanism this defends against). A
-// newline anywhere is refused outright — a genuine --git-dir answer is always
-// one line, so any newline proves something else (a git warning) was merged
-// into it. Beyond that, v must be one of the shapes git actually returns for
-// --git-dir: the literal ".git", an absolute path, or a path that (resolved
-// against gitDir, since RevParse ran with `-C gitDir`) names a directory that
-// genuinely exists.
-func validateGitDirOutput(gitDir, v string) error {
+// newline anywhere is refused outright — a genuine --git-path answer is
+// always one line, so any newline proves something else (a git warning) was
+// merged into it.
+//
+// Beyond that, v must actually look like an objects/pack answer: either the
+// literal "objects/pack" (a bare repo, whose git dir IS its own root) or a
+// path ending in "/objects/pack" (every other layout — an ordinary repo's
+// ".git/objects/pack", or a linked worktree's absolute path resolved through
+// the common dir). Confirmed empirically across all three layouts, on this
+// platform, that --git-path always uses forward slashes, even for an
+// absolute Windows path (see the fix report).
+//
+// There is deliberately no "confirm it already exists" fallback here, unlike
+// the --git-dir check this replaced: this function's entire caller exists to
+// MkdirAll objects/pack, which on a repo that has never held a pack does not
+// exist yet by definition — requiring it to pre-exist would make the first
+// fetch into a fresh repo fail.
+func validateObjectsPackPath(v string) error {
 	if strings.ContainsAny(v, "\r\n") {
-		return fmt.Errorf("rev-parse --git-dir returned more than one line (%q); this usually "+
-			"means a git warning was merged into the combined output, and the result cannot be "+
-			"trusted as a path", v)
+		return fmt.Errorf("rev-parse --git-path objects/pack returned more than one line "+
+			"(%q); this usually means a git warning was merged into the combined output, and "+
+			"the result cannot be trusted as a path", v)
 	}
-	if v == ".git" || filepath.IsAbs(v) {
+	if v == "objects/pack" || strings.HasSuffix(v, "/objects/pack") {
 		return nil
 	}
-	if st, err := os.Stat(filepath.Join(gitDir, v)); err == nil && st.IsDir() {
-		return nil
-	}
-	return fmt.Errorf("rev-parse --git-dir returned %q, which is neither \".git\", an absolute "+
-		"path, nor an existing directory under %s; refusing to treat it as the git directory", v, gitDir)
+	return fmt.Errorf("rev-parse --git-path objects/pack returned %q, which does not look "+
+		"like a pack directory; refusing to treat it as one", v)
 }

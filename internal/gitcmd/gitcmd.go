@@ -58,6 +58,17 @@ func warnWaitDelay(what string) {
 // ran", and the cause must survive even when combined output is empty.
 func git(gitDir string, args ...string) (string, int, error) {
 	cmd := exec.Command("git", append([]string{"-C", gitDir}, args...)...)
+	// Scrubbed for the same reason main.go unsets the inherited GIT_DIR: Go's
+	// exec.Command inherits this process's environment by default, so a
+	// GIT_ALTERNATE_OBJECT_DIRECTORIES set here would otherwise leak into
+	// every git() call — including WritePack's rev-list step, which would
+	// then enumerate objects reachable only through an alternate that
+	// PackObjectsFromList's own explicit override (altObjects="" for
+	// WritePack) cannot read, producing a pack request for objects it cannot
+	// actually pack. Fail-closed either way, but this makes rev-list and
+	// pack-objects agree on the same (alternate-free) world instead of
+	// disagreeing on it.
+	cmd.Env = append(os.Environ(), "GIT_ALTERNATE_OBJECT_DIRECTORIES=")
 	// Bounds the post-exit pipe drain so an fsmonitor daemon (or any other
 	// grandchild) holding the inherited write end cannot hang the helper
 	// forever. See waitDelay: DO NOT DELETE as unnecessary.
@@ -134,14 +145,22 @@ func IsAncestor(gitDir, old, new string) (bool, error) {
 	}
 }
 
-// RevParse resolves rev (a ref name, HEAD, or any other `git rev-parse`
-// input) to its sha. It returns the trimmed output, the raw exit code, and
-// any start/run error, the same three-value shape git() itself returns:
-// callers (Task 10's resolve()) decide what counts as success themselves,
-// the same way IsAncestor and WritePack above interpret git's exit codes
-// rather than collapsing them into a single bool.
-func RevParse(gitDir, rev string) (string, int, error) {
-	out, code, err := git(gitDir, "rev-parse", rev)
+// RevParse runs `git rev-parse <args...>` and returns the trimmed output,
+// the raw exit code, and any start/run error, the same three-value shape
+// git() itself returns: callers (Task 10's resolve(), repo.consolidateAndInstall)
+// decide what counts as success themselves, the same way IsAncestor and
+// WritePack above interpret git's exit codes rather than collapsing them
+// into a single bool.
+//
+// Variadic (fix round 2) rather than a single `rev` string: `--git-path
+// <path>` needs the path as a SEPARATE argv element — confirmed empirically
+// that rev-parse does not accept the `--flag=value` form for it, so
+// "--git-path=objects/pack" is not recognised as a flag at all and is
+// echoed back as a literal string rather than resolved. The single-rev
+// shape every existing caller (resolve()'s RevParse(gitDir, src)) already
+// uses still compiles unchanged: a lone variadic argument is the same call.
+func RevParse(gitDir string, args ...string) (string, int, error) {
+	out, code, err := git(gitDir, append([]string{"rev-parse"}, args...)...)
 	return out, code, err
 }
 
@@ -230,6 +249,16 @@ func WritePack(gitDir, want string, haves []string, outDir string) (string, stri
 // already written into the user's live object store, unkept and unknown to
 // git, plus no defence against a truncated pack name). See waitDelay: DO NOT
 // DELETE as unnecessary.
+//
+// pack-objects writes the pack hash to stdout, which is then parsed into a
+// name below. stdout must not be mixed with stderr here (unlike the git()
+// helper above) — any warning git writes to stderr would corrupt the parsed
+// name and produce a path that does not exist. stdout is captured alone for
+// parsing; stderr is kept separately and folded into the error message on
+// failure so diagnostics still surface. (This is a distinct hazard from I2's
+// RevParse fix, restored here after round 1's extraction dropped it: the
+// same class of bug — untrusted subprocess output trusted as data without
+// being kept clean of stderr — should not have to be rediscovered twice.)
 //
 // Both pins are normative (design v6.2). packSizeLimit must be overridden as
 // CONFIG, not as --max-pack-size=0: git reads 0 there as "unset" and falls

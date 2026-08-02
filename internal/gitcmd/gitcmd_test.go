@@ -386,6 +386,32 @@ func TestRevListNewObjectsExcludesWhatTheRepoAlreadyHas(t *testing.T) {
 	}
 }
 
+// TestRevParseAcceptsMultipleArgs covers fix round 2's variadic change: rev-
+// parse's `--git-path <path>` needs the path as a SEPARATE argv element
+// (confirmed empirically that `--git-path=objects/pack` is not recognised as
+// a flag at all and is echoed back literally rather than resolved), so
+// RevParse must be able to pass more than one argument through. Also pins
+// that the pre-existing single-arg call shape (RevParse(gitDir, rev)) still
+// compiles and behaves identically, since push.go's resolve() depends on it.
+func TestRevParseAcceptsMultipleArgs(t *testing.T) {
+	d := newRepo(t)
+	head := headOf(t, d)
+
+	// The pre-existing single-arg shape still works.
+	if got, code, err := RevParse(d, "HEAD"); err != nil || code != 0 || got != head {
+		t.Fatalf("RevParse(d, %q) = %q, %d, %v; want %q, 0, nil", "HEAD", got, code, err, head)
+	}
+
+	// The new multi-arg shape this fix round exists for.
+	got, code, err := RevParse(d, "--git-path", "objects/pack")
+	if err != nil || code != 0 {
+		t.Fatalf("RevParse(d, --git-path, objects/pack): %q, %d, %v", got, code, err)
+	}
+	if got != "objects/pack" && !strings.HasSuffix(got, "/objects/pack") {
+		t.Errorf("--git-path objects/pack = %q, want it to end in objects/pack", got)
+	}
+}
+
 // RED. SymbolicRef does not exist. A detached HEAD is ordinary, not an error.
 func TestSymbolicRef(t *testing.T) {
 	d := newRepo(t)

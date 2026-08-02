@@ -1697,42 +1697,105 @@ func TestFetchRefusesAnUnmarkedRemote(t *testing.T) {
 	}
 }
 
-// RED (fix round 1, I2). validateGitDirOutput does not exist yet. RevParse's
-// result is git()'s COMBINED stdout+stderr (trimmed) — a single git warning
-// merged in alongside a genuinely successful "--git-dir" answer must never be
-// trusted as a filesystem path outright, since consolidateAndInstall
-// MkdirAlls under it and a relative, warning-prefixed answer would land
-// inside the user's WORKING TREE (filepath.IsAbs sees false, so the fallback
-// join fires) rather than being refused.
-func TestValidateGitDirOutputRejectsUntrustedCombinedOutput(t *testing.T) {
-	d := t.TempDir()
-	if err := os.Mkdir(filepath.Join(d, ".git"), 0o755); err != nil {
-		t.Fatal(err)
+// linkedWorktree creates a linked worktree (`git worktree add`) off mainRepo
+// and returns its checkout path. mainRepo needs no commits — worktree add
+// works fine off an unborn HEAD (confirmed empirically) — which is exactly
+// why TestFetchIntoALinkedWorktreeInstallsWhereGitLooks below builds mainRepo
+// with emptyGitRepo rather than newGitRepoForPush: two independently created
+// newGitRepoForPush commits can collide on sha within the same wall-clock
+// second (see emptyGitRepo's own doc), and a colliding mainRepo would already
+// share the fetch's wanted object before Fetch ever ran, defeating the test.
+// emptyGitRepo has no commit to collide with anything.
+func linkedWorktree(t *testing.T, mainRepo string) string {
+	t.Helper()
+	wt := filepath.Join(t.TempDir(), "wt")
+	if err := exec.Command("git", "-C", mainRepo, "worktree", "add", "-q", wt, "-b", "wt-branch").Run(); err != nil {
+		t.Fatalf("git worktree add: %v", err)
 	}
-	if err := os.Mkdir(filepath.Join(d, "worktrees-git-dir"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	return wt
+}
 
+// RED (fix round 2, confirmed gap). A linked worktree's `git rev-parse
+// --git-dir` answers with the per-worktree ADMIN directory
+// (<main>/.git/worktrees/<name>), which holds HEAD and the index but has NO
+// object store of its own — git resolves objects through the worktree's
+// COMMON dir instead (<main>/.git/objects) and never looks in the admin
+// dir's objects/ at all. Before this fix, consolidateAndInstall asked
+// --git-dir and packed into "<admin-dir>/objects/pack": Fetch reported
+// success and a real .keep existed on disk, but every object it installed
+// was invisible to git — with check-connectivity, the caller would skip its
+// own check (connectivity-ok) and update refs anyway, producing refs that
+// point at objects git can never see. Confirmed this exact failure mode by
+// hand against real git before writing this test (see the fix report).
+//
+// Empirically verified (see the fix report) that `git rev-parse --git-path
+// objects/pack` resolves through the commondir indirection correctly in
+// every layout tested — ordinary repo, bare repo, and linked worktree — which
+// is what the fix below asks instead.
+func TestFetchIntoALinkedWorktreeInstallsWhereGitLooks(t *testing.T) {
+	src := newGitRepoForPush(t)
+	sha := headOfPushRepo(t, src)
+	f := transport.NewFake()
+	plantRepoOnFake(t, f, "/r", src, sha)
+
+	main := emptyGitRepo(t) // no commits — see linkedWorktree for why
+	wt := linkedWorktree(t, main)
+
+	keep, err := Fetch(f, "/r", wt, []string{sha})
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if keep == "" {
+		t.Fatal("a fetch that installs objects must return a .keep path")
+	}
+	if !gitcmd.HasObject(wt, sha) {
+		t.Error("the wanted object must be visible to git FROM THE WORKTREE — installing " +
+			"into the worktree's admin dir instead of its common dir would make the pack " +
+			"invisible to every git command, even though Fetch reported success")
+	}
+	wantDir := filepath.Join(main, ".git", "objects", "pack")
+	if got := filepath.Dir(keep); got != wantDir {
+		t.Errorf(".keep must live in the MAIN repo's real object store %s, got %s", wantDir, got)
+	}
+}
+
+// RED (fix round 2, I2 revised). validateObjectsPackPath does not exist yet —
+// it replaces fix round 1's validateGitDirOutput now that consolidateAndInstall
+// asks `--git-path objects/pack` instead of `--git-dir` (see the linked-
+// worktree test above for why). RevParse's result is still git()'s COMBINED
+// stdout+stderr (trimmed), so the same untrusted-output hazard applies: a
+// single git warning merged in alongside a genuine answer must never be
+// trusted as a filesystem path outright.
+//
+// Unlike the old --git-dir check, there is no "confirm it already exists as
+// a directory" fallback for a relative answer here: this function's whole
+// caller exists to MkdirAll objects/pack, which — on a repo that has never
+// held a pack — does not exist yet by definition. The shape check instead
+// requires the value to actually look like an objects/pack answer: either
+// the literal "objects/pack" (a bare repo, whose git dir IS its own root) or
+// a path ending in "/objects/pack" (every other layout).
+func TestValidateObjectsPackPathRejectsUntrustedCombinedOutput(t *testing.T) {
 	cases := []struct {
 		name    string
 		v       string
 		wantErr bool
 	}{
-		{"the ordinary answer", ".git", false},
-		{"an absolute path", filepath.Join(d, ".git"), false},
-		{"a relative path that genuinely exists under gitDir", "worktrees-git-dir", false},
-		{"a warning merged in before a real answer", "warning: something\n.git", true},
-		{"a warning merged in after a real answer", ".git\nwarning: something", true},
-		{"a relative path that does not exist", "not-a-real-dir", true},
+		{"bare-repo shape", "objects/pack", false},
+		{"ordinary-repo shape", ".git/objects/pack", false},
+		{"worktree absolute shape", "C:/somewhere/main/.git/objects/pack", false},
+		{"a warning merged in before a real answer", "warning: something\nobjects/pack", true},
+		{"a warning merged in after a real answer", "objects/pack\nwarning: something", true},
+		{"does not look like an objects/pack answer at all", "not-a-real-path", true},
+		{"close but wrong — trailing s", "objects/packs", true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			err := validateGitDirOutput(d, c.v)
+			err := validateObjectsPackPath(c.v)
 			if c.wantErr && err == nil {
-				t.Errorf("validateGitDirOutput(%q) = nil, want an error", c.v)
+				t.Errorf("validateObjectsPackPath(%q) = nil, want an error", c.v)
 			}
 			if !c.wantErr && err != nil {
-				t.Errorf("validateGitDirOutput(%q) = %v, want nil", c.v, err)
+				t.Errorf("validateObjectsPackPath(%q) = %v, want nil", c.v, err)
 			}
 		})
 	}
