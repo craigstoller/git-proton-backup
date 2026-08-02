@@ -7,12 +7,44 @@
 package gitcmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
+
+// waitDelay bounds how long Wait may block draining a git child's output pipes
+// AFTER git itself has already exited. It is not a command timeout.
+//
+// MECHANISM (documented os/exec behaviour). Every exec site in this package
+// redirects Stdout/Stderr to something that is not an *os.File — a
+// *bytes.Buffer via CombinedOutput, or a *strings.Builder in WritePack — so
+// os/exec creates an os.Pipe(), hands the write end to git, and copies from
+// the read end on a goroutine. Wait does not return until that goroutine sees
+// EOF, and EOF requires EVERY holder of the write end to close it, not just
+// the direct child. A git invoked with core.fsmonitor enabled spawns a daemon
+// that inherits the pipe and outlives the command, so without this the helper
+// blocks forever (go.dev/issue/23019). Identical shape to the hang observed
+// against the Proton CLI during the Stage 2.1 live gate; see
+// internal/transport/cli.go.
+//
+// LIMIT: with no Context set, the timer starts when Wait observes the child
+// has exited. A git that never exits at all is NOT bounded by this.
+//
+// A var, not a const, purely for symmetry with the transport-side knob;
+// nothing in production writes to it.
+var waitDelay = 30 * time.Second
+
+// warnWaitDelay reports an abandoned output pipe on stderr — never stdout,
+// which is protocol-only. Without it a recurrence of the grandchild-holds-the-
+// pipe case is completely invisible.
+func warnWaitDelay(what string) {
+	fmt.Fprintf(os.Stderr, "git-remote-proton: %s exited but something still held its output "+
+		"pipe open after %s; the pipe was abandoned (output may be truncated)\n", what, waitDelay)
+}
 
 // git runs `git -C gitDir <args>` and returns its combined stdout+stderr
 // (trimmed), its exit code, and any error starting/running the process.
@@ -26,7 +58,21 @@ import (
 // ran", and the cause must survive even when combined output is empty.
 func git(gitDir string, args ...string) (string, int, error) {
 	cmd := exec.Command("git", append([]string{"-C", gitDir}, args...)...)
+	// Bounds the post-exit pipe drain so an fsmonitor daemon (or any other
+	// grandchild) holding the inherited write end cannot hang the helper
+	// forever. See waitDelay: DO NOT DELETE as unnecessary.
+	cmd.WaitDelay = waitDelay
 	out, err := cmd.CombinedOutput()
+	if errors.Is(err, exec.ErrWaitDelay) {
+		// git itself SUCCEEDED — os/exec substitutes ErrWaitDelay for a nil
+		// error only on a successful exit — so ProcessState is set, the exit
+		// code below is the real one, and callers that branch on it first are
+		// unaffected. Truncated output is still handled correctly by every
+		// caller: ObjectType would see a type that is not "commit",
+		// IsAncestor switches on the exit code, and WritePack guards its own
+		// rev-list output explicitly (below), so no path silently narrows.
+		warnWaitDelay("git " + strings.Join(args, " "))
+	}
 	if cmd.ProcessState == nil {
 		return strings.TrimSpace(string(out)), -1, err
 	}
@@ -125,6 +171,17 @@ func WritePack(gitDir, want string, haves []string, outDir string) (string, stri
 		}
 		return "", "", fmt.Errorf("rev-list failed: %s", objs)
 	}
+	// The one caller of git() where truncated output would be silently WRONG
+	// rather than merely noisy: this list IS the pack's contents, so a short
+	// read produces a smaller pack that is missing objects, gets published,
+	// and is unrecoverable. Every other git() caller fails closed on its own
+	// under truncation; this one has to say so. Fail closed here rather than
+	// pack what we happen to have read.
+	if errors.Is(err, exec.ErrWaitDelay) {
+		return "", "", fmt.Errorf("rev-list exited but something still held its output pipe "+
+			"open after %s, so its object list cannot be trusted to be complete; refusing to "+
+			"build a pack that may be missing objects", waitDelay)
+	}
 	if strings.TrimSpace(objs) == "" {
 		return "", "", nil // nothing to send
 	}
@@ -149,7 +206,21 @@ func WritePack(gitDir, want string, haves []string, outDir string) (string, stri
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	// Same exposure as git() above, for the same reason: *strings.Builder is
+	// not an *os.File, so these are pipes a grandchild can hold open past the
+	// child's exit. See waitDelay: DO NOT DELETE as unnecessary.
+	cmd.WaitDelay = waitDelay
 	if err := cmd.Run(); err != nil {
+		// ErrWaitDelay means pack-objects itself exited 0 but the pipe was
+		// abandoned, so stdout — which is the pack NAME this function parses a
+		// filename out of — may be short. A truncated hash yields a path that
+		// does not exist, and the os.Stat guards below would report that as a
+		// missing pack, blaming the wrong thing. Name the real cause instead.
+		if errors.Is(err, exec.ErrWaitDelay) {
+			return "", "", fmt.Errorf("pack-objects exited but something still held its output "+
+				"pipe open after %s, so the pack name it printed cannot be trusted to be "+
+				"complete; refusing to guess which pack it wrote", waitDelay)
+		}
 		return "", "", fmt.Errorf("pack-objects: %s: %w", strings.TrimSpace(stderr.String()), err)
 	}
 	name := strings.TrimSpace(stdout.String())
@@ -189,7 +260,18 @@ func WritePack(gitDir, want string, haves []string, outDir string) (string, stri
 // why it cannot be the enforcement point for the index-version pin.
 func IndexPackVerify(packPath string) error {
 	cmd := exec.Command("git", "index-pack", "--verify", packPath)
+	// Same exposure as git() above. See waitDelay: DO NOT DELETE.
+	cmd.WaitDelay = waitDelay
 	out, err := cmd.CombinedOutput()
+	// ErrWaitDelay is substituted for a nil error ONLY on a successful exit,
+	// so the verification itself passed and only the pipe drain was abandoned.
+	// Returning it as an error would report a passing verification as
+	// "the remote index does not verify against its pack" and refuse a
+	// legitimate push — a false failure, not a fail-closed one. Warn instead.
+	if errors.Is(err, exec.ErrWaitDelay) {
+		warnWaitDelay("git index-pack --verify " + packPath)
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("index-pack --verify %s: %s: %w",
 			packPath, strings.TrimSpace(string(out)), err)
