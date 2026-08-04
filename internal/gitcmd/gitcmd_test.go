@@ -603,3 +603,92 @@ func TestIndexPackVerifyAcceptsGoodPairRejectsCorrupt(t *testing.T) {
 		t.Error("a corrupted pack must not verify")
 	}
 }
+
+// makeIdxFixture builds a tiny repo and packs its full closure, returning the
+// idx path and the object IDs the pack must contain. indexVersion is passed to
+// index-pack when rebuilding the index, so the same fixture pins v1 and v2.
+func makeIdxFixture(t *testing.T, indexVersion string) (idxPath string, oids map[string]bool) {
+	t.Helper()
+	d := t.TempDir()
+	run := func(args ...string) string {
+		out, err := exec.Command("git", append([]string{"-C", d}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	run("init", "-qb", "main")
+	run("config", "user.email", "t@t")
+	run("config", "user.name", "t")
+	if err := os.WriteFile(filepath.Join(d, "f.txt"), []byte("show-index fixture"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "f.txt")
+	run("commit", "-qm", "c")
+	sha := run("rev-parse", "HEAD")
+
+	out := t.TempDir()
+	packPath, gotIdx, err := WritePack(d, sha, nil, out)
+	if err != nil || packPath == "" {
+		t.Fatalf("WritePack: %v", err)
+	}
+	idxPath = gotIdx
+	if indexVersion == "1" {
+		// Rebuild the index as v1: Push deliberately accepts a valid remote v1
+		// .idx it did not write, so the map builder must read it too.
+		if err := os.Remove(idxPath); err != nil {
+			t.Fatal(err)
+		}
+		if o, err := exec.Command("git", "index-pack", "--index-version=1", packPath).CombinedOutput(); err != nil {
+			t.Fatalf("index-pack --index-version=1: %v: %s", err, o)
+		}
+	}
+	oids = map[string]bool{}
+	for _, line := range strings.Split(run("rev-list", "--objects", sha), "\n") {
+		if f := strings.Fields(line); len(f) > 0 {
+			oids[f[0]] = true
+		}
+	}
+	return idxPath, oids
+}
+
+// RED: ShowIndex does not exist. It must return exactly the pack's objects.
+func TestShowIndexReadsV2(t *testing.T) {
+	idx, want := makeIdxFixture(t, "2")
+	got, err := ShowIndex(idx)
+	if err != nil {
+		t.Fatalf("ShowIndex: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("ShowIndex returned %d oids, want %d", len(got), len(want))
+	}
+	for _, oid := range got {
+		if !want[oid] {
+			t.Errorf("unexpected oid %s", oid)
+		}
+	}
+}
+
+// RED (same run as above): the v1 GUARD from the spec — a v2-only reader
+// would accept an index at push time it cannot fetch later.
+func TestShowIndexReadsV1(t *testing.T) {
+	idx, want := makeIdxFixture(t, "1")
+	got, err := ShowIndex(idx)
+	if err != nil {
+		t.Fatalf("ShowIndex on a v1 index: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("ShowIndex returned %d oids from v1, want %d", len(got), len(want))
+	}
+}
+
+// RED: a structurally corrupt index must be an error, never a short answer.
+func TestShowIndexRejectsCorruptIndex(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "pack-0000000000000000000000000000000000000000.idx")
+	if err := os.WriteFile(p, []byte("not an index"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ShowIndex(p); err == nil {
+		t.Fatal("ShowIndex must reject a corrupt index")
+	}
+}

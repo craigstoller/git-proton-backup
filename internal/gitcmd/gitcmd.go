@@ -12,9 +12,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
+
+// oidRe validates a full SHA-1 object name. gitcmd is self-contained (it
+// imports nothing from internal/repo), so it holds its own copy rather than
+// sharing repo's shaRe. SHA-256 repositories are refused elsewhere by design.
+var oidRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 // waitDelay bounds how long Wait may block draining a git child's output pipes
 // AFTER git itself has already exited. It is not a command timeout.
@@ -472,4 +478,51 @@ func IndexPackVerify(packPath string) error {
 			packPath, strings.TrimSpace(string(out)), err)
 	}
 	return nil
+}
+
+// ShowIndex returns every object ID recorded in the pack index at idxPath,
+// via `git show-index` — git's own reader, which speaks index v1 AND v2.
+// That is the parent design's trap closed the way it prescribes: Push
+// deliberately accepts a valid remote v1 .idx it did not write, so a v2-only
+// parser here would accept an index at push time it cannot fetch later.
+//
+// show-index reads the index on stdin and needs no repository; output lines
+// are "<offset> <oid>" (v1) or "<offset> <oid> (<crc32>)" (v2), so the OID is
+// always the second field. Any line that does not parse that way is a hard
+// error — a truncated or garbled answer must never become a smaller map.
+func ShowIndex(idxPath string) ([]string, error) {
+	f, err := os.Open(idxPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	cmd := exec.Command("git", "show-index")
+	cmd.Stdin = f
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	// stdout here IS the object list, so an abandoned pipe means a possibly
+	// truncated list; fail closed like WritePack's rev-list guard.
+	// See waitDelay: DO NOT DELETE as unnecessary.
+	cmd.WaitDelay = waitDelay
+	if err := cmd.Run(); err != nil {
+		if errors.Is(err, exec.ErrWaitDelay) {
+			return nil, fmt.Errorf("show-index output was abandoned after %s; refusing to "+
+				"act on a possibly truncated object list", waitDelay)
+		}
+		return nil, fmt.Errorf("show-index %s: %s: %w", idxPath,
+			strings.TrimSpace(stderr.String()), err)
+	}
+	var oids []string
+	for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 || !oidRe.MatchString(fields[1]) {
+			return nil, fmt.Errorf("show-index %s: unparseable line %q", idxPath, line)
+		}
+		oids = append(oids, fields[1])
+	}
+	return oids, nil
 }
