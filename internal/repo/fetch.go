@@ -107,9 +107,22 @@ func Fetch(t transport.Transport, root, gitDir, cacheDir string, wants []string)
 		pm, herr = refreshPackMap(t, root, cacheDir, fallbackDir, stems)
 		return herr
 	}
+	// fatalAfterHeal composes the terminal message once the one self-heal
+	// round has already run. errCacheSuspect's own sentence ("this can be
+	// caused by a stale or corrupt sidecar cache") would otherwise survive
+	// into this message via %w's %v-equivalent text and sit right next to the
+	// claim that follows, self-negating: "...caused by a stale cache...
+	// ...this indicates genuine remote trouble, not a stale cache." Stripping
+	// that sentence (and the separator that joins it to the rest of err's
+	// text) before appending the post-heal explanation keeps the message
+	// internally consistent. errors.Is(err, errCacheSuspect) compatibility is
+	// deliberately not preserved here — nothing downstream inspects this
+	// composed error; it is only ever returned to the caller of Fetch.
 	fatalAfterHeal := func(err error) error {
-		return fmt.Errorf("%w (the sidecar metadata was already refreshed from the remote "+
-			"this run, so this indicates genuine remote trouble, not a stale cache)", err)
+		msg := err.Error()
+		msg = strings.TrimSuffix(msg, ": "+errCacheSuspect.Error())
+		return fmt.Errorf("%s (the sidecar metadata was already refreshed from the remote "+
+			"this run; this indicates genuine remote or transport trouble)", msg)
 	}
 
 	for {
@@ -223,6 +236,8 @@ func downloadAndVerifyPack(t transport.Transport, root, packDir, stem string, pm
 		// sidecar is cache-read trouble — heal-able, not fatal (spec: any
 		// cache I/O failure degrades). Wrapping unconditionally is safe: a
 		// genuine temp-dir failure wastes one heal round and then fatals.
+		_ = os.Remove(idxPath)
+		_ = os.Remove(packPath)
 		return false, fmt.Errorf("cannot lay sidecar beside %s: %v: %w",
 			packName, err, errCacheSuspect)
 	}

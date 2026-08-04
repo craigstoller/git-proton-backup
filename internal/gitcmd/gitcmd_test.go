@@ -799,6 +799,27 @@ func TestRevListMissingFrontierDeepensThroughATree(t *testing.T) {
 	}
 }
 
+// GUARD: pins RevListMissing's error-translation wrap — the unconditional
+// %w-wrap that names "--missing=print" and the minimum-git floor whenever the
+// underlying rev-list call itself errors (as opposed to succeeding and
+// reporting ?-lines, which every other RevListMissing test above exercises).
+// A gitDir that is not a git repository at all makes revListWithAlt fail
+// immediately, forcing the wrap branch the rest of this suite never takes.
+func TestRevListMissingWrapsUnderlyingErrorWithFloorText(t *testing.T) {
+	notARepo := t.TempDir() // deliberately never `git init`-ed
+	altObjects := t.TempDir()
+	want := strings.Repeat("a", 40) // syntactically valid, need not exist
+
+	_, err := RevListMissing(notARepo, altObjects, []string{want})
+	if err == nil {
+		t.Fatal("RevListMissing against a non-repo gitDir must return an error")
+	}
+	if !strings.Contains(err.Error(), "--missing=print") {
+		t.Errorf("wrapped error must name --missing=print (the floor-naming text "+
+			"from RevListMissing's wrap): %v", err)
+	}
+}
+
 // RED: the parser is normative — first whitespace-delimited token after '?',
 // 40-hex validated, never trimmed-and-trusted. Object lines and blank lines
 // are ignored; a malformed ?-line is a hard error.

@@ -1763,9 +1763,10 @@ func TestFetchIsIdempotentAndInstallsNothingWhenUpToDate(t *testing.T) {
 	}
 
 	// Remove every pack/idx from the remote. If the second Fetch call had to
-	// redownload anything, it would fail outright (downloadAllPacks refuses
-	// an empty packs/ folder) rather than merely reinstalling redundantly —
-	// so this also proves the remote is never touched once up to date.
+	// redownload anything, it would fail outright (Fetch fatals when
+	// listCompletePacks comes back with len(stems) == 0, i.e. an empty
+	// packs/ folder) rather than merely reinstalling redundantly — so this
+	// also proves the remote is never touched once up to date.
 	for name := range f.Files {
 		if strings.HasSuffix(name, ".pack") || strings.HasSuffix(name, ".idx") {
 			delete(f.Files, name)
@@ -1787,8 +1788,9 @@ func TestFetchIsIdempotentAndInstallsNothingWhenUpToDate(t *testing.T) {
 // Fix round 1 test strengthening: a genuine first fetch runs BEFORE the
 // corruption is injected, so `before` is a real 1 (a pack this test proves
 // was actually installed), not merely 0 by construction. Before this change
-// `before == after == 0` would have passed even if verifyDownloadedPacks were
-// entirely deleted, since dst never had a pack to lose either way.
+// `before == after == 0` would have passed even if downloadAndVerifyPack's
+// checksum/pair verification were entirely deleted, since dst never had a
+// pack to lose either way.
 func TestFetchRejectsACorruptPackAndInstallsNothing(t *testing.T) {
 	src := newGitRepoForPush(t)
 	sha := headOfPushRepo(t, src)
@@ -1807,10 +1809,11 @@ func TestFetchRejectsACorruptPackAndInstallsNothing(t *testing.T) {
 	// A second, distinct want, so the corrupted pack is actually needed —
 	// otherwise the up-to-date short-circuit would return ("", nil) before
 	// ever downloading (and therefore before ever reading) the corrupt pack,
-	// and this test would pass without exercising verifyDownloadedPacks at
-	// all. plantRepoOnFake already wrote one pack pair for `sha`; a second
-	// commit on src, packed and planted under a second remote name, gives
-	// Fetch a want whose closure is not yet satisfied locally.
+	// and this test would pass without exercising downloadAndVerifyPack's
+	// verification at all. plantRepoOnFake already wrote one pack pair for
+	// `sha`; a second commit on src, packed and planted under a second
+	// remote name, gives Fetch a want whose closure is not yet satisfied
+	// locally.
 	second := commitOnPushRepo(t, src, "b.txt", "two")
 	packPath, idxPath, err := gitcmd.WritePack(src, second, []string{sha}, t.TempDir())
 	if err != nil || packPath == "" {
@@ -2671,10 +2674,11 @@ func (r *residueTransport) ReadTo(p, local string) error {
 // ReadTo's failure path. Disabling either removal alone left the test green
 // (the other one still cleans up in time for the retry); only disabling BOTH
 // exposed it, failing with "retry found residue at ...; the residue rule is
-// violated" — confirming the assertion is live and that the entry-point
-// removal is what actually protects this in-process retry (the failure-path
-// removal exists for residue from an attempt this process lost track of, per
-// downloadAndVerifyPack's doc comment).
+// violated" — confirming the assertion is live. Per downloadAndVerifyPack's
+// doc comment (fetch.go), it is the FAILURE-PATH removal that cleans this
+// attempt's own leavings — and in this scenario it had already cleared the
+// residue before the retry began; the entry-point removal is the one that
+// exists for residue from an attempt this process lost track of.
 func TestFetchRetriesSamePackWithoutResidue(t *testing.T) {
 	src := newGitRepoForPush(t)
 	c1 := headOfPushRepo(t, src)
@@ -2865,12 +2869,11 @@ func TestFetchSkipsAnIncompletePairWhenUnneeded(t *testing.T) {
 }
 
 // GUARD, not RED: passed immediately against Task 6's code. End-to-end cache
-// degradation: an unusable cacheDir (a file) never fails the fetch, and the
-// trace still shows the sidecars arriving (via temp). Deliberate-regression
-// check: with a temporary stat-and-fatal guard inserted ahead of pruneStale
-// that errors out when cacheDir is not a real directory, this failed on
-// "cache trouble must never be fetch trouble: regression-check: cache dir
-// ... is unusable" — confirming the assertion is live.
+// degradation: an unusable cacheDir (a file) never fails the fetch. Deliberate-
+// regression check: with a temporary stat-and-fatal guard inserted ahead of
+// pruneStale that errors out when cacheDir is not a real directory, this
+// failed on "cache trouble must never be fetch trouble: regression-check:
+// cache dir ... is unusable" — confirming the assertion is live.
 func TestFetchSucceedsWithUnusableCacheDir(t *testing.T) {
 	src := newGitRepoForPush(t)
 	c1 := headOfPushRepo(t, src)
