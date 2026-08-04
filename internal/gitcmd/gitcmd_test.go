@@ -692,3 +692,129 @@ func TestShowIndexRejectsCorruptIndex(t *testing.T) {
 		t.Fatal("ShowIndex must reject a corrupt index")
 	}
 }
+
+// packInto packs exactly the objects listed in objs (newline-separated OIDs)
+// from src into <altDir>/pack, giving the alternate git its own layout.
+func packInto(t *testing.T, src, altDir, objs string) {
+	t.Helper()
+	packDir := filepath.Join(altDir, "pack")
+	if err := os.MkdirAll(packDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PackObjectsFromList(src, "", objs, filepath.Join(packDir, "pack")); err != nil {
+		t.Fatalf("PackObjectsFromList: %v", err)
+	}
+}
+
+// emptyDst creates a repo that genuinely lacks every fixture object.
+func emptyDst(t *testing.T) string {
+	t.Helper()
+	d := t.TempDir()
+	if out, err := exec.Command("git", "-C", d, "init", "-qb", "main").CombinedOutput(); err != nil {
+		t.Fatalf("init: %v: %s", err, out)
+	}
+	return d
+}
+
+// RED (undefined function), then GUARD forever: probe 1 — a missing PARENT
+// commit is reported as missing, not a fatal. This is the loop's normal
+// driving case (pack N+1 holds the new commits, the parent lives in pack N).
+func TestRevListMissingReportsMissingParent(t *testing.T) {
+	src, a, b := twoCommitRepo(t)
+	alt := t.TempDir()
+	// B's closure minus A's = B-only pack, via git's own enumeration.
+	out, err := exec.Command("git", "-C", src, "rev-list", "--objects", b, "^"+a).Output()
+	if err != nil {
+		t.Fatalf("rev-list fixture: %v", err)
+	}
+	packInto(t, src, alt, string(out))
+
+	missing, err := RevListMissing(emptyDst(t), alt, []string{b})
+	if err != nil {
+		t.Fatalf("RevListMissing: %v", err)
+	}
+	found := false
+	for _, oid := range missing {
+		if oid == a {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("missing parent %s not reported; got %v", a, missing)
+	}
+}
+
+// GUARD: probe 2 — a missing TIP is reported, not fatal. This is why the
+// loop needs no special round 0. On a git older than the floor this test
+// fails, which is exactly the signal the minimum-git decision row wants.
+func TestRevListMissingReportsMissingTip(t *testing.T) {
+	_, a, _ := twoCommitRepo(t)
+	missing, err := RevListMissing(emptyDst(t), t.TempDir(), []string{a})
+	if err != nil {
+		t.Fatalf("RevListMissing on a missing tip: %v", err)
+	}
+	if len(missing) != 1 || missing[0] != a {
+		t.Errorf("want exactly [%s], got %v", a, missing)
+	}
+}
+
+// GUARD: probe 3 — a missing TREE conceals the blob beneath it. The frontier
+// deepens round by round; missingness is discovered incrementally.
+func TestRevListMissingFrontierDeepensThroughATree(t *testing.T) {
+	src, _, b := twoCommitRepo(t)
+	alt := t.TempDir()
+	packInto(t, src, alt, b) // ONLY the commit object; its tree and blob absent
+	treeOut, err := exec.Command("git", "-C", src, "rev-parse", b+"^{tree}").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree := strings.TrimSpace(string(treeOut))
+
+	missing, err := RevListMissing(emptyDst(t), alt, []string{b})
+	if err != nil {
+		t.Fatalf("RevListMissing: %v", err)
+	}
+	sawTree := false
+	for _, oid := range missing {
+		if oid == tree {
+			sawTree = true
+		}
+	}
+	if !sawTree {
+		t.Errorf("the missing tree %s must be reported; got %v", tree, missing)
+	}
+	// The blob under the missing tree must NOT be reported yet — git cannot
+	// enumerate entries of a tree it does not have. If this ever starts
+	// failing, the loop still works (it would just converge in fewer rounds);
+	// the GUARD exists so the change is noticed, not silently absorbed.
+	blobOut, err := exec.Command("git", "-C", src, "rev-parse", b+":b.txt").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := strings.TrimSpace(string(blobOut))
+	for _, oid := range missing {
+		if oid == blob {
+			t.Errorf("blob %s beneath the missing tree must not be visible yet", blob)
+		}
+	}
+}
+
+// RED: the parser is normative — first whitespace-delimited token after '?',
+// 40-hex validated, never trimmed-and-trusted. Object lines and blank lines
+// are ignored; a malformed ?-line is a hard error.
+func TestParseMissingOIDs(t *testing.T) {
+	const oid = "e1789a06e5b16e588eb820f292b123243b73fdb7"
+	got, err := parseMissingOIDs("?" + oid + "\n" +
+		oid + " some/path.txt\n" + // object line: ignored
+		"?" + oid + " trailing/path\n" + // defensive: token before any suffix
+		"\n")
+	if err != nil {
+		t.Fatalf("parseMissingOIDs: %v", err)
+	}
+	if len(got) != 1 || got[0] != oid {
+		t.Errorf("want deduplicated [%s], got %v", oid, got)
+	}
+	if _, err := parseMissingOIDs("?nothex\n"); err == nil {
+		t.Error("a malformed ?-line must be a hard error")
+	}
+}

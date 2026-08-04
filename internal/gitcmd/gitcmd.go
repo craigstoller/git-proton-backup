@@ -480,6 +480,55 @@ func IndexPackVerify(packPath string) error {
 	return nil
 }
 
+// RevListMissing returns the OIDs of objects reachable from wants but present
+// neither in gitDir's store nor in altObjects — the missing frontier the
+// selective-fetch loop resolves through the object-to-pack map. Deduplicated;
+// empty means discovery is complete.
+//
+// Requires a git whose `rev-list --missing=print` reports missing tips and
+// parents as ?-lines (the Stage 3b minimum-git floor; probed on 2.53, pinned
+// by this package's tests). On an older git the traversal dies at the first
+// missing tip; the error wrap below names the floor so the failure is a
+// diagnosed refusal rather than git's bare fatal.
+func RevListMissing(gitDir, altObjects string, wants []string) ([]string, error) {
+	if len(wants) == 0 {
+		return nil, nil
+	}
+	out, _, err := revListWithAlt(gitDir, altObjects, wants,
+		"--objects", "--missing=print", "--stdin", "--not", "--all")
+	if err != nil {
+		return nil, fmt.Errorf("%w (note: selective fetch requires a git whose rev-list "+
+			"--missing=print reports absent objects as ?-lines; a git older than that floor "+
+			"dies here with its own 'bad object' error instead)", err)
+	}
+	return parseMissingOIDs(out)
+}
+
+// parseMissingOIDs extracts ?-prefixed OIDs from rev-list --missing=print
+// output. Normative (spec, component 4): the OID is the first whitespace-
+// delimited token after the '?', validated as 40-hex — never assumed
+// path-free, even though the probed git prints bare OIDs — and a ?-line that
+// does not yield one is a hard parse error, never skipped.
+func parseMissingOIDs(out string) ([]string, error) {
+	seen := map[string]bool{}
+	var missing []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		if !strings.HasPrefix(line, "?") {
+			continue
+		}
+		fields := strings.Fields(line[1:])
+		if len(fields) == 0 || !oidRe.MatchString(fields[0]) {
+			return nil, fmt.Errorf("unparseable missing-object line %q from rev-list", line)
+		}
+		if !seen[fields[0]] {
+			seen[fields[0]] = true
+			missing = append(missing, fields[0])
+		}
+	}
+	return missing, nil
+}
+
 // ShowIndex returns every object ID recorded in the pack index at idxPath,
 // via `git show-index` — git's own reader, which speaks index v1 AND v2.
 // That is the parent design's trap closed the way it prescribes: Push
