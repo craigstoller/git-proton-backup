@@ -2052,3 +2052,134 @@ func countInstalledPackFiles(t *testing.T, gitDir string) int {
 	}
 	return n
 }
+
+func TestResolveIdxCacheDirCreatesUnderCommonDir(t *testing.T) {
+	d := emptyGitRepo(t)
+	dir, err := ResolveIdxCacheDir(d, "/my-files/GitRemotes/demo")
+	if err != nil {
+		t.Fatalf("ResolveIdxCacheDir: %v", err)
+	}
+	if !filepath.IsAbs(dir) {
+		t.Errorf("cache dir must be absolute, got %s", dir)
+	}
+	// Under <repo>/.git/proton-v2/idx-cache/<key>: the common dir resolved
+	// through git, not assumed.
+	wantPrefix := filepath.Join(d, ".git", "proton-v2", "idx-cache")
+	if !strings.HasPrefix(dir, wantPrefix) {
+		t.Errorf("cache dir %s not under %s", dir, wantPrefix)
+	}
+	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+		t.Errorf("cache dir must exist as a directory: %v", err)
+	}
+	// The breadcrumb records the plain remote path for humans.
+	b, err := os.ReadFile(filepath.Join(dir, "remote"))
+	if err != nil || !strings.Contains(string(b), "/my-files/GitRemotes/demo") {
+		t.Errorf("breadcrumb missing or wrong: %q, %v", b, err)
+	}
+	// Two different remotes must get two different keys.
+	dir2, err := ResolveIdxCacheDir(d, "/my-files/GitRemotes/other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dir2 == dir {
+		t.Error("distinct remote roots must map to distinct cache dirs")
+	}
+}
+
+func TestEnsureSidecarDownloadsOnceThenHits(t *testing.T) {
+	f := transport.NewFake()
+	f.Files["/r/packs/pack-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.idx"] = []byte("idx-bytes")
+	cache, fallback := t.TempDir(), t.TempDir()
+	stem := "pack-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+	p1, cached, err := EnsureSidecar(f, "/r", cache, fallback, stem)
+	if err != nil || cached {
+		t.Fatalf("first call: path=%s cached=%v err=%v; want fresh download", p1, cached, err)
+	}
+	b, err := os.ReadFile(p1)
+	if err != nil || string(b) != "idx-bytes" {
+		t.Fatalf("returned path must hold the sidecar bytes: %q %v", b, err)
+	}
+	// The cache must now hold a copy under the final name.
+	if _, err := os.Stat(filepath.Join(cache, stem+".idx")); err != nil {
+		t.Fatalf("cache install missing: %v", err)
+	}
+	// Second call: a hit, no download. Delete the remote copy to prove it.
+	delete(f.Files, "/r/packs/"+stem+".idx")
+	p2, cached, err := EnsureSidecar(f, "/r", cache, fallback, stem)
+	if err != nil || !cached {
+		t.Fatalf("second call must hit the cache: cached=%v err=%v", cached, err)
+	}
+	if b, err := os.ReadFile(p2); err != nil || string(b) != "idx-bytes" {
+		t.Fatalf("cache hit returned wrong bytes: %q %v", b, err)
+	}
+}
+
+// Cache trouble must never become fetch trouble: with an unusable cacheDir
+// (a PATH THAT IS A FILE, cross-platform-reliably unusable), the sidecar
+// still arrives via fallbackDir.
+func TestEnsureSidecarDegradesWhenCacheUnusable(t *testing.T) {
+	f := transport.NewFake()
+	stem := "pack-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	f.Files["/r/packs/"+stem+".idx"] = []byte("idx2")
+	notADir := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(notADir, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, cached, err := EnsureSidecar(f, "/r", notADir, t.TempDir(), stem)
+	if err != nil || cached {
+		t.Fatalf("degraded call: %v", err)
+	}
+	if b, _ := os.ReadFile(p); string(b) != "idx2" {
+		t.Errorf("fallback copy wrong: %q", b)
+	}
+}
+
+// RefreshSidecar must return FRESH bytes even when a stale cached copy and a
+// stale fallback copy both exist (the residue rule applies to sidecars too:
+// ReadTo's overwrite behaviour is unpinned, so stale files are deleted first).
+func TestRefreshSidecarReplacesStaleCopies(t *testing.T) {
+	f := transport.NewFake()
+	stem := "pack-cccccccccccccccccccccccccccccccccccccccc"
+	f.Files["/r/packs/"+stem+".idx"] = []byte("fresh")
+	cache, fallback := t.TempDir(), t.TempDir()
+	for _, d := range []string{cache, fallback} {
+		if err := os.WriteFile(filepath.Join(d, stem+".idx"), []byte("stale"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p, err := RefreshSidecar(f, "/r", cache, fallback, stem)
+	if err != nil {
+		t.Fatalf("RefreshSidecar: %v", err)
+	}
+	if b, _ := os.ReadFile(p); string(b) != "fresh" {
+		t.Errorf("refresh returned %q, want fresh bytes", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(cache, stem+".idx")); string(b) != "fresh" {
+		t.Errorf("cache still holds %q after refresh", b)
+	}
+}
+
+func TestPruneStaleRemovesOnlyVanishedStems(t *testing.T) {
+	cache := t.TempDir()
+	keepStem := "pack-dddddddddddddddddddddddddddddddddddddddd"
+	goneStem := "pack-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	for _, n := range []string{keepStem + ".idx", goneStem + ".idx", ".tmp-123", "remote"} {
+		if err := os.WriteFile(filepath.Join(cache, n), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pruneStale(cache, map[string]bool{keepStem: true})
+	if _, err := os.Stat(filepath.Join(cache, keepStem+".idx")); err != nil {
+		t.Error("kept stem was pruned")
+	}
+	if _, err := os.Stat(filepath.Join(cache, goneStem+".idx")); !os.IsNotExist(err) {
+		t.Error("vanished stem survived pruning")
+	}
+	if _, err := os.Stat(filepath.Join(cache, ".tmp-123")); !os.IsNotExist(err) {
+		t.Error("staging leftover survived pruning")
+	}
+	if _, err := os.Stat(filepath.Join(cache, "remote")); err != nil {
+		t.Error("the breadcrumb must never be pruned")
+	}
+}
