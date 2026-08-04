@@ -307,3 +307,347 @@ state the assertion as "no *active* nodes beyond the pre-run set".
 of 3 with `create-folder tags … already exists`, so the 3-pack precondition was never
 established and Steps 3–6 — including the stage's entire selectivity proof — did not run. Cleanup
 completed; the account is back to its pre-run active state.
+
+---
+
+# Run 2
+
+**Verdict: GATE PASSED.** All seven steps executed and passed. The stage's selectivity claim is
+now **measured**, not assumed.
+
+- **Date:** 2026-08-04, 15:11–15:38 UTC
+- **Repo HEAD:** `8be5845` — **changed from run 1's `dfad74b`**, but the only commit in between is
+  `gate(v2): stage3b gate run 1 - BLOCKED on live EnsureDir/Stat staleness`, which touches
+  `docs/research/gates/stage3b-gate.md` alone (`git diff --stat dfad74b..HEAD` = 1 file, +309).
+  **No helper or transport code changed between runs**, so run 2 exercises the identical binary
+  logic and isolates the one variable the controller changed: the emptied trash.
+- **Precondition set by the controller:** Craig emptied the Proton trash entirely between runs, to
+  test the trashed-homonym hypothesis (probe C17: trashed nodes sharing names with live paths may
+  break path resolution).
+- **Demo name:** `stage3b-gate-r2` (fresh, per instruction)
+- **CLI / git:** unchanged — `cli-drive@0.7.0+5174900c`, `git version 2.53.0.windows.2`
+- **Procedure change from run 1:** every push was its own shell invocation with its exit code
+  recorded before the next command ran. Run 1's disclosed batching deviation did not recur.
+
+## Run 2 — Step 1: Pre-run listing, parent provisioning, contract table
+
+### 1.1 Fresh pre-run `/my-files` listing (run 2's cleanup contract)
+
+```
+proton-drive filesystem list /my-files --json
+```
+
+Four rows, **none carrying `trashTime`** — confirming the trash was emptied:
+
+| name | uid | creationTime |
+| --- | --- | --- |
+| `Project Repo Bundles` | `…~5QY-B6t9Eui6VKsXvJPmuA` | 2026-06-22T16:25:42.000Z |
+| `ChatGPT Export Text Backup` | `…~ThDi8B_92zkL76UXhjqFng` | 2026-05-18T02:36:23.000Z |
+| `GitBackups` | `…~Vho9hzKVaqnBLf7UnwC64w` | 2026-07-21T00:29:59.000Z |
+| `Sensitive Project Sources` | `…~n94X-kyGohebE_FBtxA5Sg` | 2026-05-22T15:12:18.000Z |
+
+Run 1's two trashed rows (`_cas-probe`, `GitRemotes`) are **gone from the listing entirely**, not
+merely flagged — the empty-trash was a permanent delete of those nodes.
+
+### 1.2 / 1.3 Parent probes and provisioning
+
+```
+proton-drive filesystem list /my-files/_cas-probe --json
+Node not found: _cas-probe
+EXIT=1
+
+proton-drive filesystem list /my-files/GitRemotes --json
+Node not found: GitRemotes
+EXIT=1
+```
+
+Both ABSENT again. Recorded:
+
+- **gate created `_cas-probe`** — uid `…~yzxv1W0vPJuYL0Wu_dYXKA`, creationTime `2026-08-04T15:11:49.328Z`
+- **gate created `GitRemotes`** — uid `…~IkPH9Xzj_QCEvxF3MFAd8g`, creationTime `2026-08-04T15:11:51.800Z`
+- **`contract` ABSENT pre-run** → gate-owned, cleaned in Step 7.
+
+Both uids differ from run 1's (`…~YalEhSrh8oFX0lUofsYmew`, `…~CdcWtrrSjXX_3vECaeciuQ`), independently
+confirming run 1's nodes were permanently removed rather than restored.
+
+### 1.4 Contract table — **PASS** (with a caching incident, disclosed)
+
+The first invocation returned a **cached** result:
+
+```
+ok  	github.com/craigstoller/git-proton-backup/internal/transport	(cached)
+```
+
+Go replayed run 1's output verbatim — identical per-scenario timings down to the centisecond
+(`TestContractCLI (269.12s)`). **A cached result is not evidence that the live half ran**, which is
+precisely what run 2 needed to establish given the account state had changed. The run was
+therefore re-issued with `-count=1` to defeat the cache. This is a procedural correction to make
+the step actually execute, not a patch, a retry past a surprise, or a change to any code or
+assertion.
+
+```
+$env:GPB_LIVE_ACCOUNT = "1"; go test ./internal/transport/ -run 'TestContract' -count=1 -v
+```
+
+```
+--- PASS: TestContractFake (0.10s)
+    --- PASS: TestContractFake/stat_absence_is_not_an_error (0.00s)
+    --- PASS: TestContractFake/create_refuses_a_local_basename_that_mismatches_the_target_leaf_(C11) (0.00s)
+    --- PASS: TestContractFake/create_lands_at_the_target_leaf_when_basenames_agree (0.02s)
+    --- PASS: TestContractFake/create_refuses_a_name_already_taken (0.02s)
+    --- PASS: TestContractFake/readTo_lands_under_the_remote_basename_in_an_existing_dir (0.03s)
+    --- PASS: TestContractFake/readTo_into_a_missing_directory_errors_and_creates_nothing (0.01s)
+    --- PASS: TestContractFake/trash_on_a_missing_target_is_committed (0.00s)
+    --- PASS: TestContractFake/ensureDir_is_idempotent_and_its_result_is_listable (0.00s)
+    --- PASS: TestContractFake/list_of_an_empty_directory_is_empty,_not_an_error (0.00s)
+--- PASS: TestContractCLI (270.99s)
+    --- PASS: TestContractCLI/stat_absence_is_not_an_error (27.75s)
+    --- PASS: TestContractCLI/create_refuses_a_local_basename_that_mismatches_the_target_leaf_(C11) (24.54s)
+    --- PASS: TestContractCLI/create_lands_at_the_target_leaf_when_basenames_agree (31.86s)
+    --- PASS: TestContractCLI/create_refuses_a_name_already_taken (31.64s)
+    --- PASS: TestContractCLI/readTo_lands_under_the_remote_basename_in_an_existing_dir (28.32s)
+    --- PASS: TestContractCLI/readTo_into_a_missing_directory_errors_and_creates_nothing (27.23s)
+    --- PASS: TestContractCLI/trash_on_a_missing_target_is_committed (26.98s)
+    --- PASS: TestContractCLI/ensureDir_is_idempotent_and_its_result_is_listable (39.28s)
+    --- PASS: TestContractCLI/list_of_an_empty_directory_is_empty,_not_an_error (33.40s)
+PASS
+ok  	github.com/craigstoller/git-proton-backup/internal/transport	271.995s
+EXIT=0
+```
+
+Fresh, distinct timings confirm a genuine live execution. **Assertion — both tests ran live,
+neither skipped, both PASS: PASS.**
+
+**Lesson for the runbook:** the gate command as written in the brief is cache-vulnerable. It
+should carry `-count=1` so a live gate can never be satisfied by a replayed result.
+
+## Run 2 — Step 2: Build, PATH, demo repo, three isolated pushes — **PASS**
+
+```
+go build -o "$env:TEMP\gpb-gate\bin\git-remote-proton.exe" ./cmd/git-remote-proton
+BUILD_EXIT=0
+RESOLVED=C:\Users\craig\AppData\Local\Temp\gpb-gate\bin\git-remote-proton.exe
+```
+
+Source repo `%TEMP%\gpb-gate\src-r2`, `git init -b main`, local `user.name`/`user.email` set,
+remote `proton-v2` → `proton::/my-files/GitRemotes/stage3b-gate-r2`.
+
+| # | commit | invocation | exit |
+| --- | --- | --- | --- |
+| push 1 | `ad4bae3` c1 | its own | **0** |
+| push 2 | `318ee89` c2 | its own | **0** |
+| push 3 | `510e12a` c3 | its own | **0** |
+
+**Push 2 — run 1's exact failure point — succeeded.**
+
+```
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/gpb-remote.json (42 bytes)
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/.lock (115 bytes)
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/refs/heads/main (41 bytes)
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/refs/heads/main (41 bytes)
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/refs/heads/main (41 bytes)
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/HEAD (21 bytes)
+To proton::/my-files/GitRemotes/stage3b-gate-r2
+   ad4bae3..318ee89  main -> main
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/.lock (115 bytes)
+PUSH2_EXIT=0
+```
+
+**The run-1 signature (`ensure dir …/refs/tags: create-folder tags … already exists`) did NOT
+recur.** No `EnsureDir` error appeared at any point in run 2, across four pushes. The one changed
+variable was the emptied trash; the helper code was byte-identical. This is consistent with the
+trashed-homonym hypothesis, though a single non-recurrence is corroboration, not proof — the
+controller should weigh it as such.
+
+**Assertion — the remote holds 3 packs from 3 pushes: PASS.**
+
+## Run 2 — Step 3: Remote shape via the CLI (read-only) — **PASS**
+
+```
+proton-drive filesystem list /my-files/GitRemotes/stage3b-gate-r2/packs --json
+```
+
+Exactly **3 `.pack` + 3 `.idx`**, no trashed rows, every stem matching `pack-[0-9a-f]{40}`:
+
+| name | created | claimedSize |
+| --- | --- | --- |
+| `pack-5d337b0ffe7a30d1ce7ccdcd0e908f3a11f2d7c2.pack` | 15:21:27Z | 221 |
+| `pack-5d337b0ffe7a30d1ce7ccdcd0e908f3a11f2d7c2.idx`  | 15:21:35Z | 1156 |
+| `pack-c49f015bf30d53ebb16c85154b72de7f3dabb868.pack` | 15:23:52Z | 277 |
+| `pack-c49f015bf30d53ebb16c85154b72de7f3dabb868.idx`  | 15:24:01Z | 1156 |
+| `pack-72d0e186b0f632e414ab731dce531e8ec5767eb6.pack` | 15:26:17Z | 305 |
+| `pack-72d0e186b0f632e414ab731dce531e8ec5767eb6.idx`  | 15:26:26Z | 1156 |
+
+## Run 2 — Step 4: Fresh clone, stderr captured — **PASS**
+
+```
+git clone -o proton-v2 "proton::/my-files/GitRemotes/stage3b-gate-r2" clone-r2 2> clone-stderr.txt
+CLONE_EXIT=0
+```
+
+Full stderr:
+
+```
+Cloning into 'clone-r2'...
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/gpb-remote.json (42 bytes)
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/refs/heads/main (41 bytes)
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/HEAD (21 bytes)
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/gpb-remote.json (42 bytes)
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/packs/pack-5d337b0ffe7a30d1ce7ccdcd0e908f3a11f2d7c2.idx (1156 bytes)
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/packs/pack-72d0e186b0f632e414ab731dce531e8ec5767eb6.idx (1156 bytes)
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/packs/pack-c49f015bf30d53ebb16c85154b72de7f3dabb868.idx (1156 bytes)
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/packs/pack-72d0e186b0f632e414ab731dce531e8ec5767eb6.pack (305 bytes)
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/packs/pack-5d337b0ffe7a30d1ce7ccdcd0e908f3a11f2d7c2.pack (221 bytes)
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/packs/pack-c49f015bf30d53ebb16c85154b72de7f3dabb868.pack (277 bytes)
+```
+
+**`/packs/`-scoped download set: exactly 3 `.idx` + 3 `.pack` — PASS.**
+
+Checkout and integrity:
+
+```
+git rev-parse --abbrev-ref HEAD   → main
+git log --oneline -3              → 510e12a c3 / 318ee89 c2 / ad4bae3 c1
+git status --porcelain            → (empty)
+git fsck                          → no output, FSCK_EXIT=0
+```
+
+Cache shape — `clone-r2/.git/proton-v2/idx-cache/fc9e8e56e13d22f2/`:
+
+```
+pack-5d337b0ffe7a30d1ce7ccdcd0e908f3a11f2d7c2.idx
+pack-72d0e186b0f632e414ab731dce531e8ec5767eb6.idx
+pack-c49f015bf30d53ebb16c85154b72de7f3dabb868.idx
+remote
+```
+
+**3 `.idx` + the `remote` breadcrumb — PASS.** Everything Stage 3a's gate proved is preserved.
+
+## Run 2 — Step 5: Incremental fetch downloads exactly the new pair — **PASS (the selectivity proof)**
+
+Source repo: commit `6c23229` c4, then `git push proton-v2 main` in its own invocation → `PUSH4_EXIT=0`.
+Remote now holds 4 packs (8 files); the new stem is **`pack-38e592fbd2e4aac1028f2ac7b73e608dc09d145f`**
+(`.pack` 15:30:36Z, `.idx` 15:30:43Z).
+
+```
+git fetch proton-v2 2> fetch-stderr.txt
+FETCH_EXIT=0
+```
+
+Full stderr:
+
+```
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/gpb-remote.json (42 bytes)
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/refs/heads/main (41 bytes)
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/HEAD (21 bytes)
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/gpb-remote.json (42 bytes)
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/packs/pack-38e592fbd2e4aac1028f2ac7b73e608dc09d145f.idx (1156 bytes)
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/packs/pack-38e592fbd2e4aac1028f2ac7b73e608dc09d145f.pack (328 bytes)
+```
+
+**`/packs/`-scoped download set: exactly `pack-38e592fb….idx` and `pack-38e592fb….pack` — the new
+stem, and nothing else. PASS.** The three pre-existing packs were not re-downloaded; their `.idx`
+files were served from the cache. **This is the stage's selectivity claim, measured against the
+real account.**
+
+```
+git log --oneline -4 proton-v2/main  → 6c23229 c4 / 510e12a c3 / 318ee89 c2 / ad4bae3 c1
+git fsck                             → no output, FSCK_EXIT=0
+```
+
+Cache after the fetch — 4 `.idx` + `remote`, the new stem added in place:
+
+```
+pack-38e592fbd2e4aac1028f2ac7b73e608dc09d145f.idx
+pack-5d337b0ffe7a30d1ce7ccdcd0e908f3a11f2d7c2.idx
+pack-72d0e186b0f632e414ab731dce531e8ec5767eb6.idx
+pack-c49f015bf30d53ebb16c85154b72de7f3dabb868.idx
+remote
+```
+
+## Run 2 — Step 6: Up-to-date re-fetch downloads nothing from `packs/` — **PASS**
+
+```
+git fetch proton-v2 2> refetch-stderr.txt
+REFETCH_EXIT=0
+```
+
+Full stderr:
+
+```
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/gpb-remote.json (42 bytes)
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/refs/heads/main (41 bytes)
+gpb: downloaded /my-files/GitRemotes/stage3b-gate-r2/HEAD (21 bytes)
+```
+
+**`/packs/`-scoped download count: 0 — PASS.** The three remaining lines are ref/marker reads,
+legitimate and excluded per the spec's gate scoping.
+
+## Run 2 — Step 7: Cleanup — **PASS**
+
+Verify-before-trashing at every step; exact paths, no wildcards. Verified contents immediately
+before trashing:
+
+```
+/my-files/GitRemotes                   → stage3b-gate-r2 [folder]            (only this gate's repo)
+/my-files/GitRemotes/stage3b-gate-r2   → gpb-remote.json, refs, packs, HEAD  (only gate artifacts)
+/my-files/_cas-probe                   → contract [folder]                   (gate-owned, absent pre-run)
+/my-files/_cas-probe/contract          → (empty)
+```
+
+```
+proton-drive filesystem trash /my-files/GitRemotes/stage3b-gate-r2  → ✅ stage3b-gate-r2   EXIT=0
+proton-drive filesystem trash /my-files/GitRemotes                  → ✅ GitRemotes        EXIT=0
+proton-drive filesystem trash /my-files/_cas-probe/contract         → ✅ contract          EXIT=0
+proton-drive filesystem trash /my-files/_cas-probe                  → ✅ _cas-probe        EXIT=0
+```
+
+### Final assertion — post-cleanup vs the run-2 pre-run listing
+
+```
+ROWS=4
+  Project Repo Bundles
+  ChatGPT Export Text Backup
+  GitBackups
+  Sensitive Project Sources
+```
+
+Active-uid comparison:
+
+```
+PRE_UIDS         = …~5QY-B6t9Eui6VKsXvJPmuA, …~n94X-kyGohebE_FBtxA5Sg, …~ThDi8B_92zkL76UXhjqFng, …~Vho9hzKVaqnBLf7UnwC64w
+POST_ACTIVE_UIDS = …~5QY-B6t9Eui6VKsXvJPmuA, …~n94X-kyGohebE_FBtxA5Sg, …~ThDi8B_92zkL76UXhjqFng, …~Vho9hzKVaqnBLf7UnwC64w
+MATCH=True
+```
+
+**Assertion — post-cleanup listing matches the pre-run listing exactly: PASS.** Unlike run 1, the
+listing contains **zero `trashTime` rows** — the four gate-created nodes do not appear at all. A
+confirming re-list returned the same four rows, so this is stable, not listing lag. Run 1's
+"trashed nodes linger in `list`" observation therefore does not reproduce here; with a
+freshly-emptied trash the pre/post comparison holds literally, as the brief intended.
+
+The four standing folders are byte-identical to the pre-run capture — same uids, same creation
+times, no `trashTime`, nothing added or altered. `GitBackups`, `Sensitive Project Sources`,
+`Project Repo Bundles` and `ChatGPT Export Text Backup` were never named as a target in any
+command.
+
+## Run 2 — Verdict
+
+**GATE PASSED.** Steps 1–7 all pass. The two run-1 blockers are resolved: push 2 succeeded with no
+`EnsureDir` error (the only changed variable being the emptied trash), and the selectivity proof
+was measured end to end —
+
+- **clone:** 3 `.idx` + 3 `.pack` from `/packs/`
+- **incremental fetch:** exactly the one new pair, `pack-38e592fb….idx` + `.pack`
+- **up-to-date re-fetch:** 0 downloads from `/packs/`
+
+with `git fsck` clean at every checkpoint and the account restored exactly to its pre-run state.
+
+Two follow-ups for the controller, neither blocking:
+
+1. **The gate command needs `-count=1`.** Run 2's first invocation was served from Go's test cache
+   and replayed run 1's output verbatim — a live gate that can be satisfied by a cached result is
+   a false-green vector. Task 8's brief should be amended.
+2. **The homonym hypothesis is corroborated, not proven.** One non-recurrence across four pushes
+   with byte-identical code is strong but single-trial evidence. If the mechanism matters for the
+   design record, it deserves a dedicated probe rather than inference from this gate.
