@@ -12,6 +12,14 @@ import (
 	"github.com/craigstoller/git-proton-backup/internal/transport"
 )
 
+// Fetch downloads every pack from the remote, verifies each, confirms the
+// closure covers wants, and installs it as ONE pack with an adjacent .keep.
+// It returns that .keep's path for the caller's `lock` response, or "" when
+// the local repository already had everything.
+//
+// It is READ-ONLY on the remote: no Bootstrap, no lock, nothing created. A
+// fetch must never be able to bring a repository into existence.
+//
 // Fetch signature gains cacheDir: "" means no persistent sidecar cache
 // (every sidecar lives in this run's temp dir). Everything below the
 // discovery loop — verify-before-install, consolidation, the single .keep —
@@ -53,6 +61,9 @@ func Fetch(t transport.Transport, root, gitDir, cacheDir string, wants []string)
 		return "", err
 	}
 	defer os.RemoveAll(tmp)
+
+	// git only finds packs in an alternate at <objects>/pack/. Flat, they are
+	// silently invisible and every object reads as missing.
 	altObjects := filepath.Join(tmp, "objects")
 	packDir := filepath.Join(altObjects, "pack")
 	fallbackDir := filepath.Join(tmp, "idx")
