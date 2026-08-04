@@ -1741,6 +1741,14 @@ Expected, precisely: compile errors first (undefined helpers; any old-signature 
 
 Delete `downloadAllPacks` and `verifyDownloadedPacks` (their invariants move into the loop). Keep `Fetch`'s head (marker check, empty-wants, presence short-circuit), tail (`ConnectivityOK`, `RevListNewObjects`, `consolidateAndInstall`), and every comment they carry. The new middle:
 
+> **SUPERSEDED (Task 6 review, F1):** the comment block below REPLACED Fetch's
+> godoc as written, losing the read-only invariant ("READ-ONLY on the remote: no
+> Bootstrap, no lock... must never be able to bring a repository into existence"),
+> the return-value description, and the `<objects>/pack/` layout comment at the
+> packDir site. Those paragraphs (recoverable via `git show e0bdff9:internal/repo/fetch.go`)
+> must be KEPT alongside the new note, not replaced by it. Fixed in the Task 6
+> fix round; a re-run must not reintroduce the deletion.
+
 ```go
 // Fetch signature gains cacheDir: "" means no persistent sidecar cache
 // (every sidecar lives in this run's temp dir). Everything below the
