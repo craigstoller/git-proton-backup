@@ -1,7 +1,9 @@
 package repo
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,11 +20,11 @@ import (
 // It is READ-ONLY on the remote: no Bootstrap, no lock, nothing created. A
 // fetch must never be able to bring a repository into existence.
 //
-// Stage 3a downloads every pack rather than discovering which are needed.
-// That is correct by construction — every pack this helper writes is
-// --no-thin and self-contained, so their union is a superset of any closure.
-// Selective discovery is Stage 3b.
-func Fetch(t transport.Transport, root, gitDir string, wants []string) (string, error) {
+// Fetch signature gains cacheDir: "" means no persistent sidecar cache
+// (every sidecar lives in this run's temp dir). Everything below the
+// discovery loop — verify-before-install, consolidation, the single .keep —
+// is Stage 3a's code, untouched.
+func Fetch(t transport.Transport, root, gitDir, cacheDir string, wants []string) (string, error) {
 	if err := RequireMarker(t, root); err != nil {
 		return "", err
 	}
@@ -64,15 +66,106 @@ func Fetch(t transport.Transport, root, gitDir string, wants []string) (string, 
 	// silently invisible and every object reads as missing.
 	altObjects := filepath.Join(tmp, "objects")
 	packDir := filepath.Join(altObjects, "pack")
-	if err := os.MkdirAll(packDir, 0o700); err != nil {
+	fallbackDir := filepath.Join(tmp, "idx")
+	for _, d := range []string{packDir, fallbackDir} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			return "", err
+		}
+	}
+
+	stems, err := listCompletePacks(t, root)
+	if err != nil {
+		return "", err
+	}
+	// A marked repo always has at least one pack (a ref cannot be published
+	// without one), so an empty listing means the remote is incomplete — and
+	// reaching this line means the local store lacks wanted objects, so
+	// "up to date" would be a lie. Same invariant as 3a's downloadAllPacks.
+	if len(stems) == 0 {
+		return "", fmt.Errorf("%s/packs holds no complete pack pairs; the remote is incomplete", root)
+	}
+	pruneStale(cacheDir, stemSet(stems))
+	pm, err := buildPackMap(t, root, cacheDir, fallbackDir, stems)
+	if err != nil {
 		return "", err
 	}
 
-	if err := downloadAllPacks(t, root, packDir); err != nil {
-		return "", err
+	downloaded := map[string]bool{}
+	healed := false
+	// heal is the ONE self-heal round: fresh listing, fresh sidecars, whole
+	// map rebuilt — after it, every terminal diagnosis rests on metadata
+	// downloaded this run. The round restarts automatically because all
+	// planning happens at the loop top.
+	heal := func() error {
+		var herr error
+		if stems, herr = listCompletePacks(t, root); herr != nil {
+			return herr
+		}
+		if len(stems) == 0 {
+			return fmt.Errorf("%s/packs holds no complete pack pairs; the remote is incomplete", root)
+		}
+		pm, herr = refreshPackMap(t, root, cacheDir, fallbackDir, stems)
+		return herr
 	}
-	if err := verifyDownloadedPacks(packDir); err != nil {
-		return "", err
+	// fatalAfterHeal composes the terminal message once the one self-heal
+	// round has already run. errCacheSuspect's own sentence ("this can be
+	// caused by a stale or corrupt sidecar cache") would otherwise survive
+	// into this message via %w's %v-equivalent text and sit right next to the
+	// claim that follows, self-negating: "...caused by a stale cache...
+	// ...this indicates genuine remote trouble, not a stale cache." Stripping
+	// that sentence (and the separator that joins it to the rest of err's
+	// text) before appending the post-heal explanation keeps the message
+	// internally consistent. errors.Is(err, errCacheSuspect) compatibility is
+	// deliberately not preserved here — nothing downstream inspects this
+	// composed error; it is only ever returned to the caller of Fetch.
+	fatalAfterHeal := func(err error) error {
+		msg := err.Error()
+		msg = strings.TrimSuffix(msg, ": "+errCacheSuspect.Error())
+		return fmt.Errorf("%s (the sidecar metadata was already refreshed from the remote "+
+			"this run; this indicates genuine remote or transport trouble)", msg)
+	}
+
+	for {
+		missing, err := gitcmd.RevListMissing(gitDir, altObjects, wants)
+		if err != nil {
+			return "", err
+		}
+		if len(missing) == 0 {
+			break // discovery complete
+		}
+		toGet, err := greedyCover(missing, pm.oidPacks, downloaded)
+		if err != nil { // always errCacheSuspect (see greedyCover)
+			if healed {
+				return "", fatalAfterHeal(err)
+			}
+			healed = true
+			if err := heal(); err != nil {
+				return "", err
+			}
+			continue
+		}
+		for _, stem := range toGet {
+			refreshed, err := downloadAndVerifyPack(t, root, packDir, stem, pm)
+			if err != nil {
+				if !errors.Is(err, errCacheSuspect) {
+					return "", err // pair-corrupt fatal, or a non-heal-able failure
+				}
+				if healed {
+					return "", fatalAfterHeal(err)
+				}
+				healed = true
+				if err := heal(); err != nil {
+					return "", err
+				}
+				break // restart the round: the plan predates the rebuild
+			}
+			downloaded[stem] = true
+			if refreshed {
+				// A pair-verify sidecar refresh rebuilt the map mid-round; the
+				// rest of toGet was planned on the old bytes. Restart planning.
+				break
+			}
+		}
 	}
 
 	// BEFORE install. A failure here must leave the local store untouched.
@@ -91,83 +184,105 @@ func Fetch(t transport.Transport, root, gitDir string, wants []string) (string, 
 	return consolidateAndInstall(gitDir, altObjects, objs)
 }
 
-// downloadAllPacks downloads every `.pack` and `.idx` under <root>/packs into
-// packDir. Two rules here are normative, not incidental:
-//
-// EVERY pack, not a selected subset. Stage 3a does no discovery: each pack
-// this helper writes is --no-thin and self-contained, so the union of all of
-// them is a superset of any closure, and taking the union is correct by
-// construction. Selective download (Stage 3b) requires the object-to-pack map
-// built from the `.idx` sidecars, which does not exist yet — a subset chosen
-// on any weaker basis could omit a delta base and produce an install that
-// verifies locally and is unusable later.
-//
-// An EMPTY packs/ is fatal, never an empty success. A marked repo always has
-// at least one pack (a ref cannot be published without one), so no packs means
-// the remote is incomplete or was tampered with — and reporting that as a
-// successful download of nothing would let the connectivity check downstream
-// pass or fail on an object store the remote never actually provided.
-// Directories and any other file type are skipped rather than refused: packs/
-// is the helper's own namespace, but a stray node there is not evidence the
-// packs are wrong.
-func downloadAllPacks(t transport.Transport, root, packDir string) error {
-	nodes, err := t.List(root + "/packs")
-	if err != nil {
-		return fmt.Errorf("cannot list %s/packs: %w", root, err)
+func stemSet(stems []string) map[string]bool {
+	m := make(map[string]bool, len(stems))
+	for _, s := range stems {
+		m[s] = true
 	}
-	got := 0
-	for _, n := range nodes {
-		if n.IsDir || !(strings.HasSuffix(n.Name, ".pack") || strings.HasSuffix(n.Name, ".idx")) {
-			continue
-		}
-		if err := t.ReadTo(root+"/packs/"+n.Name, packDir); err != nil {
-			return fmt.Errorf("cannot download %s: %w", n.Name, err)
-		}
-		if strings.HasSuffix(n.Name, ".pack") {
-			got++
-		}
-	}
-	if got == 0 {
-		return fmt.Errorf("%s/packs holds no packs; the remote is incomplete", root)
-	}
-	return nil
+	return m
 }
 
-// verifyDownloadedPacks checks each pair PER MEMBER. Only the .pack is
-// checksummed against its basename — a .idx borrows the pack's name, so
-// hashing the index and comparing it to that name could never pass. The pair
-// is validated by index-pack --verify instead. Same asymmetry as the push
-// side's publishPack/publishIdx.
-func verifyDownloadedPacks(packDir string) error {
-	entries, err := os.ReadDir(packDir)
+// downloadAndVerifyPack downloads one pack, checksums it against its own
+// basename (the .pack ALONE — the .idx borrows the pack's name, so that
+// comparison could never pass), lays the sidecar beside it (git discovers
+// packs in an alternate only via the .idx), and runs pair verification.
+//
+// refreshed reports that the sidecar was re-downloaded and the map rebuilt —
+// the caller must restart its round planning.
+//
+// RESIDUE RULE (spec, round 3): every failure path deletes what it wrote
+// before returning. ReadTo's behaviour onto an existing file is deliberately
+// unpinned (C2's identical-content skip makes reuse of stale bytes a real
+// hazard), and a healed plan may legitimately re-select this same pack, so
+// retry correctness must never depend on overwrite semantics. The remove
+// BEFORE downloading covers residue from an attempt this process lost track
+// of; the removes on each failure path cover this attempt's own leavings.
+func downloadAndVerifyPack(t transport.Transport, root, packDir, stem string, pm *packMap) (bool, error) {
+	packName := stem + ".pack"
+	packPath := filepath.Join(packDir, packName)
+	if err := os.Remove(packPath); err != nil && !os.IsNotExist(err) {
+		return false, err
+	}
+	if err := t.ReadTo(root+"/packs/"+packName, packDir); err != nil {
+		_ = os.Remove(packPath)
+		return false, fmt.Errorf("cannot download %s: %v — a truthful map might never have "+
+			"selected this pack: %w", packName, err, errCacheSuspect)
+	}
+	got, err := packContentChecksum(packPath)
+	if err != nil {
+		_ = os.Remove(packPath)
+		return false, fmt.Errorf("cannot checksum downloaded pack %s: %v: %w",
+			packName, err, errCacheSuspect)
+	}
+	if want := packNameChecksum(packName); got != want {
+		_ = os.Remove(packPath)
+		return false, fmt.Errorf("downloaded pack %s recomputes to %s; the name is the "+
+			"content checksum, so this file is not what its name claims: %w",
+			packName, got, errCacheSuspect)
+	}
+	idxPath := filepath.Join(packDir, stem+".idx")
+	if err := copyFile(pm.sidecars[stem], idxPath); err != nil {
+		// The SOURCE here may be a cache path, and an unreadable cached
+		// sidecar is cache-read trouble — heal-able, not fatal (spec: any
+		// cache I/O failure degrades). Wrapping unconditionally is safe: a
+		// genuine temp-dir failure wastes one heal round and then fatals.
+		_ = os.Remove(idxPath)
+		_ = os.Remove(packPath)
+		return false, fmt.Errorf("cannot lay sidecar beside %s: %v: %w",
+			packName, err, errCacheSuspect)
+	}
+	if err := gitcmd.IndexPackVerify(packPath); err == nil {
+		return false, nil
+	}
+	// Pair failed. The pack proved it matches its NAME, not that it is well
+	// formed — so the cached sidecar is the CHEAPER suspect, not the proven
+	// one. One fresh sidecar, map rebuilt, one re-verify.
+	fresh, rerr := RefreshSidecar(t, root, pm.cacheDir, pm.fallbackDir, stem)
+	if rerr != nil {
+		return false, rerr
+	}
+	pm.sidecars[stem] = fresh
+	if err := pm.rebuildFromSidecars(); err != nil {
+		return false, err
+	}
+	if err := os.Remove(idxPath); err != nil && !os.IsNotExist(err) {
+		return false, err
+	}
+	if err := copyFile(fresh, idxPath); err != nil {
+		return false, err
+	}
+	if err := gitcmd.IndexPackVerify(packPath); err != nil {
+		return false, fmt.Errorf("pack pair %s.{pack,idx} fails verification even with a "+
+			"freshly downloaded index; the pair is corrupt, member undetermined: %w", stem, err)
+	}
+	return true, nil
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
-	for _, e := range entries {
-		if !strings.HasSuffix(e.Name(), ".pack") {
-			continue
-		}
-		p := filepath.Join(packDir, e.Name())
-		// The repo package already owns both halves of this check, from the
-		// push side: packContentChecksum(path) (string, error) recomputes the
-		// pack's content hash, and packNameChecksum(base) string extracts the
-		// hash the basename claims. There is no single checkPackChecksum.
-		got, err := packContentChecksum(p)
-		if err != nil {
-			return fmt.Errorf("cannot checksum downloaded pack %s: %w", e.Name(), err)
-		}
-		if want := packNameChecksum(e.Name()); got != want {
-			return fmt.Errorf("downloaded pack %s recomputes to %s; the name is the "+
-				"content checksum, so this file is not what its name claims", e.Name(), got)
-		}
-		if _, err := os.Stat(strings.TrimSuffix(p, ".pack") + ".idx"); err != nil {
-			return fmt.Errorf("downloaded pack %s has no adjacent .idx", e.Name())
-		}
-		if err := gitcmd.IndexPackVerify(p); err != nil {
-			return fmt.Errorf("downloaded pair failed verification: %w", err)
-		}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
 	}
-	return nil
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // consolidateAndInstall builds ONE pack from the new objects and installs it

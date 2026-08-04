@@ -603,3 +603,239 @@ func TestIndexPackVerifyAcceptsGoodPairRejectsCorrupt(t *testing.T) {
 		t.Error("a corrupted pack must not verify")
 	}
 }
+
+// makeIdxFixture builds a tiny repo and packs its full closure, returning the
+// idx path and the object IDs the pack must contain. indexVersion is passed to
+// index-pack when rebuilding the index, so the same fixture pins v1 and v2.
+func makeIdxFixture(t *testing.T, indexVersion string) (idxPath string, oids map[string]bool) {
+	t.Helper()
+	d := t.TempDir()
+	run := func(args ...string) string {
+		out, err := exec.Command("git", append([]string{"-C", d}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	run("init", "-qb", "main")
+	run("config", "user.email", "t@t")
+	run("config", "user.name", "t")
+	if err := os.WriteFile(filepath.Join(d, "f.txt"), []byte("show-index fixture"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "f.txt")
+	run("commit", "-qm", "c")
+	sha := run("rev-parse", "HEAD")
+
+	out := t.TempDir()
+	packPath, gotIdx, err := WritePack(d, sha, nil, out)
+	if err != nil || packPath == "" {
+		t.Fatalf("WritePack: %v", err)
+	}
+	idxPath = gotIdx
+	if indexVersion == "1" {
+		// Rebuild the index as v1: Push deliberately accepts a valid remote v1
+		// .idx it did not write, so the map builder must read it too.
+		if err := os.Remove(idxPath); err != nil {
+			t.Fatal(err)
+		}
+		if o, err := exec.Command("git", "index-pack", "--index-version=1", packPath).CombinedOutput(); err != nil {
+			t.Fatalf("index-pack --index-version=1: %v: %s", err, o)
+		}
+	}
+	oids = map[string]bool{}
+	for _, line := range strings.Split(run("rev-list", "--objects", sha), "\n") {
+		if f := strings.Fields(line); len(f) > 0 {
+			oids[f[0]] = true
+		}
+	}
+	return idxPath, oids
+}
+
+// RED: ShowIndex does not exist. It must return exactly the pack's objects.
+func TestShowIndexReadsV2(t *testing.T) {
+	idx, want := makeIdxFixture(t, "2")
+	got, err := ShowIndex(idx)
+	if err != nil {
+		t.Fatalf("ShowIndex: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("ShowIndex returned %d oids, want %d", len(got), len(want))
+	}
+	for _, oid := range got {
+		if !want[oid] {
+			t.Errorf("unexpected oid %s", oid)
+		}
+	}
+}
+
+// RED (same run as above): the v1 GUARD from the spec — a v2-only reader
+// would accept an index at push time it cannot fetch later.
+func TestShowIndexReadsV1(t *testing.T) {
+	idx, want := makeIdxFixture(t, "1")
+	got, err := ShowIndex(idx)
+	if err != nil {
+		t.Fatalf("ShowIndex on a v1 index: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("ShowIndex returned %d oids from v1, want %d", len(got), len(want))
+	}
+}
+
+// RED: a structurally corrupt index must be an error, never a short answer.
+func TestShowIndexRejectsCorruptIndex(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "pack-0000000000000000000000000000000000000000.idx")
+	if err := os.WriteFile(p, []byte("not an index"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ShowIndex(p); err == nil {
+		t.Fatal("ShowIndex must reject a corrupt index")
+	}
+}
+
+// packInto packs exactly the objects listed in objs (newline-separated OIDs)
+// from src into <altDir>/pack, giving the alternate git its own layout.
+func packInto(t *testing.T, src, altDir, objs string) {
+	t.Helper()
+	packDir := filepath.Join(altDir, "pack")
+	if err := os.MkdirAll(packDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PackObjectsFromList(src, "", objs, filepath.Join(packDir, "pack")); err != nil {
+		t.Fatalf("PackObjectsFromList: %v", err)
+	}
+}
+
+// emptyDst creates a repo that genuinely lacks every fixture object.
+func emptyDst(t *testing.T) string {
+	t.Helper()
+	d := t.TempDir()
+	if out, err := exec.Command("git", "-C", d, "init", "-qb", "main").CombinedOutput(); err != nil {
+		t.Fatalf("init: %v: %s", err, out)
+	}
+	return d
+}
+
+// RED (undefined function), then GUARD forever: probe 1 — a missing PARENT
+// commit is reported as missing, not a fatal. This is the loop's normal
+// driving case (pack N+1 holds the new commits, the parent lives in pack N).
+func TestRevListMissingReportsMissingParent(t *testing.T) {
+	src, a, b := twoCommitRepo(t)
+	alt := t.TempDir()
+	// B's closure minus A's = B-only pack, via git's own enumeration.
+	out, err := exec.Command("git", "-C", src, "rev-list", "--objects", b, "^"+a).Output()
+	if err != nil {
+		t.Fatalf("rev-list fixture: %v", err)
+	}
+	packInto(t, src, alt, string(out))
+
+	missing, err := RevListMissing(emptyDst(t), alt, []string{b})
+	if err != nil {
+		t.Fatalf("RevListMissing: %v", err)
+	}
+	found := false
+	for _, oid := range missing {
+		if oid == a {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("missing parent %s not reported; got %v", a, missing)
+	}
+}
+
+// GUARD: probe 2 — a missing TIP is reported, not fatal. This is why the
+// loop needs no special round 0. On a git older than the floor this test
+// fails, which is exactly the signal the minimum-git decision row wants.
+func TestRevListMissingReportsMissingTip(t *testing.T) {
+	_, a, _ := twoCommitRepo(t)
+	missing, err := RevListMissing(emptyDst(t), t.TempDir(), []string{a})
+	if err != nil {
+		t.Fatalf("RevListMissing on a missing tip: %v", err)
+	}
+	if len(missing) != 1 || missing[0] != a {
+		t.Errorf("want exactly [%s], got %v", a, missing)
+	}
+}
+
+// GUARD: probe 3 — a missing TREE conceals the blob beneath it. The frontier
+// deepens round by round; missingness is discovered incrementally.
+func TestRevListMissingFrontierDeepensThroughATree(t *testing.T) {
+	src, _, b := twoCommitRepo(t)
+	alt := t.TempDir()
+	packInto(t, src, alt, b) // ONLY the commit object; its tree and blob absent
+	treeOut, err := exec.Command("git", "-C", src, "rev-parse", b+"^{tree}").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree := strings.TrimSpace(string(treeOut))
+
+	missing, err := RevListMissing(emptyDst(t), alt, []string{b})
+	if err != nil {
+		t.Fatalf("RevListMissing: %v", err)
+	}
+	sawTree := false
+	for _, oid := range missing {
+		if oid == tree {
+			sawTree = true
+		}
+	}
+	if !sawTree {
+		t.Errorf("the missing tree %s must be reported; got %v", tree, missing)
+	}
+	// The blob under the missing tree must NOT be reported yet — git cannot
+	// enumerate entries of a tree it does not have. If this ever starts
+	// failing, the loop still works (it would just converge in fewer rounds);
+	// the GUARD exists so the change is noticed, not silently absorbed.
+	blobOut, err := exec.Command("git", "-C", src, "rev-parse", b+":b.txt").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := strings.TrimSpace(string(blobOut))
+	for _, oid := range missing {
+		if oid == blob {
+			t.Errorf("blob %s beneath the missing tree must not be visible yet", blob)
+		}
+	}
+}
+
+// GUARD: pins RevListMissing's error-translation wrap — the unconditional
+// %w-wrap that names "--missing=print" and the minimum-git floor whenever the
+// underlying rev-list call itself errors (as opposed to succeeding and
+// reporting ?-lines, which every other RevListMissing test above exercises).
+// A gitDir that is not a git repository at all makes revListWithAlt fail
+// immediately, forcing the wrap branch the rest of this suite never takes.
+func TestRevListMissingWrapsUnderlyingErrorWithFloorText(t *testing.T) {
+	notARepo := t.TempDir() // deliberately never `git init`-ed
+	altObjects := t.TempDir()
+	want := strings.Repeat("a", 40) // syntactically valid, need not exist
+
+	_, err := RevListMissing(notARepo, altObjects, []string{want})
+	if err == nil {
+		t.Fatal("RevListMissing against a non-repo gitDir must return an error")
+	}
+	if !strings.Contains(err.Error(), "--missing=print") {
+		t.Errorf("wrapped error must name --missing=print (the floor-naming text "+
+			"from RevListMissing's wrap): %v", err)
+	}
+}
+
+// RED: the parser is normative — first whitespace-delimited token after '?',
+// 40-hex validated, never trimmed-and-trusted. Object lines and blank lines
+// are ignored; a malformed ?-line is a hard error.
+func TestParseMissingOIDs(t *testing.T) {
+	const oid = "e1789a06e5b16e588eb820f292b123243b73fdb7"
+	got, err := parseMissingOIDs("?" + oid + "\n" +
+		oid + " some/path.txt\n" + // object line: ignored
+		"?" + oid + " trailing/path\n" + // defensive: token before any suffix
+		"\n")
+	if err != nil {
+		t.Fatalf("parseMissingOIDs: %v", err)
+	}
+	if len(got) != 1 || got[0] != oid {
+		t.Errorf("want deduplicated [%s], got %v", oid, got)
+	}
+	if _, err := parseMissingOIDs("?nothex\n"); err == nil {
+		t.Error("a malformed ?-line must be a hard error")
+	}
+}
