@@ -9,7 +9,7 @@
 
 ## Goal
 
-An incremental `git fetch proton-v2` against a remote holding several packs downloads **only the pack(s) it actually needs — measured, not assumed** — with everything 3a's gate proved still passing. "Needs" is greedy, not proven-optimal: the loop downloads no pack that contributes nothing to the current missing frontier, which is the honest form of the claim (exact minimal set cover is not attempted).
+An incremental `git fetch proton-v2` against a remote holding several packs downloads **only the pack(s) it actually needs — measured, not assumed** — with everything 3a's gate proved still passing. "Needs" is greedy, not proven-optimal, and conditional on truthful metadata: with a truthful sidecar cache — the common case — the loop downloads no pack that contributes nothing to the current missing frontier; a lying cache causes at most bounded over-download before the self-heal round rebuilds it, and never a wrong install (the verification chain is unchanged). Exact minimal set cover is not attempted.
 
 3b is a pure optimisation against a live-proven baseline. That framing is load-bearing for debugging: a discovery bug reads as "fetched too little" against known-good behaviour — a comparison, not a mystery.
 
@@ -85,26 +85,34 @@ Everything around it is untouched: marker check, presence short-circuit, `Connec
 ```
 downloaded = {}
 healed = false
-loop:
+round:
     missing = RevListMissing(gitDir, altObjects, wants)
     if missing is empty: break                      # discovery complete
     packs = greedyCover(missing, map)               # forced singles, then most-covering, ties lexicographic
-    if any oid has no candidate, or packs − downloaded is empty:
-        if not healed:                              # the self-heal round, at most once per fetch:
-            healed = true                           #   re-list packs/, discard every cached sidecar for
-            refresh sidecars; rebuild map; continue #   listed packs, re-download fresh, rebuild the map
-        fatal                                       # remote incomplete (no candidate) or no-progress rule
+
+    # CACHE-SUSPECT failures — each heals at most once per fetch, then is fatal:
+    #   an OID in missing has no candidate pack        → heal, else fatal: remote incomplete
+    #   packs − downloaded is empty                    → heal, else fatal: no-progress rule
+    #   a selected pack fails download                 → heal, else fatal: remote/transport trouble
+    #   a selected pack fails checksum-vs-basename     → heal, else fatal: remote corruption
+    # heal = re-list packs/, discard every cached sidecar for listed packs,
+    #        re-download fresh, rebuild the map, RESTART the round
+
     for pack in packs − downloaded:
-        download .pack into tmp/objects/pack/
-        checksum-vs-basename on the .pack           # the .pack ALONE — never the .idx
+        download .pack into tmp/objects/pack/       # failure → heal-or-fatal, above
+        checksum-vs-basename on the .pack           # the .pack ALONE — never the .idx; failure → heal-or-fatal
         copy cached .idx beside it                  # git discovers packs in an alternate via the .idx,
                                                     # so this copy is required for traversal anyway
         index-pack --verify on the pair             # both members local: the only time pair-truth is checkable
         downloaded += pack
+        on pair failure: re-download the sidecar once, rebuild its map entries, re-verify;
+                         still failing → fatal (corrupt pair, member undetermined);
+                         now passing   → RESTART the round (the plan predates the rebuild)
 ```
 
-- **Termination is structural.** Every surviving round downloads at least one pack not previously downloaded; packs are finite; the self-heal round runs at most once; the loop ends.
-- **The self-heal round is what makes the cache-degradation promise true.** Without it, a cached sidecar that parses but lies — a bit-flipped OID entry, a cache-key collision, tampering — turns into a fatal whose message blames the remote ("incomplete") or the mapping ("no progress") when the actual fault is local and user-invisible. One fresh rebuild before either fatal means every terminal diagnosis was reached on sidecars downloaded *this run*: a fatal after healing genuinely indicts the remote. The two fatal messages state that the cache was already refreshed, so neither ever advises cache-clearing as a remedy.
+- **Termination is structural.** Every restart is paid for: the self-heal runs at most once per fetch, and a pair-refresh restart is preceded by a newly downloaded, verified pack, so restarts are bounded by pack count plus one. Between restarts, every surviving round downloads at least one pack not previously downloaded; packs are finite; the loop ends.
+- **The self-heal round is what makes the cache-degradation promise true, and its trigger set is every cache-suspect failure, not just the two fatal diagnoses.** A cached sidecar that parses but lies — a bit-flipped OID entry, a cache-key collision, tampering — can present as "remote incomplete", as "no progress", **or as a download or checksum failure on a pack a truthful map would never have selected**; in each case the actual fault may be local and user-invisible, so each gets one fresh rebuild before its fatal. After healing, every terminal diagnosis was reached on sidecars downloaded *this run*: a fatal then genuinely indicts the remote or the transport. The fatal messages state that the cache was already refreshed, so none ever advises cache-clearing as a remedy.
+- **Any map rebuild restarts the round's planning.** The missing set and the greedy plan are recomputed from the fresh map before any further download — a plan computed from the old bytes may name packs the new map knows are irrelevant. Packs already downloaded and verified are kept (they are genuine, content-addressed data; at worst over-downloaded), only the *plan* is discarded.
 - **Per-pack verification happens inside the loop, before the next `rev-list`** — no object from a pack may be trusted until both checks pass for that pack, and the next round's traversal *reads* those objects.
 - **Pair-failure handling is a heuristic, not a verdict.** Checksum-vs-basename proves the pack matches its *name*, not that it is well-formed — a malformed pack can be self-consistently named. On `index-pack --verify` failure the cached sidecar is merely the *cheaper* suspect: re-download it once, rebuild its map entries, re-verify. A pair that still fails is fatal as a **corrupt pair, member undetermined** — the message names both files and does not pretend to know which is bad.
 - **Resume-safety is presence-based and needs no new code:** `--missing=print` reports objects absent from gitDir ∪ alternate; anything already local is never missing, so an interrupted-then-retried fetch re-downloads only what it still lacks. The mixed-wants case (one want up to date, one behind) also falls out: present wants contribute no missing OIDs and therefore no downloads.
@@ -123,7 +131,8 @@ loop:
 | Cached `.idx` rejected by `show-index` | Discard, re-download once; fresh copy failing is fatal naming the file |
 | Missing OID with no candidate pack | Self-heal round (once): fresh listing, fresh sidecars, rebuilt map; recurring after it is fatal naming the OID — the remote does not hold a closure for the wants |
 | Round resolves only already-downloaded packs | Same self-heal round; recurring after it is fatal (no-progress rule). Both messages state the cache was already refreshed this run |
-| Pair verification fails | Re-download the sidecar once, rebuild its map entries, re-verify; still failing is fatal naming a **corrupt pair, member undetermined** |
+| A selected pack fails download or checksum-vs-basename | Same self-heal round — the selection may rest on a lying cache, and a truthful map might never have touched this pack; recurring after it is fatal as genuine remote or transport trouble |
+| Pair verification fails | Re-download the sidecar once, rebuild its map entries, re-verify; passing resumes with the round's plan recomputed (the old plan predates the rebuild); still failing is fatal naming a **corrupt pair, member undetermined** |
 | Any cache I/O failure (create, write, rename, read) | stderr warning; the affected sidecar(s) live in the run's temp dir; fetch proceeds |
 | Older git: `rev-list` dies at a missing tip | Wrapped, actionable error naming the minimum-git requirement (decisions table); fail-closed at round 0 |
 
@@ -131,7 +140,7 @@ All discovery failures happen **before install** — the 3a posture (a failed fe
 
 ## Testing
 
-**Deterministic — real git on both ends, the Fake in between**, as in 3a. RED tests: the loop fetches a two-pack history from the pack holding only the tip (drives one real iteration); a frontier that deepens through a missing tree (probe 3's shape — the blob is only discoverable after the tree arrives); the no-progress fatal *after* a failed self-heal; the self-heal succeeding (a parseable-but-lying cached sidecar — a bit-flipped OID entry — fixed by the rebuild, fetch completes); map rebuild after a pair-verification sidecar re-download; greedy selection (x in packs {A,B}, y in {B} → downloads B alone); a listed `.pack` without its `.idx` skipped, fetch succeeds when unneeded; grammar-violating listed names never reaching a filesystem join (asserted via the Fake's listing). GUARD tests: `--missing=print` prints missing tips and missing parents on the suite's git; `?`-token extraction and 40-hex validation; `show-index` reads a v1 index (`index-pack --index-version=1` builds the fixture); corrupt-cached-sidecar self-heal; selectivity itself — a fetch needing one of three Fake-hosted packs downloads exactly one, asserted on trace output; cache-write failure degrading to temp with the fetch still succeeding.
+**Deterministic — real git on both ends, the Fake in between**, as in 3a. RED tests: the loop fetches a two-pack history from the pack holding only the tip (drives one real iteration); a frontier that deepens through a missing tree (probe 3's shape — the blob is only discoverable after the tree arrives); the no-progress fatal *after* a failed self-heal; the self-heal succeeding (a parseable-but-lying cached sidecar — a bit-flipped OID entry — fixed by the rebuild, fetch completes); the self-heal reached from a checksum failure (a lying cache selects a pack whose Fake-hosted bytes are corrupt; the healed map routes around it and the fetch completes without that pack); map rebuild after a pair-verification sidecar re-download, with the round's plan recomputed rather than resumed; greedy selection (x in packs {A,B}, y in {B} → downloads B alone); a listed `.pack` without its `.idx` skipped, fetch succeeds when unneeded; grammar-violating listed names never reaching a filesystem join (asserted via the Fake's listing). GUARD tests: `--missing=print` prints missing tips and missing parents on the suite's git; `?`-token extraction and 40-hex validation; `show-index` reads a v1 index (`index-pack --index-version=1` builds the fixture); corrupt-cached-sidecar self-heal; selectivity itself — a fetch needing one of three Fake-hosted packs downloads exactly one, asserted on trace output; cache-write failure degrading to temp with the fetch still succeeding.
 
 **Untestable on the suite's git, recorded rather than pretended:** the older-git missing-tip fatal (the suite's git supports `--missing=print` on tips, so the wrapper's diagnosed-refusal path for that case is exercised only by unit-testing the error translation, not end-to-end).
 
@@ -161,3 +170,5 @@ Hierarchical ref names (own stage); HEAD-update (Stage 4); exact set-cover pack 
 ## Revisions
 
 **Round 1 (2026-08-03, Codex + Gemini):** Applied — self-heal round before the missing-OID and no-progress fatals, and map rebuild on every sidecar refresh (both engines; the cache-can't-fail-the-fetch principle now holds for *wrong* caches, not just absent ones); greedy pack selection replacing lexicographic-first (both engines; hash-ordered names made the old rule effectively random); complete-pairs-only map admission covering the concurrent-push window (both engines); normative pack-name grammar before any filesystem join (Codex); pair-verify fatal reworded to corrupt-pair-member-undetermined (Codex — checksum-vs-basename proves naming, not well-formedness); cache degradation generalised to all cache I/O incl. rename races (Codex); "each fetch prunes" scoped to fetches that enter discovery (Codex); normative `?`-line tokenization with 40-hex validation (Gemini), plus probe 3 pinning missing-tree line shape and the deepening frontier; `--git-common-dir` answer validated like `validateObjectsPackPath` (Gemini); minimum-git behavioural floor with diagnosed refusal (both engines raised the older-git regression); show-index spawn cost recorded as compaction debt (Gemini). Rejected — a permanent fallback to 3a's download-everything path (Codex's highest-impact proposal): a second live code path would mask selectivity regressions behind silent fallback, doubling the maintenance surface to hedge a failure the self-heal round plus diagnosed refusals already convert from opaque to actionable.
+
+**Round 2 (2026-08-03, Codex + Gemini):** Gemini: blockers none. Codex: one major, accepted — the round-1 self-heal was incomplete: it triggered only on the no-candidate and no-progress fatals, so a lying cached index could still fail a fetch by selecting a pack whose download or checksum fails (trouble a truthful map would never touch), and a pair-verify sidecar refresh left the round's already-computed plan resting on the old bytes. Fixed by widening the heal's trigger set to every cache-suspect failure (no-candidate, no-progress, selected-pack download failure, selected-pack checksum failure — each once, then fatal) and by the rule that any map rebuild restarts the round's planning; the Goal's no-noncontributing-pack claim is now explicitly conditional on a truthful cache. Termination argument updated: restarts are bounded by pack count plus one.
