@@ -2183,3 +2183,145 @@ func TestPruneStaleRemovesOnlyVanishedStems(t *testing.T) {
 		t.Error("the breadcrumb must never be pruned")
 	}
 }
+
+// RED: only complete, grammar-valid pairs survive the listing. Names are
+// remote-controlled input; nothing else may ever reach a filesystem join.
+func TestListCompletePacksFiltersGrammarAndPairs(t *testing.T) {
+	f := transport.NewFake()
+	good := "pack-" + strings.Repeat("a", 40)
+	orphanPack := "pack-" + strings.Repeat("b", 40)
+	orphanIdx := "pack-" + strings.Repeat("c", 40)
+	f.Files["/r/packs/"+good+".pack"] = []byte("p")
+	f.Files["/r/packs/"+good+".idx"] = []byte("i")
+	f.Files["/r/packs/"+orphanPack+".pack"] = []byte("p") // no idx: in-flight push, skip
+	f.Files["/r/packs/"+orphanIdx+".idx"] = []byte("i")   // no pack: unrepairable, skip
+	f.Files["/r/packs/pack-NOTHEX.pack"] = []byte("x")    // grammar violation
+	f.Files["/r/packs/stray.txt"] = []byte("x")           // stray node
+	f.Dirs["/r/packs/subdir"] = true                      // directory
+
+	stems, err := listCompletePacks(f, "/r")
+	if err != nil {
+		t.Fatalf("listCompletePacks: %v", err)
+	}
+	if len(stems) != 1 || stems[0] != good {
+		t.Errorf("want exactly [%s], got %v", good, stems)
+	}
+}
+
+// RED: the map is built by git's own reader over cached sidecars.
+func TestBuildPackMapMapsOidsToStems(t *testing.T) {
+	src := newGitRepoForPush(t)
+	sha := headOfPushRepo(t, src)
+	packPath, idxPath, err := gitcmd.WritePack(src, sha, nil, t.TempDir())
+	if err != nil || packPath == "" {
+		t.Fatalf("WritePack: %v", err)
+	}
+	stem := strings.TrimSuffix(filepath.Base(packPath), ".pack")
+	f := transport.NewFake()
+	for _, p := range []string{packPath, idxPath} {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.Files["/r/packs/"+filepath.Base(p)] = b
+	}
+	pm, err := buildPackMap(f, "/r", "", t.TempDir(), []string{stem})
+	if err != nil {
+		t.Fatalf("buildPackMap: %v", err)
+	}
+	packs := pm.oidPacks[sha]
+	if len(packs) != 1 || packs[0] != stem {
+		t.Errorf("commit %s must map to [%s], got %v", sha, stem, packs)
+	}
+}
+
+// RED: a structurally corrupt CACHED sidecar self-heals as a cache miss; the
+// map is built from the re-downloaded truth.
+func TestBuildPackMapHealsACorruptCachedSidecar(t *testing.T) {
+	src := newGitRepoForPush(t)
+	sha := headOfPushRepo(t, src)
+	packPath, idxPath, err := gitcmd.WritePack(src, sha, nil, t.TempDir())
+	if err != nil || packPath == "" {
+		t.Fatalf("WritePack: %v", err)
+	}
+	stem := strings.TrimSuffix(filepath.Base(packPath), ".pack")
+	f := transport.NewFake()
+	for _, p := range []string{packPath, idxPath} {
+		b, _ := os.ReadFile(p)
+		f.Files["/r/packs/"+filepath.Base(p)] = b
+	}
+	cache := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cache, stem+".idx"), []byte("garbage"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pm, err := buildPackMap(f, "/r", cache, t.TempDir(), []string{stem})
+	if err != nil {
+		t.Fatalf("buildPackMap must heal the corrupt cached sidecar: %v", err)
+	}
+	if len(pm.oidPacks[sha]) != 1 {
+		t.Errorf("healed map must contain the commit")
+	}
+	// And the cache must now hold the good bytes.
+	want, _ := os.ReadFile(idxPath)
+	got, _ := os.ReadFile(filepath.Join(cache, stem+".idx"))
+	if !bytes.Equal(want, got) {
+		t.Error("cache must be repaired with the fresh sidecar")
+	}
+}
+
+// RED: a corrupt sidecar FRESH from the remote is fatal naming the file.
+func TestBuildPackMapFatalOnCorruptRemoteSidecar(t *testing.T) {
+	stem := "pack-" + strings.Repeat("d", 40)
+	f := transport.NewFake()
+	f.Files["/r/packs/"+stem+".pack"] = []byte("p")
+	f.Files["/r/packs/"+stem+".idx"] = []byte("not an index")
+	_, err := buildPackMap(f, "/r", "", t.TempDir(), []string{stem})
+	if err == nil || !strings.Contains(err.Error(), stem) {
+		t.Fatalf("want a fatal naming %s, got %v", stem, err)
+	}
+}
+
+// RED: greedy cover. Forced singles first, then most-covering, ties
+// lexicographic; never a pack contributing nothing.
+func TestGreedyCover(t *testing.T) {
+	oidX, oidY, oidZ := strings.Repeat("1", 40), strings.Repeat("2", 40), strings.Repeat("3", 40)
+	// x in {A,B}, y in {B}: B alone suffices (the round-1 review counterexample).
+	m := map[string][]string{
+		oidX: {"pack-A", "pack-B"},
+		oidY: {"pack-B"},
+	}
+	got, err := greedyCover([]string{oidX, oidY}, m, map[string]bool{})
+	if err != nil {
+		t.Fatalf("greedyCover: %v", err)
+	}
+	if len(got) != 1 || got[0] != "pack-B" {
+		t.Errorf("want [pack-B], got %v", got)
+	}
+	// Tie on coverage: lexicographically first wins, deterministically.
+	m2 := map[string][]string{oidZ: {"pack-Q", "pack-P"}}
+	got2, err := greedyCover([]string{oidZ}, m2, map[string]bool{})
+	if err != nil || len(got2) != 1 || got2[0] != "pack-P" {
+		t.Errorf("tie must break lexicographically: %v %v", got2, err)
+	}
+	// No candidate at all: errCacheSuspect, naming the OID.
+	_, err = greedyCover([]string{oidZ}, map[string][]string{}, map[string]bool{})
+	if err == nil || !errors.Is(err, errCacheSuspect) || !strings.Contains(err.Error(), oidZ) {
+		t.Errorf("no-candidate must wrap errCacheSuspect and name the OID: %v", err)
+	}
+	// Still missing though its only pack was downloaded: the no-progress
+	// signature, also errCacheSuspect. (This is the unit-level home of the
+	// no-progress rule; end-to-end it is unreachable with self-consistent
+	// remote pairs, since oid-in-idx implies oid-in-pack.)
+	_, err = greedyCover([]string{oidZ}, map[string][]string{oidZ: {"pack-A"}},
+		map[string]bool{"pack-A": true})
+	if err == nil || !errors.Is(err, errCacheSuspect) {
+		t.Errorf("no-progress must wrap errCacheSuspect: %v", err)
+	}
+	// A failure names EVERY offender, sorted — rev-list order is unspecified,
+	// so a first-offender error would name a nondeterministic OID (and Task
+	// 7's fatal-message assertions depend on this determinism).
+	_, err = greedyCover([]string{oidY, oidX}, map[string][]string{}, map[string]bool{})
+	if err == nil || !strings.Contains(err.Error(), oidX) || !strings.Contains(err.Error(), oidY) {
+		t.Errorf("a no-candidate error must name all offenders: %v", err)
+	}
+}
