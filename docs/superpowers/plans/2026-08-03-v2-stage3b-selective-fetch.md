@@ -430,31 +430,9 @@ These tests replicate probes 1–3 from the spec against the suite's git, turnin
 
 - [ ] **Step 1: Write the failing tests**
 
-```go
-// twoCommitRepo builds A<-B and returns (dir, shaA, shaB).
-func twoCommitRepo(t *testing.T) (string, string, string) {
-	t.Helper()
-	d := t.TempDir()
-	run := func(args ...string) string {
-		out, err := exec.Command("git", append([]string{"-C", d}, args...)...).CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v: %v: %s", args, err, out)
-		}
-		return strings.TrimSpace(string(out))
-	}
-	run("init", "-qb", "main")
-	run("config", "user.email", "t@t")
-	run("config", "user.name", "t")
-	run("commit", "-q", "--allow-empty", "-m", "A")
-	a := run("rev-parse", "HEAD")
-	if err := os.WriteFile(filepath.Join(d, "f.txt"), []byte("payload-b"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	run("add", "f.txt")
-	run("commit", "-qm", "B")
-	return d, a, run("rev-parse", "HEAD")
-}
+**Do NOT define a two-commit fixture — `gitcmd_test.go` already has one.** `twoCommitRepo(t *testing.T) (dir, first, second string)` exists at `gitcmd_test.go:357`: commit 1 adds `a.txt`, commit 2 adds `b.txt` (distinguishing content, deliberately — see its comment about sha collisions). Reuse it; redeclaring it is a compile error. Note for the tests below: the blob added by the second commit is **`b.txt`**, and the second commit's pack-minus-first also carries the `a.txt` blob's ABSENCE (the tree references it, so a B-only alternate reports it missing too — assertions below use containment, never exact-set equality, for exactly this reason).
 
+```go
 // packInto packs exactly the objects listed in objs (newline-separated OIDs)
 // from src into <altDir>/pack, giving the alternate git's own layout.
 func packInto(t *testing.T, src, altDir, objs string) {
@@ -549,7 +527,7 @@ func TestRevListMissingFrontierDeepensThroughATree(t *testing.T) {
 	// enumerate entries of a tree it does not have. If this ever starts
 	// failing, the loop still works (it would just converge in fewer rounds);
 	// the GUARD exists so the change is noticed, not silently absorbed.
-	blobOut, err := exec.Command("git", "-C", src, "rev-parse", b+":f.txt").Output()
+	blobOut, err := exec.Command("git", "-C", src, "rev-parse", b+":b.txt").Output()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -910,6 +888,16 @@ func RefreshSidecar(t transport.Transport, root, cacheDir, fallbackDir, stem str
 	name := stem + ".idx"
 	if err := os.Remove(filepath.Join(fallbackDir, name)); err != nil && !os.IsNotExist(err) {
 		return "", err
+	}
+	// Evict the stale cache entry BEFORE attempting the install: if the
+	// install's rename then fails, the next run gets a cache MISS rather
+	// than silently trusting the very bytes this refresh exists to replace.
+	// Best-effort like every cache write — a failed evict only warns.
+	if cacheDir != "" {
+		if err := os.Remove(filepath.Join(cacheDir, name)); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "git-remote-proton: cannot evict stale cache entry %s: %v\n",
+				name, err)
+		}
 	}
 	p, err := downloadSidecar(t, root, fallbackDir, name)
 	if err != nil {
@@ -1405,9 +1393,12 @@ func greedyCover(missing []string, oidPacks map[string][]string, downloaded map[
 			}
 		}
 		if best == "" {
-			// Unreachable given the per-OID fresh check above; defensive so a
-			// logic slip can never spin.
-			break
+			// Unreachable given the per-OID fresh check above — but the
+			// defensive arm must FAIL CLOSED: a silent partial cover would
+			// download too little and push the failure downstream to
+			// ConnectivityOK with a worse diagnosis.
+			return nil, fmt.Errorf("internal: greedy cover could not cover %d remaining "+
+				"missing objects: %w", len(uncovered), errCacheSuspect)
 		}
 		chosen[best] = true
 		covered()
@@ -1447,9 +1438,11 @@ git commit -m "feat(v2): pack listing grammar, object-to-pack map, greedy cover"
 - Consumes: everything Tasks 2–5 produced (`RevListMissing`, `ShowIndex` via `packMap`, `EnsureSidecar`/`RefreshSidecar`/`pruneStale`/`ResolveIdxCacheDir`, `listCompletePacks`, `buildPackMap`, `refreshPackMap`, `greedyCover`, `errCacheSuspect`); existing `packContentChecksum(path) (string, error)` and `packNameChecksum(base) string` (`push.go:577,600`); `gitcmd.IndexPackVerify`, `gitcmd.ConnectivityOK`, `gitcmd.RevListNewObjects`; `consolidateAndInstall` (unchanged).
 - Produces: `Fetch(t transport.Transport, root, gitDir, cacheDir string, wants []string) (string, error)` — the ONLY signature change; `cacheDir==""` means no persistent cache (sidecars in the run's temp dir). Test helpers `plantIncrementalPacks` and `countPackDownloads` (Task 7 reuses both — exact signatures below).
 
-- [ ] **Step 1: Update existing call sites mechanically**
+- [ ] **Step 1: Extend the signature (body untouched) and update call sites mechanically**
 
-Every existing call `Fetch(f, "/r", dst, wants...)` in `repo_test.go` gains `""` as the new fourth argument: `Fetch(f, "/r", dst, "", []string{sha})`. Grep for `Fetch(` in `repo_test.go` — the sites are in `TestFetchInstallsTheClosure`, `TestFetchIsIdempotentAndInstallsNothingWhenUpToDate`, `TestFetchRejectsACorruptPackAndInstallsNothing`, `TestFetchRefusesAnUnmarkedRemote`, `TestFetchIntoALinkedWorktreeInstallsWhereGitLooks`, `TestFetchWithARelativeGitDirInstallsCorrectly`. Do not change their assertions — with one narrow exception: if `TestFetchRejectsACorruptPackAndInstallsNothing` asserts on the old error MESSAGE text, update only the expected message (the new loop reports the corruption via the heal-then-fatal path, so the wording differs); its substantive assertions (error non-nil, nothing installed) stand unchanged.
+First, in `fetch.go`, change ONLY the signature line to `func Fetch(t transport.Transport, root, gitDir, cacheDir string, wants []string) (string, error)` — with `_ = cacheDir` as the first body line and nothing else touched. This keeps the package compiling with the OLD download-everything behaviour, which Step 3 depends on: the RED must be OBSERVED failing against it before Step 4 replaces the body (the RED-before-fix discipline; a red that was never seen red proves nothing).
+
+Then every existing call `Fetch(f, "/r", dst, wants...)` in `repo_test.go` gains `""` as the new fourth argument: `Fetch(f, "/r", dst, "", []string{sha})`. Grep for `Fetch(` in `repo_test.go` — the sites are in `TestFetchInstallsTheClosure`, `TestFetchIsIdempotentAndInstallsNothingWhenUpToDate`, `TestFetchRejectsACorruptPackAndInstallsNothing`, `TestFetchRefusesAnUnmarkedRemote`, `TestFetchIntoALinkedWorktreeInstallsWhereGitLooks`, `TestFetchWithARelativeGitDirInstallsCorrectly`. Do not change their assertions — with one narrow exception: if `TestFetchRejectsACorruptPackAndInstallsNothing` asserts on the old error MESSAGE text, update only the expected message (the new loop reports the corruption via the heal-then-fatal path, so the wording differs); its substantive assertions (error non-nil, nothing installed) stand unchanged.
 
 In `cmd/git-remote-proton/main.go`, in the `case strings.HasPrefix(line, "fetch "):` block (main.go:392), immediately before the `repo.Fetch` call (main.go:427), insert:
 
@@ -1538,8 +1531,13 @@ func TestCountPackDownloads(t *testing.T) {
 	}
 }
 
-// RED: the loop iterates — a two-pack history reachable only via discovery
-// (round 1 gets the tip's pack, round 2 its parent's) installs completely.
+// GUARD, not RED — and the label is load-bearing: this test also passes
+// against 3a's download-everything code (downloading every pack converges
+// too), so it pins CONVERGENCE across a pack split, not selectivity. The
+// loop's distinguishing observable is the trace-counted selectivity test
+// below, whose deliberate-regression check (Step 6) is the proof it can
+// fail. Convergence still needs its own pin: a discovery bug that fetches
+// too little fails HERE first, with the clearest diagnosis.
 func TestFetchDiscoversAcrossPacks(t *testing.T) {
 	src := newGitRepoForPush(t)
 	c1 := headOfPushRepo(t, src)
@@ -1636,8 +1634,11 @@ func plantOneMorePack(t *testing.T, f *transport.Fake, root, src, prev, tip stri
 	return []string{strings.TrimSuffix(filepath.Base(packPath), ".pack")}
 }
 
-// RED: probe 3 end-to-end — a frontier that deepens through a missing tree
-// converges in multiple rounds (commit pack, then tree pack, then blob pack).
+// GUARD, not RED, same reasoning as TestFetchDiscoversAcrossPacks: probe 3
+// end-to-end — a frontier that deepens through a missing tree converges
+// (commit pack, then tree pack, then blob pack). Download-everything also
+// passes this; the pin is that multi-round discovery CONVERGES, which is
+// exactly what breaks if the loop's termination or restart logic is wrong.
 func TestFetchFrontierDeepensThroughHandBuiltPacks(t *testing.T) {
 	src := newGitRepoForPush(t)
 	commitOnPushRepo(t, src, "deep.txt", "payload")
@@ -1705,13 +1706,13 @@ func TestFetchFrontierDeepensThroughHandBuiltPacks(t *testing.T) {
 
 Note on `TestFetchFrontierDeepensThroughHandBuiltPacks`'s classification loop: the root tree's rev-list line is the bare tree OID with an EMPTY path (a trailing space) so it lands via `len(fields) == 1`, and any PARENT commits from `newGitRepoForPush`'s earlier history land there too (commits also print bare). The heuristic intentionally over-approximates "tree-ish": the test's purpose is only that objects land in multiple packs split by graph depth, forcing multiple discovery rounds — its assertions do not depend on perfect classification, only on convergence and a clean fsck.
 
-- [ ] **Step 3: Run new tests, confirm they fail (helpers undefined / signature mismatch)**
+- [ ] **Step 3: Run new tests, confirm the failures are the EXPECTED ones**
 
 ```
 go test ./internal/repo/ -run 'TestFetch|TestCountPackDownloads' -v
 ```
 
-Expected: compile errors first (old signature call sites you have not yet updated will surface here if missed), then assertion failures against the still-download-everything implementation.
+Expected, precisely: compile errors first (undefined helpers; any old-signature call site you missed surfaces here). Once compiling — against the still-download-everything implementation — the ONE genuine RED is `TestFetchDownloadsOnlyTheNeededPack` (its `packs != 1` assertion fires: download-everything transfers every pair). `TestFetchDiscoversAcrossPacks` and `TestFetchFrontierDeepensThroughHandBuiltPacks` are GUARDs and may already pass; `TestCountPackDownloads` passes as soon as the helper exists. Record which assertion fired for the RED.
 
 - [ ] **Step 4: Rewrite `fetch.go`**
 
@@ -1883,7 +1884,12 @@ func downloadAndVerifyPack(t transport.Transport, root, packDir, stem string, pm
 	}
 	idxPath := filepath.Join(packDir, stem+".idx")
 	if err := copyFile(pm.sidecars[stem], idxPath); err != nil {
-		return false, err
+		// The SOURCE here may be a cache path, and an unreadable cached
+		// sidecar is cache-read trouble — heal-able, not fatal (spec: any
+		// cache I/O failure degrades). Wrapping unconditionally is safe: a
+		// genuine temp-dir failure wastes one heal round and then fatals.
+		return false, fmt.Errorf("cannot lay sidecar beside %s: %v: %w",
+			packName, err, errCacheSuspect)
 	}
 	if err := gitcmd.IndexPackVerify(packPath); err == nil {
 		return false, nil
@@ -1961,7 +1967,7 @@ git commit -m "feat(v2): selective fetch - discovery loop replaces download-ever
 - Modify: `internal/repo/fetch.go` / `packmap.go` / `idxcache.go` only if a test exposes a defect
 
 **Interfaces:**
-- Consumes: `plantIncrementalPacks`, `plantOneMorePack`, `countPackDownloads` (Task 6 — exact signatures in that task), `Fetch(t, root, gitDir, cacheDir string, wants []string)`, `transport.NewTraced`, `errCacheSuspect`.
+- Consumes: `plantIncrementalPacks`, `plantOneMorePack`, `countPackDownloads` (Task 6 — exact signatures in that task), `Fetch(t, root, gitDir, cacheDir string, wants []string)`, `transport.NewTraced`, `errCacheSuspect`, and the PRE-EXISTING test helper `countInstalledPackFiles(t *testing.T, gitDir string) int` (`repo_test.go:2038` — counts `.pack` files in the repo's real object store).
 - Produces: nothing new — this task exists so a reviewer can reject the failure-mode coverage independently of the happy path.
 
 - [ ] **Step 1: Write the tests (all RED until proven otherwise — run each against the Task 6 code and record which pass already; any that passes immediately is relabelled GUARD in its comment)**
@@ -2274,14 +2280,14 @@ git commit -m "test(v2): 3b failure modes - heal, residue, pair refresh, degrada
 - Consumes: the built helper (`go build ./cmd/git-remote-proton`), the real Proton CLI (`cli-drive@0.7.0`), `GPB_LIVE_ACCOUNT=1`.
 - Produces: the stage's pass/fail verdict, recorded verbatim.
 
-**Rules (repeat: these are hard):** every write confined to `/my-files/GitRemotes/<demo>` (pick a fresh demo name, e.g. `stage3b-gate`); `GitBackups`, `Sensitive Project Sources`, `Project Repo Bundles`, `ChatGPT Export Text Backup` untouchable; report BLOCKED with verbatim output on any failure — never patch, never retry past the first surprise; verify-before-trashing-parents on cleanup; confirm `/my-files` ends at exactly the four known folders plus the gate's own.
+**Rules (repeat: these are hard):** every write confined to the two allowed roots — `/my-files/GitRemotes/<demo>` (pick a fresh demo name, e.g. `stage3b-gate`) and `/my-files/_cas-probe` (the contract table's own `liveRoot` lives under it); `GitBackups`, `Sensitive Project Sources`, `Project Repo Bundles`, `ChatGPT Export Text Backup` untouchable; report BLOCKED with verbatim output on any failure — never patch, never retry past the first surprise; verify-before-trashing-parents on cleanup. **Record the `/my-files` listing BEFORE anything else runs**; the final cleanup assertion is that the post-cleanup listing MATCHES that pre-run listing (nothing new left behind) — not a hardcoded folder count, which would false-fail on pre-existing `_cas-probe`/`GitRemotes` residue this gate does not own.
 
 - [ ] **Step 1: Contract table live half**
 
 ```
-$env:GPB_LIVE_ACCOUNT = "1"; go test ./internal/transport/ -run TestTransportContract -v
+$env:GPB_LIVE_ACCOUNT = "1"; go test ./internal/transport/ -run 'TestContract' -v
 ```
-Expected: the `*CLI` half runs (loudly, not skipped) and passes 9/9. Any failure → BLOCKED.
+The tests are `TestContractFake` and `TestContractCLI` (`contract_test.go:203,214`) — the pattern must match BOTH; a pattern matching neither reports PASS with "no tests to run", which is a false green. Expected: `TestContractCLI` RUNS its 9 scenarios live (loudly, not skipped — the skip message names `GPB_LIVE_ACCOUNT`) and passes, `TestContractFake` passes. Any failure → BLOCKED. Note the live contract table writes under `/my-files/_cas-probe/contract` (`liveRoot`, `contract_test.go:15`) — an allowed root, listed in the rules above.
 
 - [ ] **Step 2: Build and install the helper on PATH; create the demo repo**
 
@@ -2316,7 +2322,7 @@ Assert: zero `gpb: downloaded */packs/*` lines. (Ref/marker reads are legitimate
 
 - [ ] **Step 7: Record and clean up**
 
-Write `docs/research/gates/stage3b-gate.md` with every command, every assertion, and the verbatim download-line sets. Cleanup: trash `/my-files/GitRemotes/stage3b-gate` ONLY (verify the path before trashing; list `/my-files` after and confirm exactly the original four folders remain). Commit the gate record (+ trailer).
+Write `docs/research/gates/stage3b-gate.md` with every command, every assertion, and the verbatim download-line sets. Cleanup: trash `/my-files/GitRemotes/stage3b-gate` ONLY (verify the path before trashing); then list `/my-files` and assert it matches the PRE-RUN listing captured under the rules above. Commit the gate record (+ trailer).
 
 ---
 
@@ -2325,3 +2331,7 @@ Write `docs/research/gates/stage3b-gate.md` with every command, every assertion,
 - **Spec coverage:** trace decorator (T1), ShowIndex v1/v2 (T2), RevListMissing + normative parsing + probe GUARDs + min-git wrap (T3), cache location/shape/degradation/prune/breadcrumb (T4), grammar + complete pairs + map + self-heal-at-build + greedy (T5), loop + heal + residue + restart-on-rebuild + presence short-circuit + verify-before-install preserved (T6), failure modes incl. fatal-after-heal wording, pair member-undetermined, degradation e2e (T7), measured live gate incl. 3a preservation and zero-download re-fetch (T8). Parked-flag dispositions are spec-recorded and need no code.
 - **Known coverage limits, stated:** the older-git missing-tip refusal is exercised only as the error-wrap text (untestable end-to-end on a floor-satisfying git — spec records this); the loop-level no-progress fatal is covered at unit level in `greedyCover` (end-to-end unreachable with self-consistent pairs, as the spec's Testing section notes).
 - **Type consistency check:** `Fetch(t, root, gitDir, cacheDir string, wants []string)` used identically in T6 steps 1/4 and T7; `EnsureSidecar` returns `(string, bool, error)` in T4 and is consumed with three values in T5; `greedyCover(missing, oidPacks, downloaded)` matches between T5 and T6; helper signatures (`plantIncrementalPacks`, `countPackDownloads`) declared in T6 and reused unchanged in T7.
+
+## Revisions
+
+**Round 1 (2026-08-03, Gemini + Codex; Codex's first attempt timed out on the full bundle and was rerun narrowed, plan-only, at high effort).** Applied from Gemini: `countInstalledPackFiles` listed in Task 7's Consumes (pre-existing helper — Gemini's compile-failure claim was wrong, the listing hygiene right); `copyFile` failure at the sidecar-laying site wrapped `errCacheSuspect` (the source may be a cache path; cache reads degrade, never fatal); `greedyCover`'s defensive arm now fails closed instead of returning a silent partial cover; `RefreshSidecar` evicts the stale cache entry before installing so a failed rename yields a miss, not a stale hit. Rejected from Gemini: the `path`-import Interfaces listing (the step text already instructs the import; Interfaces blocks carry cross-task symbols, not stdlib). Applied from Codex: the plan's `twoCommitRepo` deleted — `gitcmd_test.go:357` already defines it (redeclare = compile error); Task 8's contract-table run pattern corrected to `'TestContract'` (the old pattern matched nothing — a false green); Task 8's write-confinement rules now name both allowed roots incl. `_cas-probe`, and the cleanup assertion compares pre/post listings instead of a hardcoded folder count; `TestFetchDiscoversAcrossPacks` and `TestFetchFrontierDeepensThroughHandBuiltPacks` relabelled GUARD with the reasoning inline (they pass against download-everything; the loop's one genuine RED is the trace-counted selectivity test), and Task 6 Step 1 now extends `Fetch`'s signature body-untouched so that RED is observable against the old behaviour before the rewrite.
