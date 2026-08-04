@@ -1156,6 +1156,13 @@ func TestGreedyCover(t *testing.T) {
 	if err == nil || !errors.Is(err, errCacheSuspect) {
 		t.Errorf("no-progress must wrap errCacheSuspect: %v", err)
 	}
+	// A failure names EVERY offender, sorted — rev-list order is unspecified,
+	// so a first-offender error would name a nondeterministic OID (and Task
+	// 7's fatal-message assertions depend on this determinism).
+	_, err = greedyCover([]string{oidY, oidX}, map[string][]string{}, map[string]bool{})
+	if err == nil || !strings.Contains(err.Error(), oidX) || !strings.Contains(err.Error(), oidY) {
+		t.Errorf("a no-candidate error must name all offenders: %v", err)
+	}
 }
 ```
 
@@ -1332,12 +1339,18 @@ func (pm *packMap) rebuildFromSidecars() error {
 // a pack contributing nothing to the frontier. Both failure modes wrap
 // errCacheSuspect (see its doc).
 func greedyCover(missing []string, oidPacks map[string][]string, downloaded map[string]bool) ([]string, error) {
+	// Both failure scans run over the WHOLE frontier before erroring, and the
+	// error names every offender, sorted: rev-list's output order is
+	// unspecified, so erroring at the first offender would make the named OID
+	// nondeterministic — and a diagnosis that names one of forty missing
+	// objects at random is worse than one that names all forty.
+	var noCandidate, noProgress []string
 	uncovered := map[string]bool{}
 	for _, oid := range missing {
 		cands := oidPacks[oid]
 		if len(cands) == 0 {
-			return nil, fmt.Errorf("no pack on the remote contains missing object %s: %w",
-				oid, errCacheSuspect)
+			noCandidate = append(noCandidate, oid)
+			continue
 		}
 		fresh := 0
 		for _, c := range cands {
@@ -1346,11 +1359,21 @@ func greedyCover(missing []string, oidPacks map[string][]string, downloaded map[
 			}
 		}
 		if fresh == 0 {
-			return nil, fmt.Errorf("object %s is still missing although every pack claiming "+
-				"to contain it was already downloaded and verified (no progress is possible): %w",
-				oid, errCacheSuspect)
+			noProgress = append(noProgress, oid)
+			continue
 		}
 		uncovered[oid] = true
+	}
+	if len(noCandidate) > 0 {
+		sort.Strings(noCandidate)
+		return nil, fmt.Errorf("no pack on the remote contains missing object(s) %s: %w",
+			strings.Join(noCandidate, ", "), errCacheSuspect)
+	}
+	if len(noProgress) > 0 {
+		sort.Strings(noProgress)
+		return nil, fmt.Errorf("object(s) %s are still missing although every pack claiming "+
+			"to contain them was already downloaded and verified (no progress is possible): %w",
+			strings.Join(noProgress, ", "), errCacheSuspect)
 	}
 	chosen := map[string]bool{}
 	covered := func() {
@@ -2282,12 +2305,19 @@ git commit -m "test(v2): 3b failure modes - heal, residue, pair refresh, degrada
 
 **Rules (repeat: these are hard):** every write confined to the two allowed roots — `/my-files/GitRemotes/<demo>` (pick a fresh demo name, e.g. `stage3b-gate`) and `/my-files/_cas-probe` (the contract table's own `liveRoot` lives under it); `GitBackups`, `Sensitive Project Sources`, `Project Repo Bundles`, `ChatGPT Export Text Backup` untouchable; report BLOCKED with verbatim output on any failure — never patch, never retry past the first surprise; verify-before-trashing-parents on cleanup. **Record the `/my-files` listing BEFORE anything else runs**; the final cleanup assertion is that the post-cleanup listing MATCHES that pre-run listing (nothing new left behind) — not a hardcoded folder count, which would false-fail on pre-existing `_cas-probe`/`GitRemotes` residue this gate does not own.
 
-- [ ] **Step 1: Contract table live half**
+- [ ] **Step 1: Pre-run listing, parent provisioning, then the contract table's live half**
+
+First capture the pre-run truth and provision the probe parent:
+
+1. `proton-drive filesystem list /my-files --json` → record verbatim; this is the listing the final cleanup assertion compares against.
+2. `proton-drive filesystem list /my-files/_cas-probe --json`. If `_cas-probe` is ABSENT, create it (`create-folder`) and record "gate created `_cas-probe`" — the contract table's `liveRoot` is `/my-files/_cas-probe/contract` (`contract_test.go:15`) and its parent is not created recursively, so a missing parent would otherwise block mid-test. If it EXISTS, record its contents — anything already inside is residue this gate does not own and must survive cleanup.
+
+Then run the table:
 
 ```
 $env:GPB_LIVE_ACCOUNT = "1"; go test ./internal/transport/ -run 'TestContract' -v
 ```
-The tests are `TestContractFake` and `TestContractCLI` (`contract_test.go:203,214`) — the pattern must match BOTH; a pattern matching neither reports PASS with "no tests to run", which is a false green. Expected: `TestContractCLI` RUNS its 9 scenarios live (loudly, not skipped — the skip message names `GPB_LIVE_ACCOUNT`) and passes, `TestContractFake` passes. Any failure → BLOCKED. Note the live contract table writes under `/my-files/_cas-probe/contract` (`liveRoot`, `contract_test.go:15`) — an allowed root, listed in the rules above.
+The tests are `TestContractFake` and `TestContractCLI` (`contract_test.go:203,214`) — the pattern must match BOTH; a pattern matching neither reports PASS with "no tests to run", which is a false green. Expected: `TestContractCLI` RUNS its 9 scenarios live (loudly, not skipped — the skip message names `GPB_LIVE_ACCOUNT`) and passes, `TestContractFake` passes. Any failure → BLOCKED.
 
 - [ ] **Step 2: Build and install the helper on PATH; create the demo repo**
 
@@ -2322,7 +2352,13 @@ Assert: zero `gpb: downloaded */packs/*` lines. (Ref/marker reads are legitimate
 
 - [ ] **Step 7: Record and clean up**
 
-Write `docs/research/gates/stage3b-gate.md` with every command, every assertion, and the verbatim download-line sets. Cleanup: trash `/my-files/GitRemotes/stage3b-gate` ONLY (verify the path before trashing); then list `/my-files` and assert it matches the PRE-RUN listing captured under the rules above. Commit the gate record (+ trailer).
+Write `docs/research/gates/stage3b-gate.md` with every command, every assertion, and the verbatim download-line sets. Cleanup, verify-before-trashing-parents throughout:
+
+1. Trash `/my-files/GitRemotes/stage3b-gate` (verify the path holds only this gate's repo first). If `GitRemotes` itself was created by this gate (check the pre-run listing) and is now empty, trash it too.
+2. List `/my-files/_cas-probe`: trash `contract` if the contract run left it (it holds only per-test roots the table creates), then — ONLY if Step 1 recorded "gate created `_cas-probe`" and it is now empty — trash `_cas-probe` itself. Pre-existing residue recorded in Step 1 stays untouched.
+3. Final assertion: `proton-drive filesystem list /my-files --json` matches the PRE-RUN listing from Step 1 exactly.
+
+Commit the gate record (+ trailer).
 
 ---
 
@@ -2335,3 +2371,5 @@ Write `docs/research/gates/stage3b-gate.md` with every command, every assertion,
 ## Revisions
 
 **Round 1 (2026-08-03, Gemini + Codex; Codex's first attempt timed out on the full bundle and was rerun narrowed, plan-only, at high effort).** Applied from Gemini: `countInstalledPackFiles` listed in Task 7's Consumes (pre-existing helper — Gemini's compile-failure claim was wrong, the listing hygiene right); `copyFile` failure at the sidecar-laying site wrapped `errCacheSuspect` (the source may be a cache path; cache reads degrade, never fatal); `greedyCover`'s defensive arm now fails closed instead of returning a silent partial cover; `RefreshSidecar` evicts the stale cache entry before installing so a failed rename yields a miss, not a stale hit. Rejected from Gemini: the `path`-import Interfaces listing (the step text already instructs the import; Interfaces blocks carry cross-task symbols, not stdlib). Applied from Codex: the plan's `twoCommitRepo` deleted — `gitcmd_test.go:357` already defines it (redeclare = compile error); Task 8's contract-table run pattern corrected to `'TestContract'` (the old pattern matched nothing — a false green); Task 8's write-confinement rules now name both allowed roots incl. `_cas-probe`, and the cleanup assertion compares pre/post listings instead of a hardcoded folder count; `TestFetchDiscoversAcrossPacks` and `TestFetchFrontierDeepensThroughHandBuiltPacks` relabelled GUARD with the reasoning inline (they pass against download-everything; the loop's one genuine RED is the trace-counted selectivity test), and Task 6 Step 1 now extends `Fetch`'s signature body-untouched so that RED is observable against the old behaviour before the rewrite.
+
+**Round 2 (2026-08-03, Codex + Gemini).** Gemini: blockers none. Codex, both accepted: (1) the round-1 gate-cleanup fix was itself defective — the contract table creates `/my-files/_cas-probe/contract` mid-gate (and blocks outright if the non-recursively-created parent is absent), so a bare pre/post listing comparison could not hold; Task 8 Step 1 now captures the pre-run listings AND provisions `_cas-probe` when absent, and Step 7 verifiably cleans `contract` plus any gate-created parents before the pre/post assertion. (2) `greedyCover` errored at the FIRST candidate-less OID in rev-list order, which is unspecified — Task 7's fatal-message assertion on `c1` was therefore nondeterministic; both failure scans now run over the whole frontier and name every offender, sorted, with a unit test pinning the all-offenders property.
