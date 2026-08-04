@@ -5,8 +5,10 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -2566,5 +2568,323 @@ func TestGreedyCover(t *testing.T) {
 	_, err = greedyCover([]string{oidY, oidX}, map[string][]string{}, map[string]bool{})
 	if err == nil || !strings.Contains(err.Error(), oidX) || !strings.Contains(err.Error(), oidY) {
 		t.Errorf("a no-candidate error must name all offenders: %v", err)
+	}
+}
+
+// GUARD, not RED: passed immediately against Task 6's code. A parseable-but-
+// LYING cached sidecar (valid idx bytes filed under the wrong stem) misroutes
+// discovery; the self-heal round must fix it and the fetch must complete.
+// This is the spec's "correctness never depends on the cache being right"
+// promise. Deliberate-regression check: with heal() stubbed to a no-op, this
+// failed with "no pack on the remote contains missing object(s) <c2-sha>:
+// ... this can be caused by a stale or corrupt sidecar cache (the sidecar
+// metadata was already refreshed ...)" — confirming the assertion is live.
+func TestFetchSelfHealsALyingCache(t *testing.T) {
+	src := newGitRepoForPush(t)
+	c1 := headOfPushRepo(t, src)
+	c2 := commitOnPushRepo(t, src, "f2.txt", "two")
+	f := transport.NewFake()
+	stems := plantIncrementalPacks(t, f, "/r", src, []string{c1, c2})
+
+	// Poison: both cache entries hold pack-1's idx bytes, so c2's objects
+	// appear to live nowhere.
+	cache := t.TempDir()
+	idx1 := f.Files["/r/packs/"+stems[0]+".idx"]
+	for _, stem := range stems {
+		if err := os.WriteFile(filepath.Join(cache, stem+".idx"), idx1, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dst := emptyGitRepo(t)
+	if _, err := Fetch(f, "/r", dst, cache, []string{c2}); err != nil {
+		t.Fatalf("Fetch must self-heal a lying cache: %v", err)
+	}
+	if !gitcmd.HasObject(dst, c2) {
+		t.Error("objects missing after healed fetch")
+	}
+}
+
+// GUARD, not RED: passed immediately against Task 6's code. After the heal,
+// the same diagnosis is genuine: an object the remote truly does not hold is
+// fatal, names the OID, and says the cache was already refreshed (so the
+// message never advises cache-clearing). Deliberate-regression check: with
+// fatalAfterHeal's wrap message text swapped out for wording that omits
+// "already refreshed", this failed on "fatal must state the metadata was
+// already refreshed" — confirming the assertion is live.
+func TestFetchFatalAfterHealNamesTheOidAndTheRefresh(t *testing.T) {
+	src := newGitRepoForPush(t)
+	c1 := headOfPushRepo(t, src)
+	c2 := commitOnPushRepo(t, src, "f2.txt", "two")
+	f := transport.NewFake()
+	stems := plantIncrementalPacks(t, f, "/r", src, []string{c1, c2})
+	// Remove pack 1 entirely: c1's closure is genuinely gone from the remote.
+	delete(f.Files, "/r/packs/"+stems[0]+".pack")
+	delete(f.Files, "/r/packs/"+stems[0]+".idx")
+
+	dst := emptyGitRepo(t)
+	_, err := Fetch(f, "/r", dst, t.TempDir(), []string{c2})
+	if err == nil {
+		t.Fatal("a remote missing part of the closure must be fatal")
+	}
+	if !strings.Contains(err.Error(), c1) {
+		t.Errorf("fatal must name the missing OID %s: %v", c1, err)
+	}
+	if !strings.Contains(err.Error(), "already refreshed") {
+		t.Errorf("fatal must state the metadata was already refreshed: %v", err)
+	}
+	// Nothing installed: the 3a posture holds.
+	if n := countInstalledPackFiles(t, dst); n != 0 {
+		t.Errorf("failed fetch must leave the local store untouched; %d packs installed", n)
+	}
+}
+
+// residueTransport fails the FIRST download of target, leaving partial bytes
+// at the destination — then, on the retry, REFUSES if those bytes are still
+// there. This pins the residue rule directly: retry correctness must not
+// depend on ReadTo's unpinned overwrite behaviour.
+type residueTransport struct {
+	*transport.Fake
+	target   string
+	tripped  bool
+	sawStale bool
+}
+
+func (r *residueTransport) ReadTo(p, local string) error {
+	if p == r.target {
+		dest := filepath.Join(local, path.Base(p))
+		if !r.tripped {
+			r.tripped = true
+			_ = os.WriteFile(dest, []byte("partial residue"), 0o644)
+			return fmt.Errorf("injected transient failure downloading %s", p)
+		}
+		if _, err := os.Stat(dest); err == nil {
+			r.sawStale = true
+			return fmt.Errorf("retry found residue at %s; the residue rule is violated", dest)
+		}
+	}
+	return r.Fake.ReadTo(p, local)
+}
+
+// GUARD, not RED: passed immediately against Task 6's code. Deliberate-
+// regression check: downloadAndVerifyPack removes packPath TWICE — once
+// unconditionally at function entry (before ReadTo), and once again on
+// ReadTo's failure path. Disabling either removal alone left the test green
+// (the other one still cleans up in time for the retry); only disabling BOTH
+// exposed it, failing with "retry found residue at ...; the residue rule is
+// violated" — confirming the assertion is live and that the entry-point
+// removal is what actually protects this in-process retry (the failure-path
+// removal exists for residue from an attempt this process lost track of, per
+// downloadAndVerifyPack's doc comment).
+func TestFetchRetriesSamePackWithoutResidue(t *testing.T) {
+	src := newGitRepoForPush(t)
+	c1 := headOfPushRepo(t, src)
+	f := transport.NewFake()
+	stems := plantIncrementalPacks(t, f, "/r", src, []string{c1})
+	rt := &residueTransport{Fake: f, target: "/r/packs/" + stems[0] + ".pack"}
+
+	dst := emptyGitRepo(t)
+	if _, err := Fetch(rt, "/r", dst, "", []string{c1}); err != nil {
+		t.Fatalf("Fetch must survive one transient pack-download failure via the heal "+
+			"round (sawStale=%v): %v", rt.sawStale, err)
+	}
+	if rt.sawStale {
+		t.Error("the retry found the failed attempt's residue; it must have been deleted")
+	}
+	if !gitcmd.HasObject(dst, c1) {
+		t.Error("objects missing after retried fetch")
+	}
+}
+
+// GUARD, not RED: passed immediately against Task 6's code. A corrupt remote
+// PACK selected because of a lying cache: checksum fails, heal reroutes to
+// the honest pack, fetch completes WITHOUT the corrupt one. Deliberate-
+// regression check: with the checksum-mismatch error no longer wrapping
+// errCacheSuspect (making it non-heal-able), this failed with "Fetch must
+// heal past the checksum failure: downloaded pack ... recomputes to ...; the
+// name is the content checksum, so this file is not what its name claims" —
+// confirming the assertion is live.
+func TestFetchChecksumFailureHealsAndRoutesAround(t *testing.T) {
+	src := newGitRepoForPush(t)
+	c1 := headOfPushRepo(t, src)
+	c2 := commitOnPushRepo(t, src, "f2.txt", "two")
+	c3 := commitOnPushRepo(t, src, "f3.txt", "three")
+	f := transport.NewFake()
+	stems := plantIncrementalPacks(t, f, "/r", src, []string{c1, c2, c3})
+
+	// dst already holds c1..c2: fetch once with the ref at c2, then advance.
+	dst := emptyGitRepo(t)
+	if _, err := Fetch(f, "/r", dst, "", []string{c2}); err != nil {
+		t.Fatalf("staging fetch: %v", err)
+	}
+	if out, err := exec.Command("git", "-C", dst, "update-ref", "refs/heads/main", c2).CombinedOutput(); err != nil {
+		t.Fatalf("update-ref: %v: %s", err, out)
+	}
+
+	// Corrupt pack 2's remote bytes (now unneeded by dst), and poison the
+	// cache so c3's missing objects appear to live in pack 2: cache holds
+	// pack-3's idx bytes under pack-2's stem, and pack-2's under pack-3's.
+	cache := t.TempDir()
+	idx2 := f.Files["/r/packs/"+stems[1]+".idx"]
+	idx3 := f.Files["/r/packs/"+stems[2]+".idx"]
+	if err := os.WriteFile(filepath.Join(cache, stems[1]+".idx"), idx3, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cache, stems[2]+".idx"), idx2, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pack2 := f.Files["/r/packs/"+stems[1]+".pack"]
+	corrupt := append([]byte{}, pack2...)
+	corrupt[len(corrupt)/2] ^= 0xff
+	f.Files["/r/packs/"+stems[1]+".pack"] = corrupt
+
+	var trace strings.Builder
+	tr := transport.NewTraced(f, &trace)
+	if _, err := Fetch(tr, "/r", dst, cache, []string{c3}); err != nil {
+		t.Fatalf("Fetch must heal past the checksum failure: %v", err)
+	}
+	if !gitcmd.HasObject(dst, c3) {
+		t.Error("c3 missing after healed fetch")
+	}
+}
+
+// altPackingIdx builds a SECOND packing of sha's full closure at store-only
+// compression: same OIDs, different bytes and name. Its idx is the perfect
+// lie — a map built from it is RIGHT about which objects the stem serves,
+// so greedy still selects the pack and the failure surfaces at PAIR
+// verification, not earlier as a no-candidate heal. (A sidecar with the
+// WRONG oids would divert into the heal path before any pack downloads —
+// the trap this fixture exists to avoid.)
+func altPackingIdx(t *testing.T, src, sha, realStem string) []byte {
+	t.Helper()
+	objs, err := exec.Command("git", "-C", src, "rev-list", "--objects", sha).Output()
+	if err != nil {
+		t.Fatalf("rev-list: %v", err)
+	}
+	dir := t.TempDir()
+	cmd := exec.Command("git", "-C", src, "-c", "pack.compression=0",
+		"-c", "pack.packSizeLimit=0",
+		"pack-objects", "--no-thin", "--index-version=2", "-q", filepath.Join(dir, "pack"))
+	cmd.Stdin = bytes.NewReader(objs)
+	nameOut, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("alt pack-objects: %v", err)
+	}
+	name := "pack-" + strings.TrimSpace(string(nameOut))
+	if name == realStem {
+		t.Fatal("fixture: the two packings coincide; the lie would be the truth")
+	}
+	b, err := os.ReadFile(filepath.Join(dir, name+".idx"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// GUARD, not RED: passed immediately against Task 6's code. Pair
+// verification with a lying-but-valid CACHED sidecar whose OID set is right
+// (see altPackingIdx): pack downloads fine, checksum passes, index-pack
+// --verify fails; ONE sidecar re-download fixes it and the fetch completes —
+// no heal round consumed. Deliberate-regression check: forcing the second
+// (post-refresh) verify attempt to fail unconditionally (overwriting the
+// freshly copied sidecar with garbage right before the re-verify) turned the
+// recovery into the same "pair is corrupt, member undetermined" fatal that
+// TestFetchGenuinelyCorruptPairIsFatalMemberUndetermined pins, and this test
+// failed on "Fetch must recover from a lying sidecar via pair-verify
+// refresh: ... member undetermined" — confirming a genuinely-recoverable
+// case actually depends on the refresh succeeding, not merely on always
+// reaching the fatal branch.
+func TestFetchPairFailureRefreshesSidecarAndCompletes(t *testing.T) {
+	src := newGitRepoForPush(t)
+	c1 := headOfPushRepo(t, src)
+	f := transport.NewFake()
+	stems := plantIncrementalPacks(t, f, "/r", src, []string{c1})
+	cache := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cache, stems[0]+".idx"),
+		altPackingIdx(t, src, c1, stems[0]), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dst := emptyGitRepo(t)
+	if _, err := Fetch(f, "/r", dst, cache, []string{c1}); err != nil {
+		t.Fatalf("Fetch must recover from a lying sidecar via pair-verify refresh: %v", err)
+	}
+	if !gitcmd.HasObject(dst, c1) {
+		t.Errorf("%s missing", c1)
+	}
+	// The cache must have been repaired with the remote's true sidecar.
+	got, err := os.ReadFile(filepath.Join(cache, stems[0]+".idx"))
+	if err != nil || !bytes.Equal(got, f.Files["/r/packs/"+stems[0]+".idx"]) {
+		t.Error("cache must hold the true sidecar after the refresh")
+	}
+}
+
+// GUARD, not RED: passed immediately against Task 6's code. A genuinely
+// mismatched REMOTE pair — same-OIDs alt-packing idx planted as the remote's
+// own sidecar, so the map is right but the pair can never verify — is fatal
+// as "corrupt pair, member undetermined", after the one sidecar refresh
+// re-downloads the same wrong bytes. Deliberate-regression check: with the
+// "member undetermined" wording removed from downloadAndVerifyPack's final
+// fatal, this failed on "fatal must not pretend to know which member is bad"
+// — confirming the assertion is live.
+func TestFetchGenuinelyCorruptPairIsFatalMemberUndetermined(t *testing.T) {
+	src := newGitRepoForPush(t)
+	c1 := headOfPushRepo(t, src)
+	f := transport.NewFake()
+	stems := plantIncrementalPacks(t, f, "/r", src, []string{c1})
+	f.Files["/r/packs/"+stems[0]+".idx"] = altPackingIdx(t, src, c1, stems[0])
+
+	dst := emptyGitRepo(t)
+	_, err := Fetch(f, "/r", dst, "", []string{c1})
+	if err == nil {
+		t.Fatal("a genuinely mismatched remote pair must be fatal")
+	}
+	if !strings.Contains(err.Error(), "member undetermined") {
+		t.Errorf("fatal must not pretend to know which member is bad: %v", err)
+	}
+	if n := countInstalledPackFiles(t, dst); n != 0 {
+		t.Errorf("nothing may be installed after a pair fatal; got %d", n)
+	}
+}
+
+// GUARD, not RED: passed immediately against Task 6's code. A listed .pack
+// with no .idx (a push in flight) is skipped; a fetch not needing it
+// succeeds. Deliberate-regression check: with listCompletePacks's
+// pack-only-no-idx branch changed to include the incomplete stem instead of
+// skipping it, this failed on "cannot download pack-fff...fff.idx: not
+// found: /r/packs/pack-fff...fff.idx" — confirming the assertion is live.
+func TestFetchSkipsAnIncompletePairWhenUnneeded(t *testing.T) {
+	src := newGitRepoForPush(t)
+	c1 := headOfPushRepo(t, src)
+	f := transport.NewFake()
+	plantIncrementalPacks(t, f, "/r", src, []string{c1})
+	f.Files["/r/packs/pack-"+strings.Repeat("f", 40)+".pack"] = []byte("in-flight, no idx")
+
+	dst := emptyGitRepo(t)
+	if _, err := Fetch(f, "/r", dst, "", []string{c1}); err != nil {
+		t.Fatalf("an unneeded incomplete pair must not break the fetch: %v", err)
+	}
+}
+
+// GUARD, not RED: passed immediately against Task 6's code. End-to-end cache
+// degradation: an unusable cacheDir (a file) never fails the fetch, and the
+// trace still shows the sidecars arriving (via temp). Deliberate-regression
+// check: with a temporary stat-and-fatal guard inserted ahead of pruneStale
+// that errors out when cacheDir is not a real directory, this failed on
+// "cache trouble must never be fetch trouble: regression-check: cache dir
+// ... is unusable" — confirming the assertion is live.
+func TestFetchSucceedsWithUnusableCacheDir(t *testing.T) {
+	src := newGitRepoForPush(t)
+	c1 := headOfPushRepo(t, src)
+	f := transport.NewFake()
+	plantIncrementalPacks(t, f, "/r", src, []string{c1})
+	notADir := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(notADir, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dst := emptyGitRepo(t)
+	if _, err := Fetch(f, "/r", dst, notADir, []string{c1}); err != nil {
+		t.Fatalf("cache trouble must never be fetch trouble: %v", err)
+	}
+	if !gitcmd.HasObject(dst, c1) {
+		t.Error("objects missing")
 	}
 }
