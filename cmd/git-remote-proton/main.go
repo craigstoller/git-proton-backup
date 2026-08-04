@@ -65,13 +65,13 @@ func run() int {
 	// call, so clearing the inherited env var here is safe and necessary.
 	os.Unsetenv("GIT_DIR")
 
-	t := transport.NewCLI("")
+	cli := transport.NewCLI("")
 	// Advisory only, and a knowing deviation from the design's "refuse to
 	// run" rule: a hard allowlist is a Stage 4 policy decision, because it
 	// breaks the user's tooling the day Proton ships a new build. But a
 	// silent behaviour change across CLI versions is what broke v1, so the
 	// mismatch is at least made visible. stderr, never stdout.
-	if v, err := t.Version(); err != nil {
+	if v, err := cli.Version(); err != nil {
 		warn(fmt.Errorf("could not determine the Proton CLI version: %w", err))
 	} else if !transport.IsCertified(v) {
 		warn(fmt.Errorf("Proton CLI reports %q but the transport contract is certified "+
@@ -81,7 +81,7 @@ func run() int {
 	out := bufio.NewWriter(os.Stdout)
 	defer out.Flush()
 
-	return loop(t, root, gitDir, in, out)
+	return loop(transport.NewTraced(cli, os.Stderr), root, gitDir, in, out)
 }
 
 // resolveGitDir captures GIT_DIR from the environment and resolves it to an
