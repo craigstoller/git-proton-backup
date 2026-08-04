@@ -1706,7 +1706,7 @@ func TestFetchInstallsTheClosure(t *testing.T) {
 	plantRepoOnFake(t, f, "/r", src, sha)
 
 	dst := emptyGitRepo(t) // genuinely lacks src's objects — see emptyGitRepo
-	keep, err := Fetch(f, "/r", dst, []string{sha})
+	keep, err := Fetch(f, "/r", dst, "", []string{sha})
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -1756,7 +1756,7 @@ func TestFetchIsIdempotentAndInstallsNothingWhenUpToDate(t *testing.T) {
 	plantRepoOnFake(t, f, "/r", src, sha)
 
 	dst := emptyGitRepo(t)
-	if _, err := Fetch(f, "/r", dst, []string{sha}); err != nil {
+	if _, err := Fetch(f, "/r", dst, "", []string{sha}); err != nil {
 		t.Fatalf("first fetch: %v", err)
 	}
 
@@ -1770,7 +1770,7 @@ func TestFetchIsIdempotentAndInstallsNothingWhenUpToDate(t *testing.T) {
 		}
 	}
 
-	keep, err := Fetch(f, "/r", dst, []string{sha})
+	keep, err := Fetch(f, "/r", dst, "", []string{sha})
 	if err != nil {
 		t.Fatalf("second fetch: %v", err)
 	}
@@ -1794,7 +1794,7 @@ func TestFetchRejectsACorruptPackAndInstallsNothing(t *testing.T) {
 	plantRepoOnFake(t, f, "/r", src, sha)
 
 	dst := emptyGitRepo(t)
-	if _, err := Fetch(f, "/r", dst, []string{sha}); err != nil {
+	if _, err := Fetch(f, "/r", dst, "", []string{sha}); err != nil {
 		t.Fatalf("priming fetch: %v", err)
 	}
 	before := countInstalledPackFiles(t, dst)
@@ -1830,7 +1830,7 @@ func TestFetchRejectsACorruptPackAndInstallsNothing(t *testing.T) {
 		}
 	}
 
-	if _, err := Fetch(f, "/r", dst, []string{second}); err == nil {
+	if _, err := Fetch(f, "/r", dst, "", []string{second}); err == nil {
 		t.Fatal("a corrupt remote pack must be fatal")
 	}
 	if got := countInstalledPackFiles(t, dst); got != before {
@@ -1845,7 +1845,7 @@ func TestFetchRefusesAnUnmarkedRemote(t *testing.T) {
 		t.Fatal(err)
 	}
 	dst := emptyGitRepo(t)
-	if _, err := Fetch(f, "/r", dst, []string{"1111111111111111111111111111111111111111"}); err == nil {
+	if _, err := Fetch(f, "/r", dst, "", []string{"1111111111111111111111111111111111111111"}); err == nil {
 		t.Error("fetch must refuse a folder with no marker, not initialise it")
 	}
 	if _, ok := f.Files["/r/gpb-remote.json"]; ok {
@@ -1897,7 +1897,7 @@ func TestFetchIntoALinkedWorktreeInstallsWhereGitLooks(t *testing.T) {
 	main := emptyGitRepo(t) // no commits — see linkedWorktree for why
 	wt := linkedWorktree(t, main)
 
-	keep, err := Fetch(f, "/r", wt, []string{sha})
+	keep, err := Fetch(f, "/r", wt, "", []string{sha})
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -1972,7 +1972,7 @@ func TestFetchWithARelativeGitDirInstallsCorrectly(t *testing.T) {
 	dst := emptyGitRepo(t)
 	chdirForTest(t, dst) // the process cwd IS the worktree — exactly what git sets up
 
-	keep, err := Fetch(f, "/r", ".git", []string{sha}) // RELATIVE gitDir, the live shape
+	keep, err := Fetch(f, "/r", ".git", "", []string{sha}) // RELATIVE gitDir, the live shape
 	if err != nil {
 		t.Fatalf("Fetch with a relative gitDir: %v", err)
 	}
@@ -1985,6 +1985,249 @@ func TestFetchWithARelativeGitDirInstallsCorrectly(t *testing.T) {
 	wantDir := filepath.Join(dst, ".git", "objects", "pack")
 	if got := filepath.Dir(keep); got != wantDir {
 		t.Errorf(".keep must live in %s, got %s", wantDir, got)
+	}
+}
+
+// plantIncrementalPacks pushes src's history onto the Fake as N incremental
+// packs — shas[i]'s pack contains its closure minus shas[i-1]'s — with the
+// ref left at the LAST sha. Returns the stems in history order.
+func plantIncrementalPacks(t *testing.T, f *transport.Fake, root, src string, shas []string) []string {
+	t.Helper()
+	if err := Bootstrap(f, root); err != nil {
+		t.Fatal(err)
+	}
+	var stems []string
+	for i, sha := range shas {
+		var haves []string
+		if i > 0 {
+			haves = []string{shas[i-1]}
+		}
+		packPath, idxPath, err := gitcmd.WritePack(src, sha, haves, t.TempDir())
+		if err != nil || packPath == "" {
+			t.Fatalf("WritePack(%s): %v", sha, err)
+		}
+		for _, p := range []string{packPath, idxPath} {
+			b, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.Files[root+"/packs/"+filepath.Base(p)] = b
+		}
+		stems = append(stems, strings.TrimSuffix(filepath.Base(packPath), ".pack"))
+	}
+	if _, err := WriteRef(f, root, "refs/heads/main", shas[len(shas)-1], false); err != nil {
+		t.Fatal(err)
+	}
+	return stems
+}
+
+// countPackDownloads parses trace output for downloads under <root>/packs/,
+// returning per-extension counts and the downloaded names. This helper IS
+// the measurement the gate uses; TestCountPackDownloads pins it.
+func countPackDownloads(trace, root string) (packs, idxs int, names []string) {
+	for _, line := range strings.Split(trace, "\n") {
+		rest, ok := strings.CutPrefix(line, "gpb: downloaded ")
+		if !ok {
+			continue
+		}
+		p := strings.SplitN(rest, " (", 2)[0]
+		if !strings.HasPrefix(p, root+"/packs/") {
+			continue
+		}
+		name := strings.TrimPrefix(p, root+"/packs/")
+		names = append(names, name)
+		if strings.HasSuffix(name, ".pack") {
+			packs++
+		}
+		if strings.HasSuffix(name, ".idx") {
+			idxs++
+		}
+	}
+	return
+}
+
+// GUARD on the measurement itself: the counter must distinguish, or every
+// selectivity assertion in this suite and the live gate is theater.
+func TestCountPackDownloads(t *testing.T) {
+	trace := "gpb: downloaded /r/packs/pack-a.pack (5 bytes)\n" +
+		"gpb: downloaded /r/packs/pack-a.idx (3 bytes)\n" +
+		"gpb: downloaded /r/refs/heads/main (41 bytes)\n" + // ref reads excluded
+		"noise\n"
+	p, i, names := countPackDownloads(trace, "/r")
+	if p != 1 || i != 1 || len(names) != 2 {
+		t.Fatalf("p=%d i=%d names=%v", p, i, names)
+	}
+}
+
+// GUARD, not RED — and the label is load-bearing: this test also passes
+// against 3a's download-everything code (downloading every pack converges
+// too), so it pins CONVERGENCE across a pack split, not selectivity. The
+// loop's distinguishing observable is the trace-counted selectivity test
+// below, whose deliberate-regression check (Step 6) is the proof it can
+// fail. Convergence still needs its own pin: a discovery bug that fetches
+// too little fails HERE first, with the clearest diagnosis.
+func TestFetchDiscoversAcrossPacks(t *testing.T) {
+	src := newGitRepoForPush(t)
+	c1 := headOfPushRepo(t, src)
+	c2 := commitOnPushRepo(t, src, "f2.txt", "two")
+	f := transport.NewFake()
+	plantIncrementalPacks(t, f, "/r", src, []string{c1, c2})
+
+	dst := emptyGitRepo(t)
+	keep, err := Fetch(f, "/r", dst, "", []string{c2})
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if keep == "" {
+		t.Fatal("an installing fetch must return a .keep")
+	}
+	for _, sha := range []string{c1, c2} {
+		if !gitcmd.HasObject(dst, sha) {
+			t.Errorf("object %s missing after fetch", sha)
+		}
+	}
+}
+
+// RED: selectivity, measured. dst already holds c1..c2 (via a first fetch);
+// after c3 is pushed, the incremental fetch downloads EXACTLY the new pair.
+// The full-fetch count beside it is the deliberate-regression twin: the
+// measurement demonstrably registers every download, so had the incremental
+// fetch over-downloaded, the ==1 assertion would have caught it.
+func TestFetchDownloadsOnlyTheNeededPack(t *testing.T) {
+	src := newGitRepoForPush(t)
+	c1 := headOfPushRepo(t, src)
+	c2 := commitOnPushRepo(t, src, "f2.txt", "two")
+	f := transport.NewFake()
+	stems := plantIncrementalPacks(t, f, "/r", src, []string{c1, c2})
+
+	var trace strings.Builder
+	tr := transport.NewTraced(f, &trace)
+	dst := emptyGitRepo(t)
+	cache := t.TempDir()
+	if _, err := Fetch(tr, "/r", dst, cache, []string{c2}); err != nil {
+		t.Fatalf("first fetch: %v", err)
+	}
+	fullPacks, fullIdxs, _ := countPackDownloads(trace.String(), "/r")
+	if fullPacks != 2 || fullIdxs != 2 {
+		t.Fatalf("full fetch must download both pairs (twin measurement): packs=%d idxs=%d",
+			fullPacks, fullIdxs)
+	}
+
+	// git updates refs AFTER the helper exits; simulate before the increment.
+	run := func(args ...string) {
+		if out, err := exec.Command("git", append([]string{"-C", dst}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	run("update-ref", "refs/heads/main", c2)
+
+	c3 := commitOnPushRepo(t, src, "f3.txt", "three")
+	newStems := plantOneMorePack(t, f, "/r", src, c2, c3)
+	trace.Reset()
+	if _, err := Fetch(tr, "/r", dst, cache, []string{c3}); err != nil {
+		t.Fatalf("incremental fetch: %v", err)
+	}
+	packs, idxs, names := countPackDownloads(trace.String(), "/r")
+	if packs != 1 || idxs != 1 {
+		t.Errorf("incremental fetch must download exactly one pair, got packs=%d idxs=%d (%v)",
+			packs, idxs, names)
+	}
+	for _, n := range names {
+		if !strings.HasPrefix(n, newStems[0]) {
+			t.Errorf("downloaded %s; only %s.* was needed", n, newStems[0])
+		}
+	}
+	_ = stems
+}
+
+// plantOneMorePack adds ONE more incremental pack (tip..prev) to an
+// already-planted Fake and moves the ref. Separate from plantIncrementalPacks
+// because Bootstrap and the first WriteRef must not rerun.
+func plantOneMorePack(t *testing.T, f *transport.Fake, root, src, prev, tip string) []string {
+	t.Helper()
+	packPath, idxPath, err := gitcmd.WritePack(src, tip, []string{prev}, t.TempDir())
+	if err != nil || packPath == "" {
+		t.Fatalf("WritePack: %v", err)
+	}
+	for _, p := range []string{packPath, idxPath} {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.Files[root+"/packs/"+filepath.Base(p)] = b
+	}
+	if _, err := WriteRef(f, root, "refs/heads/main", tip, true); err != nil {
+		t.Fatal(err)
+	}
+	return []string{strings.TrimSuffix(filepath.Base(packPath), ".pack")}
+}
+
+// GUARD, not RED, same reasoning as TestFetchDiscoversAcrossPacks: probe 3
+// end-to-end — a frontier that deepens through a missing tree converges
+// (commit pack, then tree pack, then blob pack). Download-everything also
+// passes this; the pin is that multi-round discovery CONVERGES, which is
+// exactly what breaks if the loop's termination or restart logic is wrong.
+func TestFetchFrontierDeepensThroughHandBuiltPacks(t *testing.T) {
+	src := newGitRepoForPush(t)
+	commitOnPushRepo(t, src, "deep.txt", "payload")
+	sha := headOfPushRepo(t, src)
+	out := func(args ...string) string {
+		b, err := exec.Command("git", append([]string{"-C", src}, args...)...).Output()
+		if err != nil {
+			t.Fatalf("git %v: %v", args, err)
+		}
+		return strings.TrimSpace(string(b))
+	}
+	tree := out("rev-parse", sha+"^{tree}")
+	blobList := out("rev-list", "--objects", sha)
+	f := transport.NewFake()
+	if err := Bootstrap(f, "/r"); err != nil {
+		t.Fatal(err)
+	}
+	// One hand-built pack per object CLASS: commit alone, tree(s) alone,
+	// blob(s) alone — forcing one discovery round per depth level.
+	classes := [][]string{{sha}, nil, nil}
+	for _, line := range strings.Split(blobList, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] == sha {
+			continue
+		}
+		if fields[0] == tree || strings.Contains(line, "/") || len(fields) == 1 {
+			classes[1] = append(classes[1], fields[0]) // trees (root tree has no path)
+		} else {
+			classes[2] = append(classes[2], fields[0]) // pathed blobs
+		}
+	}
+	for _, objs := range classes {
+		if len(objs) == 0 {
+			continue
+		}
+		dir := t.TempDir()
+		name, err := gitcmd.PackObjectsFromList(src, "", strings.Join(objs, "\n"),
+			filepath.Join(dir, "pack"))
+		if err != nil {
+			t.Fatalf("PackObjectsFromList: %v", err)
+		}
+		for _, ext := range []string{".pack", ".idx"} {
+			b, err := os.ReadFile(filepath.Join(dir, "pack-"+name+ext))
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.Files["/r/packs/pack-"+name+ext] = b
+		}
+	}
+	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	dst := emptyGitRepo(t)
+	if _, err := Fetch(f, "/r", dst, "", []string{sha}); err != nil {
+		t.Fatalf("Fetch across a deepening frontier: %v", err)
+	}
+	if !gitcmd.HasObject(dst, sha) {
+		t.Error("commit missing after multi-round discovery")
+	}
+	if out, err := exec.Command("git", "-C", dst, "fsck", "--no-dangling").CombinedOutput(); err != nil {
+		t.Errorf("fsck after multi-round fetch: %v: %s", err, out)
 	}
 }
 

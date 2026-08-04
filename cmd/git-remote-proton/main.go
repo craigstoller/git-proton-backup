@@ -424,7 +424,13 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 				warn(fmt.Errorf("fetch batch contained no wants"))
 				return 1
 			}
-			keep, err := repo.Fetch(t, root, gitDir, wants)
+			cacheDir, cerr := repo.ResolveIdxCacheDir(gitDir, root)
+			if cerr != nil {
+				warn(fmt.Errorf("sidecar cache unavailable (%v); pack indexes will be "+
+					"re-downloaded this fetch", cerr))
+				cacheDir = ""
+			}
+			keep, err := repo.Fetch(t, root, gitDir, cacheDir, wants)
 			if err != nil {
 				warn(err)
 				return 1
