@@ -2324,9 +2324,9 @@ First capture the pre-run truth and provision the probe parent:
 Then run the table:
 
 ```
-$env:GPB_LIVE_ACCOUNT = "1"; go test ./internal/transport/ -run 'TestContract' -v
+$env:GPB_LIVE_ACCOUNT = "1"; go test ./internal/transport/ -run 'TestContract' -count=1 -v
 ```
-The tests are `TestContractFake` and `TestContractCLI` (`contract_test.go:203,214`) — the pattern must match BOTH; a pattern matching neither reports PASS with "no tests to run", which is a false green. Expected: `TestContractCLI` RUNS its 9 scenarios live (loudly, not skipped — the skip message names `GPB_LIVE_ACCOUNT`) and passes, `TestContractFake` passes. Any failure → BLOCKED.
+The tests are `TestContractFake` and `TestContractCLI` (`contract_test.go:203,214`) — the pattern must match BOTH; a pattern matching neither reports PASS with "no tests to run", which is a false green. **`-count=1` is mandatory** (added after gate run 2 caught the omission): without it, Go replays a CACHED result verbatim — identical timings included — and a cached replay is not evidence the live half ran. Expected: `TestContractCLI` RUNS its 9 scenarios live (loudly, not skipped — the skip message names `GPB_LIVE_ACCOUNT`) and passes, `TestContractFake` passes. Any failure → BLOCKED.
 
 - [ ] **Step 2: Build and install the helper on PATH; create the demo repo**
 

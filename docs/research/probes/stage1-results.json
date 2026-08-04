@@ -178,6 +178,25 @@
         "failed": 0
       }
     },
+    "C17": {
+      "question": "Can `filesystem info` from a fresh process miss a folder created seconds-to-minutes earlier by another process? (The Stage 3b gate run 1 BLOCKED on exactly that signature: EnsureDir's Stat said refs/tags was absent minutes after push 1 created it, then create-folder failed 'already exists'.)",
+      "answer": "STALENESS: NO - 15/15 trials clean. A fresh-process `info` resolved a cross-process `create-folder` at every interval probed: ~65-130 ms after creation returned (10/10), and at 60 s, 180 s, 300 s (3/3). list-vs-info never disagreed (2/2). The staleness hypothesis is measured dead. THE GATE FAILURE'S LEADING EXPLANATION IS TRASHED-HOMONYM NAME CONFLICT, corroborated but not proven: CLI docs state a name that conflicts with other node(s) stops being usable as a path component, `list` returns trashed nodes, and gate cleanups only ever trashed (never purged) - so run 1 executed with multiple trashed generations of GitRemotes present. After Craig emptied the trash entirely, run 2 re-ran byte-identical code with unbatched pushes and the failure did not recur (all 4 pushes exit 0). Single-trial corroboration; the conflict mechanism itself was never directly provoked.",
+      "evidence": {
+        "stalenessTrials": 10,
+        "stalenessMisses": 0,
+        "gapMsRange": "65-130",
+        "supplementaryDelaysSeconds": [60, 180, 300],
+        "supplementaryMisses": 0,
+        "listVsInfoTrials": 2,
+        "listVsInfoDisagreements": 0,
+        "run1FailureVerbatim": "ensure dir /my-files/GitRemotes/stage3b-gate/refs/tags: create-folder tags in /my-files/GitRemotes/stage3b-gate/refs failed: A file or folder with that name already exists: exit status 1",
+        "run2AfterTrashEmpty": "failure did not recur; code identical between runs (sole intervening commit touched the gate record only)",
+        "relatedToC15": "The original C15 n=1 anomaly (list showed GitRemotes while info said Node not found) occurred IMMEDIATELY AFTER trashing GitRemotes - consistent with the same homonym mechanism, not with propagation staleness",
+        "practicalConsequence": "Keep the Proton trash free of project-path homonyms during gates (empty trash, or purge project items). An EnsureDir already-exists tolerance is a Stage 4 design candidate, with a known subtlety: the confirming Stat may be subject to the same resolution failure. Gate procedure now mandates -count=1 on the contract-table run (a cached replay is not a live run).",
+        "untested": "Directly provoking the conflict: create folder, trash it, recreate same name, then info/create through the path from a fresh process. Do this before designing around the mechanism.",
+        "raisedBy": "Stage 3b gate run 1 (BLOCKED); probe run 2026-08-04; gate run 2 corroboration same day"
+      }
+    },
     "C16": {
       "question": "Does `filesystem download` require its destination directory to already exist? (Transport.ReadTo is documented as 'localPath must be an existing directory; implementations do not create it', and Stage 2's contract text justified that by asserting the real CLI does not create it either)",
       "answer": "NO - IT SILENTLY CREATES THE MISSING DESTINATION AND SUCCEEDS. Given a destination directory that does not exist, `filesystem download <remotePath> <missingDir>` creates it, lands the file inside it, and exits 0. THE EARLIER CLAIM IS WITHDRAWN: 'the real CLI does not create it' was written into Stage 2's Transport contract comment and repeated in the Fake's own doc comments, and it was wrong. It was never probed - it was inferred, and no test could catch it because only the Fake (which genuinely does not create it, via os.WriteFile) ran in CI. THE CONTRACT WAS KEPT, NOT LOOSENED: `*CLI.ReadTo` now stats localDir itself and refuses before ever spawning the CLI, so the documented directory-must-exist behaviour is enforced by the WRAPPER rather than inherited from the binary. Rationale: every caller in this codebase creates its temp dir with os.MkdirTemp before calling ReadTo, so a missing destination always indicates a caller bug, and a transport that silently created the directory would hide that bug instead of surfacing it. This is also the first genuine Fake/CLI divergence the shared contract table (Task 2) failed to catch on its own - it was found only because the live half finally ran.",
