@@ -123,6 +123,27 @@ for _, stem := range []string{stem1, stem2} {
 
 Skip the deliberate-regression check for this test — a resume would also pass it, and claiming otherwise would be a false pin (record that honestly in the task report).
 
+> **SUPERSEDED (Stage 4 execution, Task 1 review, 2026-08-05):** the garbage-byte corruption
+> this step prescribes is caught by `buildPackMap`'s pre-loop `ShowIndex` cache-miss check
+> (`packmap.go:98-101`), which heals the sidecar BEFORE any round is planned — the mid-loop
+> pair-refresh (`downloadAndVerifyPack`, `fetch.go:244-268`) and the `if refreshed { break }`
+> round-restart (`fetch.go:160-166`) are never reached by this fixture, so the prescribed
+> GUARD comment's "mid-plan pair-refresh" framing overclaimed what the test pins, and
+> retro-Codex 1's motivating scenario (a second pack still pending across a mid-round
+> refresh) stayed untested. As executed: (a) the garbage-byte test STANDS with its comment
+> corrected to the pre-loop heal it actually exercises — still novel coverage: the first
+> end-to-end two-pack proof that a corrupt cached sidecar yields a complete, bounded fetch;
+> (b) a SECOND test (`TestFetchMidRoundPairRefreshWithTwoPacksCompletes`) corrupts the first
+> stem's cached sidecar with the `altPackingIdx`-style same-OID reindex instead — the only
+> known mechanism that passes `ShowIndex` pre-loop yet fails pack-pair verification mid-round
+> (the existing single-pack test proves it reaches the mid-loop path). The earlier
+> peer-review objection to `altPackingIdx` (same OID set → rebuilt plan unchanged →
+> restart-vs-resume indistinguishable) is conceded in that test's HONEST SCOPE comment; what
+> it pins is completion and bounded downloads through a genuine mid-round refresh with a
+> second pack still in the plan — exactly retro-Codex 1's ask. The implementer must verify
+> the mid-loop path actually fires (the refresh trace line appears / the `.idx` re-download
+> shows in the transfer trace).
+
 - [ ] **Step 6: Trace size-unknown branch test** (`internal/transport/trace_test.go`, `package transport`)
 
 ```go
