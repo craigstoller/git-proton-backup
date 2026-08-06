@@ -75,3 +75,23 @@ func TestTracedDelegatesSilently(t *testing.T) {
 		t.Errorf("non-ReadTo methods logged %q; want nothing", buf.String())
 	}
 }
+
+// readToWithoutLanding reports ReadTo success without creating the local
+// file, which is the only way to reach Traced's size-unknown branch.
+type readToWithoutLanding struct{ Transport }
+
+func (readToWithoutLanding) ReadTo(p, local string) error { return nil }
+
+// GUARD (Stage 4): the size-unknown fallback must still emit the normative
+// "gpb: downloaded" prefix the gate greps for.
+func TestTracedReportsSizeUnknownWhenTheFileDidNotLand(t *testing.T) {
+	var buf strings.Builder
+	tr := NewTraced(readToWithoutLanding{}, &buf)
+	if err := tr.ReadTo("/r/packs/pack-x.idx", t.TempDir()); err != nil {
+		t.Fatalf("stub ReadTo must succeed: %v", err)
+	}
+	want := "gpb: downloaded /r/packs/pack-x.idx (size unknown)\n"
+	if buf.String() != want {
+		t.Errorf("trace line %q, want %q", buf.String(), want)
+	}
+}

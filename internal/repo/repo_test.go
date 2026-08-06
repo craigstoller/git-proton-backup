@@ -2749,6 +2749,16 @@ func TestFetchChecksumFailureHealsAndRoutesAround(t *testing.T) {
 	if !gitcmd.HasObject(dst, c3) {
 		t.Error("c3 missing after healed fetch")
 	}
+	// GUARD (M1, Stage 4): the route-around must be visible in the transfer
+	// trace — the poisoned pack downloads exactly once (its failed attempt),
+	// never again after the heal, and the covering pack exactly once.
+	badStem, coverStem := stems[1], stems[2]
+	if got := strings.Count(trace.String(), "/packs/"+badStem+".pack"); got != 1 {
+		t.Errorf("poisoned pack downloaded %d times, want exactly 1; trace:\n%s", got, trace.String())
+	}
+	if got := strings.Count(trace.String(), "/packs/"+coverStem+".pack"); got != 1 {
+		t.Errorf("covering pack downloaded %d times, want exactly 1; trace:\n%s", got, trace.String())
+	}
 }
 
 // altPackingIdx builds a SECOND packing of sha's full closure at store-only
@@ -2821,6 +2831,58 @@ func TestFetchPairFailureRefreshesSidecarAndCompletes(t *testing.T) {
 	}
 }
 
+// TestFetchPairFailureWithTwoPacksRefreshesAndCompletes: two pushes plant two
+// packs (stem1 = c1's own pack, stem2 = c1->c2's delta) both needed by the
+// want (dst starts empty). stem1's CACHED sidecar is corrupted with GARBAGE
+// BYTES — a bit flip on its own real content, not altPackingIdx's same-OID-
+// set alternate packing, which a peer review found leaves the plan unchanged
+// and the assertions blind — so the cached sidecar genuinely fails
+// validation (empirically: buildPackMap's show-index cache-miss check) and
+// the refresh machinery genuinely re-downloads it, with a second pack
+// (stem2) still left in the plan when it does. The fetch must still complete
+// and deliver c2.
+func TestFetchPairFailureWithTwoPacksRefreshesAndCompletes(t *testing.T) {
+	src := newGitRepoForPush(t)
+	c1 := headOfPushRepo(t, src)
+	c2 := commitOnPushRepo(t, src, "f2.txt", "two")
+	f := transport.NewFake()
+	stems := plantIncrementalPacks(t, f, "/r", src, []string{c1, c2})
+	stem1, stem2 := stems[0], stems[1]
+
+	cache := t.TempDir()
+	idx1 := f.Files["/r/packs/"+stem1+".idx"]
+	corrupt := append([]byte{}, idx1...)
+	corrupt[len(corrupt)/2] ^= 0xff
+	if err := os.WriteFile(filepath.Join(cache, stem1+".idx"), corrupt, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dst := emptyGitRepo(t)
+	var trace strings.Builder
+	tr := transport.NewTraced(f, &trace)
+	_, err := Fetch(tr, "/r", dst, cache, []string{c2})
+	// GUARD (retro-Codex 1, Stage 4): a mid-plan pair-refresh with a second
+	// pack still in the plan must complete the whole fetch. HONEST SCOPE: this
+	// pins completion and bounded downloads through a two-pack refresh; it does
+	// NOT empirically distinguish restart from resume (both complete this
+	// fixture) — that distinction stays structurally pinned at unit level.
+	if err != nil {
+		t.Fatalf("fetch must survive a mid-plan sidecar refresh with two packs: %v", err)
+	}
+	if !gitcmd.HasObject(dst, c2) {
+		t.Errorf("want %s missing after two-pack refresh fetch", c2)
+	}
+	if got := strings.Count(trace.String(), "/packs/"+stem1+".idx"); got < 1 {
+		t.Errorf("the corrupted sidecar was never re-downloaded; trace:\n%s", trace.String())
+	}
+	for _, stem := range []string{stem1, stem2} {
+		if got := strings.Count(trace.String(), "/packs/"+stem+".pack"); got < 1 || got > 2 {
+			t.Errorf("pack %s downloaded %d times, want 1 or 2 (bounded); trace:\n%s",
+				stem, got, trace.String())
+		}
+	}
+}
+
 // GUARD, not RED: passed immediately against Task 6's code. A genuinely
 // mismatched REMOTE pair — same-OIDs alt-packing idx planted as the remote's
 // own sidecar, so the map is right but the pair can never verify — is fatal
@@ -2865,6 +2927,12 @@ func TestFetchSkipsAnIncompletePairWhenUnneeded(t *testing.T) {
 	dst := emptyGitRepo(t)
 	if _, err := Fetch(f, "/r", dst, "", []string{c1}); err != nil {
 		t.Fatalf("an unneeded incomplete pair must not break the fetch: %v", err)
+	}
+	// GUARD (M3, Stage 4): exit-0 alone does not prove the closure landed —
+	// assert the want is actually present in the object store.
+	if !gitcmd.HasObject(dst, c1) {
+		t.Errorf("fetched closure must contain want %s; a fetch that skips the "+
+			"incomplete pair must still deliver everything", c1)
 	}
 }
 
