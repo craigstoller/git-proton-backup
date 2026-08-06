@@ -1588,6 +1588,78 @@ func TestUpdateHEADFailsClosedOnUnrecognisedOutcome(t *testing.T) {
 //    run and must stay green; UpdateHEAD is a separate function and does not
 //    touch WriteHEAD's CreateExclusive-only, never-overwrite contract.
 
+// refusedHeadCreateTransport wraps a Fake but forces CreateExclusive to
+// report (Refused, nil) for the HEAD path specifically — modelling a
+// concurrent non-v2 actor creating HEAD between UpdateHEAD's Stat check and
+// its own CreateExclusive call. Mirrors refusedRefCreateTransport's shape
+// (line ~915), which forces the same outcome under refs/heads/ for
+// WriteRef's concurrent-creator case; this is the CREATE-path sibling for
+// UpdateHEAD's Refused arm.
+type refusedHeadCreateTransport struct {
+	*transport.Fake
+	forPath string
+}
+
+func (r refusedHeadCreateTransport) CreateExclusive(p, local string) (transport.Outcome, error) {
+	if p == r.forPath {
+		return transport.Refused, nil
+	}
+	return r.Fake.CreateExclusive(p, local)
+}
+
+// 18 GUARD (fix round 1, Important finding): UpdateHEAD's Refused arm is the
+//
+//	one arm whose behaviour is NOVEL versus WriteHEAD's — refuse rather
+//	than adopt, because "the user asked for THIS branch" — and had no test
+//	on either path. Before this test, the entire matrix stayed green even
+//	if the arm were mutated to WriteHEAD's form (`return transport.Refused,
+//	nil`), a plausible copy-paste regression whose live effect is a
+//	non-v2 actor's HEAD silently reported as success. Covers both paths:
+//	the update path via the Fake's own byte-identical Refused (modelling
+//	probe C2, no new scaffolding needed — UpdateRevision on identical
+//	bytes already returns Refused), and the create path via
+//	refusedHeadCreateTransport above, which was equally cheap given the
+//	existing refusedRefCreateTransport pattern to copy.
+func TestUpdateHEADRefusedOutcomeIsAnError(t *testing.T) {
+	t.Run("update path", func(t *testing.T) {
+		f := transport.NewFake()
+		_ = Bootstrap(f, "/r")
+		f.Files["/r/HEAD"] = []byte("ref: refs/heads/main\n")
+
+		// Byte-identical rewrite: UpdateRevision reports Refused (fake.go).
+		out, err := UpdateHEAD(f, "/r", "refs/heads/main")
+		if err == nil {
+			t.Fatal("UpdateHEAD must report an error on a Refused outcome, not adopt the existing HEAD")
+		}
+		if out != transport.Ambiguous {
+			t.Errorf("a Refused write must be reported as Ambiguous, got %v", out)
+		}
+		if !strings.Contains(err.Error(), "refused") || !strings.Contains(err.Error(), "re-run to reconcile") {
+			t.Errorf("must name the refusal and ask for a re-run, got: %v", err)
+		}
+	})
+
+	t.Run("create path", func(t *testing.T) {
+		f := transport.NewFake()
+		_ = Bootstrap(f, "/r")
+		tr := refusedHeadCreateTransport{Fake: f, forPath: "/r/" + HeadName}
+
+		out, err := UpdateHEAD(tr, "/r", "refs/heads/main")
+		if err == nil {
+			t.Fatal("UpdateHEAD must report an error on a Refused outcome, not adopt whatever landed")
+		}
+		if out != transport.Ambiguous {
+			t.Errorf("a Refused write must be reported as Ambiguous, got %v", out)
+		}
+		if !strings.Contains(err.Error(), "refused") || !strings.Contains(err.Error(), "re-run to reconcile") {
+			t.Errorf("must name the refusal and ask for a re-run, got: %v", err)
+		}
+		if _, ok := f.Files["/r/HEAD"]; ok {
+			t.Error("nothing must be recorded as HEAD content on a refused create")
+		}
+	})
+}
+
 // --- Task 4: SetHead (the --set-head operation) -----------------------------
 
 // RED: SetHead does not exist.
