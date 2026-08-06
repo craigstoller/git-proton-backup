@@ -1137,6 +1137,25 @@ if (Test-Path $payload) {
 2. **Checksum mismatch refuses:** `.sha256` naming a wrong digest → exit nonzero, nothing copied into the temp LOCALAPPDATA.
 3. **Missing exe skips cleanly:** no exe beside the script copy → exit 0, output contains "skipping helper install".
 
+> **SUPERSEDED (Stage 4 execution, Task 6 review, 2026-08-06):** two defects in this task's
+> plan-supplied content, both found by the task review after verbatim transcription.
+> (1) **The draft-release step's guard was ref-only.** `if: startsWith(github.ref,
+> 'refs/tags/v')` also fires when a `workflow_dispatch` run is manually targeted AT a tag ref
+> (the UI's "Use workflow from" dropdown or the API's `ref` parameter allows any ref), so a
+> dispatch-on-tag would create the draft release the "build-only dry run" rule forbids. As
+> executed the guard is `if: github.event_name == 'push' && startsWith(github.ref,
+> 'refs/tags/v')`.
+> (2) **The Pester isolation rule missed the registry channel.** Overriding
+> `$env:LOCALAPPDATA` for the child `pwsh` sandboxes the filesystem writes, but
+> `install.ps1`'s PATH persistence uses `[Environment]::SetEnvironmentVariable('Path', …,
+> 'User')` — a direct `HKCU\Environment` registry write no process-env override contains.
+> Every test run (and the implementer's manual sandbox runs) permanently appended a
+> dangling GUID-temp entry to the REAL user PATH; four such entries were found on the
+> machine and removed in the fix round. As executed, `install.ps1` gains a `-SkipPathUpdate`
+> switch (default off — shipped behaviour unchanged; the Task 8 gate still proves the real
+> PATH update end to end via fresh-shell resolution) and every Pester invocation of the
+> installer passes it; the success-path test also asserts the PATH-update message is absent.
+
 - [ ] **Step 4: CHANGELOG**
 
 Add at the top of `CHANGELOG.md`:
