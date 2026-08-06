@@ -705,7 +705,7 @@ Executable, not prose. Produces a committed results file that becomes normative.
 
 **Stage 3 — a real `git clone` and `git fetch`.** Idx cache, iterative discovery with termination, single-pack consolidation, `.keep`, connectivity verification. Ends when `git clone -o proton-v2 proton::…` produces a working checkout.
 
-**Stage 4 — productionisation.** Cross-compiled release artefacts, v1 coexistence testing, recovery documentation and its test, broader protocol conformance.
+**Stage 4 — productionisation.** Shipped: a windows/amd64 release build (the only platform its gate has run on; other platforms build from source and are unsupported), published as a draft until the live gate passes against those exact bytes, the CLI version allowlist, `--set-head`, and v1 coexistence documentation. Recovery documentation and its test, and broader protocol conformance, remain open.
 
 Compaction and retention remain a separately approved milestone. v2 reserves nothing for them beyond the marker's `version` field, which is the seam a future layout change goes through.
 

@@ -32,7 +32,7 @@ verification degrades to Windows Cloud Files sync-state only (see
 ```powershell
 git clone https://github.com/craigstoller/git-proton-backup.git
 cd git-proton-backup
-.\install.ps1                    # copies the module into your $PSModulePath
+.\install.ps1                    # copies the module into your $PSModulePath (+ the v2 helper exe, when present)
 Import-Module GitProtonBackup
 Initialize-ProtonBackup          # guided first run: finds the Proton Drive sync folder,
                                   # resolves the CLI, probes auth, writes config.json
@@ -85,6 +85,14 @@ are not equivalent, and the restore story is where that matters most.
 | Remote name | `proton` | `proton-v2` |
 | Restore needs | git only, from any machine — the bundle itself is the backup, no account needed | git, `git-remote-proton` on PATH, and the certified Proton Drive CLI signed in |
 
+**Install v2 first — `git-remote-proton` doesn't land on PATH by default.** Download the release
+assets (`git-remote-proton.exe`, `git-remote-proton.exe.sha256`, `install.ps1`) from a [GitHub
+Release](https://github.com/craigstoller/git-proton-backup/releases) into one folder and run
+`install.ps1` there: it verifies the exe against the `.sha256`, copies it to
+`%LOCALAPPDATA%\Programs\git-proton-backup`, and adds that folder to your user PATH — open a
+**new** terminal afterward, since the script can't change its caller's own session. Building from
+source works too: `go build ./cmd/git-remote-proton` and put the resulting exe on PATH yourself.
+
 ```
 git clone -o proton-v2 proton::/my-files/GitRemotes/myrepo
 git push proton-v2 main
@@ -125,7 +133,8 @@ Because the domain is Windows, and PowerShell is what Windows already speaks.
   few lines of inline P/Invoke here; it isn't portable, and neither is the transport.
 - **Zero runtime for the audience.** The people this is for — Windows users with git and a Proton
   account — install nothing to run it: no Python, no packaging manager, no binary to trust.
-  `install.ps1` copies a module; that's the whole footprint.
+  `install.ps1` copies a module — plus, when a helper exe sits beside the script, that exe under
+  `%LOCALAPPDATA%\Programs\git-proton-backup` and a user-PATH entry — that's the whole footprint.
 - **The job is glue.** Orchestrating git, a vendor CLI, filesystem state, and Task Scheduler is
   exactly what a shell is for. A compiled language would add build weight to a tool whose honest
   job is coordination, not computation.

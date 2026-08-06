@@ -103,6 +103,12 @@ func WriteHEAD(t transport.Transport, root, branch string) (transport.Outcome, e
 // that function backfills and never overwrites, a contract its tests pin.
 // The caller MUST hold the repo lock. Verified by read-back like every
 // write (the CLI silently skips byte-identical rewrites).
+//
+// UpdateHEAD does NOT short-circuit a rewrite that matches the existing
+// target itself: callers must check first, because the CLI comes back
+// Refused for a byte-identical write and UpdateHEAD reports that as an
+// error, not success. SetHead's read-first short-circuit is the reference
+// caller.
 func UpdateHEAD(t transport.Transport, root, branch string) (transport.Outcome, error) {
 	if !strings.HasPrefix(branch, "refs/heads/") {
 		return transport.Ambiguous, fmt.Errorf("refusing to point HEAD at %q: not a branch", branch)

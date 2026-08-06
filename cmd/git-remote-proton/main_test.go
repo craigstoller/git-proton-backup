@@ -1008,8 +1008,12 @@ func TestDispatchUtility_Version_PrintsVersionAndCertifiedCLI(t *testing.T) {
 // "--set-head" invocation with 0 or 1 following args must be handled with a
 // usage message on stderr and exit code 1, and must NEVER reach runSetHead —
 // which would construct a real *transport.CLI and spawn `proton-drive
-// --version`. Asserting stdout is empty is what proves that did not happen:
-// a version check, if it ran, would put output there.
+// --version`. The load-bearing assertions are the stderr "usage" text (a
+// runSetHead failure would instead print "git-remote-proton: ...") and the
+// arity check returning before any construction — NOT the empty stdout,
+// which stays empty on both paths regardless: EnforceCertified writes only
+// to stderr, and Version() returns the child's output rather than printing
+// it.
 func TestDispatchUtility_SetHead_WrongArity_NoCLIConstruction(t *testing.T) {
 	cases := []struct {
 		name string
