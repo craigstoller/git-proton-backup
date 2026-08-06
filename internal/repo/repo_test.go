@@ -2209,6 +2209,60 @@ func emptyGitRepo(t *testing.T) string {
 	return d
 }
 
+// assertSamePackDir fails the test unless want and got name the same
+// directory on disk, robust to the 8.3 short-name aliasing that first
+// surfaced this comparison as flaky (CI on GitHub's windows-latest runner,
+// first-ever run of the Go suite): the runner's TEMP is set to a DOS 8.3
+// short spelling (e.g. RUNNER~1), so a want path built by joining
+// t.TempDir() onto other segments inherits that short spelling, while got
+// -- consolidateAndInstall's `git rev-parse --git-path objects/pack` answer
+// -- comes back resolved to the long form (runneradmin) by git/Windows. Same
+// physical directory, two spellings; a raw string compare treats that as two
+// different directories and fails a correct fetch. Reproduced locally by
+// pointing TMP/TEMP at a short-form alias of a scratch directory and running
+// the affected test (see the fix report) -- it fails with exactly this
+// shape, want and got spelled differently but identical up to the alias.
+//
+// filepath.EvalSymlinks resolves an 8.3 alias to its final long-form
+// spelling on Windows (it is not merely a symlink resolver there -- see its
+// doc), so running both sides through it before comparing absorbs the alias
+// without weakening the assertion: it must still fail if the pack genuinely
+// lands in a different directory, which EvalSymlinks alone would still
+// report as a mismatch. os.SameFile is a second, stat-identity-based check
+// used only if the normalised strings still differ -- it catches a residual
+// false negative (a trailing separator, a UNC-prefix difference) using
+// filesystem identity (device+inode / file index) rather than string shape,
+// again without accepting a genuinely different directory as a match.
+//
+// If EvalSymlinks fails on either side (e.g. the directory does not exist),
+// that failure is folded into the failure message rather than silently
+// passing or panicking -- a missing directory is itself a real assertion
+// failure, not grounds to skip the check.
+func assertSamePackDir(t *testing.T, context, want, got string) {
+	t.Helper()
+	wantEval, wErr := filepath.EvalSymlinks(want)
+	gotEval, gErr := filepath.EvalSymlinks(got)
+	if wErr == nil && gErr == nil {
+		if wantEval == gotEval {
+			return
+		}
+		wantInfo, wStatErr := os.Stat(wantEval)
+		gotInfo, gStatErr := os.Stat(gotEval)
+		if wStatErr == nil && gStatErr == nil && os.SameFile(wantInfo, gotInfo) {
+			return
+		}
+		t.Errorf("%s %s, got %s (normalised: want=%s got=%s)", context, want, got, wantEval, gotEval)
+		return
+	}
+	// Could not normalise one or both sides -- fall back to a raw compare so
+	// a genuine mismatch is still reported, with the normalisation errors
+	// folded in for diagnosis.
+	if want != got {
+		t.Errorf("%s %s, got %s (path normalisation failed: want-err=%v got-err=%v)",
+			context, want, got, wErr, gErr)
+	}
+}
+
 // plantRepoOnFake pushes a real repo's history into a Fake as a v2 remote:
 // marker, refs, and one pack pair under packs/.
 func plantRepoOnFake(t *testing.T, f *transport.Fake, root, gitDir, sha string) {
@@ -2264,9 +2318,7 @@ func TestFetchInstallsTheClosure(t *testing.T) {
 		t.Errorf("want exactly 1 installed pack, got %d", n)
 	}
 	wantDir := filepath.Join(dst, ".git", "objects", "pack")
-	if got := filepath.Dir(keep); got != wantDir {
-		t.Errorf(".keep must live in %s, got %s", wantDir, got)
-	}
+	assertSamePackDir(t, ".keep must live in", wantDir, filepath.Dir(keep))
 }
 
 // RED. A second fetch of the same want installs nothing. This is what
@@ -2447,9 +2499,7 @@ func TestFetchIntoALinkedWorktreeInstallsWhereGitLooks(t *testing.T) {
 			"invisible to every git command, even though Fetch reported success")
 	}
 	wantDir := filepath.Join(main, ".git", "objects", "pack")
-	if got := filepath.Dir(keep); got != wantDir {
-		t.Errorf(".keep must live in the MAIN repo's real object store %s, got %s", wantDir, got)
-	}
+	assertSamePackDir(t, ".keep must live in the MAIN repo's real object store", wantDir, filepath.Dir(keep))
 }
 
 // chdirForTest changes the process's working directory to dir for the
@@ -2520,9 +2570,7 @@ func TestFetchWithARelativeGitDirInstallsCorrectly(t *testing.T) {
 		t.Error("the wanted object must be present after a fetch with a relative gitDir")
 	}
 	wantDir := filepath.Join(dst, ".git", "objects", "pack")
-	if got := filepath.Dir(keep); got != wantDir {
-		t.Errorf(".keep must live in %s, got %s", wantDir, got)
-	}
+	assertSamePackDir(t, ".keep must live in", wantDir, filepath.Dir(keep))
 }
 
 // plantIncrementalPacks pushes src's history onto the Fake as N incremental
