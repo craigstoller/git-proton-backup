@@ -24,8 +24,15 @@ jobs:
         shell: pwsh
         run: |
           Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
-          $findings = Invoke-ScriptAnalyzer -Path . -Recurse -Settings .\PSScriptAnalyzerSettings.psd1
-          if ($findings) { $findings | Format-Table | Out-String | Write-Host; throw "PSScriptAnalyzer: $($findings.Count) finding(s)" }
+          # Shipped code only: installer, module, tests. Research probes under
+          # docs/research/ are frozen evidence, deliberately not linted.
+          $paths = 'install.ps1', 'GitProtonBackup', 'tests'
+          $findings = foreach ($p in $paths) { Invoke-ScriptAnalyzer -Path $p -Recurse -Settings .\PSScriptAnalyzerSettings.psd1 }
+          if ($findings) {
+            $findings | Format-Table RuleName, Severity, ScriptName, Line, Message -AutoSize | Out-String | Write-Host
+            throw "PSScriptAnalyzer: $($findings.Count) finding(s)"
+          }
+          Write-Host 'PSScriptAnalyzer: clean'
       - name: Pester (installer tests included)
         shell: pwsh
         run: |
