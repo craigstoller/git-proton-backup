@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.1 — unreleased
+## 0.3.1 — 2026-08-06
 
 One version line covers both tools in this repository: the GitProtonBackup
 PowerShell module (v1, bundles) and the git-remote-proton helper (v2, CAS
