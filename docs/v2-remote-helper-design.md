@@ -1,6 +1,6 @@
 # git-remote-proton — v2 design
 
-**Status:** design v6.3, revised 2026-08-02 during and after Stage 3a implementation. v5 was settled after four rounds of Codex + Gemini peer review; v6, v6.1, v6.2 and v6.3 each change exactly one mechanism, and each only because implementation proved the original unimplementable, unenforceable, or worse than what shipped — see the revision history.
+**Status:** design v6.4, revised 2026-08-06 during Stage 4 implementation. v5 was settled after four rounds of Codex + Gemini peer review; v6, v6.1, v6.2 and v6.3 each change exactly one mechanism, and each only because implementation proved the original unimplementable, unenforceable, or worse than what shipped. v6.4 is different in kind: it documents Stage 4's shipped additions — the CLI version allowlist and the `--set-head` operation — rather than a single corrected mechanism. See the revision history.
 **Relates to:** [issue #3](https://github.com/craigstoller/git-proton-backup/issues/3).
 **Depends on:** [`docs/research/remote-helper-prior-art.md`](research/remote-helper-prior-art.md) — read first; assumed, not repeated.
 **Pinned to:** Proton Drive CLI **`cli-drive@0.7.0`** (SDK `js@0.20.0`) — Stage 1 was certified
@@ -295,6 +295,62 @@ makes read-back verification more important rather than less. So `UpdateRevision
 
 **Immutable objects** (packs, indexes) use `CreateExclusive`. `Refused` there means only that **the name is already taken** — it is not evidence about the bytes behind it, and it is never success on the strength of the refusal alone. It becomes success only after Push's reconciliation rule, which differs by member: a `.pack` is compared byte-for-byte against the candidate, because its name is its content checksum; a `.idx` is not, because its name is borrowed from its pack and more than one valid index can carry it. See Push for the full rule.
 
+## CLI version allowlist
+
+**Shipped Stage 4.** The seam is CLI-transport construction: before the first filesystem command
+on either the protocol path (`run()`) or `--set-head` (`runSetHead()`), the helper runs
+`proton-drive --version` once per process and matches the CLI's identity token against a
+compiled-in certified list — today exactly one build, `transport.CertifiedCLI =
+"cli-drive@0.7.0+5174900c"` (`internal/transport/cli.go`). Matching is exact-token, not
+containment or a prefix: `IsCertified` requires the first whitespace-delimited field starting
+`cli-drive@` to equal `CertifiedCLI` exactly, so `cli-drive@0.7.0+5174900c-extra` is **not**
+certified. The SDK line in `--version`'s output is recorded in diagnostics but never matched —
+only the CLI line's token gates anything.
+
+**Refuse by default, override loudly.** `transport.EnforceCertified` is the enforcement point:
+
+- **Mismatch, unparseable `--version` output, or a nonzero `--version` exit → refuse**, before
+  any filesystem command, naming what was found (or that it could not be determined) and what is
+  certified.
+- **`GPB_UNCERTIFIED_CLI=1` → proceed**, printing a loud stderr warning naming the untested (or
+  undetermined) version on every helper invocation. The override is never remembered or cached
+  across processes — it is read fresh from the environment each run.
+- **A binary that never started refuses regardless of the override.** "Never started" is
+  detected structurally — `verr` non-nil and not an `*exec.ExitError` — rather than narrowly as
+  `exec.ErrNotFound`, because the narrow check let permission-denied, a bad executable format, or
+  `CLI.Exe` pointing at a directory all fall through to the generic (overridable) branch and
+  proceed, which is exactly the binary-synthesis the override must never do (fix round 1). The
+  override covers a CLI that ran and reported something uncertified; it does not conjure a CLI
+  that never ran at all.
+
+**Where it does and does not run.** The check fires wherever a CLI transport is constructed: the
+protocol path and `--set-head`, both before touching the repo. `--version` constructs no
+transport and is therefore never gated — the diagnostic for "your CLI isn't certified" must not
+itself require a certified CLI to print. A CLI that never starts at all still fails exactly as it
+always has (spawn error, fail closed) — the allowlist adds no new failure path there, only a new
+refusal for a CLI that DOES start but is not the certified build.
+
+**Threat-model framing: a compatibility gate, not a provenance check.** The allowlist defends
+against accidental drift — an auto-updated or hand-upgraded CLI silently changing semantics
+under the helper, exactly the failure class this document already establishes between 0.4.6 and
+0.7.0: the `activeRevision` payload shape, the byte-identical-rewrite auto-skip, and
+concurrent-startup behaviour (all above), plus the local-path globbing hazard confirmed live on
+0.7.0 (probe C13, above). It does **not** defend against a hostile binary on PATH: a spoofed
+`--version` defeats the check trivially — the gate's own shim test proves it — and that is
+accepted as out of scope, because a helper that already trusts the CLI with every byte of repo
+data has no meaningful defence against a malicious one regardless of what `--version` claims.
+
+**Defense in depth, behind the front door — the design/code contradiction this closes.**
+`parseNodeJSON` (`cli.go`) tolerates two `activeRevision` shapes: 0.7.0's unwrapped form and
+0.4.6's `{ok, value}` wrapper. That tolerance is KEPT, not removed by the allowlist — but its
+role changes. Read on its own, a parser that accepts two CLI versions' output reads as a floor,
+contradicting this document's stated rule, unchanged since v4: "exact versions, not a floor or
+prefix." The allowlist resolves that reading: it is the front door, gating on the exact certified
+build before any filesystem command runs; the parser's version tolerance is defense in depth
+*behind* that door. The two are not in tension once ordered this way, and this document now says
+so explicitly rather than leaving the contradiction implicit — see also the two updated rows in
+the error table, below, which previously recorded this as deliberately unimplemented.
+
 ## Concurrency posture
 
 **Single writer per repo is a product precondition, weakly enforced.**
@@ -411,7 +467,7 @@ This conformance is **Stage 2/3 work**, not Stage 4 — it is a correctness prop
 | Old sha absent locally, unforced | `error <ref> fetch first` |
 | Forced branch update | Skip ancestry; still `UpdateRevision` + verify |
 | Branch target not a commit | **Reject** — git never allows a branch to point at a tree, blob, or tag object |
-| Delete (`push :dst`) | `Trash`; refuse to delete the branch `HEAD` points at |
+| Delete (`push :dst`) | `Trash`; refuse to delete the branch `HEAD` points at, naming `git-remote-proton --set-head <url> <branch>` as the remedy |
 | Tag create | `CreateExclusive` |
 | Tag update | Requires force, matching git's rule; no ancestry check |
 | `refs/notes/*`, `refs/replace/*`, other valid namespaces | **NOT IMPLEMENTED IN STAGE 2 — rejected outright with a named reason.** See the v6.1 note below; the rule as written here is unimplementable while `ListRefs` is non-recursive |
@@ -496,14 +552,108 @@ The helper owns the closure. Git's `fetch` capability is defined as transferring
 
 **Discovery cost grows linearly with pack count.** Every fetch enumerates `packs/`; a new client downloads every `.idx`. This is the design's main scaling weakness and the reason compaction is a real milestone.
 
+## Utility modes: `--version` and `--set-head`
+
+**Shipped Stage 4.** Beyond the protocol path git invokes (`git-remote-proton <name> <url>`), the
+helper also serves two direct-invocation "utility modes," dispatched from `os.Args[1]` before any
+protocol I/O begins (`dispatchUtility`, `cmd/git-remote-proton/main.go`): `--version` and
+`--set-head <address> <branch>`.
+
+**`--set-head` ships as a direct-invocation utility mode, not a protocol extension.** Remote
+helpers have no protocol verb for changing a remote's default branch, and the user — not git —
+is the natural invoker of that change.
+
+**Dispatch matches a closed set, not a prefix.** `os.Args[1]` must EQUAL `--version` or
+`--set-head` exactly; every other value takes the protocol path unchanged, even one that begins
+with `--`. A prefix match (`--*`) would misroute a remote whose *configured name* begins with
+`--` — git passes the remote's name as `os.Args[1]` on the protocol path — but the closed set
+narrows that collision to exactly two strings. **`--version` and `--set-head` are documented here
+as reserved: a remote cannot be named either of those two strings and used with this helper**,
+because those exact `os.Args[1]` values are claimed by utility-mode dispatch instead of being
+passed through as a remote name.
+
+**Utility-mode stdout is safe because the argv shapes are disjoint.** Every other command in this
+helper writes protocol data to stdout and diagnostics to stderr; utility mode writes its result
+to stdout instead — `--version` prints `git-remote-proton <version> (certified CLI:
+<CertifiedCLI>)`, `--set-head` confirms with `HEAD is now <ref>` — because git never invokes the
+helper with either of these two `os.Args[1]` values during a real remote-helper session, so
+utility-mode stdout can never interleave with the protocol stream.
+
+**Arity is checked before anything else runs.** `--set-head` takes exactly two further arguments
+(`<proton::address> <branch>`); the wrong count refuses with a usage line on stderr (`usage:
+git-remote-proton --set-head <proton::address> <branch>`) before `CanonicalRoot`, the allowlist,
+or any repo access. A bare invocation with no arguments at all falls through `dispatchUtility` (it
+requires at least `os.Args[1]`) and keeps the helper's existing "must be run by git as a remote
+helper" usage error.
+
+**`--version` constructs no CLI transport and is therefore never allowlist-gated** (see CLI
+version allowlist, above) — the diagnostic for an uncertified CLI must not itself require a
+certified CLI to run. `--set-head` constructs one and is gated like everything else.
+
+### `--set-head` grammar
+
+`<address>` is anything `CanonicalRoot` accepts, with or without the `proton::` prefix.
+`<branch>` is a short name (normalised to `refs/heads/<branch>`) or a full `refs/heads/…` ref;
+anything outside `refs/heads/` is refused — HEAD points at branches only, the same rule
+`WriteHEAD` already enforces. The hierarchical-name refusal is checked first, ahead of the
+general staging-path check, so it gets its own named reason: a leaf containing `/` or `\` is
+refused naming Stage 5, not yet supported. The remaining leaf must pass the same
+`checkStageableLeaf` rules the push path enforces — no braces, no Windows reserved device names,
+not empty/`.`/`..`. Matching against remote branches is exact byte comparison, no case folding.
+
+### Flow, lock, and outcome semantics
+
+Order: dispatch (arity-checked) → `CanonicalRoot` → allowlist check (transport construction) →
+`RequireMarker` → `AcquireLock` → **verify `refs/heads/<branch>` exists remotely, on every
+invocation, before any short-circuit** → read `HEAD` under the lock → if it already names the
+verified target, report success and stop (idempotent, no upload) → `UpdateHEAD` → `Release`.
+
+The existence check runs before the idempotence short-circuit deliberately — a round-3
+peer-review finding both engines caught independently: reading `HEAD` first and short-circuiting
+on a match, without first confirming the branch still exists, would let a `HEAD` that already
+names a since-deleted branch report success instead of refusing. Verifying first closes that. The
+same read-`HEAD`-under-lock step is also what makes a re-run after an `Ambiguous` outcome
+self-reconciling: a re-run either finds the write already landed (reports success) or makes a
+fresh attempt — no special retry mode is needed.
+
+The lock is released via `defer` on every exit path, the same "release on every exit path" rule
+and the same stale-lock/holder-nonce semantics as every other lock-holding operation in this
+design (see Concurrency posture, above). Within the lock, verify-then-write is serialised against
+every other v2 writer — branch deletion takes the same lock. Non-v2 actors (the web UI, other
+Proton clients) can still mutate the repo at any time; that is the same accepted model every
+existing v2 operation lives with, not a new exposure `--set-head` introduces.
+
+**`UpdateHEAD` carries the overwrite; `WriteHEAD` is untouched.** `WriteHEAD` is backfill-only by
+pinned contract (`TestWriteHEADNeverOverwritesExistingHEAD`) and never overwrites an existing
+symref. `UpdateHEAD` (`internal/repo/head.go`) is the new function that does, and it branches on
+whether `HEAD` currently exists: it `Stat`s the path first, then calls `UpdateRevision` (`upload
+-f merge`, per probe C14) when `HEAD` is present — the ordinary overwrite case — or
+`CreateExclusive` when it is absent, which is the headless-repo rescue this document already
+defines elsewhere: a repo with no `HEAD` file at all, either because its first push was
+tags-only (the ref-transition table's own headless case) or because an operator deleted the
+`HEAD` file in the web UI to repair a corrupt one (`SetHead`'s own doc comment names this path).
+Either way it stages the same local basename `HEAD` used everywhere else, and both
+branches feed the same closed-set outcome handling as the marker and ref paths: `Committed` falls
+through to read-back verification; `Refused` is impossible from another v2 writer under the lock,
+so it is read as a non-v2 actor and refused rather than adopted — the user asked for THIS branch;
+`Ambiguous` likewise refuses, both with "re-run to reconcile"; and any unrecognised outcome fails
+closed rather than guessing.
+
+**The branch-delete refusal names this as the remedy.** The ref-transition table's delete row, in
+Push above, and `push.go`'s refusal text now both name `git-remote-proton --set-head <url>
+<branch>` as the fix for "refusing to delete the branch HEAD points at" — previously the refusal
+named the problem with no way out.
+
 ## Error handling
 
 **Fail closed.** Anything unconfirmed is a failure.
 
 | Class | Behaviour |
 |---|---|
-| CLI missing, logged out, session expired mid-operation | Startup probe plus per-call detection; actionable message. **Stage 2.1 ships the probe as a WARNING, not a refusal** — see the row below; the two were deferred together |
-| CLI version not on the certified allowlist | Refuse to run - exact versions, not a floor. **NOT IMPLEMENTED as of Stage 2.1, deliberately.** The helper warns on stderr and continues. A hard allowlist breaks the user's tooling the day Proton ships a new build, which is a policy call the user deferred to Stage 4; a silent behaviour change across versions is what broke v1, so the mismatch is at least made visible now. **The deferral covers both this row and the one above** — the startup probe exists but has no teeth, so a missing CLI warns and then fails opaquely a moment later in bootstrap |
+| CLI missing, logged out, session expired mid-operation | The CLI-version allowlist gate (above) refuses outright, before any filesystem command, for a CLI that never starts at all (missing binary, permission denied, not an executable) — that case is no longer a warning followed by an opaque bootstrap failure. A session that is valid at startup but expires mid-operation is not covered by that gate and is detected per-call, where the CLI's own error surfaces through the affected transport method's actionable message |
+| CLI version not on the certified allowlist | **Shipped Stage 4** (see CLI version allowlist, above): refuse to run before any filesystem command, naming what was found versus what is certified — exact versions, not a floor. `GPB_UNCERTIFIED_CLI=1` overrides with a loud per-invocation stderr warning, never cached across processes. **This row previously said NOT IMPLEMENTED as of Stage 2.1, deliberately** — Stage 2.1 shipped the version probe as an advisory warning only, deferring a hard refusal to this stage as a policy call, since a silent behaviour change across CLI versions is what broke v1 in the first place. That deferral is now resolved |
+| `proton-drive --version` exits 0 but its output does not match a certified token | Same refusal as above, naming the found output verbatim (quoted, bounded to 200 chars) — treated as uncertified, not as version-undetermined, because the process ran and its output is trustworthy text even though it does not match. The override still applies, and its warning names that same found text |
+| `proton-drive --version` exits nonzero (the binary started and ran) | Refusal treated as version-undetermined: the process ran, but a nonzero exit forfeits trust in anything it printed, so nothing is named as "found." The override still applies; its warning says the version could not be determined rather than naming a wrong one |
 | `failedItems > 0` with exit code 0 | Treated as failure — never inferred from exit status |
 | Unparseable or unexpected `--json` shape | `Ambiguous`; reconcile against remote state before retry |
 | Mutation timed out after the remote may have committed | `Ambiguous`; read back before any retry |
@@ -555,7 +705,7 @@ Executable, not prose. Produces a committed results file that becomes normative.
 
 **Stage 3 — a real `git clone` and `git fetch`.** Idx cache, iterative discovery with termination, single-pack consolidation, `.keep`, connectivity verification. Ends when `git clone -o proton-v2 proton::…` produces a working checkout.
 
-**Stage 4 — productionisation.** Cross-compiled release artefacts, v1 coexistence testing, recovery documentation and its test, broader protocol conformance.
+**Stage 4 — productionisation.** Shipped: a windows/amd64 release build (the only platform its gate has run on; other platforms build from source and are unsupported), published as a draft until the live gate passes against those exact bytes, the CLI version allowlist, `--set-head`, and v1 coexistence documentation. Recovery documentation and its test, and broader protocol conformance, remain open.
 
 Compaction and retention remain a separately approved milestone. v2 reserves nothing for them beyond the marker's `version` field, which is the seam a future layout change goes through.
 
@@ -575,6 +725,84 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
 ---
 
 ## Revision history
+
+**v6.4, 2026-08-06 — Stage 4 ships: CLI version allowlist, `--set-head`, and the docs update that closes a standing design/code contradiction.**
+
+- **The CLI version allowlist is now enforced, not advisory.** The error table's "CLI version not
+  on the certified allowlist" row said, as of Stage 2.1, "NOT IMPLEMENTED... deliberately... The
+  helper warns on stderr and continues." `transport.EnforceCertified` (`internal/transport/cli.go`)
+  now refuses to run before any filesystem command unless the CLI reports exactly `CertifiedCLI`,
+  with `GPB_UNCERTIFIED_CLI=1` as the documented override. Both existing error-table rows are
+  updated to match, and two rows are added distinguishing an unparseable-but-clean-exit
+  `--version` (refused, naming the found text verbatim) from a nonzero exit (refused as
+  version-undetermined — nothing printed is trustworthy) — the two are NOT the same refusal
+  wording, which an earlier draft of this revision collapsed into one row and a fix round
+  corrected (see the amendment note below). A new "CLI version allowlist" section states the
+  mechanism and its threat-model framing.
+- **This closes the `parseNodeJSON` contradiction that had stood since Stage 2.** `parseNodeJSON`
+  (`cli.go`) tolerates both the 0.4.6 wrapped `{ok,value}` shape and the 0.7.0 unwrapped shape —
+  version-tolerant parsing that read as a floor, while this document's stated rule (unchanged
+  since v4) is "exact versions, not a floor or prefix." The allowlist is now that front door; the
+  parser's tolerance is defense in depth behind it, not a substitute for it. Both are kept, and
+  the design/code disagreement is resolved in favour of the shipped front-door enforcement.
+- **`--set-head` closes the one user-facing gap Stage 3 left**: a v2 remote's default branch could
+  not be changed in-tool. It ships as a direct-invocation utility mode, dispatched from a closed
+  `os.Args[1]` set alongside `--version` — not a protocol extension, since remote helpers have no
+  protocol verb for it and the user, not git, is the natural invoker. The new "Utility modes"
+  section states the dispatch rationale, the branch-name grammar, the lock and
+  verify-before-short-circuit ordering (branch existence checked on every run, before the
+  idempotence short-circuit — a round-3 peer-review finding, both engines), and the
+  `UpdateHEAD`/`WriteHEAD` split: `UpdateHEAD` carries the overwrite, branching on whether `HEAD`
+  currently exists (`UpdateRevision` when present, `CreateExclusive` for the headless-repo rescue
+  when absent), while `WriteHEAD` stays untouched and backfill-only, pinned by
+  `TestWriteHEADNeverOverwritesExistingHEAD`.
+- **The branch-delete refusal now names its own remedy.** The ref-transition table's delete row,
+  and `internal/repo/push.go`'s refusal message, both name `git-remote-proton --set-head <url>
+  <branch>` as the fix for "refusing to delete the branch HEAD points at" — previously the
+  refusal named the problem but not the way out.
+- **`--version` and `--set-head` are documented as reserved.** Because dispatch matches
+  `os.Args[1]` against a closed set rather than a prefix, only a remote literally named
+  `--version` or `--set-head` could collide with utility-mode dispatch — and this document now
+  states plainly that those two strings cannot be used as a remote name with this helper.
+- README gained a v1/v2 coexistence section, per the Stage 4 spec's component 4: the side-by-side
+  table, the dedicated-root guidance (never inside `GitBackups`), the restore-contract honesty
+  (v1: git only; v2: git + helper + certified CLI), and the trash note scoped to homonym cleanup
+  with an evidence-capture step, not a blanket "empty your trash."
+
+**Amendment (fix round 1, 2026-08-06) — three accuracy defects found on review, all confirmed against code and corrected in place rather than superseded as v6.5, since v6.4 had not yet been treated as settled.**
+
+- **README's restore-needs table cell contradicted its own prose.** The table said v1 restore
+  needs "git only, from any device signed into your Proton account"; the prose two paragraphs
+  down (correctly) said no account is needed at restore time, because the bundle itself is the
+  backup. The table cell was wrong, not the prose — fixed to "git only, from any machine... no
+  account needed."
+- **`UpdateHEAD` was described as unconditionally using `upload -f merge`.** The shipped function
+  (`internal/repo/head.go:116-126`) `Stat`s `HEAD` first and branches: `UpdateRevision` (merge)
+  only when `HEAD` already exists, `CreateExclusive` when it is absent — the headless-repo rescue
+  this document defines elsewhere. The original v6.4 text described only the merge branch, which
+  is also not this document's own cross-check table's wording ("CAS via
+  `CreateExclusive`/`UpdateRevision`," Component 2 of the Stage 4 spec). Both branches are now
+  described, here and in the "Utility modes" section itself.
+- **The error table collapsed two distinct refusals into one row with the wrong shared wording.**
+  Per `EnforceCertified` (`cli.go:453-477`), "could not be determined (%v)" fires only when
+  `Version()` returned an error from a process that STARTED and exited nonzero (`*exec.ExitError`);
+  a start failure is refused earlier, by the separate never-started check, with its own "Proton
+  CLI could not be started" message, and never reaches this wording at all. A clean exit whose
+  output does not match a certified token takes a third path: `found` stays the actual quoted,
+  bounded output, never "could not be determined." The merged row claimed the first two cases got
+  the same wording; split back into two rows matching the Stage 4 spec's own error table.
+
+**Amendment (fix round 2, 2026-08-06) — the fix-round-1 amendment above introduced its own
+inaccuracy, caught on re-review.** Its third bullet originally said "could not be determined
+(%v)" fires when `Version()` "returned an error — a nonzero exit or a start failure," as if both
+reached the same code path. They do not: a start failure is caught EARLIER, by
+`EnforceCertified`'s own never-started check (`verr != nil && !errors.As(verr, &exitErr)`), which
+returns "Proton CLI could not be started: %w" immediately and never falls through to the
+`found`/"could not be determined" logic at all. Only a process that STARTED and exited nonzero
+(`verr` wraps an `*exec.ExitError`) reaches that wording. The split error-table rows above
+(`--version exits 0 but...` / `--version exits nonzero...`) already stated this correctly; only
+this prose sentence conflicted with them, and it is corrected in place above rather than
+appending yet another amendment layer for a two-word phrase.
 
 **v6.3, 2026-08-02 — Fetch verifies connectivity BEFORE the install, not after it.**
 

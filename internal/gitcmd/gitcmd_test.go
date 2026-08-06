@@ -693,6 +693,25 @@ func TestShowIndexRejectsCorruptIndex(t *testing.T) {
 	}
 }
 
+// GUARD (Stage 4): the open failure must name show-index and the path.
+func TestShowIndexWrapsTheOpenError(t *testing.T) {
+	_, err := ShowIndex(filepath.Join(t.TempDir(), "absent.idx"))
+	if err == nil || !strings.Contains(err.Error(), "show-index") {
+		t.Errorf("want a show-index-prefixed error for a missing idx, got %v", err)
+	}
+}
+
+// RED then GUARD (Stage 4): the garbled-line arm was never exercised before.
+func TestParseShowIndexOutputRefusesGarbledLines(t *testing.T) {
+	if _, err := parseShowIndexOutput("x.idx", "12 0123456789012345678901234567890123456789\nnot a line"); err == nil {
+		t.Error("a garbled line must be a hard error, not a smaller map")
+	}
+	oids, err := parseShowIndexOutput("x.idx", "12 0123456789012345678901234567890123456789 (crc)")
+	if err != nil || len(oids) != 1 {
+		t.Errorf("a valid v2 line must parse: oids=%v err=%v", oids, err)
+	}
+}
+
 // packInto packs exactly the objects listed in objs (newline-separated OIDs)
 // from src into <altDir>/pack, giving the alternate git its own layout.
 func packInto(t *testing.T, src, altDir, objs string) {

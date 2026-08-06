@@ -268,6 +268,13 @@ func downloadAndVerifyPack(t transport.Transport, root, packDir, stem string, pm
 	return true, nil
 }
 
+// copyFile copies src to dst. out is closed EXACTLY ONCE on each path, with
+// no `defer out.Close()` alongside: a deferred second Close fired after the
+// explicit one, got os.ErrClosed, and discarded it — harmless until someone
+// adds error handling to the defer, at which point every successful copy
+// starts reporting "file already closed". Close's error is worth returning:
+// on a filesystem that defers write errors it is the only place a failed
+// flush surfaces at all.
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {

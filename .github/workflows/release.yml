@@ -1,0 +1,71 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+# Least-privilege, declared explicitly: draft-release creation must not
+# depend on the repository's default token permissions (spec, round-2).
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v5
+        with:
+          # Release builds pin the toolchain to go.mod for reproducibility —
+          # deliberately unlike ci.yml's 'stable' (which proves newest-compat).
+          go-version-file: go.mod
+      - name: Test (hermetic; the live half loudly skips in CI)
+        shell: pwsh
+        run: go vet ./... && go test ./...
+      - name: Lint installer (it ships as a release asset)
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          # Shipped code only: installer, module, tests. Research probes under
+          # docs/research/ are frozen evidence, deliberately not linted.
+          $paths = 'install.ps1', 'GitProtonBackup', 'tests'
+          $findings = foreach ($p in $paths) { Invoke-ScriptAnalyzer -Path $p -Recurse -Settings .\PSScriptAnalyzerSettings.psd1 }
+          if ($findings) {
+            $findings | Format-Table RuleName, Severity, ScriptName, Line, Message -AutoSize | Out-String | Write-Host
+            throw "PSScriptAnalyzer: $($findings.Count) finding(s)"
+          }
+          Write-Host 'PSScriptAnalyzer: clean'
+      - name: Pester (installer tests included)
+        shell: pwsh
+        run: |
+          Install-Module Pester -MinimumVersion 5.5 -Force -SkipPublisherCheck -Scope CurrentUser -AllowClobber
+          Import-Module Pester -MinimumVersion 5.5
+          git config --global user.email 'ci@ci'; git config --global user.name 'ci'
+          Invoke-Pester -Path tests -CI
+      - name: Version
+        id: ver
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/*') { $v = $env:GITHUB_REF -replace '^refs/tags/','' }
+          else { $v = "dev+$($env:GITHUB_SHA.Substring(0,7))" }
+          "version=$v" >> $env:GITHUB_OUTPUT
+      - name: Build
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: go build -trimpath -ldflags "-X main.version=$env:VERSION" -o git-remote-proton.exe ./cmd/git-remote-proton
+      - name: Checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash git-remote-proton.exe -Algorithm SHA256).Hash.ToLower()
+          Set-Content git-remote-proton.exe.sha256 -Value "$hash  git-remote-proton.exe" -NoNewline
+      - name: Upload build artifact (dispatch dry run only — never a release)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: git-remote-proton-dev
+          path: git-remote-proton.exe*
+      - name: Create DRAFT release (tag runs only)
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create $env:GITHUB_REF_NAME --draft --title $env:GITHUB_REF_NAME --notes "See CHANGELOG.md. Draft until the Stage 4 live gate passes against these exact bytes." git-remote-proton.exe git-remote-proton.exe.sha256 install.ps1

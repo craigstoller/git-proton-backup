@@ -123,6 +123,27 @@ for _, stem := range []string{stem1, stem2} {
 
 Skip the deliberate-regression check for this test — a resume would also pass it, and claiming otherwise would be a false pin (record that honestly in the task report).
 
+> **SUPERSEDED (Stage 4 execution, Task 1 review, 2026-08-05):** the garbage-byte corruption
+> this step prescribes is caught by `buildPackMap`'s pre-loop `ShowIndex` cache-miss check
+> (`packmap.go:98-101`), which heals the sidecar BEFORE any round is planned — the mid-loop
+> pair-refresh (`downloadAndVerifyPack`, `fetch.go:244-268`) and the `if refreshed { break }`
+> round-restart (`fetch.go:160-166`) are never reached by this fixture, so the prescribed
+> GUARD comment's "mid-plan pair-refresh" framing overclaimed what the test pins, and
+> retro-Codex 1's motivating scenario (a second pack still pending across a mid-round
+> refresh) stayed untested. As executed: (a) the garbage-byte test STANDS with its comment
+> corrected to the pre-loop heal it actually exercises — still novel coverage: the first
+> end-to-end two-pack proof that a corrupt cached sidecar yields a complete, bounded fetch;
+> (b) a SECOND test (`TestFetchMidRoundPairRefreshWithTwoPacksCompletes`) corrupts the first
+> stem's cached sidecar with the `altPackingIdx`-style same-OID reindex instead — the only
+> known mechanism that passes `ShowIndex` pre-loop yet fails pack-pair verification mid-round
+> (the existing single-pack test proves it reaches the mid-loop path). The earlier
+> peer-review objection to `altPackingIdx` (same OID set → rebuilt plan unchanged →
+> restart-vs-resume indistinguishable) is conceded in that test's HONEST SCOPE comment; what
+> it pins is completion and bounded downloads through a genuine mid-round refresh with a
+> second pack still in the plan — exactly retro-Codex 1's ask. The implementer must verify
+> the mid-loop path actually fires (the refresh trace line appears / the `.idx` re-download
+> shows in the transfer trace).
+
 - [ ] **Step 6: Trace size-unknown branch test** (`internal/transport/trace_test.go`, `package transport`)
 
 ```go
@@ -515,6 +536,23 @@ func bound(s string, n int) string {
 
 (`errors` and `os/exec` are already imported by cli.go; verify, add if not. Version's underlying read shares `run()`'s CombinedOutput + WaitDelay machinery with every other command — the spec's "bounds how much output it will read" is implemented at the diagnostic-quoting level above; note this narrowing in the task report.)
 
+> **SUPERSEDED (Stage 4 execution, Task 3 review, 2026-08-05):** the `errors.Is(verr,
+> exec.ErrNotFound)` check above under-implements the spec's "the override does not synthesize
+> a binary" row. `run()` returns code −1 with the RAW start error for the whole never-started
+> class (not on PATH, permission denied, bad executable format, `CLI.Exe` pointing at a
+> directory), but only the not-on-PATH case is `exec.ErrNotFound` — every other spawn failure
+> fell to the generic branch and PROCEEDED under `GPB_UNCERTIFIED_CLI=1`, contradicting both
+> the doc comment ("a binary that never STARTED refuses regardless of the override") and the
+> spec. As executed: never-started is detected as `verr != nil && !errors.As(verr,
+> new(*exec.ExitError))` — `Version()`'s errors partition cleanly into ran-and-exited-nonzero
+> (`*exec.ExitError`, version undetermined, override applies) and never-started (raw start
+> error: `*exec.Error` or `*os.PathError`, override inapplicable), and the WaitDelay case
+> never errors (`TestVersionSucceedsThroughAWaitDelay` pins success). A regression test
+> covers a non-ErrNotFound spawn failure with the override set. Additionally, the brief's
+> test list had no assertion pinning `Version()`'s full-output change (reverting to
+> first-line-only left the suite green); a pin asserting the SDK line survives in the
+> certified role's `Version()` output was added.
+
 - [ ] **Step 4: Run to verify they pass**
 
 ```
@@ -618,6 +656,15 @@ Cover, at minimum — each test comment carries its label:
 //    is delete-HEAD-via-web-UI (existing documented remedy), after which
 //    the repo is headless and SetHead works via the create path.
 ```
+
+> **SUPERSEDED (Stage 4 execution, Task 4 review, 2026-08-05):** the 17-scenario matrix above
+> omitted the one arm whose behaviour is NOVEL in `UpdateHEAD` — the `Refused` arm that
+> refuses rather than adopting (the exact semantic distinguishing it from `WriteHEAD`'s
+> adopt-theirs `Refused` arm). The whole matrix stayed green with that arm mutated to
+> `WriteHEAD`'s form, i.e. a plausible copy-paste regression silently reporting a foreign
+> HEAD as success. As executed, a scenario 18 was added: `UpdateHEAD` on a byte-identical
+> rewrite (the Fake's `UpdateRevision` returns `Refused` for it, modelling probe C2) must
+> return an error, not success — no new scaffolding needed.
 
 - [ ] **Step 2: Run to verify they fail** (`go test ./internal/repo/ -run 'TestUpdateHEAD|TestSetHead' -count=1 -v`) — expected: FAIL, undefined symbols. Record.
 
@@ -1089,6 +1136,25 @@ if (Test-Path $payload) {
 1. **Release-asset layout succeeds (the gate's exact case):** stage a fake exe + a `.sha256` naming its real digest beside the script copy → exit 0, exe present under the temp LOCALAPPDATA's `Programs\git-proton-backup\`, output contains "helper-only install".
 2. **Checksum mismatch refuses:** `.sha256` naming a wrong digest → exit nonzero, nothing copied into the temp LOCALAPPDATA.
 3. **Missing exe skips cleanly:** no exe beside the script copy → exit 0, output contains "skipping helper install".
+
+> **SUPERSEDED (Stage 4 execution, Task 6 review, 2026-08-06):** two defects in this task's
+> plan-supplied content, both found by the task review after verbatim transcription.
+> (1) **The draft-release step's guard was ref-only.** `if: startsWith(github.ref,
+> 'refs/tags/v')` also fires when a `workflow_dispatch` run is manually targeted AT a tag ref
+> (the UI's "Use workflow from" dropdown or the API's `ref` parameter allows any ref), so a
+> dispatch-on-tag would create the draft release the "build-only dry run" rule forbids. As
+> executed the guard is `if: github.event_name == 'push' && startsWith(github.ref,
+> 'refs/tags/v')`.
+> (2) **The Pester isolation rule missed the registry channel.** Overriding
+> `$env:LOCALAPPDATA` for the child `pwsh` sandboxes the filesystem writes, but
+> `install.ps1`'s PATH persistence uses `[Environment]::SetEnvironmentVariable('Path', …,
+> 'User')` — a direct `HKCU\Environment` registry write no process-env override contains.
+> Every test run (and the implementer's manual sandbox runs) permanently appended a
+> dangling GUID-temp entry to the REAL user PATH; four such entries were found on the
+> machine and removed in the fix round. As executed, `install.ps1` gains a `-SkipPathUpdate`
+> switch (default off — shipped behaviour unchanged; the Task 8 gate still proves the real
+> PATH update end to end via fresh-shell resolution) and every Pester invocation of the
+> installer passes it; the success-path test also asserts the PATH-update message is absent.
 
 - [ ] **Step 4: CHANGELOG**
 

@@ -32,7 +32,7 @@ verification degrades to Windows Cloud Files sync-state only (see
 ```powershell
 git clone https://github.com/craigstoller/git-proton-backup.git
 cd git-proton-backup
-.\install.ps1                    # copies the module into your $PSModulePath
+.\install.ps1                    # copies the module into your $PSModulePath (+ the v2 helper exe, when present)
 Import-Module GitProtonBackup
 Initialize-ProtonBackup          # guided first run: finds the Proton Drive sync folder,
                                   # resolves the CLI, probes auth, writes config.json
@@ -73,6 +73,57 @@ whenever it's stale, whether or not anything flagged a problem along the way. Ru
 install it as a daily check. Full rationale for all of this: [docs/design.md](docs/design.md).
 Curious how a non-developer shipped this? See [how it was built](docs/how-it-was-built.md).
 
+## Two tools in this repo: bundles (v1) and a git remote (v2)
+
+This repo ships two independent ways to get a git repo onto Proton Drive. They coexist safely in
+one repo — different remote names, no shared mirror, no shared lock, no shared config — but they
+are not equivalent, and the restore story is where that matters most.
+
+| | v1 — bundles | v2 — `git-remote-proton` |
+|---|---|---|
+| Transport | Proton Drive's Windows sync app; a single bundle file lands in the synced folder | The Proton Drive CLI, invoked directly by the helper as a real git remote |
+| Remote name | `proton` | `proton-v2` |
+| Restore needs | git only, from any machine — the bundle itself is the backup, no account needed | git, `git-remote-proton` on PATH, and the certified Proton Drive CLI signed in |
+
+**Install v2 first — `git-remote-proton` doesn't land on PATH by default.** Download the release
+assets (`git-remote-proton.exe`, `git-remote-proton.exe.sha256`, `install.ps1`) from a [GitHub
+Release](https://github.com/craigstoller/git-proton-backup/releases) into one folder and run
+`install.ps1` there: it verifies the exe against the `.sha256`, copies it to
+`%LOCALAPPDATA%\Programs\git-proton-backup`, and adds that folder to your user PATH — open a
+**new** terminal afterward, since the script can't change its caller's own session. Building from
+source works too: `go build ./cmd/git-remote-proton` and put the resulting exe on PATH yourself.
+
+```
+git clone -o proton-v2 proton::/my-files/GitRemotes/myrepo
+git push proton-v2 main
+```
+
+Wiring both onto one repo is safe: install v1 as usual (`Install-ProtonBackup`), then add the
+`proton-v2` remote alongside it. Full design: [docs/v2-remote-helper-design.md](docs/v2-remote-helper-design.md).
+
+**Keep v2 remotes off `GitBackups`.** Point v2 at its own root — `/my-files/GitRemotes/` is the
+convention used above — and never inside `GitBackups`, the folder v1's bundles live in.
+Initializing a v2 repo hard-refuses a non-empty folder that has no v2 marker, so pointing it at
+your populated `GitBackups` root fails safely — but an *empty* subfolder would be silently
+adopted as a v2 repo, so don't create one there even as a placeholder.
+
+**Restore contracts, stated honestly.** A v1 bundle restores with nothing but git —
+`git clone <bundle-path>` — from any machine, any OS, no account needed at the moment of
+restore. A v2 restore needs three things to be true at once: git, `git-remote-proton` installed
+and on PATH, and the certified Proton Drive CLI signed in. That is a real dependency v1 doesn't
+have, not a footnote — plan around it if a v2 remote is ever your only copy of something.
+
+**If a v2 push fails with "already exists" out of nowhere:** this has been observed once,
+unexplained (writeup: [docs/research/gates/stage3b-gate.md](docs/research/gates/stage3b-gate.md),
+run 1; a follow-up 30-trial provocation attempt could not reproduce it —
+[docs/research/probes/c17b-provocation-log.md](docs/research/probes/c17b-provocation-log.md)).
+Before clearing anything, capture evidence: run `proton-drive filesystem list` / `filesystem
+info --json` on the failing path and note what the Proton Drive web UI's trash shows for it —
+that capture is what turns a one-off into something reproducible. Only then remove, from the
+trash, items whose names collide with the repo's remote path, and retry. The advice is scoped to
+those homonyms — never "empty your trash" wholesale, which would take unrelated recoverable
+files with it.
+
 ## Why PowerShell?
 
 Because the domain is Windows, and PowerShell is what Windows already speaks.
@@ -82,7 +133,8 @@ Because the domain is Windows, and PowerShell is what Windows already speaks.
   few lines of inline P/Invoke here; it isn't portable, and neither is the transport.
 - **Zero runtime for the audience.** The people this is for — Windows users with git and a Proton
   account — install nothing to run it: no Python, no packaging manager, no binary to trust.
-  `install.ps1` copies a module; that's the whole footprint.
+  `install.ps1` copies a module — plus, when a helper exe sits beside the script, that exe under
+  `%LOCALAPPDATA%\Programs\git-proton-backup` and a user-PATH entry — that's the whole footprint.
 - **The job is glue.** Orchestrating git, a vendor CLI, filesystem state, and Task Scheduler is
   exactly what a shell is for. A compiled language would add build weight to a tool whose honest
   job is coordination, not computation.
@@ -157,8 +209,10 @@ promised.
 ## Roadmap
 
 - **macOS** — if there's demonstrated interest.
-- **Linux** — either via CLI-direct upload (bypassing the sync-folder transport entirely) or once
-  Proton ships a Linux sync client.
+- **Linux** — `git-remote-proton` (v2) already does exactly this: CLI-direct upload, bypassing
+  the sync-folder transport entirely. It's windows/amd64 only for now — the only platform its
+  gate has run on — so Linux support means porting v2's build, not a new mechanism. For v1
+  specifically, the alternative is waiting for Proton to ship a Linux sync client.
 - **PowerShell Gallery** — the manifest is Gallery-ready; publishing is a fast-follow, not a v1
   blocker.
 

@@ -38,6 +38,14 @@ const (
 	roleCLI      = "cli"
 	roleCLIClean = "cli-clean"
 	roleLinger   = "linger"
+
+	// The four EnforceCertified stand-ins, below runVersionRole. Each ignores
+	// its args entirely, exactly like runHelperRole above — run() always
+	// calls Version() with "--version", so there is nothing to branch on.
+	roleCertified      = "version-certified"
+	roleWrongVersion   = "version-wrong"
+	roleNonzeroVersion = "version-nonzero"
+	roleNoToken        = "version-no-token"
 )
 
 // helperVersionLine is what the stand-in prints, shaped like the real CLI's
@@ -61,6 +69,8 @@ func TestMain(m *testing.M) {
 		runHelperRole(os.Getenv(helperEnv))
 	case roleLinger:
 		runLingerRole()
+	case roleCertified, roleWrongVersion, roleNonzeroVersion, roleNoToken:
+		runVersionRole(os.Getenv(helperEnv))
 	}
 	if err := setupHelper(); err != nil {
 		fmt.Fprintln(os.Stderr, "helper setup:", err)
@@ -100,6 +110,30 @@ func runLingerRole() {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	os.Exit(0)
+}
+
+// runVersionRole is the stand-in proton-drive for the EnforceCertified
+// tests. Unlike runHelperRole it never spawns a grandchild: WaitDelay
+// interaction is TestRunAbandonsAPipeHeldOpenByAGrandchild's concern, not
+// this one's, so each role just prints its --version output (or none) and
+// exits. It never returns.
+func runVersionRole(role string) {
+	switch role {
+	case roleCertified:
+		// The genuine captured shape: two lines, CLI then SDK. The certified
+		// path must exercise the real parse, not a synthetic one-liner.
+		fmt.Println("Proton Drive CLI " + CertifiedCLI)
+		fmt.Println("Proton Drive SDK js@0.20.0+5174900c")
+	case roleWrongVersion:
+		fmt.Println("Proton Drive CLI cli-drive@9.9.9+deadbeef")
+		fmt.Println("Proton Drive SDK js@0.20.0+5174900c")
+	case roleNonzeroVersion:
+		fmt.Fprintln(os.Stderr, "proton-drive: internal error")
+		os.Exit(1)
+	case roleNoToken:
+		fmt.Println("unexpected output with no cli-drive@ token")
 	}
 	os.Exit(0)
 }
@@ -607,9 +641,193 @@ func TestParseNodeJSONRejectsUnknownType(t *testing.T) {
 	}
 }
 
-// RED. IsCertified does not exist. The first case is the one that matters:
-// the real --version line embeds the build id, so equality would reject the
-// certified build itself.
+// certifiedRoleCLI, wrongVersionRoleCLI, nonzeroVersionRoleCLI, and
+// noTokenRoleCLI each set this test's helper role and hand back a *CLI
+// pointed at this same test binary, re-exec'd as the stand-in proton-drive
+// via runVersionRole above — the same os/exec helper-process technique
+// TestMain already uses for the WaitDelay tests, so EnforceCertified drives
+// the real run()/Version() path end to end rather than a mock.
+func certifiedRoleCLI(t *testing.T) *CLI {
+	t.Helper()
+	t.Setenv(helperEnv, roleCertified)
+	return &CLI{Exe: os.Args[0]}
+}
+
+func wrongVersionRoleCLI(t *testing.T) *CLI {
+	t.Helper()
+	t.Setenv(helperEnv, roleWrongVersion)
+	return &CLI{Exe: os.Args[0]}
+}
+
+func nonzeroVersionRoleCLI(t *testing.T) *CLI {
+	t.Helper()
+	t.Setenv(helperEnv, roleNonzeroVersion)
+	return &CLI{Exe: os.Args[0]}
+}
+
+func noTokenRoleCLI(t *testing.T) *CLI {
+	t.Helper()
+	t.Setenv(helperEnv, roleNoToken)
+	return &CLI{Exe: os.Args[0]}
+}
+
+// RED (Stage 4): EnforceCertified does not exist. The advisory warn in
+// cmd/main.go becomes this enforcing check; the design's "refuse to run"
+// rule finally matches the code.
+func TestEnforceCertifiedAcceptsTheCertifiedBuild(t *testing.T) {
+	// role serving "Proton Drive CLI " + CertifiedCLI on --version
+	var buf strings.Builder
+	if err := EnforceCertified(certifiedRoleCLI(t), false, &buf); err != nil {
+		t.Fatalf("the certified build must pass: %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("no warning on the certified path, got %q", buf.String())
+	}
+}
+
+func TestEnforceCertifiedRefusesAMismatchNamingBothSides(t *testing.T) {
+	err := EnforceCertified(wrongVersionRoleCLI(t), false, io.Discard)
+	if err == nil {
+		t.Fatal("an uncertified version must refuse")
+	}
+	for _, want := range []string{"cli-drive@9.9.9", CertifiedCLI, "GPB_UNCERTIFIED_CLI"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal must name %q, got %q", want, err.Error())
+		}
+	}
+}
+
+func TestEnforceCertifiedOverrideProceedsWithALoudWarning(t *testing.T) {
+	var buf strings.Builder
+	if err := EnforceCertified(wrongVersionRoleCLI(t), true, &buf); err != nil {
+		t.Fatalf("override must proceed: %v", err)
+	}
+	for _, want := range []string{"UNCERTIFIED", "cli-drive@9.9.9", CertifiedCLI} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("warning must name %q, got %q", want, buf.String())
+		}
+	}
+}
+
+func TestEnforceCertifiedTreatsAFailedVersionAsUndetermined(t *testing.T) {
+	// nonzero-exit role: refusal without override, "could not be determined"
+	// warning + proceed with it.
+	if err := EnforceCertified(nonzeroVersionRoleCLI(t), false, io.Discard); err == nil {
+		t.Error("a failed --version must refuse without the override")
+	}
+	var buf strings.Builder
+	if err := EnforceCertified(nonzeroVersionRoleCLI(t), true, &buf); err != nil {
+		t.Errorf("override must proceed on an undetermined version: %v", err)
+	}
+	if !strings.Contains(buf.String(), "could not be determined") {
+		t.Errorf("warning must say the version could not be determined, got %q", buf.String())
+	}
+}
+
+func TestEnforceCertifiedSurfacesAMissingBinary(t *testing.T) {
+	// Spec rows: a missing binary is "not an allowlist path" and "the
+	// override does not synthesize a binary" — so a binary that never
+	// STARTED refuses even WITH the override, carrying the spawn failure.
+	err := EnforceCertified(NewCLI("nonexistent-xyz-binary-gpb-test"), false, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "nonexistent-xyz-binary-gpb-test") {
+		t.Errorf("refusal must surface the spawn failure, got %v", err)
+	}
+	if err := EnforceCertified(NewCLI("nonexistent-xyz-binary-gpb-test"), true, io.Discard); err == nil {
+		t.Error("the override must not synthesize a missing binary")
+	}
+}
+
+// TestEnforceCertifiedNeverProceedsOnANonLookupStartFailure is the Task 3
+// fix-round-1 regression (plan SUPERSEDED banner, Task 3 review, 2026-08-05).
+// The original `errors.Is(verr, exec.ErrNotFound)` never-started check only
+// covered the not-on-PATH case: every OTHER way a process can fail to start
+// (permission denied, bad executable format, CLI.Exe pointing at a
+// directory) fell through to the generic branch and PROCEEDED under
+// GPB_UNCERTIFIED_CLI=1, contradicting EnforceCertified's own doc comment
+// ("A binary that never STARTED refuses regardless of the override").
+//
+// A same-named ".exe" file containing plain text is the mechanism, verified
+// empirically on this Windows environment (see the scratch check run before
+// writing this test): starting it produces `*fs.PathError` — "This version
+// of %1 is not compatible with the version of Windows you're running" — not
+// exec.ErrNotFound and not *exec.ExitError. A bare directory with NO ".exe"
+// suffix was tried first and rejected as the mechanism: on Windows that
+// actually resolves through LookPath's PATHEXT probing to the SAME
+// ErrNotFound-wrapping error as a plain not-on-PATH miss, so it would not
+// have exercised the gap this test exists to close.
+func TestEnforceCertifiedNeverProceedsOnANonLookupStartFailure(t *testing.T) {
+	dir := t.TempDir()
+	fakeExe := filepath.Join(dir, "not-a-real-binary.exe")
+	if err := os.WriteFile(fakeExe, []byte("not a real exe, just text\n"), 0o755); err != nil {
+		t.Fatalf("writing the bad-executable-format stand-in: %v", err)
+	}
+	c := NewCLI(fakeExe)
+
+	// Sanity: confirm this really is a never-started, non-ErrNotFound,
+	// non-ExitError failure before trusting the assertions below — a false
+	// premise here would make the test pass for the wrong reason.
+	_, verr := c.Version()
+	if verr == nil {
+		t.Fatalf("the bad-format stand-in must fail to start, got a nil error")
+	}
+	if errors.Is(verr, exec.ErrNotFound) {
+		t.Fatalf("this regression needs a start failure that is NOT exec.ErrNotFound, got %v", verr)
+	}
+	var exitErr *exec.ExitError
+	if errors.As(verr, &exitErr) {
+		t.Fatalf("this regression needs a start failure, not an exit error, got %v", verr)
+	}
+
+	if err := EnforceCertified(c, false, io.Discard); err == nil {
+		t.Error("a non-ErrNotFound start failure must refuse without the override")
+	}
+	if err := EnforceCertified(c, true, io.Discard); err == nil {
+		t.Error("the override must not proceed on a non-ErrNotFound start failure either")
+	}
+}
+
+func TestIsCertifiedIsExactTokenNotContainment(t *testing.T) {
+	// RED against the current strings.Contains implementation — the
+	// containment cases below PASS it today and must not survive.
+	for _, bad := range []string{
+		"Proton Drive CLI cli-drive@0.7.0+5174900c-extra",
+		"embedded " + CertifiedCLI + "-suffix",
+		"no recognisable token here",
+		"",
+	} {
+		if IsCertified(bad) {
+			t.Errorf("%q must not be certified under exact-token matching", bad)
+		}
+	}
+	// The real two-line captured output stays certified (SDK line ignored).
+	if !IsCertified("Proton Drive CLI " + CertifiedCLI + "\nProton Drive SDK js@0.20.0+5174900c") {
+		t.Error("the genuine two-line --version output must be certified")
+	}
+}
+
+func TestEnforceCertifiedRefusesUnparseableOutput(t *testing.T) {
+	// Output with no cli-drive@ token: refusal without override, proceed
+	// with it (spec's unparseable rows).
+	if err := EnforceCertified(noTokenRoleCLI(t), false, io.Discard); err == nil {
+		t.Error("output with no cli-drive@ token must refuse")
+	}
+	var buf strings.Builder
+	if err := EnforceCertified(noTokenRoleCLI(t), true, &buf); err != nil {
+		t.Errorf("override must proceed on unparseable output: %v", err)
+	}
+}
+
+// TestIsCertifiedMatchesTheRealVersionLine pins IsCertified against the real
+// --version line under exact-token matching (Stage 4). Containment used to
+// be the rationale here — the certified build id sits inside a longer line
+// ("Proton Drive CLI " + CertifiedCLI), so an equality check on the WHOLE
+// LINE would flag the certified build as uncertified — but containment also
+// accepted a build id embedded as a PREFIX of something else entirely
+// (TestIsCertifiedIsExactTokenNotContainment, above), which the design's
+// "exact versions, not a floor or prefix" forbids. The fix is exact-token:
+// extract the whitespace-delimited field that starts "cli-drive@" and
+// compare THAT for equality, so the certified line still matches and a
+// suffixed impostor no longer does.
 func TestIsCertifiedMatchesTheRealVersionLine(t *testing.T) {
 	if !IsCertified("Proton Drive CLI " + CertifiedCLI) {
 		t.Error("the real --version line must be recognised as certified")
@@ -625,6 +843,26 @@ func TestIsCertifiedMatchesTheRealVersionLine(t *testing.T) {
 		if IsCertified(bad) {
 			t.Errorf("%q must not be recognised as certified", bad)
 		}
+	}
+}
+
+// TestVersionReturnsTheFullOutputIncludingTheSDKLine is the Task 3
+// fix-round-1 pin for Version()'s full-output change (plan SUPERSEDED
+// banner, Task 3 review, 2026-08-05): the original brief's test list had no
+// assertion that would fail if Version() were reverted to first-line-only
+// (the old `strings.Cut(strings.TrimSpace(out), "\n")`) — every other
+// assertion in this file reads only first-line tokens, which a
+// first-line-only Version() also satisfies, so the suite stayed green
+// against a silent revert. Deliberate-regression checked (recorded in the
+// task report): temporarily restoring the old first-line-only body makes
+// this fail on the `strings.Contains(v, "js@0.20.0")` assertion below.
+func TestVersionReturnsTheFullOutputIncludingTheSDKLine(t *testing.T) {
+	v, err := certifiedRoleCLI(t).Version()
+	if err != nil {
+		t.Fatalf("Version: %v", err)
+	}
+	if !strings.Contains(v, "js@0.20.0") {
+		t.Errorf("Version() must carry the SDK line through to diagnostics, got %q", v)
 	}
 }
 

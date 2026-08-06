@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -395,15 +396,25 @@ func dirOf(p string) string {
 // silently.
 const CertifiedCLI = "cli-drive@0.7.0+5174900c"
 
-// IsCertified reports whether a --version line names the certified build.
-// It is containment, not equality: the CLI prints the build id inside a
-// longer line ("Proton Drive CLI cli-drive@0.7.0+5174900c"), so an equality
-// check would flag the certified build as uncertified.
-func IsCertified(versionLine string) bool {
-	return strings.Contains(versionLine, CertifiedCLI)
+// IsCertified reports whether --version output names EXACTLY the certified
+// build. Exact-token, not containment: the first whitespace-delimited field
+// starting "cli-drive@" must EQUAL CertifiedCLI. Containment was a prefix
+// match by another name — it accepted "cli-drive@0.7.0+5174900c-extra" —
+// and "exact versions, not a floor or prefix" is the design's rule. Output
+// with no such token is simply not certified (the unparseable case).
+func IsCertified(versionOutput string) bool {
+	for _, f := range strings.Fields(versionOutput) {
+		if strings.HasPrefix(f, "cli-drive@") {
+			return f == CertifiedCLI
+		}
+	}
+	return false
 }
 
-// Version returns the first line of `proton-drive --version`.
+// Version returns the full trimmed output of `proton-drive --version`
+// (both the CLI and SDK lines), not just the first line: the SDK line
+// belongs in diagnostics even though EnforceCertified's allowlist match
+// only ever looks at the CLI line's token (see IsCertified).
 func (c *CLI) Version() (string, error) {
 	out, code, err := c.run("--version")
 	if code != 0 {
@@ -412,6 +423,63 @@ func (c *CLI) Version() (string, error) {
 		}
 		return "", fmt.Errorf("proton-drive --version failed: %s", strings.TrimSpace(out))
 	}
-	line, _, _ := strings.Cut(strings.TrimSpace(out), "\n")
-	return strings.TrimSpace(line), nil
+	return strings.TrimSpace(out), nil
+}
+
+// EnforceCertified is the Stage 4 allowlist: the design's "refuse to run"
+// rule, enforced. nil means proceed — either the CLI reports the certified
+// build, or allowUncertified is set and the loud warning was written to w.
+// A binary that never STARTED refuses regardless of the override (the
+// override does not synthesize a binary; the spawn failure is the report).
+// The check is a compatibility gate against accidental drift, not a
+// provenance check: a spoofed --version defeats it trivially, and a helper
+// that trusts the CLI with every byte of repo data has no defence against a
+// malicious binary anyway (spec, Decisions).
+//
+// Never-started is detected as "verr is non-nil and is not an
+// *exec.ExitError", not narrowly as exec.ErrNotFound (Task 3 fix round 1:
+// the ErrNotFound-only check let every OTHER never-started case — permission
+// denied, bad executable format, CLI.Exe pointing at a directory — fall
+// through to the generic branch and PROCEED under the override, exactly the
+// synthesis this doc comment says must not happen). Version()'s errors
+// partition cleanly on this test: a process that ran and exited non-zero
+// always surfaces *exec.ExitError (version undetermined, override applies —
+// the CLI is real, we just could not read a certified line from it), while a
+// process that never started surfaces the raw start error instead
+// (*exec.Error from LookPath, *os.PathError/*fs.PathError from Start — never
+// an ExitError), and a WaitDelay-only hiccup never reaches here as an error
+// at all (TestVersionSucceedsThroughAWaitDelay pins that a zero exit
+// carrying ErrWaitDelay reads as success).
+func EnforceCertified(c *CLI, allowUncertified bool, w io.Writer) error {
+	v, verr := c.Version()
+	if verr == nil && IsCertified(v) {
+		return nil
+	}
+	var exitErr *exec.ExitError
+	if verr != nil && !errors.As(verr, &exitErr) {
+		return fmt.Errorf("Proton CLI could not be started: %w", verr)
+	}
+	// Quoted diagnostics are BOUNDED: --version output is remote-tool
+	// output, and an error message must not become a channel for megabytes.
+	found := fmt.Sprintf("%q", bound(v, 200))
+	if verr != nil {
+		found = fmt.Sprintf("could not be determined (%v)", verr)
+	}
+	if allowUncertified {
+		fmt.Fprintf(w, "git-remote-proton: WARNING: proceeding with an UNCERTIFIED "+
+			"Proton CLI because GPB_UNCERTIFIED_CLI=1. Version %s; certified: %s. "+
+			"Behaviour on this build is unvalidated.\n", found, CertifiedCLI)
+		return nil
+	}
+	return fmt.Errorf("Proton CLI version %s, but this build is certified only "+
+		"against %s; refusing to run. Set GPB_UNCERTIFIED_CLI=1 to proceed anyway "+
+		"(unvalidated), or install the certified CLI", found, CertifiedCLI)
+}
+
+// bound truncates s for quoting in diagnostics.
+func bound(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…(truncated)"
 }

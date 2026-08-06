@@ -1423,6 +1423,535 @@ func TestReadHEADAcceptsCRLF(t *testing.T) {
 	}
 }
 
+// --- Task 4: UpdateHEAD (overwrite-capable HEAD write) ----------------------
+
+// RED: UpdateHEAD does not exist.
+
+// 1  UpdateHEAD overwrites an existing HEAD and verifies by read-back.
+func TestUpdateHEADOverwritesExistingAndVerifiesByReadBack(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	f.Files["/r/HEAD"] = []byte("ref: refs/heads/old\n")
+
+	out, err := UpdateHEAD(f, "/r", "refs/heads/new")
+	if err != nil || out != transport.Committed {
+		t.Fatalf("UpdateHEAD: %v %v", out, err)
+	}
+	if got := string(f.Files["/r/HEAD"]); got != "ref: refs/heads/new\n" {
+		t.Errorf("HEAD file = %q, want ref: refs/heads/new", got)
+	}
+	branch, ok, err := ReadHEAD(f, "/r")
+	if err != nil || !ok {
+		t.Fatalf("ReadHEAD: %v %v", ok, err)
+	}
+	if branch != "refs/heads/new" {
+		t.Errorf("ReadHEAD = %q, want refs/heads/new", branch)
+	}
+}
+
+// 2  UpdateHEAD creates HEAD when absent (the headless-remote rescue).
+func TestUpdateHEADCreatesWhenAbsent(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+
+	out, err := UpdateHEAD(f, "/r", "refs/heads/main")
+	if err != nil || out != transport.Committed {
+		t.Fatalf("UpdateHEAD: %v %v", out, err)
+	}
+	branch, ok, err := ReadHEAD(f, "/r")
+	if err != nil || !ok {
+		t.Fatalf("ReadHEAD: %v %v", ok, err)
+	}
+	if branch != "refs/heads/main" {
+		t.Errorf("ReadHEAD = %q, want refs/heads/main", branch)
+	}
+}
+
+// 3  UpdateHEAD refuses a non-branch target (mirrors WriteHEAD's rule).
+func TestUpdateHEADRefusesNonBranchTarget(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+
+	if out, err := UpdateHEAD(f, "/r", "refs/tags/v1"); err == nil {
+		t.Errorf("UpdateHEAD must refuse a non-branch target, got %v, nil error", out)
+	}
+	if _, ok := f.Files["/r/HEAD"]; ok {
+		t.Error("nothing must be written to the transport for a rejected target")
+	}
+}
+
+// ambiguousUpdateTransport wraps a Fake but forces UpdateRevision to report
+// Ambiguous for a chosen path. Fake's FailNext field only drives
+// CreateExclusive (see fake.go), so UpdateHEAD's exists-branch — which calls
+// UpdateRevision — needs its own stub to exercise the Ambiguous arm; this is
+// the sibling unknownOutcomeTransport (line ~1205) does not provide, since
+// that one overrides CreateExclusive only.
+type ambiguousUpdateTransport struct {
+	*transport.Fake
+	forPath string
+}
+
+func (a ambiguousUpdateTransport) UpdateRevision(p, local string) (transport.Outcome, error) {
+	if p == a.forPath {
+		return transport.Ambiguous, nil
+	}
+	return a.Fake.UpdateRevision(p, local)
+}
+
+// 4  UpdateHEAD reports Ambiguous outcomes as re-run-to-reconcile errors, on
+//
+//	the UPDATE path (HEAD already exists), via ambiguousUpdateTransport
+//	above.
+func TestUpdateHEADAmbiguousOutcomeOnUpdatePath(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	f.Files["/r/HEAD"] = []byte("ref: refs/heads/old\n")
+	tr := ambiguousUpdateTransport{Fake: f, forPath: "/r/" + HeadName}
+
+	out, err := UpdateHEAD(tr, "/r", "refs/heads/new")
+	if err == nil {
+		t.Fatal("UpdateHEAD must report an error on an Ambiguous UpdateRevision outcome")
+	}
+	if out != transport.Ambiguous {
+		t.Errorf("must report Ambiguous, got %v", out)
+	}
+	if !strings.Contains(err.Error(), "re-run to reconcile") {
+		t.Errorf("must ask for a re-run to reconcile, got: %v", err)
+	}
+}
+
+// unknownOutcomeUpdateTransport is unknownOutcomeTransport's sibling for the
+// UPDATE path: UpdateHEAD's exists-branch calls UpdateRevision instead of
+// CreateExclusive, so the fail-closed default arm needs its own outcome
+// source to force there too.
+type unknownOutcomeUpdateTransport struct {
+	*transport.Fake
+	forPath string
+}
+
+func (u unknownOutcomeUpdateTransport) UpdateRevision(p, local string) (transport.Outcome, error) {
+	if p == u.forPath {
+		return transport.Outcome(42), nil
+	}
+	return u.Fake.UpdateRevision(p, local)
+}
+
+// 5  UpdateHEAD fails closed on an unrecognised Outcome on BOTH paths
+//
+//	(mirrors TestWriteHEADFailsClosedOnUnrecognisedOutcome, line ~1336; the
+//	update subtest needs the new decorator just above).
+func TestUpdateHEADFailsClosedOnUnrecognisedOutcome(t *testing.T) {
+	t.Run("create path", func(t *testing.T) {
+		f := transport.NewFake()
+		_ = Bootstrap(f, "/r")
+		tr := unknownOutcomeTransport{Fake: f, forPath: "/r/" + HeadName}
+
+		out, err := UpdateHEAD(tr, "/r", "refs/heads/main")
+		if err == nil {
+			t.Fatal("UpdateHEAD must fail closed on an unrecognised outcome")
+		}
+		if out != transport.Ambiguous {
+			t.Errorf("an unrecognised outcome must be reported as Ambiguous, got %v", out)
+		}
+		if !strings.Contains(err.Error(), "outcome(42)") {
+			t.Errorf("the refusal must name the outcome it saw, got: %v", err)
+		}
+		if _, ok := f.Files["/r/HEAD"]; ok {
+			t.Error("no HEAD was actually written; nothing may claim otherwise")
+		}
+	})
+
+	t.Run("update path", func(t *testing.T) {
+		f := transport.NewFake()
+		_ = Bootstrap(f, "/r")
+		f.Files["/r/HEAD"] = []byte("ref: refs/heads/old\n")
+		tr := unknownOutcomeUpdateTransport{Fake: f, forPath: "/r/" + HeadName}
+
+		out, err := UpdateHEAD(tr, "/r", "refs/heads/new")
+		if err == nil {
+			t.Fatal("UpdateHEAD must fail closed on an unrecognised outcome")
+		}
+		if out != transport.Ambiguous {
+			t.Errorf("an unrecognised outcome must be reported as Ambiguous, got %v", out)
+		}
+		if !strings.Contains(err.Error(), "outcome(42)") {
+			t.Errorf("the refusal must name the outcome it saw, got: %v", err)
+		}
+		if got := string(f.Files["/r/HEAD"]); got != "ref: refs/heads/old\n" {
+			t.Errorf("the existing HEAD must be untouched, got %q", got)
+		}
+	})
+}
+
+// 6  GUARD: WriteHEAD still never overwrites — TestWriteHEADNeverOverwritesExistingHEAD
+//    (line ~1361, unmodified) is re-run as part of this same package's test
+//    run and must stay green; UpdateHEAD is a separate function and does not
+//    touch WriteHEAD's CreateExclusive-only, never-overwrite contract.
+
+// refusedHeadCreateTransport wraps a Fake but forces CreateExclusive to
+// report (Refused, nil) for the HEAD path specifically — modelling a
+// concurrent non-v2 actor creating HEAD between UpdateHEAD's Stat check and
+// its own CreateExclusive call. Mirrors refusedRefCreateTransport's shape
+// (line ~915), which forces the same outcome under refs/heads/ for
+// WriteRef's concurrent-creator case; this is the CREATE-path sibling for
+// UpdateHEAD's Refused arm.
+type refusedHeadCreateTransport struct {
+	*transport.Fake
+	forPath string
+}
+
+func (r refusedHeadCreateTransport) CreateExclusive(p, local string) (transport.Outcome, error) {
+	if p == r.forPath {
+		return transport.Refused, nil
+	}
+	return r.Fake.CreateExclusive(p, local)
+}
+
+// 18 GUARD (fix round 1, Important finding): UpdateHEAD's Refused arm is the
+//
+//	one arm whose behaviour is NOVEL versus WriteHEAD's — refuse rather
+//	than adopt, because "the user asked for THIS branch" — and had no test
+//	on either path. Before this test, the entire matrix stayed green even
+//	if the arm were mutated to WriteHEAD's form (`return transport.Refused,
+//	nil`), a plausible copy-paste regression whose live effect is a
+//	non-v2 actor's HEAD silently reported as success. Covers both paths:
+//	the update path via the Fake's own byte-identical Refused (modelling
+//	probe C2, no new scaffolding needed — UpdateRevision on identical
+//	bytes already returns Refused), and the create path via
+//	refusedHeadCreateTransport above, which was equally cheap given the
+//	existing refusedRefCreateTransport pattern to copy.
+func TestUpdateHEADRefusedOutcomeIsAnError(t *testing.T) {
+	t.Run("update path", func(t *testing.T) {
+		f := transport.NewFake()
+		_ = Bootstrap(f, "/r")
+		f.Files["/r/HEAD"] = []byte("ref: refs/heads/main\n")
+
+		// Byte-identical rewrite: UpdateRevision reports Refused (fake.go).
+		out, err := UpdateHEAD(f, "/r", "refs/heads/main")
+		if err == nil {
+			t.Fatal("UpdateHEAD must report an error on a Refused outcome, not adopt the existing HEAD")
+		}
+		if out != transport.Ambiguous {
+			t.Errorf("a Refused write must be reported as Ambiguous, got %v", out)
+		}
+		if !strings.Contains(err.Error(), "refused") || !strings.Contains(err.Error(), "re-run to reconcile") {
+			t.Errorf("must name the refusal and ask for a re-run, got: %v", err)
+		}
+	})
+
+	t.Run("create path", func(t *testing.T) {
+		f := transport.NewFake()
+		_ = Bootstrap(f, "/r")
+		tr := refusedHeadCreateTransport{Fake: f, forPath: "/r/" + HeadName}
+
+		out, err := UpdateHEAD(tr, "/r", "refs/heads/main")
+		if err == nil {
+			t.Fatal("UpdateHEAD must report an error on a Refused outcome, not adopt whatever landed")
+		}
+		if out != transport.Ambiguous {
+			t.Errorf("a Refused write must be reported as Ambiguous, got %v", out)
+		}
+		if !strings.Contains(err.Error(), "refused") || !strings.Contains(err.Error(), "re-run to reconcile") {
+			t.Errorf("must name the refusal and ask for a re-run, got: %v", err)
+		}
+		if _, ok := f.Files["/r/HEAD"]; ok {
+			t.Error("nothing must be recorded as HEAD content on a refused create")
+		}
+	})
+}
+
+// --- Task 4: SetHead (the --set-head operation) -----------------------------
+
+// RED: SetHead does not exist.
+
+// assertLockReleased fails the test if the Fake still holds a .lock file for
+// root. SetHead's defer must release the lock on every exit path, including
+// every refusal below the point it successfully acquires one (scenario 15).
+func assertLockReleased(t *testing.T, f *transport.Fake, root string) {
+	t.Helper()
+	if _, ok := f.Files[root+"/"+LockName]; ok {
+		t.Errorf("SetHead must release its own lock on refusal, but %s/%s is still present", root, LockName)
+	}
+}
+
+// 7  SetHead succeeds: two branches, HEAD at A, SetHead("b") → HEAD reads
+//
+//	back refs/heads/b; returns "refs/heads/b".
+func TestSetHeadSucceeds(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	if _, err := WriteRef(f, "/r", "refs/heads/a", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := WriteRef(f, "/r", "refs/heads/b", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := WriteHEAD(f, "/r", "refs/heads/a"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := SetHead(f, "/r", "b")
+	if err != nil {
+		t.Fatalf("SetHead: %v", err)
+	}
+	if got != "refs/heads/b" {
+		t.Errorf("SetHead returned %q, want refs/heads/b", got)
+	}
+	branch, ok, err := ReadHEAD(f, "/r")
+	if err != nil || !ok {
+		t.Fatalf("ReadHEAD: %v %v", ok, err)
+	}
+	if branch != "refs/heads/b" {
+		t.Errorf("HEAD = %q, want refs/heads/b", branch)
+	}
+}
+
+// countingTransport wraps a Fake and counts CreateExclusive/UpdateRevision
+// calls PER PATH, so an idempotence test can assert zero writes to HEAD
+// specifically rather than zero writes overall — AcquireLock/Release always
+// perform their own CreateExclusive/Trash against the .lock path, so a
+// global counter would never read zero. transport.NewTraced is not usable
+// here: it only instruments ReadTo, so it would report zero writes even when
+// writes happen (peer-review finding).
+type countingTransport struct {
+	*transport.Fake
+	writes map[string]int
+}
+
+func newCountingTransport(f *transport.Fake) *countingTransport {
+	return &countingTransport{Fake: f, writes: map[string]int{}}
+}
+
+func (c *countingTransport) CreateExclusive(p, local string) (transport.Outcome, error) {
+	c.writes[p]++
+	return c.Fake.CreateExclusive(p, local)
+}
+
+func (c *countingTransport) UpdateRevision(p, local string) (transport.Outcome, error) {
+	c.writes[p]++
+	return c.Fake.UpdateRevision(p, local)
+}
+
+// 8  Same-target idempotence: SetHead to the branch HEAD already names
+//
+//	succeeds WITHOUT uploading a new HEAD.
+func TestSetHeadIdempotentMakesNoHeadWrite(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := WriteHEAD(f, "/r", "refs/heads/main"); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newCountingTransport(f)
+	got, err := SetHead(c, "/r", "main")
+	if err != nil {
+		t.Fatalf("SetHead: %v", err)
+	}
+	if got != "refs/heads/main" {
+		t.Errorf("SetHead returned %q, want refs/heads/main", got)
+	}
+	if n := c.writes["/r/HEAD"]; n != 0 {
+		t.Errorf("same-target SetHead must not write HEAD, got %d write(s)", n)
+	}
+}
+
+// 9  Dangling HEAD refuses: HEAD names refs/heads/gone, branch "gone" does
+//
+//	not exist, SetHead("gone") → error naming the branches that DO exist.
+//	This is the round-3 peer-review finding: branch existence must be
+//	verified BEFORE the idempotence short-circuit below, or a HEAD already
+//	naming a since-deleted branch would short-circuit straight to success.
+func TestSetHeadRefusesDanglingHead(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	f.Files["/r/HEAD"] = []byte("ref: refs/heads/gone\n")
+
+	if _, err := SetHead(f, "/r", "gone"); err == nil {
+		t.Fatal("SetHead must refuse a branch that does not exist, even though HEAD already names it")
+	} else if !strings.Contains(err.Error(), "main") {
+		t.Errorf("refusal must name the branches that DO exist, got: %v", err)
+	}
+	assertLockReleased(t, f, "/r")
+}
+
+// 10 Unknown branch refuses, error names existing branches.
+func TestSetHeadRefusesUnknownBranch(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := SetHead(f, "/r", "nope")
+	if err == nil {
+		t.Fatal("SetHead must refuse a branch that does not exist")
+	}
+	if !strings.Contains(err.Error(), "main") {
+		t.Errorf("refusal must name existing branches, got: %v", err)
+	}
+	assertLockReleased(t, f, "/r")
+}
+
+// 11 Empty repo (marker present, no branches) refuses with "push a branch
+//
+//	first".
+func TestSetHeadRefusesEmptyRepo(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+
+	_, err := SetHead(f, "/r", "main")
+	if err == nil {
+		t.Fatal("SetHead must refuse when no branches exist")
+	}
+	if !strings.Contains(err.Error(), "push a branch first") {
+		t.Errorf("refusal must say to push a branch first, got: %v", err)
+	}
+	assertLockReleased(t, f, "/r")
+}
+
+// 12 Hierarchical name ("feature/x") refuses naming Stage 5.
+func TestSetHeadRefusesHierarchicalName(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := SetHead(f, "/r", "feature/x")
+	if err == nil {
+		t.Fatal("SetHead must refuse a hierarchical branch name")
+	}
+	if !strings.Contains(err.Error(), "Stage 5") {
+		t.Errorf("refusal must name Stage 5, got: %v", err)
+	}
+	assertLockReleased(t, f, "/r")
+}
+
+// 13 Tag target ("refs/tags/v1") refuses: HEAD points at branches only.
+func TestSetHeadRefusesTagTarget(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := SetHead(f, "/r", "refs/tags/v1")
+	if err == nil {
+		t.Fatal("SetHead must refuse a tag target")
+	}
+	if !strings.Contains(err.Error(), "branches only") {
+		t.Errorf("refusal must say HEAD points at branches only, got: %v", err)
+	}
+	assertLockReleased(t, f, "/r")
+}
+
+// 14 No marker → RequireMarker's refusal, verbatim.
+func TestSetHeadRefusesNoMarker(t *testing.T) {
+	f := transport.NewFake()
+	// Deliberately no Bootstrap: no marker present.
+
+	_, err := SetHead(f, "/r", "main")
+	if err == nil {
+		t.Fatal("SetHead must refuse when there is no marker")
+	}
+	if !strings.Contains(err.Error(), MarkerName) {
+		t.Errorf("refusal must be RequireMarker's own reason, got: %v", err)
+	}
+	assertLockReleased(t, f, "/r")
+}
+
+// 15 Lock held → AcquireLock's refusal; and (via assertLockReleased calls
+//
+//	threaded through scenarios 9-14 above) SetHead released ITS OWN lock on
+//	every refusal path that got far enough to acquire one.
+func TestSetHeadRefusesWhenLockHeld(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	held, err := AcquireLock(f, "/r")
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer func() {
+		if err := held.Release(); err != nil {
+			t.Fatalf("release: %v", err)
+		}
+	}()
+
+	if _, err := SetHead(f, "/r", "main"); err == nil {
+		t.Fatal("SetHead must refuse while the repo is locked by someone else")
+	}
+	// The pre-existing lock is not SetHead's to release: it must still be
+	// present, untouched, after SetHead's own AcquireLock call fails on it.
+	if _, ok := f.Files["/r/"+LockName]; !ok {
+		t.Error("the other holder's lock must survive SetHead's failed acquisition attempt")
+	}
+}
+
+// 16 Short-name normalization: SetHead("main") == SetHead("refs/heads/main").
+func TestSetHeadNormalizesShortName(t *testing.T) {
+	build := func() *transport.Fake {
+		f := transport.NewFake()
+		_ = Bootstrap(f, "/r")
+		sha := "1111111111111111111111111111111111111111"
+		if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+
+	short, err := SetHead(build(), "/r", "main")
+	if err != nil {
+		t.Fatalf("SetHead(short): %v", err)
+	}
+	full, err := SetHead(build(), "/r", "refs/heads/main")
+	if err != nil {
+		t.Fatalf("SetHead(full): %v", err)
+	}
+	if short != full || short != "refs/heads/main" {
+		t.Errorf("SetHead(%q) = %q, SetHead(%q) = %q; want both refs/heads/main",
+			"main", short, "refs/heads/main", full)
+	}
+}
+
+// 17 Corrupt or unreadable HEAD refuses (fail closed): make ReadHEAD error
+//
+//	(non-symref HEAD content) and assert SetHead returns that error WITHOUT
+//	writing. A ReadHEAD error here is FATAL — it must never license an
+//	overwrite, covering transient transport trouble as much as corrupt
+//	content. The in-tool repair path for a genuinely corrupt HEAD is
+//	delete-HEAD-via-web-UI (existing documented remedy), after which the
+//	repo is headless and SetHead's create path applies.
+func TestSetHeadRefusesCorruptHead(t *testing.T) {
+	f := transport.NewFake()
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	// Non-symref content: a detached OID, not "ref: refs/heads/...".
+	f.Files["/r/HEAD"] = []byte(sha + "\n")
+
+	if _, err := SetHead(f, "/r", "main"); err == nil {
+		t.Fatal("SetHead must fail closed when HEAD is corrupt, not overwrite it")
+	}
+	if got := string(f.Files["/r/HEAD"]); got != sha+"\n" {
+		t.Errorf("corrupt HEAD must be left untouched, got %q", got)
+	}
+	assertLockReleased(t, f, "/r")
+}
+
 // RED. Push does not write HEAD at all today.
 func TestPushWritesHeadOnFirstPush(t *testing.T) {
 	f := transport.NewFake()
@@ -1528,6 +2057,9 @@ func TestPushRefusesToDeleteTheBranchHeadPointsAt(t *testing.T) {
 	}
 	if !strings.Contains(res[0].Err, "HEAD points at") {
 		t.Errorf("reason = %q, want it to name why the delete was refused", res[0].Err)
+	}
+	if !strings.Contains(res[0].Err, "--set-head") {
+		t.Errorf("the refusal must name the in-tool remedy, got %q", res[0].Err)
 	}
 	if _, ok := f.Files["/r/refs/heads/main"]; !ok {
 		t.Error("the ref file must survive a refused delete")
@@ -2749,6 +3281,16 @@ func TestFetchChecksumFailureHealsAndRoutesAround(t *testing.T) {
 	if !gitcmd.HasObject(dst, c3) {
 		t.Error("c3 missing after healed fetch")
 	}
+	// GUARD (M1, Stage 4): the route-around must be visible in the transfer
+	// trace — the poisoned pack downloads exactly once (its failed attempt),
+	// never again after the heal, and the covering pack exactly once.
+	badStem, coverStem := stems[1], stems[2]
+	if got := strings.Count(trace.String(), "/packs/"+badStem+".pack"); got != 1 {
+		t.Errorf("poisoned pack downloaded %d times, want exactly 1; trace:\n%s", got, trace.String())
+	}
+	if got := strings.Count(trace.String(), "/packs/"+coverStem+".pack"); got != 1 {
+		t.Errorf("covering pack downloaded %d times, want exactly 1; trace:\n%s", got, trace.String())
+	}
 }
 
 // altPackingIdx builds a SECOND packing of sha's full closure at store-only
@@ -2821,6 +3363,136 @@ func TestFetchPairFailureRefreshesSidecarAndCompletes(t *testing.T) {
 	}
 }
 
+// TestFetchPairFailureWithTwoPacksRefreshesAndCompletes: two pushes plant two
+// packs (stem1 = c1's own pack, stem2 = c1->c2's delta) both needed by the
+// want (dst starts empty). stem1's CACHED sidecar is corrupted with GARBAGE
+// BYTES — a bit flip on its own real content, not altPackingIdx's same-OID-
+// set alternate packing. Confirmed (Stage 4 fix round 1) that git's own
+// show-index rejects bit-flipped bytes, so this is caught by buildPackMap's
+// PRE-LOOP show-index cache-miss check (packmap.go:98-101), which heals the
+// sidecar BEFORE any round is planned — NOT downloadAndVerifyPack's mid-loop
+// pair-refresh or fetch.go's `if refreshed { break }` round-restart
+// (fetch.go:160-166), which this fixture never reaches. It is still novel
+// coverage: the first end-to-end two-pack proof that a corrupt cached
+// sidecar yields a complete, bounded fetch. See
+// TestFetchMidRoundPairRefreshWithTwoPacksCompletes below for the mid-round
+// path this test does NOT exercise.
+func TestFetchPairFailureWithTwoPacksRefreshesAndCompletes(t *testing.T) {
+	src := newGitRepoForPush(t)
+	c1 := headOfPushRepo(t, src)
+	c2 := commitOnPushRepo(t, src, "f2.txt", "two")
+	f := transport.NewFake()
+	stems := plantIncrementalPacks(t, f, "/r", src, []string{c1, c2})
+	stem1, stem2 := stems[0], stems[1]
+
+	cache := t.TempDir()
+	idx1 := f.Files["/r/packs/"+stem1+".idx"]
+	corrupt := append([]byte{}, idx1...)
+	corrupt[len(corrupt)/2] ^= 0xff
+	if err := os.WriteFile(filepath.Join(cache, stem1+".idx"), corrupt, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dst := emptyGitRepo(t)
+	var trace strings.Builder
+	tr := transport.NewTraced(f, &trace)
+	_, err := Fetch(tr, "/r", dst, cache, []string{c2})
+	// GUARD (retro-Codex 1, Stage 4): a corrupt cached sidecar, healed by
+	// buildPackMap's PRE-LOOP show-index cache-miss check, must still yield a
+	// complete two-pack fetch with bounded downloads. HONEST SCOPE: this pins
+	// the pre-loop heal path only — it does NOT reach downloadAndVerifyPack's
+	// mid-loop pair-refresh or fetch.go's round-restart, so it does not
+	// exercise (and cannot stand in for) a genuine mid-round refresh with a
+	// second pack still pending; see
+	// TestFetchMidRoundPairRefreshWithTwoPacksCompletes for that.
+	if err != nil {
+		t.Fatalf("fetch must survive a pre-loop sidecar heal with two packs: %v", err)
+	}
+	if !gitcmd.HasObject(dst, c2) {
+		t.Errorf("want %s missing after two-pack refresh fetch", c2)
+	}
+	if got := strings.Count(trace.String(), "/packs/"+stem1+".idx"); got < 1 {
+		t.Errorf("the corrupted sidecar was never re-downloaded; trace:\n%s", trace.String())
+	}
+	for _, stem := range []string{stem1, stem2} {
+		if got := strings.Count(trace.String(), "/packs/"+stem+".pack"); got < 1 || got > 2 {
+			t.Errorf("pack %s downloaded %d times, want 1 or 2 (bounded); trace:\n%s",
+				stem, got, trace.String())
+		}
+	}
+}
+
+// TestFetchMidRoundPairRefreshWithTwoPacksCompletes: the same two-pack
+// fixture (stem1 = c1's own pack, stem2 = c1->c2's delta, both needed since
+// dst starts empty), but stem1's CACHED sidecar is corrupted with the
+// altPackingIdx-style same-OID reindex — a syntactically valid idx (correct
+// object set, different bytes) built from a SECOND, differently-compressed
+// packing of the same closure. This is the only known mechanism that passes
+// buildPackMap's pre-loop show-index check (the map it produces is right
+// about which objects the stem serves, so greedy planning is unaffected) yet
+// fails pack-pair verification mid-round once the REAL pack bytes are
+// downloaded and paired against it — the same mechanism the existing
+// single-pack TestFetchPairFailureRefreshesSidecarAndCompletes uses, proven
+// there to reach downloadAndVerifyPack's mid-loop refresh. Here a second pack
+// (stem2) is still left in the plan when that refresh fires, which is
+// retro-Codex 1's actual motivating scenario.
+//
+// HONEST SCOPE: because the corruption preserves the same OID set, the
+// rebuilt plan after the refresh is unchanged from before it — this does NOT
+// empirically distinguish a round restart from a mid-round resume (both
+// complete this fixture identically); that distinction stays structurally
+// pinned at unit level, not observed here. What this test pins is completion
+// and bounded downloads through a GENUINE mid-round pair-refresh with a
+// second pack still in the plan — verified by requiring the first stem's
+// .idx to reappear in the transfer trace, proof the mid-loop refresh
+// actually fired.
+func TestFetchMidRoundPairRefreshWithTwoPacksCompletes(t *testing.T) {
+	src := newGitRepoForPush(t)
+	c1 := headOfPushRepo(t, src)
+	c2 := commitOnPushRepo(t, src, "f2.txt", "two")
+	f := transport.NewFake()
+	stems := plantIncrementalPacks(t, f, "/r", src, []string{c1, c2})
+	stem1, stem2 := stems[0], stems[1]
+
+	cache := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cache, stem1+".idx"),
+		altPackingIdx(t, src, c1, stem1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dst := emptyGitRepo(t)
+	var trace strings.Builder
+	tr := transport.NewTraced(f, &trace)
+	_, err := Fetch(tr, "/r", dst, cache, []string{c2})
+	// GUARD (retro-Codex 1, Stage 4): a mid-round pair-refresh with a second
+	// pack still in the plan must complete the whole fetch. HONEST SCOPE: the
+	// same-OID corruption leaves the rebuilt plan unchanged, so this does NOT
+	// empirically distinguish restart from resume (both complete this
+	// fixture) — that distinction stays structurally pinned at unit level.
+	// What this pins is completion and bounded downloads through a genuine
+	// mid-round refresh with a second pack still pending.
+	if err != nil {
+		t.Fatalf("fetch must survive a mid-round sidecar refresh with two packs: %v", err)
+	}
+	if !gitcmd.HasObject(dst, c2) {
+		t.Errorf("want %s missing after mid-round refresh fetch", c2)
+	}
+	// Mandatory verification (Stage 4 fix round 1): the .idx re-download in
+	// the trace is the proof the mid-loop refresh actually fired, not just
+	// the pre-loop heal TestFetchPairFailureWithTwoPacksRefreshesAndCompletes
+	// exercises.
+	if got := strings.Count(trace.String(), "/packs/"+stem1+".idx"); got < 1 {
+		t.Errorf("the mid-round refresh never re-downloaded the lying sidecar; "+
+			"the mid-loop pair-refresh path was not reached; trace:\n%s", trace.String())
+	}
+	for _, stem := range []string{stem1, stem2} {
+		if got := strings.Count(trace.String(), "/packs/"+stem+".pack"); got < 1 || got > 2 {
+			t.Errorf("pack %s downloaded %d times, want 1 or 2 (bounded); trace:\n%s",
+				stem, got, trace.String())
+		}
+	}
+}
+
 // GUARD, not RED: passed immediately against Task 6's code. A genuinely
 // mismatched REMOTE pair — same-OIDs alt-packing idx planted as the remote's
 // own sidecar, so the map is right but the pair can never verify — is fatal
@@ -2865,6 +3537,12 @@ func TestFetchSkipsAnIncompletePairWhenUnneeded(t *testing.T) {
 	dst := emptyGitRepo(t)
 	if _, err := Fetch(f, "/r", dst, "", []string{c1}); err != nil {
 		t.Fatalf("an unneeded incomplete pair must not break the fetch: %v", err)
+	}
+	// GUARD (M3, Stage 4): exit-0 alone does not prove the closure landed —
+	// assert the want is actually present in the object store.
+	if !gitcmd.HasObject(dst, c1) {
+		t.Errorf("fetched closure must contain want %s; a fetch that skips the "+
+			"incomplete pair must still deliver everything", c1)
 	}
 }
 

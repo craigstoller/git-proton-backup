@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -13,6 +14,13 @@ import (
 	"github.com/craigstoller/git-proton-backup/internal/transport"
 )
 
+// version is stamped by the release build via
+//
+//	-ldflags "-X main.version=<tag>"
+//
+// and stays "dev" for a plain `go build`.
+var version = "dev"
+
 // main only chooses the process exit code. All cleanup lives in run's defers:
 // calling os.Exit directly from deep inside the command loop would skip every
 // deferred func (Go does not run defers on os.Exit), which is exactly the lock
@@ -21,7 +29,57 @@ func main() {
 	os.Exit(run())
 }
 
+// dispatchUtility handles the CLOSED set of direct-invocation modes. Only
+// exact matches dispatch: a prefix match would misroute a remote whose
+// configured name begins with "--" (git passes the remote NAME as argv[1]),
+// so only remotes literally named --version or --set-head can collide, and
+// those two strings are documented as reserved. Utility stdout is permitted:
+// git never invokes the helper with these argv shapes, so it cannot
+// interleave with the protocol stream.
+func dispatchUtility(args []string, stdout, stderr io.Writer) (bool, int) {
+	if len(args) < 2 {
+		return false, 0
+	}
+	switch args[1] {
+	case "--version":
+		fmt.Fprintf(stdout, "git-remote-proton %s (certified CLI: %s)\n",
+			version, transport.CertifiedCLI)
+		return true, 0
+	case "--set-head":
+		if len(args) != 4 {
+			fmt.Fprintln(stderr, "usage: git-remote-proton --set-head <proton::address> <branch>")
+			return true, 1
+		}
+		return true, runSetHead(args[2], args[3], stdout, stderr)
+	}
+	return false, 0
+}
+
+func runSetHead(addr, branch string, stdout, stderr io.Writer) int {
+	root, err := repo.CanonicalRoot(addr)
+	if err != nil {
+		fmt.Fprintf(stderr, "git-remote-proton: %v\n", err)
+		return 1
+	}
+	cli := transport.NewCLI("")
+	if err := transport.EnforceCertified(cli,
+		os.Getenv("GPB_UNCERTIFIED_CLI") == "1", stderr); err != nil {
+		fmt.Fprintf(stderr, "git-remote-proton: %v\n", err)
+		return 1
+	}
+	set, err := repo.SetHead(transport.NewTraced(cli, stderr), root, branch)
+	if err != nil {
+		fmt.Fprintf(stderr, "git-remote-proton: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "HEAD is now %s\n", set)
+	return 0
+}
+
 func run() int {
+	if handled, code := dispatchUtility(os.Args, os.Stdout, os.Stderr); handled {
+		return code
+	}
 	if len(os.Args) < 3 {
 		fmt.Fprintln(os.Stderr, "git-remote-proton: must be run by git as a remote helper")
 		return 1
@@ -66,16 +124,14 @@ func run() int {
 	os.Unsetenv("GIT_DIR")
 
 	cli := transport.NewCLI("")
-	// Advisory only, and a knowing deviation from the design's "refuse to
-	// run" rule: a hard allowlist is a Stage 4 policy decision, because it
-	// breaks the user's tooling the day Proton ships a new build. But a
-	// silent behaviour change across CLI versions is what broke v1, so the
-	// mismatch is at least made visible. stderr, never stdout.
-	if v, err := cli.Version(); err != nil {
-		warn(fmt.Errorf("could not determine the Proton CLI version: %w", err))
-	} else if !transport.IsCertified(v) {
-		warn(fmt.Errorf("Proton CLI reports %q but the transport contract is certified "+
-			"against %s; behaviour may differ", v, transport.CertifiedCLI))
+	// The Stage 4 allowlist: refuse-by-default against the certified build,
+	// with GPB_UNCERTIFIED_CLI=1 as the explicit, loud escape hatch. This
+	// closed the design/code contradiction open since Stage 2 — the advisory
+	// warn that used to live here is now transport.EnforceCertified.
+	if err := transport.EnforceCertified(cli,
+		os.Getenv("GPB_UNCERTIFIED_CLI") == "1", os.Stderr); err != nil {
+		warn(err)
+		return 1
 	}
 	in := bufio.NewScanner(os.Stdin)
 	out := bufio.NewWriter(os.Stdout)
