@@ -2835,12 +2835,16 @@ func TestFetchPairFailureRefreshesSidecarAndCompletes(t *testing.T) {
 // packs (stem1 = c1's own pack, stem2 = c1->c2's delta) both needed by the
 // want (dst starts empty). stem1's CACHED sidecar is corrupted with GARBAGE
 // BYTES — a bit flip on its own real content, not altPackingIdx's same-OID-
-// set alternate packing, which a peer review found leaves the plan unchanged
-// and the assertions blind — so the cached sidecar genuinely fails
-// validation (empirically: buildPackMap's show-index cache-miss check) and
-// the refresh machinery genuinely re-downloads it, with a second pack
-// (stem2) still left in the plan when it does. The fetch must still complete
-// and deliver c2.
+// set alternate packing. Confirmed (Stage 4 fix round 1) that git's own
+// show-index rejects bit-flipped bytes, so this is caught by buildPackMap's
+// PRE-LOOP show-index cache-miss check (packmap.go:98-101), which heals the
+// sidecar BEFORE any round is planned — NOT downloadAndVerifyPack's mid-loop
+// pair-refresh or fetch.go's `if refreshed { break }` round-restart
+// (fetch.go:160-166), which this fixture never reaches. It is still novel
+// coverage: the first end-to-end two-pack proof that a corrupt cached
+// sidecar yields a complete, bounded fetch. See
+// TestFetchMidRoundPairRefreshWithTwoPacksCompletes below for the mid-round
+// path this test does NOT exercise.
 func TestFetchPairFailureWithTwoPacksRefreshesAndCompletes(t *testing.T) {
 	src := newGitRepoForPush(t)
 	c1 := headOfPushRepo(t, src)
@@ -2861,19 +2865,93 @@ func TestFetchPairFailureWithTwoPacksRefreshesAndCompletes(t *testing.T) {
 	var trace strings.Builder
 	tr := transport.NewTraced(f, &trace)
 	_, err := Fetch(tr, "/r", dst, cache, []string{c2})
-	// GUARD (retro-Codex 1, Stage 4): a mid-plan pair-refresh with a second
-	// pack still in the plan must complete the whole fetch. HONEST SCOPE: this
-	// pins completion and bounded downloads through a two-pack refresh; it does
-	// NOT empirically distinguish restart from resume (both complete this
-	// fixture) — that distinction stays structurally pinned at unit level.
+	// GUARD (retro-Codex 1, Stage 4): a corrupt cached sidecar, healed by
+	// buildPackMap's PRE-LOOP show-index cache-miss check, must still yield a
+	// complete two-pack fetch with bounded downloads. HONEST SCOPE: this pins
+	// the pre-loop heal path only — it does NOT reach downloadAndVerifyPack's
+	// mid-loop pair-refresh or fetch.go's round-restart, so it does not
+	// exercise (and cannot stand in for) a genuine mid-round refresh with a
+	// second pack still pending; see
+	// TestFetchMidRoundPairRefreshWithTwoPacksCompletes for that.
 	if err != nil {
-		t.Fatalf("fetch must survive a mid-plan sidecar refresh with two packs: %v", err)
+		t.Fatalf("fetch must survive a pre-loop sidecar heal with two packs: %v", err)
 	}
 	if !gitcmd.HasObject(dst, c2) {
 		t.Errorf("want %s missing after two-pack refresh fetch", c2)
 	}
 	if got := strings.Count(trace.String(), "/packs/"+stem1+".idx"); got < 1 {
 		t.Errorf("the corrupted sidecar was never re-downloaded; trace:\n%s", trace.String())
+	}
+	for _, stem := range []string{stem1, stem2} {
+		if got := strings.Count(trace.String(), "/packs/"+stem+".pack"); got < 1 || got > 2 {
+			t.Errorf("pack %s downloaded %d times, want 1 or 2 (bounded); trace:\n%s",
+				stem, got, trace.String())
+		}
+	}
+}
+
+// TestFetchMidRoundPairRefreshWithTwoPacksCompletes: the same two-pack
+// fixture (stem1 = c1's own pack, stem2 = c1->c2's delta, both needed since
+// dst starts empty), but stem1's CACHED sidecar is corrupted with the
+// altPackingIdx-style same-OID reindex — a syntactically valid idx (correct
+// object set, different bytes) built from a SECOND, differently-compressed
+// packing of the same closure. This is the only known mechanism that passes
+// buildPackMap's pre-loop show-index check (the map it produces is right
+// about which objects the stem serves, so greedy planning is unaffected) yet
+// fails pack-pair verification mid-round once the REAL pack bytes are
+// downloaded and paired against it — the same mechanism the existing
+// single-pack TestFetchPairFailureRefreshesSidecarAndCompletes uses, proven
+// there to reach downloadAndVerifyPack's mid-loop refresh. Here a second pack
+// (stem2) is still left in the plan when that refresh fires, which is
+// retro-Codex 1's actual motivating scenario.
+//
+// HONEST SCOPE: because the corruption preserves the same OID set, the
+// rebuilt plan after the refresh is unchanged from before it — this does NOT
+// empirically distinguish a round restart from a mid-round resume (both
+// complete this fixture identically); that distinction stays structurally
+// pinned at unit level, not observed here. What this test pins is completion
+// and bounded downloads through a GENUINE mid-round pair-refresh with a
+// second pack still in the plan — verified by requiring the first stem's
+// .idx to reappear in the transfer trace, proof the mid-loop refresh
+// actually fired.
+func TestFetchMidRoundPairRefreshWithTwoPacksCompletes(t *testing.T) {
+	src := newGitRepoForPush(t)
+	c1 := headOfPushRepo(t, src)
+	c2 := commitOnPushRepo(t, src, "f2.txt", "two")
+	f := transport.NewFake()
+	stems := plantIncrementalPacks(t, f, "/r", src, []string{c1, c2})
+	stem1, stem2 := stems[0], stems[1]
+
+	cache := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cache, stem1+".idx"),
+		altPackingIdx(t, src, c1, stem1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dst := emptyGitRepo(t)
+	var trace strings.Builder
+	tr := transport.NewTraced(f, &trace)
+	_, err := Fetch(tr, "/r", dst, cache, []string{c2})
+	// GUARD (retro-Codex 1, Stage 4): a mid-round pair-refresh with a second
+	// pack still in the plan must complete the whole fetch. HONEST SCOPE: the
+	// same-OID corruption leaves the rebuilt plan unchanged, so this does NOT
+	// empirically distinguish restart from resume (both complete this
+	// fixture) — that distinction stays structurally pinned at unit level.
+	// What this pins is completion and bounded downloads through a genuine
+	// mid-round refresh with a second pack still pending.
+	if err != nil {
+		t.Fatalf("fetch must survive a mid-round sidecar refresh with two packs: %v", err)
+	}
+	if !gitcmd.HasObject(dst, c2) {
+		t.Errorf("want %s missing after mid-round refresh fetch", c2)
+	}
+	// Mandatory verification (Stage 4 fix round 1): the .idx re-download in
+	// the trace is the proof the mid-loop refresh actually fired, not just
+	// the pre-loop heal TestFetchPairFailureWithTwoPacksRefreshesAndCompletes
+	// exercises.
+	if got := strings.Count(trace.String(), "/packs/"+stem1+".idx"); got < 1 {
+		t.Errorf("the mid-round refresh never re-downloaded the lying sidecar; "+
+			"the mid-loop pair-refresh path was not reached; trace:\n%s", trace.String())
 	}
 	for _, stem := range []string{stem1, stem2} {
 		if got := strings.Count(trace.String(), "/packs/"+stem+".pack"); got < 1 || got > 2 {
