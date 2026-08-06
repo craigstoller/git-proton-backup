@@ -57,7 +57,7 @@ jobs:
           name: git-remote-proton-dev
           path: git-remote-proton.exe*
       - name: Create DRAFT release (tag runs only)
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}

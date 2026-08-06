@@ -4,6 +4,7 @@
 [CmdletBinding()]
 param(
     [switch]$Force,
+    [switch]$SkipPathUpdate,
     [string]$HelperExe = (Join-Path $PSScriptRoot 'git-remote-proton.exe')
 )
 $ErrorActionPreference = 'Stop'
@@ -25,14 +26,18 @@ if (Test-Path $HelperExe) {
     } catch {
         throw "Cannot replace $helperDir\git-remote-proton.exe (a git process may be using it). Close running git commands and re-run. $_"
     }
-    # PATH check tolerates empty user PATHs (no leading semicolon) and
-    # trailing-backslash variants (no duplicate entries) — peer-reviewed.
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $entries = @(($userPath -split ';') | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') })
-    if ($entries -notcontains $helperDir.TrimEnd('\')) {
-        $newPath = if ([string]::IsNullOrEmpty($userPath)) { $helperDir } else { "$userPath;$helperDir" }
-        [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
-        Write-Host "Added $helperDir to your user PATH. Open a NEW terminal for it to take effect (this script cannot change its caller's session)."
+    if ($SkipPathUpdate) {
+        Write-Host "Skipping user PATH update (-SkipPathUpdate)."
+    } else {
+        # PATH check tolerates empty user PATHs (no leading semicolon) and
+        # trailing-backslash variants (no duplicate entries) — peer-reviewed.
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        $entries = @(($userPath -split ';') | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') })
+        if ($entries -notcontains $helperDir.TrimEnd('\')) {
+            $newPath = if ([string]::IsNullOrEmpty($userPath)) { $helperDir } else { "$userPath;$helperDir" }
+            [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+            Write-Host "Added $helperDir to your user PATH. Open a NEW terminal for it to take effect (this script cannot change its caller's session)."
+        }
     }
     Write-Host "Helper installed: $helperDir\git-remote-proton.exe"
 } else {

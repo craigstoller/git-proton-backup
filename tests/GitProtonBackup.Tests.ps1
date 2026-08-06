@@ -517,11 +517,16 @@ Describe 'Cloud Files placeholder state decoding' {
 }
 
 Describe 'install.ps1 helper block' {
-    # Isolation rule (Stage 4 Task 6): every test here copies install.ps1 into a TestDrive:
-    # directory WITHOUT a GitProtonBackup payload folder — so the module block always takes
-    # its skip path — and runs it in a CHILD pwsh -NoProfile process with $env:LOCALAPPDATA
+    # Isolation rule (Stage 4 Task 6, fix round 1): every test here copies install.ps1 into a
+    # TestDrive: directory WITHOUT a GitProtonBackup payload folder — so the module block always
+    # takes its skip path — and runs it in a CHILD pwsh -NoProfile process with $env:LOCALAPPDATA
     # pointed at a TestDrive: subdir. No test may ever write to the real Documents modules
     # directory or the real LOCALAPPDATA (an earlier draft had exactly that contamination bug).
+    # $env:LOCALAPPDATA only sandboxes the filesystem side — install.ps1's PATH persistence is a
+    # direct HKCU\Environment registry write via [Environment]::SetEnvironmentVariable(...,
+    # 'User') that no process-env override contains. Every invocation below therefore also
+    # passes -SkipPathUpdate so no test run ever touches the real user PATH (SUPERSEDED banner,
+    # Task 6 review).
     BeforeAll {
         function New-InstallerSandbox {
             $id = [guid]::NewGuid().ToString('N').Substring(0, 8)
@@ -536,7 +541,7 @@ Describe 'install.ps1 helper block' {
         function Invoke-InstallerSandbox {
             param($ScriptDir, $LocalAppData)
             $script = Join-Path $ScriptDir 'install.ps1'
-            $output = & pwsh -NoProfile -Command "`$env:LOCALAPPDATA = '$LocalAppData'; & '$script'" 2>&1 | Out-String
+            $output = & pwsh -NoProfile -Command "`$env:LOCALAPPDATA = '$LocalAppData'; & '$script' -SkipPathUpdate" 2>&1 | Out-String
             $exitCode = $LASTEXITCODE
             [pscustomobject]@{ ExitCode = $exitCode; Output = $output }
         }
@@ -553,6 +558,9 @@ Describe 'install.ps1 helper block' {
         $r.ExitCode | Should -Be 0
         Test-Path (Join-Path $sb.LocalAppData 'Programs\git-proton-backup\git-remote-proton.exe') | Should -BeTrue
         $r.Output | Should -Match 'helper-only install'
+        # Proves -SkipPathUpdate actually took the skip branch and never reached the real-PATH
+        # mutation path (the registry-channel gap the fix round closed).
+        $r.Output | Should -Not -Match 'Added .*to your user PATH'
     }
 
     It 'checksum mismatch refuses to install the helper and copies nothing' {
