@@ -536,6 +536,23 @@ func bound(s string, n int) string {
 
 (`errors` and `os/exec` are already imported by cli.go; verify, add if not. Version's underlying read shares `run()`'s CombinedOutput + WaitDelay machinery with every other command — the spec's "bounds how much output it will read" is implemented at the diagnostic-quoting level above; note this narrowing in the task report.)
 
+> **SUPERSEDED (Stage 4 execution, Task 3 review, 2026-08-05):** the `errors.Is(verr,
+> exec.ErrNotFound)` check above under-implements the spec's "the override does not synthesize
+> a binary" row. `run()` returns code −1 with the RAW start error for the whole never-started
+> class (not on PATH, permission denied, bad executable format, `CLI.Exe` pointing at a
+> directory), but only the not-on-PATH case is `exec.ErrNotFound` — every other spawn failure
+> fell to the generic branch and PROCEEDED under `GPB_UNCERTIFIED_CLI=1`, contradicting both
+> the doc comment ("a binary that never STARTED refuses regardless of the override") and the
+> spec. As executed: never-started is detected as `verr != nil && !errors.As(verr,
+> new(*exec.ExitError))` — `Version()`'s errors partition cleanly into ran-and-exited-nonzero
+> (`*exec.ExitError`, version undetermined, override applies) and never-started (raw start
+> error: `*exec.Error` or `*os.PathError`, override inapplicable), and the WaitDelay case
+> never errors (`TestVersionSucceedsThroughAWaitDelay` pins success). A regression test
+> covers a non-ErrNotFound spawn failure with the override set. Additionally, the brief's
+> test list had no assertion pinning `Version()`'s full-output change (reverting to
+> first-line-only left the suite green); a pin asserting the SDK line survives in the
+> certified role's `Version()` output was added.
+
 - [ ] **Step 4: Run to verify they pass**
 
 ```
