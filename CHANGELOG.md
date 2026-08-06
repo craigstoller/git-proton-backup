@@ -1,11 +1,14 @@
 # Changelog
 
-## 0.3.0 — unreleased
+## 0.3.1 — unreleased
 
 One version line covers both tools in this repository: the GitProtonBackup
 PowerShell module (v1, bundles) and the git-remote-proton helper (v2, CAS
 remote). This is the first release to ship the helper as a built artifact.
 
+- **install.ps1** now detects when another `git-remote-proton.exe` earlier on
+  PATH shadows the installed helper and warns loudly naming both paths
+  (found by Stage 4 gate run 1, which blocked on a silent shadow).
 - **git-remote-proton:** certified-CLI allowlist enforced (exact build match;
   `GPB_UNCERTIFIED_CLI=1` overrides with a loud warning).
 - **git-remote-proton:** `--set-head` changes a remote's default branch
@@ -15,6 +18,11 @@ remote). This is the first release to ship the helper as a built artifact.
   `.sha256` sidecar is present) and adds it to the user PATH.
 - Releases are published as drafts and made public only after the live gate
   passes against the exact built bytes.
+
+## 0.3.0 — never released
+
+Tagged, draft built, gate-blocked on the installer shadow defect above;
+superseded by 0.3.1.
 
 ## 0.2.4 — 2026-08-01
 

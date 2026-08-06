@@ -539,9 +539,13 @@ Describe 'install.ps1 helper block' {
         }
 
         function Invoke-InstallerSandbox {
-            param($ScriptDir, $LocalAppData)
+            param($ScriptDir, $LocalAppData, [string]$EffectivePath = '')
             $script = Join-Path $ScriptDir 'install.ps1'
-            $output = & pwsh -NoProfile -Command "`$env:LOCALAPPDATA = '$LocalAppData'; & '$script' -SkipPathUpdate" 2>&1 | Out-String
+            # -EffectivePath is always passed explicitly (default '' = no directories to
+            # search, i.e. no shadow) so no invocation here ever falls back to the real
+            # Machine/User registry PATH — see the shadow-detection tests below for the
+            # two outcomes exercised with a real synthetic value.
+            $output = & pwsh -NoProfile -Command "`$env:LOCALAPPDATA = '$LocalAppData'; & '$script' -SkipPathUpdate -EffectivePath '$EffectivePath'" 2>&1 | Out-String
             $exitCode = $LASTEXITCODE
             [pscustomobject]@{ ExitCode = $exitCode; Output = $output }
         }
@@ -579,5 +583,55 @@ Describe 'install.ps1 helper block' {
         $r = Invoke-InstallerSandbox -ScriptDir $sb.ScriptDir -LocalAppData $sb.LocalAppData
         $r.ExitCode | Should -Be 0
         $r.Output | Should -Match 'skipping helper install'
+    }
+
+    # Stage 4 gate run 1 (BLOCKED): a stale git-remote-proton.exe earlier on PATH
+    # shadowed the freshly installed helper — install.ps1 printed success and exited 0
+    # while git kept resolving the old binary. These two tests exercise both outcomes of
+    # the -EffectivePath shadow check WITHOUT ever reading the real registry PATH: a
+    # synthetic PATH built from TestDrive dirs, passed explicitly, is the only input.
+    It 'a git-remote-proton.exe earlier on the synthetic PATH triggers a loud warning naming both paths' {
+        $sb = New-InstallerSandbox
+        $exePath = Join-Path $sb.ScriptDir 'git-remote-proton.exe'
+        Set-Content -Path $exePath -Value 'fake exe bytes' -NoNewline
+        $hash = (Get-FileHash $exePath -Algorithm SHA256).Hash.ToLower()
+        Set-Content -Path "$exePath.sha256" -Value "$hash  git-remote-proton.exe" -NoNewline
+
+        $shadowDir = Join-Path $TestDrive "shadow-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        New-Item -ItemType Directory -Path $shadowDir -Force | Out-Null
+        $shadowExe = Join-Path $shadowDir 'git-remote-proton.exe'
+        Set-Content -Path $shadowExe -Value 'stale exe bytes' -NoNewline
+
+        $installedExe = Join-Path $sb.LocalAppData 'Programs\git-proton-backup\git-remote-proton.exe'
+        # Shadow dir listed FIRST — earlier on PATH than where the helper would resolve.
+        $effectivePath = "$shadowDir;$(Split-Path $installedExe -Parent)"
+
+        $r = Invoke-InstallerSandbox -ScriptDir $sb.ScriptDir -LocalAppData $sb.LocalAppData -EffectivePath $effectivePath
+        $r.ExitCode | Should -Be 0                                   # remedy is environmental, not a failure
+        $r.Output | Should -Match 'WARNING'
+        $r.Output | Should -Match ([regex]::Escape($shadowExe))      # names the shadowing exe
+        $r.Output | Should -Match ([regex]::Escape($installedExe))   # names the installed exe
+    }
+
+    It 'no earlier match on the synthetic PATH: no warning (behaviour unchanged)' {
+        $sb = New-InstallerSandbox
+        $exePath = Join-Path $sb.ScriptDir 'git-remote-proton.exe'
+        Set-Content -Path $exePath -Value 'fake exe bytes' -NoNewline
+        $hash = (Get-FileHash $exePath -Algorithm SHA256).Hash.ToLower()
+        Set-Content -Path "$exePath.sha256" -Value "$hash  git-remote-proton.exe" -NoNewline
+
+        $decoyDir = Join-Path $TestDrive "decoy-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        New-Item -ItemType Directory -Path $decoyDir -Force | Out-Null   # no exe inside — never a match
+
+        $installedDir = Join-Path $sb.LocalAppData 'Programs\git-proton-backup'
+        # Decoy first (no match), then the dir the helper installs into (the real first
+        # hit once the copy has happened) — proves the check doesn't false-positive when
+        # the installed copy is genuinely the winner.
+        $effectivePath = "$decoyDir;$installedDir"
+
+        $r = Invoke-InstallerSandbox -ScriptDir $sb.ScriptDir -LocalAppData $sb.LocalAppData -EffectivePath $effectivePath
+        $r.ExitCode | Should -Be 0
+        $r.Output | Should -Not -Match 'WARNING'
+        $r.Output | Should -Not -Match 'shadow'
     }
 }

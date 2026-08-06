@@ -5,7 +5,16 @@
 param(
     [switch]$Force,
     [switch]$SkipPathUpdate,
-    [string]$HelperExe = (Join-Path $PSScriptRoot 'git-remote-proton.exe')
+    [string]$HelperExe = (Join-Path $PSScriptRoot 'git-remote-proton.exe'),
+    # The PATH a FRESH shell would resolve, Machine then User in order — read-only,
+    # used only for shadow detection below, never mutated. Overridable so tests can
+    # supply a synthetic PATH built from TestDrive dirs instead of touching the real
+    # registry (Stage 4 Task 6 review: an earlier draft's tests leaked GUID-temp
+    # entries into the real user PATH doing exactly that).
+    [string]$EffectivePath = (
+        [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
+        [Environment]::GetEnvironmentVariable('Path', 'User')
+    )
 )
 $ErrorActionPreference = 'Stop'
 
@@ -40,6 +49,30 @@ if (Test-Path $HelperExe) {
         }
     }
     Write-Host "Helper installed: $helperDir\git-remote-proton.exe"
+
+    # Stage 4 gate run 1 (BLOCKED at step 1.5): a stale git-remote-proton.exe already
+    # earlier on PATH silently outran this fresh install — the script printed success
+    # and exited 0 while git kept running the old binary. Detect that: walk the PATH a
+    # fresh shell would resolve (Machine then User, in order) for the first
+    # git-remote-proton.exe, and compare it to the one just installed. This check is
+    # read-only and runs regardless of -SkipPathUpdate — that switch controls whether
+    # PATH gets MUTATED, not whether shadowing gets checked.
+    $installedExe = Join-Path $helperDir 'git-remote-proton.exe'
+    $pathDirs = @(($EffectivePath -split ';') | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') })
+    $shadow = $null
+    foreach ($dir in $pathDirs) {
+        $candidate = Join-Path $dir 'git-remote-proton.exe'
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $shadow = $candidate
+            break
+        }
+    }
+    if ($shadow -and ($shadow.TrimEnd('\') -ne $installedExe.TrimEnd('\'))) {
+        Write-Warning ("Another git-remote-proton.exe is earlier on PATH and shadows the copy " +
+            "just installed: a fresh shell will run $shadow instead of $installedExe. Remove or " +
+            "rename the shadowing copy, or reorder PATH so $helperDir comes first — until you " +
+            "do, git keeps running the old binary.")
+    }
 } else {
     Write-Host "No git-remote-proton.exe found at $HelperExe — skipping helper install (module only)."
 }
