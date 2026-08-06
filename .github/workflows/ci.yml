@@ -28,6 +28,11 @@ jobs:
         run: |
           Install-Module Pester -MinimumVersion 5.5 -Force -SkipPublisherCheck -Scope CurrentUser -AllowClobber
           Import-Module Pester -MinimumVersion 5.5
+          # CI-only belt-and-braces on a throwaway VM. NEVER copy this to a dev
+          # machine (it clobbers the real identity — happened twice in Stage 4):
+          # every test-created repo sets its own repo-scoped user.email/name, and
+          # the suite passes with no git identity available at all (verified
+          # locally with GIT_CONFIG_GLOBAL masked, 121/121).
           git config --global user.email 'ci@ci'; git config --global user.name 'ci'
           Invoke-Pester -Path tests -CI
   go:
