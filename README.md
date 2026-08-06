@@ -83,7 +83,7 @@ are not equivalent, and the restore story is where that matters most.
 |---|---|---|
 | Transport | Proton Drive's Windows sync app; a single bundle file lands in the synced folder | The Proton Drive CLI, invoked directly by the helper as a real git remote |
 | Remote name | `proton` | `proton-v2` |
-| Restore needs | git only, from any device signed into your Proton account | git, `git-remote-proton` on PATH, and the certified Proton Drive CLI signed in |
+| Restore needs | git only, from any machine — the bundle itself is the backup, no account needed | git, `git-remote-proton` on PATH, and the certified Proton Drive CLI signed in |
 
 ```
 git clone -o proton-v2 proton::/my-files/GitRemotes/myrepo

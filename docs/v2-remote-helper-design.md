@@ -625,11 +625,19 @@ existing v2 operation lives with, not a new exposure `--set-head` introduces.
 
 **`UpdateHEAD` carries the overwrite; `WriteHEAD` is untouched.** `WriteHEAD` is backfill-only by
 pinned contract (`TestWriteHEADNeverOverwritesExistingHEAD`) and never overwrites an existing
-symref. `UpdateHEAD` (`internal/repo/head.go`) is the new function that does: it uses the same
-staged-file CAS path pushes use for every mutable write (local basename `HEAD`, `upload -f
-merge`, per probe C14), with the same closed-set outcome handling as the marker and ref paths —
-`Committed` is done, `Ambiguous` refuses with "re-run to reconcile," and any unrecognised outcome
-fails closed rather than guessing.
+symref. `UpdateHEAD` (`internal/repo/head.go`) is the new function that does, and it branches on
+whether `HEAD` currently exists: it `Stat`s the path first, then calls `UpdateRevision` (`upload
+-f merge`, per probe C14) when `HEAD` is present — the ordinary overwrite case — or
+`CreateExclusive` when it is absent, which is the headless-repo rescue this document already
+defines elsewhere: a repo with no `HEAD` file at all, either because its first push was
+tags-only (the ref-transition table's own headless case) or because an operator deleted the
+`HEAD` file in the web UI to repair a corrupt one (`SetHead`'s own doc comment names this path).
+Either way it stages the same local basename `HEAD` used everywhere else, and both
+branches feed the same closed-set outcome handling as the marker and ref paths: `Committed` falls
+through to read-back verification; `Refused` is impossible from another v2 writer under the lock,
+so it is read as a non-v2 actor and refused rather than adopted — the user asked for THIS branch;
+`Ambiguous` likewise refuses, both with "re-run to reconcile"; and any unrecognised outcome fails
+closed rather than guessing.
 
 **The branch-delete refusal names this as the remedy.** The ref-transition table's delete row, in
 Push above, and `push.go`'s refusal text now both name `git-remote-proton --set-head <url>
@@ -644,7 +652,8 @@ named the problem with no way out.
 |---|---|
 | CLI missing, logged out, session expired mid-operation | The CLI-version allowlist gate (above) refuses outright, before any filesystem command, for a CLI that never starts at all (missing binary, permission denied, not an executable) — that case is no longer a warning followed by an opaque bootstrap failure. A session that is valid at startup but expires mid-operation is not covered by that gate and is detected per-call, where the CLI's own error surfaces through the affected transport method's actionable message |
 | CLI version not on the certified allowlist | **Shipped Stage 4** (see CLI version allowlist, above): refuse to run before any filesystem command, naming what was found versus what is certified — exact versions, not a floor. `GPB_UNCERTIFIED_CLI=1` overrides with a loud per-invocation stderr warning, never cached across processes. **This row previously said NOT IMPLEMENTED as of Stage 2.1, deliberately** — Stage 2.1 shipped the version probe as an advisory warning only, deferring a hard refusal to this stage as a policy call, since a silent behaviour change across CLI versions is what broke v1 in the first place. That deferral is now resolved |
-| `proton-drive --version` exits nonzero, or its output is unparseable | Same refusal as above, treated as version-undetermined; the override still applies, and the warning says the version could not be determined rather than naming a wrong one |
+| `proton-drive --version` exits 0 but its output does not match a certified token | Same refusal as above, naming the found output verbatim (quoted, bounded to 200 chars) — treated as uncertified, not as version-undetermined, because the process ran and its output is trustworthy text even though it does not match. The override still applies, and its warning names that same found text |
+| `proton-drive --version` exits nonzero (the binary started and ran) | Refusal treated as version-undetermined: the process ran, but a nonzero exit forfeits trust in anything it printed, so nothing is named as "found." The override still applies; its warning says the version could not be determined rather than naming a wrong one |
 | `failedItems > 0` with exit code 0 | Treated as failure — never inferred from exit status |
 | Unparseable or unexpected `--json` shape | `Ambiguous`; reconcile against remote state before retry |
 | Mutation timed out after the remote may have committed | `Ambiguous`; read back before any retry |
@@ -723,9 +732,13 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   on the certified allowlist" row said, as of Stage 2.1, "NOT IMPLEMENTED... deliberately... The
   helper warns on stderr and continues." `transport.EnforceCertified` (`internal/transport/cli.go`)
   now refuses to run before any filesystem command unless the CLI reports exactly `CertifiedCLI`,
-  with `GPB_UNCERTIFIED_CLI=1` as the documented override. Both error-table rows are updated to
-  match, a third row is added for a nonzero/unparseable `--version` exit, and a new "CLI version
-  allowlist" section states the mechanism and its threat-model framing.
+  with `GPB_UNCERTIFIED_CLI=1` as the documented override. Both existing error-table rows are
+  updated to match, and two rows are added distinguishing an unparseable-but-clean-exit
+  `--version` (refused, naming the found text verbatim) from a nonzero exit (refused as
+  version-undetermined — nothing printed is trustworthy) — the two are NOT the same refusal
+  wording, which an earlier draft of this revision collapsed into one row and a fix round
+  corrected (see the amendment note below). A new "CLI version allowlist" section states the
+  mechanism and its threat-model framing.
 - **This closes the `parseNodeJSON` contradiction that had stood since Stage 2.** `parseNodeJSON`
   (`cli.go`) tolerates both the 0.4.6 wrapped `{ok,value}` shape and the 0.7.0 unwrapped shape —
   version-tolerant parsing that read as a floor, while this document's stated rule (unchanged
@@ -739,8 +752,10 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   section states the dispatch rationale, the branch-name grammar, the lock and
   verify-before-short-circuit ordering (branch existence checked on every run, before the
   idempotence short-circuit — a round-3 peer-review finding, both engines), and the
-  `UpdateHEAD`/`WriteHEAD` split (`UpdateHEAD` overwrites under the lock; `WriteHEAD` stays
-  backfill-only, pinned by `TestWriteHEADNeverOverwritesExistingHEAD`).
+  `UpdateHEAD`/`WriteHEAD` split: `UpdateHEAD` carries the overwrite, branching on whether `HEAD`
+  currently exists (`UpdateRevision` when present, `CreateExclusive` for the headless-repo rescue
+  when absent), while `WriteHEAD` stays untouched and backfill-only, pinned by
+  `TestWriteHEADNeverOverwritesExistingHEAD`.
 - **The branch-delete refusal now names its own remedy.** The ref-transition table's delete row,
   and `internal/repo/push.go`'s refusal message, both name `git-remote-proton --set-head <url>
   <branch>` as the fix for "refusing to delete the branch HEAD points at" — previously the
@@ -753,6 +768,27 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   table, the dedicated-root guidance (never inside `GitBackups`), the restore-contract honesty
   (v1: git only; v2: git + helper + certified CLI), and the trash note scoped to homonym cleanup
   with an evidence-capture step, not a blanket "empty your trash."
+
+**Amendment (fix round 1, 2026-08-06) — three accuracy defects found on review, all confirmed against code and corrected in place rather than superseded as v6.5, since v6.4 had not yet been treated as settled.**
+
+- **README's restore-needs table cell contradicted its own prose.** The table said v1 restore
+  needs "git only, from any device signed into your Proton account"; the prose two paragraphs
+  down (correctly) said no account is needed at restore time, because the bundle itself is the
+  backup. The table cell was wrong, not the prose — fixed to "git only, from any machine... no
+  account needed."
+- **`UpdateHEAD` was described as unconditionally using `upload -f merge`.** The shipped function
+  (`internal/repo/head.go:116-126`) `Stat`s `HEAD` first and branches: `UpdateRevision` (merge)
+  only when `HEAD` already exists, `CreateExclusive` when it is absent — the headless-repo rescue
+  this document defines elsewhere. The original v6.4 text described only the merge branch, which
+  is also not this document's own cross-check table's wording ("CAS via
+  `CreateExclusive`/`UpdateRevision`," Component 2 of the Stage 4 spec). Both branches are now
+  described, here and in the "Utility modes" section itself.
+- **The error table collapsed two distinct refusals into one row with the wrong shared wording.**
+  Per `EnforceCertified` (`cli.go:453-477`), "could not be determined (%v)" fires only when
+  `Version()` returned an error — a nonzero exit or a start failure. A clean exit whose output
+  does not match a certified token takes a different path entirely: `found` stays the actual
+  quoted, bounded output, never "could not be determined." The merged row claimed both cases got
+  the same wording; split back into two rows matching the Stage 4 spec's own error table.
 
 **v6.3, 2026-08-02 — Fetch verifies connectivity BEFORE the install, not after it.**
 
