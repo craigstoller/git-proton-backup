@@ -542,7 +542,7 @@ func parseMissingOIDs(out string) ([]string, error) {
 func ShowIndex(idxPath string) ([]string, error) {
 	f, err := os.Open(idxPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("show-index %s: %w", idxPath, err)
 	}
 	defer f.Close()
 	cmd := exec.Command("git", "show-index")
@@ -562,8 +562,15 @@ func ShowIndex(idxPath string) ([]string, error) {
 		return nil, fmt.Errorf("show-index %s: %s: %w", idxPath,
 			strings.TrimSpace(stderr.String()), err)
 	}
+	return parseShowIndexOutput(idxPath, stdout.String())
+}
+
+// parseShowIndexOutput turns show-index stdout into the OID list. Any line
+// that is not "<offset> <oid> ..." is a hard error — a truncated or garbled
+// answer must never become a smaller map.
+func parseShowIndexOutput(idxPath, out string) ([]string, error) {
 	var oids []string
-	for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		if line == "" {
 			continue
 		}

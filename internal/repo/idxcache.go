@@ -33,7 +33,8 @@ import (
 func ResolveIdxCacheDir(gitDir, root string) (string, error) {
 	out, code, err := gitcmd.RevParse(gitDir, "--git-common-dir")
 	if err != nil {
-		return "", fmt.Errorf("cannot resolve the git common dir for %s: %w", gitDir, err)
+		return "", fmt.Errorf("cannot resolve the git common dir for %s: %s: %w",
+			gitDir, strings.TrimSpace(out), err)
 	}
 	if code != 0 {
 		return "", fmt.Errorf("rev-parse --git-common-dir exited %d: %s", code, out)
@@ -161,6 +162,12 @@ func installIntoCache(cacheDir, src, name string) {
 // enter discovery (an up-to-date fetch short-circuits before listing).
 // v2 never deletes a pack, so firing is defensive, not expected. Best-effort
 // throughout: a prune failure warns and moves on.
+//
+// Staleness is keyed on the COMPLETE-pair stems the caller kept, which is
+// deliberately narrower than the design's name-in-listing rule: a cached
+// .idx whose pack is currently incomplete (mid-push) is pruned here and
+// simply re-downloaded if the pair later completes. Recorded as a
+// post-implementation reconciliation in the Stage 3b spec.
 func pruneStale(cacheDir string, keep map[string]bool) {
 	if cacheDir == "" {
 		return

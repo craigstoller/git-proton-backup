@@ -182,3 +182,8 @@ Hierarchical ref names (own stage); HEAD-update (Stage 4); exact set-cover pack 
 
 - **Zero complete pairs at discovery is an immediate fatal, not heal-then-fatal.** The error-table row says an in-flight `.pack` "becomes an error only if discovery needs it after the self-heal round's fresh listing" — true whenever at least one complete pair exists (the no-candidate → heal path re-lists). But a remote with *zero* complete pairs fatals before any heal: refs are published only after their pair completes, so a listed want with zero complete pairs already implies tampering, and 3a's empty-`packs/`-is-fatal invariant is kept verbatim.
 - **The no-progress fatal is pinned at unit level, not end-to-end.** With self-consistent remote pairs it is unreachable end-to-end (an OID in a verified pack's index is in the pack, so it cannot stay missing), so `greedyCover`'s no-progress arm carries the pin and the shared fatal-after-heal path is exercised end-to-end via the no-candidate flavour. The Testing section's listing of it among the RED scenarios reads as e2e; it is not.
+- **`listCompletePacks` stderr-notes only packish-looking skips.** The Testing section's letter
+  says every skipped node gets a note; the shipped code notes only names ending `.pack`/`.idx`
+  that fail the grammar, plus the pack-without-index case. Kept as shipped (Stage 4 decision):
+  non-packish nodes in `packs/` are foreign junk the helper deliberately ignores, and per-node
+  notes would make stderr volume depend on outside actors.

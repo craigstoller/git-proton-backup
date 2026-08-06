@@ -607,26 +607,5 @@ func linkOrCopy(src, dst string) error {
 	if err := os.Link(src, dst); err == nil {
 		return nil
 	}
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	// Closed EXACTLY ONCE on each path, with no `defer out.Close()` alongside.
-	// There used to be both: the deferred call fired second, got os.ErrClosed,
-	// and discarded it. Harmless as long as the defer stays bare — and a
-	// silent breakage the moment someone adds error handling to it, at which
-	// point every successful copy would start reporting "file already closed".
-	// The explicit form is kept rather than the deferred one because Close's
-	// error is worth returning: on a filesystem that defers write errors it is
-	// the only place a failed flush surfaces at all.
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close() // best effort; the copy error is the one worth reporting
-		return err
-	}
-	return out.Close()
+	return copyFile(src, dst)
 }
