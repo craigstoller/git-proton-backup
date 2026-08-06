@@ -785,10 +785,24 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   described, here and in the "Utility modes" section itself.
 - **The error table collapsed two distinct refusals into one row with the wrong shared wording.**
   Per `EnforceCertified` (`cli.go:453-477`), "could not be determined (%v)" fires only when
-  `Version()` returned an error — a nonzero exit or a start failure. A clean exit whose output
-  does not match a certified token takes a different path entirely: `found` stays the actual
-  quoted, bounded output, never "could not be determined." The merged row claimed both cases got
+  `Version()` returned an error from a process that STARTED and exited nonzero (`*exec.ExitError`);
+  a start failure is refused earlier, by the separate never-started check, with its own "Proton
+  CLI could not be started" message, and never reaches this wording at all. A clean exit whose
+  output does not match a certified token takes a third path: `found` stays the actual quoted,
+  bounded output, never "could not be determined." The merged row claimed the first two cases got
   the same wording; split back into two rows matching the Stage 4 spec's own error table.
+
+**Amendment (fix round 2, 2026-08-06) — the fix-round-1 amendment above introduced its own
+inaccuracy, caught on re-review.** Its third bullet originally said "could not be determined
+(%v)" fires when `Version()` "returned an error — a nonzero exit or a start failure," as if both
+reached the same code path. They do not: a start failure is caught EARLIER, by
+`EnforceCertified`'s own never-started check (`verr != nil && !errors.As(verr, &exitErr)`), which
+returns "Proton CLI could not be started: %w" immediately and never falls through to the
+`found`/"could not be determined" logic at all. Only a process that STARTED and exited nonzero
+(`verr` wraps an `*exec.ExitError`) reaches that wording. The split error-table rows above
+(`--version exits 0 but...` / `--version exits nonzero...`) already stated this correctly; only
+this prose sentence conflicted with them, and it is corrected in place above rather than
+appending yet another amendment layer for a two-word phrase.
 
 **v6.3, 2026-08-02 — Fetch verifies connectivity BEFORE the install, not after it.**
 
