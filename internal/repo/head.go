@@ -98,6 +98,60 @@ func WriteHEAD(t transport.Transport, root, branch string) (transport.Outcome, e
 	return transport.Committed, nil
 }
 
+// UpdateHEAD points HEAD at branch, OVERWRITING any existing symref — the
+// write half of the --set-head operation, and deliberately not WriteHEAD:
+// that function backfills and never overwrites, a contract its tests pin.
+// The caller MUST hold the repo lock. Verified by read-back like every
+// write (the CLI silently skips byte-identical rewrites).
+func UpdateHEAD(t transport.Transport, root, branch string) (transport.Outcome, error) {
+	if !strings.HasPrefix(branch, "refs/heads/") {
+		return transport.Ambiguous, fmt.Errorf("refusing to point HEAD at %q: not a branch", branch)
+	}
+	staged, cleanup, err := stagedFile([]byte(headPrefix+branch+"\n"), HeadName)
+	if err != nil {
+		return transport.Ambiguous, err
+	}
+	defer cleanup()
+
+	p := root + "/" + HeadName
+	_, exists, err := t.Stat(p)
+	if err != nil {
+		return transport.Ambiguous, fmt.Errorf("stat %s: %w", p, err)
+	}
+	var out transport.Outcome
+	if exists {
+		out, err = t.UpdateRevision(p, staged)
+	} else {
+		out, err = t.CreateExclusive(p, staged)
+	}
+	if err != nil {
+		return transport.Ambiguous, err
+	}
+	switch out {
+	case transport.Committed:
+		// Falls through to the read-back below.
+	case transport.Refused:
+		// Under the lock no v2 writer can race us, so a refusal here is a
+		// non-v2 actor. Do not adopt: the user asked for THIS branch.
+		return transport.Ambiguous, fmt.Errorf("HEAD write for %s was refused mid-operation; "+
+			"re-run to reconcile", p)
+	case transport.Ambiguous:
+		return transport.Ambiguous, fmt.Errorf("HEAD update outcome ambiguous for %s; "+
+			"re-run to reconcile", p)
+	default:
+		return transport.Ambiguous, fmt.Errorf("HEAD update for %s returned an unrecognised "+
+			"outcome %s; refusing to guess whether it landed", p, out)
+	}
+	got, ok, err := ReadHEAD(t, root)
+	if err != nil {
+		return transport.Ambiguous, err
+	}
+	if !ok || got != branch {
+		return transport.Ambiguous, fmt.Errorf("HEAD reads back as %q, expected %q", got, branch)
+	}
+	return transport.Committed, nil
+}
+
 // ReadHEAD returns the branch HEAD points at. Absence is (_, false, nil);
 // content that is not a branch symref is fatal, never coerced — the same rule
 // the ref-file grammar follows.
