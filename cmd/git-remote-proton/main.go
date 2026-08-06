@@ -21,6 +21,13 @@ import (
 // and stays "dev" for a plain `go build`.
 var version = "dev"
 
+// uncertifiedCLIEnv is the allowlist-override variable, read at BOTH
+// transport.EnforceCertified call sites (run and runSetHead). One const, not
+// two literals: a typo in either would silently disable the override on that
+// path alone — fails closed, but with the two entry points disagreeing about
+// what the documented variable is.
+const uncertifiedCLIEnv = "GPB_UNCERTIFIED_CLI"
+
 // main only chooses the process exit code. All cleanup lives in run's defers:
 // calling os.Exit directly from deep inside the command loop would skip every
 // deferred func (Go does not run defers on os.Exit), which is exactly the lock
@@ -63,7 +70,7 @@ func runSetHead(addr, branch string, stdout, stderr io.Writer) int {
 	}
 	cli := transport.NewCLI("")
 	if err := transport.EnforceCertified(cli,
-		os.Getenv("GPB_UNCERTIFIED_CLI") == "1", stderr); err != nil {
+		os.Getenv(uncertifiedCLIEnv) == "1", stderr); err != nil {
 		fmt.Fprintf(stderr, "git-remote-proton: %v\n", err)
 		return 1
 	}
@@ -129,7 +136,7 @@ func run() int {
 	// closed the design/code contradiction open since Stage 2 — the advisory
 	// warn that used to live here is now transport.EnforceCertified.
 	if err := transport.EnforceCertified(cli,
-		os.Getenv("GPB_UNCERTIFIED_CLI") == "1", os.Stderr); err != nil {
+		os.Getenv(uncertifiedCLIEnv) == "1", os.Stderr); err != nil {
 		warn(err)
 		return 1
 	}

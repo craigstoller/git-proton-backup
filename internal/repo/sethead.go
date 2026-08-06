@@ -29,6 +29,9 @@ func SetHead(t transport.Transport, root, branchArg string) (string, error) {
 	}
 	// Release on EVERY exit path; its error is reported, never masking the
 	// operation's own result — the same contract cmd's loop defer documents.
+	// The report goes to os.Stderr directly, this package's convention for
+	// advisory warnings (idxcache.go does the same) — so tests cannot capture
+	// it.
 	defer func() {
 		if rerr := lock.Release(); rerr != nil {
 			fmt.Fprintf(os.Stderr, "git-remote-proton: %v\n", rerr)

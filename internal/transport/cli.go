@@ -429,6 +429,9 @@ func (c *CLI) Version() (string, error) {
 // EnforceCertified is the Stage 4 allowlist: the design's "refuse to run"
 // rule, enforced. nil means proceed — either the CLI reports the certified
 // build, or allowUncertified is set and the loud warning was written to w.
+// w must be non-nil: the override path writes to it unconditionally, and
+// with two callers now (run and runSetHead) that contract is no longer
+// visible from a single call site.
 // A binary that never STARTED refuses regardless of the override (the
 // override does not synthesize a binary; the spawn failure is the report).
 // The check is a compatibility gate against accidental drift, not a

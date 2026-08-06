@@ -968,12 +968,6 @@ func TestLoop_FetchBatch_DegenerateFirstLineFailsClosed(t *testing.T) {
 	}
 }
 
-// TestLoop_FetchBatch_CheckConnectivityFalse_NoConnectivityOk is the minor
-// fold-in: the negative branch of the option was correct by construction
-// (checkConnectivity defaults false, and the "if checkConnectivity" guard
-// already existed) but had no direct test. Not a RED — it already passed
-// against the code as committed for Task 6, since fix round 1 only tightens
-// batch-line parsing and does not touch the option-false path.
 // --- Task 5: utility dispatch (--version, --set-head) ---
 //
 // RED (Stage 4): dispatchUtility does not exist yet. The dispatch set is
@@ -1084,6 +1078,12 @@ func TestDispatchUtility_NoArgsAtAll_DoesNotHandle(t *testing.T) {
 	}
 }
 
+// TestLoop_FetchBatch_CheckConnectivityFalse_NoConnectivityOk is the minor
+// fold-in: the negative branch of the option was correct by construction
+// (checkConnectivity defaults false, and the "if checkConnectivity" guard
+// already existed) but had no direct test. Not a RED — it already passed
+// against the code as committed for Task 6, since fix round 1 only tightens
+// batch-line parsing and does not touch the option-false path.
 func TestLoop_FetchBatch_CheckConnectivityFalse_NoConnectivityOk(t *testing.T) {
 	src := newGitRepoWithCommit(t)
 	sha := headOf(t, src)
