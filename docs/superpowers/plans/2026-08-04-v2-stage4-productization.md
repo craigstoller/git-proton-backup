@@ -88,27 +88,40 @@ if !gitcmd.HasObject(gitDir, want) {
 
 - [ ] **Step 5: New two-pack pair-refresh test** (beside `TestFetchPairFailureRefreshesSidecarAndCompletes`, `repo_test.go:2800`)
 
-The existing test uses ONE pack, so restart-vs-resume of a multi-pack plan is structurally-but-not-empirically pinned (retro-Codex finding 1). Write `TestFetchPairFailureWithTwoPacksRefreshesAndCompletes`: mirror the existing test's fixture construction, but make TWO pushes so the remote holds two packs both needed by the want, then corrupt the CACHED sidecar of the FIRST stem exactly the way the single-pack test does. Assert:
+The existing test uses ONE pack. Write `TestFetchPairFailureWithTwoPacksRefreshesAndCompletes`: read the existing test first — its locals are the `*transport.Fake` (reported as `f`), the repo path (`dst`), and commit shas (`c1`/`c2`); verify the actual names in the body and use THOSE, not this plan's placeholders. Fixture: TWO pushes so the remote holds two packs both needed by the want, then corrupt the CACHED sidecar of the FIRST stem with **garbage bytes** (so pair-verify fails and the refresh machinery genuinely runs — NOT the existing helper that builds an alternate index with the same OID set, which a peer review showed leaves the plan unchanged and the assertions blind). Wrap the fake explicitly before the `Fetch` call:
+
+```go
+var trace strings.Builder
+tr := transport.NewTraced(f, &trace)
+// pass tr to Fetch
+```
+
+Assert (adapt local names as above):
 
 ```go
 // GUARD (retro-Codex 1, Stage 4): a mid-plan pair-refresh with a second
-// pack still in the plan must complete the whole fetch, not just the
-// refreshed pack's slice.
+// pack still in the plan must complete the whole fetch. HONEST SCOPE: this
+// pins completion and bounded downloads through a two-pack refresh; it does
+// NOT empirically distinguish restart from resume (both complete this
+// fixture) — that distinction stays structurally pinned at unit level.
 if err != nil {
 	t.Fatalf("fetch must survive a mid-plan sidecar refresh with two packs: %v", err)
 }
-if !gitcmd.HasObject(gitDir, want) {
-	t.Errorf("want %s missing after two-pack refresh fetch", want)
+if !gitcmd.HasObject(dst, c2) {
+	t.Errorf("want %s missing after two-pack refresh fetch", c2)
+}
+if got := strings.Count(trace.String(), "/packs/"+stem1+".idx"); got < 1 {
+	t.Errorf("the corrupted sidecar was never re-downloaded; trace:\n%s", trace.String())
 }
 for _, stem := range []string{stem1, stem2} {
 	if got := strings.Count(trace.String(), "/packs/"+stem+".pack"); got < 1 || got > 2 {
-		t.Errorf("pack %s downloaded %d times, want 1 or 2 (bounded restart); trace:\n%s",
+		t.Errorf("pack %s downloaded %d times, want 1 or 2 (bounded); trace:\n%s",
 			stem, got, trace.String())
 	}
 }
 ```
 
-(The 1-or-2 bound is deliberate: a plan restart after the refresh may legitimately re-download, but unbounded re-downloading is the regression this pins.)
+Skip the deliberate-regression check for this test — a resume would also pass it, and claiming otherwise would be a false pin (record that honestly in the task report).
 
 - [ ] **Step 6: Trace size-unknown branch test** (`internal/transport/trace_test.go`, `package transport`)
 
@@ -315,8 +328,11 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Test: `cmd/git-remote-proton/main_test.go`
 
 **Interfaces:**
-- Consumes: `(c *CLI) Version() (string, error)` — already fails on nonzero exit and returns the first line; `IsCertified(versionLine string) bool`; `CertifiedCLI`.
-- Produces: `transport.EnforceCertified(c *CLI, allowUncertified bool, w io.Writer) error` — nil means proceed (certified, or uncertified-with-override after writing the warning to `w`); non-nil is the refusal, error text naming found vs certified and the override. Task 5's `--set-head` path calls this exact function.
+- Consumes: `(c *CLI) Version() (string, error)` — already fails on nonzero exit; this task CHANGES it to return the full trimmed output (both lines) instead of the first line only, so diagnostics can carry the SDK line (spec: recorded, not matched). Its only caller is the advisory block this task replaces, plus its own tests.
+- Produces:
+  - `transport.EnforceCertified(c *CLI, allowUncertified bool, w io.Writer) error` — nil means proceed (certified, or uncertified-with-override after writing the warning to `w`); non-nil is the refusal, naming found vs certified and the override. Task 5's `--set-head` path calls this exact function.
+  - `IsCertified(versionOutput string) bool` — REWRITTEN to exact-token matching: it extracts the first whitespace-delimited field starting `cli-drive@` and compares it for **equality** against `CertifiedCLI`. The current `strings.Contains` is a peer-review blocker: it accepts `cli-drive@0.7.0+5174900c-extra` and any text embedding the certified string, which is a prefix match by another name — exactly what the spec's "exact versions, not a floor or prefix" forbids. No token at all → not certified (the unparseable case).
+- **Seam decision (spec §1 "fires at transport construction"):** enforcement is an explicit `EnforceCertified` call immediately after each `NewCLI` site (there are exactly two after Task 5: `run()` and `runSetHead`), NOT embedded inside `NewCLI`. Embedding would make every existing test that constructs a CLI with a fake exe spawn a version check, breaking the whole cli_test machinery for zero safety gain. Recorded so a reviewer doesn't re-litigate it.
 
 - [ ] **Step 1: Write the failing tests** (`cli_test.go`, using the existing fake-exe TestMain role machinery — see `helperVersionLine` at line 45 and the role pattern at lines 58–63; add roles as needed for a wrong-version line and a nonzero exit)
 
@@ -375,18 +391,51 @@ func TestEnforceCertifiedTreatsAFailedVersionAsUndetermined(t *testing.T) {
 }
 
 func TestEnforceCertifiedSurfacesAMissingBinary(t *testing.T) {
-	// The spawn failure itself must be visible in the refusal (spec: the
-	// allowlist adds no new path for a missing binary; the override does
-	// not synthesize one — but with enforcement running first, the spawn
-	// error is what the refusal must carry).
+	// Spec rows: a missing binary is "not an allowlist path" and "the
+	// override does not synthesize a binary" — so a binary that never
+	// STARTED refuses even WITH the override, carrying the spawn failure.
 	err := EnforceCertified(NewCLI("nonexistent-xyz-binary-gpb-test"), false, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "nonexistent-xyz-binary-gpb-test") {
 		t.Errorf("refusal must surface the spawn failure, got %v", err)
 	}
+	if err := EnforceCertified(NewCLI("nonexistent-xyz-binary-gpb-test"), true, io.Discard); err == nil {
+		t.Error("the override must not synthesize a missing binary")
+	}
+}
+
+func TestIsCertifiedIsExactTokenNotContainment(t *testing.T) {
+	// RED against the current strings.Contains implementation — the
+	// containment cases below PASS it today and must not survive.
+	for _, bad := range []string{
+		"Proton Drive CLI cli-drive@0.7.0+5174900c-extra",
+		"embedded " + CertifiedCLI + "-suffix",
+		"no recognisable token here",
+		"",
+	} {
+		if IsCertified(bad) {
+			t.Errorf("%q must not be certified under exact-token matching", bad)
+		}
+	}
+	// The real two-line captured output stays certified (SDK line ignored).
+	if !IsCertified("Proton Drive CLI " + CertifiedCLI + "\nProton Drive SDK js@0.20.0+5174900c") {
+		t.Error("the genuine two-line --version output must be certified")
+	}
+}
+
+func TestEnforceCertifiedRefusesUnparseableOutput(t *testing.T) {
+	// Output with no cli-drive@ token: refusal without override, proceed
+	// with it (spec's unparseable rows).
+	if err := EnforceCertified(noTokenRoleCLI(t), false, io.Discard); err == nil {
+		t.Error("output with no cli-drive@ token must refuse")
+	}
+	var buf strings.Builder
+	if err := EnforceCertified(noTokenRoleCLI(t), true, &buf); err != nil {
+		t.Errorf("override must proceed on unparseable output: %v", err)
+	}
 }
 ```
 
-(`certifiedRoleCLI`/`wrongVersionRoleCLI`/`nonzeroVersionRoleCLI` are helpers you write against the existing TestMain role machinery — use the version string `cli-drive@9.9.9+deadbeef` for the wrong-version role so the assertions above hold verbatim.)
+(`certifiedRoleCLI`/`wrongVersionRoleCLI`/`nonzeroVersionRoleCLI`/`noTokenRoleCLI` are helpers you write against the existing TestMain role machinery. The certified role must serve the genuine captured TWO-line output — `"Proton Drive CLI " + CertifiedCLI + "\nProton Drive SDK js@0.20.0+5174900c"` — so the certified-pass case exercises the real parse (spec, Testing). Use `cli-drive@9.9.9+deadbeef` for the wrong-version role so the assertions above hold verbatim. The existing `TestIsCertifiedMatchesTheRealVersionLine` (cli_test.go:613) keeps passing under exact-token matching — its positive cases are whole fields, its negatives lack the token — but update its doc comment, which currently explains the containment rationale.)
 
 - [ ] **Step 2: Run to verify they fail**
 
@@ -395,12 +444,37 @@ go test ./internal/transport/ -run 'TestEnforceCertified' -count=1 -v
 ```
 Expected: FAIL — `EnforceCertified` undefined. Record it.
 
-- [ ] **Step 3: Implement** (in `cli.go`, directly under `IsCertified`)
+- [ ] **Step 3: Implement** (in `cli.go`; rewrite `IsCertified`, adjust `Version`, add `EnforceCertified`)
+
+`Version` (cli.go:407): return the full trimmed output instead of cutting to the first line — the SDK line belongs in diagnostics (spec: recorded, not matched). Update its doc comment; its start-failure test is unaffected.
+
+`IsCertified` rewrite (replace the containment body and its doc):
+
+```go
+// IsCertified reports whether --version output names EXACTLY the certified
+// build. Exact-token, not containment: the first whitespace-delimited field
+// starting "cli-drive@" must EQUAL CertifiedCLI. Containment was a prefix
+// match by another name — it accepted "cli-drive@0.7.0+5174900c-extra" —
+// and "exact versions, not a floor or prefix" is the design's rule. Output
+// with no such token is simply not certified (the unparseable case).
+func IsCertified(versionOutput string) bool {
+	for _, f := range strings.Fields(versionOutput) {
+		if strings.HasPrefix(f, "cli-drive@") {
+			return f == CertifiedCLI
+		}
+	}
+	return false
+}
+```
+
+`EnforceCertified`:
 
 ```go
 // EnforceCertified is the Stage 4 allowlist: the design's "refuse to run"
 // rule, enforced. nil means proceed — either the CLI reports the certified
 // build, or allowUncertified is set and the loud warning was written to w.
+// A binary that never STARTED refuses regardless of the override (the
+// override does not synthesize a binary; the spawn failure is the report).
 // The check is a compatibility gate against accidental drift, not a
 // provenance check: a spoofed --version defeats it trivially, and a helper
 // that trusts the CLI with every byte of repo data has no defence against a
@@ -410,7 +484,12 @@ func EnforceCertified(c *CLI, allowUncertified bool, w io.Writer) error {
 	if verr == nil && IsCertified(v) {
 		return nil
 	}
-	found := fmt.Sprintf("%q", v)
+	if verr != nil && errors.Is(verr, exec.ErrNotFound) {
+		return fmt.Errorf("Proton CLI not found: %w", verr)
+	}
+	// Quoted diagnostics are BOUNDED: --version output is remote-tool
+	// output, and an error message must not become a channel for megabytes.
+	found := fmt.Sprintf("%q", bound(v, 200))
 	if verr != nil {
 		found = fmt.Sprintf("could not be determined (%v)", verr)
 	}
@@ -424,7 +503,17 @@ func EnforceCertified(c *CLI, allowUncertified bool, w io.Writer) error {
 		"against %s; refusing to run. Set GPB_UNCERTIFIED_CLI=1 to proceed anyway "+
 		"(unvalidated), or install the certified CLI", found, CertifiedCLI)
 }
+
+// bound truncates s for quoting in diagnostics.
+func bound(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…(truncated)"
+}
 ```
+
+(`errors` and `os/exec` are already imported by cli.go; verify, add if not. Version's underlying read shares `run()`'s CombinedOutput + WaitDelay machinery with every other command — the spec's "bounds how much output it will read" is implemented at the diagnostic-quoting level above; note this narrowing in the task report.)
 
 - [ ] **Step 4: Run to verify they pass**
 
@@ -491,9 +580,13 @@ Cover, at minimum — each test comment carries its label:
 // 1  UpdateHEAD overwrites an existing HEAD and verifies by read-back.
 // 2  UpdateHEAD creates HEAD when absent (the headless-remote rescue).
 // 3  UpdateHEAD refuses a non-branch target (mirrors WriteHEAD's rule).
-// 4  UpdateHEAD reports Ambiguous outcomes as re-run-to-reconcile errors.
-// 5  UpdateHEAD fails closed on an unrecognised Outcome (mirror
-//    TestWriteHEADFailsClosedOnUnrecognisedOutcome at line 1336).
+// 4  UpdateHEAD reports Ambiguous outcomes as re-run-to-reconcile errors —
+//    on the UPDATE path: the existing outcome-forcing decorators override
+//    CreateExclusive only (repo_test.go:483, :1205), so write a sibling
+//    decorator overriding UpdateRevision for these arms.
+// 5  UpdateHEAD fails closed on an unrecognised Outcome on BOTH paths
+//    (mirror TestWriteHEADFailsClosedOnUnrecognisedOutcome at line 1336;
+//    update path needs the new decorator from 4).
 // 6  GUARD: WriteHEAD STILL never overwrites (re-run the existing
 //    TestWriteHEADNeverOverwritesExistingHEAD; it must stay green).
 
@@ -501,9 +594,11 @@ Cover, at minimum — each test comment carries its label:
 // 7  SetHead succeeds: two branches, HEAD at A, SetHead("b") → HEAD reads
 //    back refs/heads/b; returns "refs/heads/b".
 // 8  Same-target idempotence: SetHead to the branch HEAD already names
-//    succeeds WITHOUT uploading — assert no UpdateRevision/CreateExclusive
-//    reached the transport (wrap the Fake in a counting decorator, or use
-//    transport.NewTraced and assert zero new writes — downloads are fine).
+//    succeeds WITHOUT uploading — wrap the Fake in a small COUNTING
+//    decorator (embed transport.Transport, override UpdateRevision and
+//    CreateExclusive to increment then delegate) and assert zero writes.
+//    transport.NewTraced is NOT usable here: it logs only ReadTo, so it
+//    reports zero writes even when writes happen (peer-review finding).
 // 9  Dangling HEAD refuses: HEAD names refs/heads/gone, branch "gone" does
 //    not exist, SetHead("gone") → error naming the branches that DO exist
 //    (round-3 peer-review finding — verification runs BEFORE the
@@ -517,11 +612,18 @@ Cover, at minimum — each test comment carries its label:
 // 15 Lock held → AcquireLock's refusal; and SetHead released ITS lock on
 //    every refusal path above (assert the Fake holds no .lock after each).
 // 16 Short-name normalization: SetHead("main") == SetHead("refs/heads/main").
+// 17 Corrupt or unreadable HEAD refuses (fail closed): make ReadHEAD error
+//    (e.g. non-symref HEAD content in the Fake) and assert SetHead returns
+//    that error WITHOUT writing. The in-tool repair path for a corrupt HEAD
+//    is delete-HEAD-via-web-UI (existing documented remedy), after which
+//    the repo is headless and SetHead works via the create path.
 ```
 
 - [ ] **Step 2: Run to verify they fail** (`go test ./internal/repo/ -run 'TestUpdateHEAD|TestSetHead' -count=1 -v`) — expected: FAIL, undefined symbols. Record.
 
 - [ ] **Step 3: Implement `UpdateHEAD`** (in `head.go`, under `WriteHEAD`)
+
+The exists-branch below (`UpdateRevision` when HEAD exists, `CreateExclusive` when absent) is deliberate and peer-review-adjudicated: it is the same branch `WriteRef` takes — "the staged-file CAS path pushes use" — and both primitives are certified by probes. The reviewer-suggested alternative (always `UpdateRevision`, relying on it upserting an absent node) leans on UNCERTIFIED CLI behaviour: C14 proved merge-revises-existing, nothing proved create-on-absent. Do not "simplify" this.
 
 ```go
 // UpdateHEAD points HEAD at branch, OVERWRITING any existing symref — the
@@ -639,11 +741,16 @@ func SetHead(t transport.Transport, root, branchArg string) (string, error) {
 	}
 
 	// Idempotence short-circuit — AFTER the existence check above. A ReadHEAD
-	// error is NOT fatal here: corrupt-or-unreadable HEAD content is exactly
-	// what this operation exists to overwrite, so it falls through to the
-	// update rather than wedging the one tool that can fix it.
-	head, hasHead, herr := ReadHEAD(t, root)
-	if herr == nil && hasHead && head == branch {
+	// error is FATAL (fail closed): it covers transient transport trouble as
+	// much as corrupt content, and an indeterminate read must never license a
+	// destructive overwrite (peer-review finding on this plan). A genuinely
+	// corrupt HEAD is repaired by deleting the HEAD file in the web UI —
+	// after which the repo is headless and SetHead's create path applies.
+	head, hasHead, err := ReadHEAD(t, root)
+	if err != nil {
+		return "", err
+	}
+	if hasHead && head == branch {
 		return branch, nil
 	}
 
@@ -667,8 +774,7 @@ func normalizeBranch(arg string) (string, error) {
 	}
 	leaf := strings.TrimPrefix(b, "refs/heads/")
 	if strings.ContainsAny(leaf, `/\`) {
-		return "", fmt.Errorf("hierarchical ref names are not supported yet (planned as their "+
-			"own stage): %q", arg)
+		return "", fmt.Errorf("hierarchical ref names are not supported yet (Stage 5): %q", arg)
 	}
 	if err := checkStageableLeaf(leaf); err != nil {
 		return "", err
@@ -865,10 +971,25 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
-          go-version: stable
+          # Release builds pin the toolchain to go.mod for reproducibility —
+          # deliberately unlike ci.yml's 'stable' (which proves newest-compat).
+          go-version-file: go.mod
       - name: Test (hermetic; the live half loudly skips in CI)
         shell: pwsh
         run: go vet ./... && go test ./...
+      - name: Lint installer (it ships as a release asset)
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $findings = Invoke-ScriptAnalyzer -Path . -Recurse -Settings .\PSScriptAnalyzerSettings.psd1
+          if ($findings) { $findings | Format-Table | Out-String | Write-Host; throw "PSScriptAnalyzer: $($findings.Count) finding(s)" }
+      - name: Pester (installer tests included)
+        shell: pwsh
+        run: |
+          Install-Module Pester -MinimumVersion 5.5 -Force -SkipPublisherCheck -Scope CurrentUser -AllowClobber
+          Import-Module Pester -MinimumVersion 5.5
+          git config --global user.email 'ci@ci'; git config --global user.name 'ci'
+          Invoke-Pester -Path tests -CI
       - name: Version
         id: ver
         shell: pwsh
@@ -932,9 +1053,13 @@ if (Test-Path $HelperExe) {
     } catch {
         throw "Cannot replace $helperDir\git-remote-proton.exe (a git process may be using it). Close running git commands and re-run. $_"
     }
+    # PATH check tolerates empty user PATHs (no leading semicolon) and
+    # trailing-backslash variants (no duplicate entries) — peer-reviewed.
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    if (($userPath -split ';') -notcontains $helperDir) {
-        [Environment]::SetEnvironmentVariable('Path', "$userPath;$helperDir", 'User')
+    $entries = @(($userPath -split ';') | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') })
+    if ($entries -notcontains $helperDir.TrimEnd('\')) {
+        $newPath = if ([string]::IsNullOrEmpty($userPath)) { $helperDir } else { "$userPath;$helperDir" }
+        [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
         Write-Host "Added $helperDir to your user PATH. Open a NEW terminal for it to take effect (this script cannot change its caller's session)."
     }
     Write-Host "Helper installed: $helperDir\git-remote-proton.exe"
@@ -942,19 +1067,28 @@ if (Test-Path $HelperExe) {
     Write-Host "No git-remote-proton.exe found at $HelperExe — skipping helper install (module only)."
 }
 
-# ---- module (v1), semantics unchanged ----
-$dest = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'PowerShell\Modules\GitProtonBackup'
-if ((Test-Path $dest) -and -not $Force) { throw "Already installed at $dest — re-run with -Force to overwrite." }
-New-Item -ItemType Directory -Path $dest -Force | Out-Null
-Copy-Item -Path (Join-Path $PSScriptRoot 'GitProtonBackup\*') -Destination $dest -Recurse -Force
-Write-Host "Installed. Start with: Import-Module GitProtonBackup; Initialize-ProtonBackup"
+# ---- module (v1), semantics unchanged when the payload is present ----
+# A release download is exe + sha256 + this script, with NO module payload
+# beside it — that layout must install the helper and SKIP the module, not
+# throw (peer-review blocker: the gate's install step is exactly this case).
+$payload = Join-Path $PSScriptRoot 'GitProtonBackup'
+if (Test-Path $payload) {
+    $dest = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'PowerShell\Modules\GitProtonBackup'
+    if ((Test-Path $dest) -and -not $Force) { throw "Already installed at $dest — re-run with -Force to overwrite." }
+    New-Item -ItemType Directory -Path $dest -Force | Out-Null
+    Copy-Item -Path (Join-Path $payload '*') -Destination $dest -Recurse -Force
+    Write-Host "Installed. Start with: Import-Module GitProtonBackup; Initialize-ProtonBackup"
+} else {
+    Write-Host "No GitProtonBackup module payload beside the script — helper-only install. For the module, clone the repository and re-run."
+}
 ```
 
 - [ ] **Step 3: Pester tests** (append a `Describe 'install.ps1 helper block'` to `tests/GitProtonBackup.Tests.ps1`, matching the file's Pester 5 style)
 
-Two tests, both driving the script in a child `pwsh` with `$env:LOCALAPPDATA` pointed at a `TestDrive:` temp dir so nothing real is touched:
-1. **Checksum mismatch refuses:** stage a fake exe + a `.sha256` naming a wrong digest → the script throws, exit nonzero, nothing copied into the temp LOCALAPPDATA.
-2. **Missing exe skips cleanly:** point `-HelperExe` at a nonexistent path (and `-Force` so the module block is exercised) → exit 0, output contains "skipping helper install".
+**Isolation rule for every test here:** copy `install.ps1` into a `TestDrive:` directory WITHOUT a `GitProtonBackup` payload folder (so the module block always takes its skip path and can never write to the real Documents modules directory — an earlier draft of this plan had exactly that contamination bug), and run it in a child `pwsh -NoProfile` with `$env:LOCALAPPDATA` pointed at a `TestDrive:` subdir. Three tests:
+1. **Release-asset layout succeeds (the gate's exact case):** stage a fake exe + a `.sha256` naming its real digest beside the script copy → exit 0, exe present under the temp LOCALAPPDATA's `Programs\git-proton-backup\`, output contains "helper-only install".
+2. **Checksum mismatch refuses:** `.sha256` naming a wrong digest → exit nonzero, nothing copied into the temp LOCALAPPDATA.
+3. **Missing exe skips cleanly:** no exe beside the script copy → exit 0, output contains "skipping helper install".
 
 - [ ] **Step 4: CHANGELOG**
 
@@ -1043,20 +1177,29 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 **Precondition (Craig, not the runner):** push main, push the `v0.3.0` tag, confirm the draft release exists with exactly three assets; empty the Proton trash (the runner records trash-adjacent state but never empties).
 
-- [ ] **Step 1: Author the gate brief** for the runner, containing verbatim: the standing rules (write confinement to `/my-files/GitRemotes/<demo>` + `/my-files/_cas-probe`; the four untouchable folders; verify-before-trash with exact paths; BLOCKED-on-surprise, never patch, never retry past a surprise; `-count=1` on the contract-table command; record pre-run `/my-files` listing AND what is known of trash state before assuming anything), plus the spec's four steps: (1) download all three draft assets, record each SHA256 in the gate log, verify the exe checksum, install via `install.ps1 -Force`, fresh-shell `git-remote-proton --version` must resolve from PATH and report the tag — every later step runs THIS binary; (2) allowlist live: real CLI passes; a PATH-shimmed wrong-version `proton-drive` (confined to the gate temp dir) proves refusal and `GPB_UNCERTIFIED_CLI=1` override; (3) `--set-head` end to end: demo repo with two branches, set-head to the second, verify HEAD via CLI + fresh clone checks out the new default, then delete the OLD default (must succeed) and attempt delete of the NEW default (must refuse, naming `--set-head`); (4) after Craig publishes: re-download every published asset and compare each SHA256 to the staged digests. Cleanup per standing rules; post-run listing must match pre-run active state.
+- [ ] **Step 1: Author the gate brief** for the runner, containing verbatim: the standing rules (write confinement to `/my-files/GitRemotes/<demo>` + `/my-files/_cas-probe`; the four untouchable folders; verify-before-trash with exact paths; BLOCKED-on-surprise, never patch, never retry past a surprise; `-count=1` on the contract-table command; record pre-run `/my-files` listing AND what is known of trash state before assuming anything), plus the spec's four steps: (1) download all three draft assets into an empty gate directory, record each SHA256 in the gate log, verify the exe checksum, run `install.ps1` from that directory (no module payload is present, so the module block must SKIP with its helper-only message — a throw here is a Task 6 defect and a gate BLOCK), then from a fresh shell `git-remote-proton --version` must resolve from PATH and report the tag — every later step runs THIS binary; (2) allowlist live: real CLI passes; a PATH-shimmed wrong-version `proton-drive` (confined to the gate temp dir) proves refusal and `GPB_UNCERTIFIED_CLI=1` override; (3) `--set-head` end to end: demo repo with two branches, set-head to the second, verify HEAD via CLI + fresh clone checks out the new default, then delete the OLD default (must succeed) and attempt delete of the NEW default (must refuse, naming `--set-head`); (4) after Craig publishes: re-download every published asset and compare each SHA256 to the staged digests. Cleanup per standing rules; post-run listing must match pre-run active state.
 
 - [ ] **Step 2: Dispatch the gate runner** (live-account rules from the runbook apply; the runner reports BLOCKED with verbatim output and never patches).
 
-- [ ] **Step 3: Record and commit the gate record**
+- [ ] **Step 3: Record and commit the INTERIM gate record** (steps 1–3 verdicts; the record states explicitly that the digest closure has not yet run and the verdict is provisional)
 
 ```bash
 git add docs/research/gates/stage4-gate.md
-git commit -m "gate(v2): stage 4 live gate record
+git commit -m "gate(v2): stage 4 live gate record - steps 1-3, pre-publication
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
 
-PASS → tell Craig to publish the draft; then run gate step 4's digest closure and append it to the record. BLOCKED → stop, report, plan the fix wave; the next attempt ships as `v0.3.1`.
+- [ ] **Step 4: Digest closure and FINAL verdict** — only after Craig publishes the draft: re-download every published asset, compare each SHA256 to the staged digests, append the comparison and the final verdict to the record, and commit again. The gate is not PASSED until this commit exists (spec: only the full comparison substantiates "the published bytes are the gated bytes").
+
+```bash
+git add docs/research/gates/stage4-gate.md
+git commit -m "gate(v2): stage 4 gate final - publication digest closure
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+```
+
+BLOCKED at any step → stop, report, plan the fix wave; the next attempt ships as `v0.3.1` (tags are never moved or reused).
 
 ---
 
@@ -1064,4 +1207,8 @@ PASS → tell Craig to publish the draft; then run gate step 4's digest closure 
 
 - **Spec coverage:** allowlist → Task 3; `--set-head` (grammar, ordering, UpdateHEAD/WriteHEAD split, remedy text) → Tasks 4–5; release pipeline (draft, permissions, dispatch, installer, checksum, CHANGELOG) → Task 6; coexistence + design v6.4 → Task 7; hygiene items 1–9 → Tasks 1–2 (item 4, the 3b bullet, in Task 2); gate incl. per-asset digest closure → Task 8. EnsureDir tolerance: correctly absent (dropped by spec).
 - **Type consistency:** `EnforceCertified(c *CLI, allowUncertified bool, w io.Writer) error` (Tasks 3, 5); `SetHead(t transport.Transport, root, branchArg string) (string, error)` (Tasks 4, 5); `UpdateHEAD(t transport.Transport, root, branch string) (transport.Outcome, error)` (Task 4); `var version = "dev"` / `-X main.version` (Tasks 5, 6); asset names `git-remote-proton.exe`, `.exe.sha256`, `install.ps1` (Tasks 6, 8).
-- **Known judgment calls carried from the spec, not invented here:** missing-binary refusal surfaces the spawn error inside the allowlist refusal (spec's row read as intent, noted in Task 3 test 5); corrupt-HEAD falls through the short-circuit to the overwrite (spec's flow read literally, commented in `SetHead`). If a reviewer disputes either, the spec is the tiebreaker and Craig is the appeal.
+- **Adjudicated judgment calls (peer-reviewed, do not re-litigate without new evidence):** missing binary refuses even with the override, surfacing the spawn error (`errors.Is(err, exec.ErrNotFound)`); a `ReadHEAD` error in `SetHead` is fatal — an indeterminate read never licenses an overwrite, and corrupt-HEAD repair goes delete-via-web-UI → headless → create path; `UpdateHEAD` keeps the `WriteRef`-style exists-branch because always-`UpdateRevision` would lean on uncertified upsert-on-absent behaviour; allowlist enforcement is an explicit call after each `NewCLI` site, not embedded in `NewCLI` (embedding breaks the fake-exe test machinery).
+
+## Plan peer review (2026-08-04, Codex xhigh + Gemini 3.1 Pro via agy, one round)
+
+Codex reviewed against the spec and the real code; Gemini reviewed the plan's code blocks. Applied: **installer works from the three release assets** — module block skips when no payload folder sits beside the script; without this the gate's install step throws and the stage cannot pass [Codex blocker]; **exact-token `IsCertified`** replacing containment (which accepted `…+5174900c-extra`), with unparseable-output tests and the genuine two-line certified fixture [Codex blocker]; missing-binary refusal made override-proof; `Version` returns full output so diagnostics carry the SDK line; bounded diagnostic quoting [Codex]; `SetHead` fails closed on any `ReadHEAD` error (test 17 added) [Codex]; `UpdateRevision`-overriding outcome decorator required for the update-path arms [Codex]; counting decorator (not `NewTraced`) for the zero-writes idempotence assert [Codex]; two-pack fixture corrupts with garbage bytes and states its honest scope (pins completion through mid-plan refresh, does not empirically distinguish restart from resume) [Codex]; hierarchical error names Stage 5 verbatim [Codex]; release workflow pins `go-version-file: go.mod` and runs PSScriptAnalyzer + Pester (the installer is a shipped asset) [Codex]; gate record split into interim and post-publication-closure commits [Codex]; Task 1 step 5 snippet grounded in the real test's locals with an explicit `NewTraced` wrap [Gemini]; installer PATH handles empty user PATH and trailing-backslash duplicates [Gemini]; Pester tests isolated so no test can ever write to the real Documents modules directory [Codex]. Rejected with reasons: always-`UpdateRevision` for `UpdateHEAD` and enforcement-inside-`NewCLI` (both above); byte-level read bounding inside `run()` (shared machinery, WaitDelay-guarded; bound applied at the diagnostic layer and the narrowing recorded).
