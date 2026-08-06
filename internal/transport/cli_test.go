@@ -737,6 +737,55 @@ func TestEnforceCertifiedSurfacesAMissingBinary(t *testing.T) {
 	}
 }
 
+// TestEnforceCertifiedNeverProceedsOnANonLookupStartFailure is the Task 3
+// fix-round-1 regression (plan SUPERSEDED banner, Task 3 review, 2026-08-05).
+// The original `errors.Is(verr, exec.ErrNotFound)` never-started check only
+// covered the not-on-PATH case: every OTHER way a process can fail to start
+// (permission denied, bad executable format, CLI.Exe pointing at a
+// directory) fell through to the generic branch and PROCEEDED under
+// GPB_UNCERTIFIED_CLI=1, contradicting EnforceCertified's own doc comment
+// ("A binary that never STARTED refuses regardless of the override").
+//
+// A same-named ".exe" file containing plain text is the mechanism, verified
+// empirically on this Windows environment (see the scratch check run before
+// writing this test): starting it produces `*fs.PathError` — "This version
+// of %1 is not compatible with the version of Windows you're running" — not
+// exec.ErrNotFound and not *exec.ExitError. A bare directory with NO ".exe"
+// suffix was tried first and rejected as the mechanism: on Windows that
+// actually resolves through LookPath's PATHEXT probing to the SAME
+// ErrNotFound-wrapping error as a plain not-on-PATH miss, so it would not
+// have exercised the gap this test exists to close.
+func TestEnforceCertifiedNeverProceedsOnANonLookupStartFailure(t *testing.T) {
+	dir := t.TempDir()
+	fakeExe := filepath.Join(dir, "not-a-real-binary.exe")
+	if err := os.WriteFile(fakeExe, []byte("not a real exe, just text\n"), 0o755); err != nil {
+		t.Fatalf("writing the bad-executable-format stand-in: %v", err)
+	}
+	c := NewCLI(fakeExe)
+
+	// Sanity: confirm this really is a never-started, non-ErrNotFound,
+	// non-ExitError failure before trusting the assertions below — a false
+	// premise here would make the test pass for the wrong reason.
+	_, verr := c.Version()
+	if verr == nil {
+		t.Fatalf("the bad-format stand-in must fail to start, got a nil error")
+	}
+	if errors.Is(verr, exec.ErrNotFound) {
+		t.Fatalf("this regression needs a start failure that is NOT exec.ErrNotFound, got %v", verr)
+	}
+	var exitErr *exec.ExitError
+	if errors.As(verr, &exitErr) {
+		t.Fatalf("this regression needs a start failure, not an exit error, got %v", verr)
+	}
+
+	if err := EnforceCertified(c, false, io.Discard); err == nil {
+		t.Error("a non-ErrNotFound start failure must refuse without the override")
+	}
+	if err := EnforceCertified(c, true, io.Discard); err == nil {
+		t.Error("the override must not proceed on a non-ErrNotFound start failure either")
+	}
+}
+
 func TestIsCertifiedIsExactTokenNotContainment(t *testing.T) {
 	// RED against the current strings.Contains implementation — the
 	// containment cases below PASS it today and must not survive.
@@ -794,6 +843,26 @@ func TestIsCertifiedMatchesTheRealVersionLine(t *testing.T) {
 		if IsCertified(bad) {
 			t.Errorf("%q must not be recognised as certified", bad)
 		}
+	}
+}
+
+// TestVersionReturnsTheFullOutputIncludingTheSDKLine is the Task 3
+// fix-round-1 pin for Version()'s full-output change (plan SUPERSEDED
+// banner, Task 3 review, 2026-08-05): the original brief's test list had no
+// assertion that would fail if Version() were reverted to first-line-only
+// (the old `strings.Cut(strings.TrimSpace(out), "\n")`) — every other
+// assertion in this file reads only first-line tokens, which a
+// first-line-only Version() also satisfies, so the suite stayed green
+// against a silent revert. Deliberate-regression checked (recorded in the
+// task report): temporarily restoring the old first-line-only body makes
+// this fail on the `strings.Contains(v, "js@0.20.0")` assertion below.
+func TestVersionReturnsTheFullOutputIncludingTheSDKLine(t *testing.T) {
+	v, err := certifiedRoleCLI(t).Version()
+	if err != nil {
+		t.Fatalf("Version: %v", err)
+	}
+	if !strings.Contains(v, "js@0.20.0") {
+		t.Errorf("Version() must carry the SDK line through to diagnostics, got %q", v)
 	}
 }
 

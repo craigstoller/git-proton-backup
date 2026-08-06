@@ -435,13 +435,29 @@ func (c *CLI) Version() (string, error) {
 // provenance check: a spoofed --version defeats it trivially, and a helper
 // that trusts the CLI with every byte of repo data has no defence against a
 // malicious binary anyway (spec, Decisions).
+//
+// Never-started is detected as "verr is non-nil and is not an
+// *exec.ExitError", not narrowly as exec.ErrNotFound (Task 3 fix round 1:
+// the ErrNotFound-only check let every OTHER never-started case — permission
+// denied, bad executable format, CLI.Exe pointing at a directory — fall
+// through to the generic branch and PROCEED under the override, exactly the
+// synthesis this doc comment says must not happen). Version()'s errors
+// partition cleanly on this test: a process that ran and exited non-zero
+// always surfaces *exec.ExitError (version undetermined, override applies —
+// the CLI is real, we just could not read a certified line from it), while a
+// process that never started surfaces the raw start error instead
+// (*exec.Error from LookPath, *os.PathError/*fs.PathError from Start — never
+// an ExitError), and a WaitDelay-only hiccup never reaches here as an error
+// at all (TestVersionSucceedsThroughAWaitDelay pins that a zero exit
+// carrying ErrWaitDelay reads as success).
 func EnforceCertified(c *CLI, allowUncertified bool, w io.Writer) error {
 	v, verr := c.Version()
 	if verr == nil && IsCertified(v) {
 		return nil
 	}
-	if verr != nil && errors.Is(verr, exec.ErrNotFound) {
-		return fmt.Errorf("Proton CLI not found: %w", verr)
+	var exitErr *exec.ExitError
+	if verr != nil && !errors.As(verr, &exitErr) {
+		return fmt.Errorf("Proton CLI could not be started: %w", verr)
 	}
 	// Quoted diagnostics are BOUNDED: --version output is remote-tool
 	// output, and an error message must not become a channel for megabytes.
