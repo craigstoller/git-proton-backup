@@ -867,3 +867,106 @@ The controller should still adjudicate the write re-issue disclosed in Surprise 
 **The publication digest closure (spec step 4) has NOT yet run.** This verdict is **provisional
 until it does**: the three staged digests in §1.2 must be compared against the published release's
 assets after the draft is published. Only then does this become a full PASS.
+
+---
+
+### Publication digest closure (run 2, 2026-08-06)
+
+**Closure verdict: PASS — all three published assets are byte-identical to the gated bytes. The
+provisional qualifier on run 2's verdict is LIFTED.**
+
+The release under test was published between the gate run and this closure. This step re-downloaded
+every published asset from the now-public release into a **new empty directory**
+(`…\scratchpad\stage4-gate-r2-closure`, verified non-existent beforehand, 0 entries at creation —
+the run 2 staging directory was never reused), hashed each, and compared against the staged digests
+recorded in run 2 §1.2. The step is read-only throughout: no account access, no writes outside the
+closure directory and this record.
+
+#### Published release metadata
+
+| field | value |
+| --- | --- |
+| tag | `v0.3.1` |
+| `isDraft` | `false` |
+| `publishedAt` | `2026-08-06T18:34:39Z` |
+| `createdAt` | `2026-08-06T16:04:15Z` |
+| url | `https://github.com/craigstoller/git-proton-backup/releases/tag/v0.3.1` |
+
+Asset set: **exactly the three expected names**, no more and no fewer.
+
+| asset | id | size | asset URL now under |
+| --- | --- | --- | --- |
+| `git-remote-proton.exe` | `504134088` (`RA_kwDOTfWuiM4eDHnI`) | 3891712 | `…/releases/download/v0.3.1/` |
+| `git-remote-proton.exe.sha256` | `504134089` (`RA_kwDOTfWuiM4eDHnJ`) | 87 | `…/releases/download/v0.3.1/` |
+| `install.ps1` | `504134090` (`RA_kwDOTfWuiM4eDHnK`) | 5336 | `…/releases/download/v0.3.1/` |
+
+The asset **ids are unchanged** from the draft observed in run 2 §1.1, and each asset's `createdAt`
+(`2026-08-06T16:38:40Z`) is unchanged — publication moved the release out of draft and re-homed the
+download URLs from `untagged-13c1a5168ba7bf0df8e1` to `v0.3.1`, without re-uploading the assets.
+
+#### Staged vs published digests (SHA256)
+
+```
+git-remote-proton.exe
+  staged (recorded) : d38cd21189d989e7954f9dfc8721648861bb2f40ed6326fc038d5228116fb4e8
+  staged (re-hashed): d38cd21189d989e7954f9dfc8721648861bb2f40ed6326fc038d5228116fb4e8   [staging dir unchanged: True]
+  published         : d38cd21189d989e7954f9dfc8721648861bb2f40ed6326fc038d5228116fb4e8
+  RESULT            : EQUAL
+
+git-remote-proton.exe.sha256
+  staged (recorded) : 719b3c465c0366ba477a34d693990c634065cfe0e1c4315d33fc5a01a58ac6b2
+  staged (re-hashed): 719b3c465c0366ba477a34d693990c634065cfe0e1c4315d33fc5a01a58ac6b2   [staging dir unchanged: True]
+  published         : 719b3c465c0366ba477a34d693990c634065cfe0e1c4315d33fc5a01a58ac6b2
+  RESULT            : EQUAL
+
+install.ps1
+  staged (recorded) : 265925b9ba2c41fc4a5b7b17d96c1d910a731bb96260e2030eed90891e41d120
+  staged (re-hashed): 265925b9ba2c41fc4a5b7b17d96c1d910a731bb96260e2030eed90891e41d120
+  published         : 265925b9ba2c41fc4a5b7b17d96c1d910a731bb96260e2030eed90891e41d120
+  RESULT            : EQUAL
+
+ALL THREE MATCH: True
+```
+
+Each comparison is made three ways, and all three agree:
+
+1. **Recorded vs published** — the digests written into run 2 §1.2 *before* publication equal the
+   digests of the freshly downloaded published assets.
+2. **Staging directory re-hashed** — the run 2 staging copies still hash to their recorded values,
+   so the recorded digests were not transcribed from drifted files.
+3. **Byte-level comparison** — beyond hash equality, staged and published files were compared byte
+   for byte and are identical at identical lengths (3891712 / 87 / 5336).
+
+The published sidecar also remains self-consistent against the published exe:
+
+```
+sidecar token: d38cd21189d989e7954f9dfc8721648861bb2f40ed6326fc038d5228116fb4e8
+exe hash     : d38cd21189d989e7954f9dfc8721648861bb2f40ed6326fc038d5228116fb4e8
+self-consistent: True
+```
+
+`install.ps1` was checked to the same standard as the exe deliberately — it is code users execute,
+with the same supply-chain exposure as the binary it installs.
+
+#### Final verdict
+
+### **PASS** — Stage 4 live gate, run 2, v0.3.1
+
+Every step of the brief is green (0, 1, 2, 3, cleanup — see run 2's verdict table), and the
+publication digest closure confirms that **the bytes gated against the real Proton account are
+exactly the bytes now published to users**. The provisional qualifier carried by run 2's verdict is
+lifted; no qualifier remains outstanding on this gate.
+
+Two items from run 2 remain for the controller's attention and are *not* changed by this closure:
+the disclosed write re-issue in Surprise R2-1 (still awaiting adjudication), and the Stage 5 ledger
+candidates recorded under both surprises.
+
+### Controller adjudications (run 2 disclosed deviations)
+
+Both run 2 deviations were adjudicated ACCEPTED by the controller before the final commit
+(rulings recorded in the SDD ledger and the run 2 record's commit message): the
+parent-create-and-repush after `Node not found: GitRemotes` was pre-authorized by the gate
+brief ("you may create `/my-files/GitRemotes` if absent") with the failed write verified
+atomic before re-issue; the clone re-run to a short path after MAX_PATH was a read, and
+declining `core.longpaths` was correct restraint. Stage 5 ledger candidates from both
+surprises are filed in the SDD ledger and project memory.
