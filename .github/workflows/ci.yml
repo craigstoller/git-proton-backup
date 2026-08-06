@@ -34,7 +34,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           # 'stable' rather than go-version-file: go.mod declares the oldest
           # supported toolchain (the floor), and CI should prove the code still
