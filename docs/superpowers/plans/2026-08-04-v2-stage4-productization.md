@@ -657,6 +657,15 @@ Cover, at minimum — each test comment carries its label:
 //    the repo is headless and SetHead works via the create path.
 ```
 
+> **SUPERSEDED (Stage 4 execution, Task 4 review, 2026-08-05):** the 17-scenario matrix above
+> omitted the one arm whose behaviour is NOVEL in `UpdateHEAD` — the `Refused` arm that
+> refuses rather than adopting (the exact semantic distinguishing it from `WriteHEAD`'s
+> adopt-theirs `Refused` arm). The whole matrix stayed green with that arm mutated to
+> `WriteHEAD`'s form, i.e. a plausible copy-paste regression silently reporting a foreign
+> HEAD as success. As executed, a scenario 18 was added: `UpdateHEAD` on a byte-identical
+> rewrite (the Fake's `UpdateRevision` returns `Refused` for it, modelling probe C2) must
+> return an error, not success — no new scaffolding needed.
+
 - [ ] **Step 2: Run to verify they fail** (`go test ./internal/repo/ -run 'TestUpdateHEAD|TestSetHead' -count=1 -v`) — expected: FAIL, undefined symbols. Record.
 
 - [ ] **Step 3: Implement `UpdateHEAD`** (in `head.go`, under `WriteHEAD`)
