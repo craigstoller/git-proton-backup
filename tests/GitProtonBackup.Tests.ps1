@@ -515,3 +515,61 @@ Describe 'Cloud Files placeholder state decoding' {
         $s.InSync | Should -BeTrue
     }
 }
+
+Describe 'install.ps1 helper block' {
+    # Isolation rule (Stage 4 Task 6): every test here copies install.ps1 into a TestDrive:
+    # directory WITHOUT a GitProtonBackup payload folder — so the module block always takes
+    # its skip path — and runs it in a CHILD pwsh -NoProfile process with $env:LOCALAPPDATA
+    # pointed at a TestDrive: subdir. No test may ever write to the real Documents modules
+    # directory or the real LOCALAPPDATA (an earlier draft had exactly that contamination bug).
+    BeforeAll {
+        function New-InstallerSandbox {
+            $id = [guid]::NewGuid().ToString('N').Substring(0, 8)
+            $scriptDir = Join-Path $TestDrive "install-$id"
+            $localAppData = Join-Path $TestDrive "localappdata-$id"
+            New-Item -ItemType Directory -Path $scriptDir -Force | Out-Null
+            New-Item -ItemType Directory -Path $localAppData -Force | Out-Null
+            Copy-Item -Path "$PSScriptRoot/../install.ps1" -Destination (Join-Path $scriptDir 'install.ps1') -Force
+            [pscustomobject]@{ ScriptDir = $scriptDir; LocalAppData = $localAppData }
+        }
+
+        function Invoke-InstallerSandbox {
+            param($ScriptDir, $LocalAppData)
+            $script = Join-Path $ScriptDir 'install.ps1'
+            $output = & pwsh -NoProfile -Command "`$env:LOCALAPPDATA = '$LocalAppData'; & '$script'" 2>&1 | Out-String
+            $exitCode = $LASTEXITCODE
+            [pscustomobject]@{ ExitCode = $exitCode; Output = $output }
+        }
+    }
+
+    It 'release-asset layout (exe + matching .sha256, no module payload): helper installs, module block skips' {
+        $sb = New-InstallerSandbox
+        $exePath = Join-Path $sb.ScriptDir 'git-remote-proton.exe'
+        Set-Content -Path $exePath -Value 'fake exe bytes' -NoNewline
+        $hash = (Get-FileHash $exePath -Algorithm SHA256).Hash.ToLower()
+        Set-Content -Path "$exePath.sha256" -Value "$hash  git-remote-proton.exe" -NoNewline
+
+        $r = Invoke-InstallerSandbox -ScriptDir $sb.ScriptDir -LocalAppData $sb.LocalAppData
+        $r.ExitCode | Should -Be 0
+        Test-Path (Join-Path $sb.LocalAppData 'Programs\git-proton-backup\git-remote-proton.exe') | Should -BeTrue
+        $r.Output | Should -Match 'helper-only install'
+    }
+
+    It 'checksum mismatch refuses to install the helper and copies nothing' {
+        $sb = New-InstallerSandbox
+        $exePath = Join-Path $sb.ScriptDir 'git-remote-proton.exe'
+        Set-Content -Path $exePath -Value 'fake exe bytes' -NoNewline
+        Set-Content -Path "$exePath.sha256" -Value ('0' * 64 + '  git-remote-proton.exe') -NoNewline
+
+        $r = Invoke-InstallerSandbox -ScriptDir $sb.ScriptDir -LocalAppData $sb.LocalAppData
+        $r.ExitCode | Should -Not -Be 0
+        Test-Path (Join-Path $sb.LocalAppData 'Programs\git-proton-backup\git-remote-proton.exe') | Should -BeFalse
+    }
+
+    It 'missing exe skips the helper install cleanly' {
+        $sb = New-InstallerSandbox
+        $r = Invoke-InstallerSandbox -ScriptDir $sb.ScriptDir -LocalAppData $sb.LocalAppData
+        $r.ExitCode | Should -Be 0
+        $r.Output | Should -Match 'skipping helper install'
+    }
+}
