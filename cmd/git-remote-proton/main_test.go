@@ -974,6 +974,112 @@ func TestLoop_FetchBatch_DegenerateFirstLineFailsClosed(t *testing.T) {
 // already existed) but had no direct test. Not a RED — it already passed
 // against the code as committed for Task 6, since fix round 1 only tightens
 // batch-line parsing and does not touch the option-false path.
+// --- Task 5: utility dispatch (--version, --set-head) ---
+//
+// RED (Stage 4): dispatchUtility does not exist yet. The dispatch set is
+// CLOSED — only exact "--version" / "--set-head" strings at args[1]
+// dispatch; anything else, including other "--"-prefixed argv (a remote
+// actually named "--upstream"), must reach the protocol path untouched
+// (round-1 Gemini finding). Utility stdout is exempt from protocol-only by
+// argv disjointness: git never invokes the helper with these argv shapes.
+
+// TestDispatchUtility_Version_PrintsVersionAndCertifiedCLI is test 1: dispatchUtility
+// with args[1] == "--version" handles it and writes the version line to stdout.
+func TestDispatchUtility_Version_PrintsVersionAndCertifiedCLI(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	handled, code := dispatchUtility([]string{"git-remote-proton", "--version"}, &stdout, &stderr)
+
+	if !handled {
+		t.Fatal("dispatchUtility must handle --version")
+	}
+	if code != 0 {
+		t.Errorf("code = %d, want 0", code)
+	}
+	want := fmt.Sprintf("git-remote-proton %s (certified CLI: %s)\n", "dev", transport.CertifiedCLI)
+	if stdout.String() != want {
+		t.Errorf("stdout = %q, want %q", stdout.String(), want)
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+// TestDispatchUtility_SetHead_WrongArity_NoCLIConstruction is test 2: a
+// "--set-head" invocation with 0 or 1 following args must be handled with a
+// usage message on stderr and exit code 1, and must NEVER reach runSetHead —
+// which would construct a real *transport.CLI and spawn `proton-drive
+// --version`. Asserting stdout is empty is what proves that did not happen:
+// a version check, if it ran, would put output there.
+func TestDispatchUtility_SetHead_WrongArity_NoCLIConstruction(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"zero following args", []string{"git-remote-proton", "--set-head"}},
+		{"one following arg", []string{"git-remote-proton", "--set-head", "proton::/my-files/r"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			handled, code := dispatchUtility(c.args, &stdout, &stderr)
+
+			if !handled {
+				t.Fatal("dispatchUtility must handle a malformed --set-head invocation")
+			}
+			if code != 1 {
+				t.Errorf("code = %d, want 1", code)
+			}
+			if !strings.Contains(stderr.String(), "usage") {
+				t.Errorf("stderr = %q, want a usage message", stderr.String())
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("stdout = %q, want empty: an arity error must return before any CLI "+
+					"construction or version check", stdout.String())
+			}
+		})
+	}
+}
+
+// TestDispatchUtility_OtherArgs_DoesNotHandle is test 3: the closed-set
+// guard. Any args[1] outside {"--version", "--set-head"} — including
+// another "--"-prefixed string, such as a remote literally named
+// "--upstream" — must NOT be handled, so it reaches the protocol path
+// unchanged.
+func TestDispatchUtility_OtherArgs_DoesNotHandle(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	handled, code := dispatchUtility(
+		[]string{"git-remote-proton", "--upstream", "proton::/my-files/r"}, &stdout, &stderr)
+
+	if handled {
+		t.Fatal("dispatchUtility must not handle an argv[1] outside the closed set")
+	}
+	if code != 0 {
+		t.Errorf("code = %d, want 0 (unused when handled is false)", code)
+	}
+	if stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Errorf("stdout=%q stderr=%q, want both empty: an unhandled call must produce no output",
+			stdout.String(), stderr.String())
+	}
+}
+
+// TestDispatchUtility_NoArgsAtAll_DoesNotHandle is test 4: dispatchUtility
+// called with no arguments beyond the program name must report unhandled,
+// leaving run()'s own "must be run by git" check (len(os.Args) < 3) to fire.
+// This asserts dispatchUtility's own behaviour directly rather than
+// run()'s, because run() with too few args goes on to spawn things this
+// hermetic test must not trigger.
+func TestDispatchUtility_NoArgsAtAll_DoesNotHandle(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	handled, _ := dispatchUtility([]string{"git-remote-proton"}, &stdout, &stderr)
+
+	if handled {
+		t.Fatal("dispatchUtility must not handle argv with no arguments beyond the program name")
+	}
+	if stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Errorf("stdout=%q stderr=%q, want both empty", stdout.String(), stderr.String())
+	}
+}
+
 func TestLoop_FetchBatch_CheckConnectivityFalse_NoConnectivityOk(t *testing.T) {
 	src := newGitRepoWithCommit(t)
 	sha := headOf(t, src)

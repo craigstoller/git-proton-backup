@@ -2058,6 +2058,9 @@ func TestPushRefusesToDeleteTheBranchHeadPointsAt(t *testing.T) {
 	if !strings.Contains(res[0].Err, "HEAD points at") {
 		t.Errorf("reason = %q, want it to name why the delete was refused", res[0].Err)
 	}
+	if !strings.Contains(res[0].Err, "--set-head") {
+		t.Errorf("the refusal must name the in-tool remedy, got %q", res[0].Err)
+	}
 	if _, ok := f.Files["/r/refs/heads/main"]; !ok {
 		t.Error("the ref file must survive a refused delete")
 	}

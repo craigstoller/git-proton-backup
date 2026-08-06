@@ -165,7 +165,7 @@ func pushOne(t transport.Transport, root, gitDir string,
 		}
 		if hasHead && head == u.Dst {
 			return fail(fmt.Sprintf("refusing to delete the branch HEAD points at (%s); "+
-				"change the default branch first", u.Dst))
+				"change the default branch first (git-remote-proton --set-head <url> <branch>)", u.Dst))
 		}
 		out, err := t.Trash(root + "/" + u.Dst)
 		if err != nil {
