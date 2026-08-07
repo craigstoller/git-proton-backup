@@ -152,6 +152,36 @@ func IsAncestor(gitDir, old, new string) (bool, error) {
 	}
 }
 
+// CheckRefFormat runs `git check-ref-format <name>` — the ground truth
+// repo.CheckRefName's in-process rule set is checked against by
+// TestCheckRefNameParityWithGit (internal/repo/refname_test.go).
+//
+// Deliberately NO "--" separator: verified live 2026-08-06,
+// `check-ref-format -- refs/heads/main` exits 129 (a usage error) while the
+// bare form exits 0/1 correctly (round-2 Codex blocker). This carries no
+// argument-injection exposure: every caller here passes a name already
+// required to start with "refs/", so a leading "-" can never occur.
+//
+// Contract, mirroring IsAncestor's exit-code interpretation above: exit 0 is
+// the confirmed positive (true, nil); exit 1 is the confirmed negative
+// (false, nil); any other exit — 129 included — is a tooling failure, not a
+// confirmed verdict, and is surfaced as (false, err) rather than silently
+// read as "not a valid ref name".
+func CheckRefFormat(name string) (bool, error) {
+	out, code, err := git(".", "check-ref-format", name)
+	switch code {
+	case 0:
+		return true, nil
+	case 1:
+		return false, nil
+	default:
+		if err != nil {
+			return false, fmt.Errorf("check-ref-format %s: %s: %w", name, out, err)
+		}
+		return false, fmt.Errorf("check-ref-format %s: %s (exit %d)", name, out, code)
+	}
+}
+
 // RevParse runs `git rev-parse <args...>` and returns the trimmed output,
 // the raw exit code, and any start/run error, the same three-value shape
 // git() itself returns: callers (Task 10's resolve(), repo.consolidateAndInstall)

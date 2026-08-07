@@ -28,7 +28,69 @@ func NewFake() *Fake {
 	return &Fake{Files: map[string][]byte{}, Dirs: map[string]bool{}}
 }
 
-func (f *Fake) EnsureDir(p string) error { f.Dirs[p] = true; return nil }
+// isBuiltinMountParent reports whether p is one of the Proton Drive
+// namespaces this Fake treats as already existing without ever being
+// explicitly created: the two top-level mounts themselves, and up to two
+// path components beneath /devices — a device root ("/devices/<id>") and one
+// folder inside it ("/devices/<id>/<folder>"). This mirrors
+// docs/superpowers/plans/2026-08-06-v2-stage5-hierarchical-refs.md's
+// EnsureParents design (Task 11), where "/devices/<device-id>" is the real
+// protected mount boundary, not "/devices" alone — a lone device id is
+// itself a pre-existing root the CLI cannot create, the same way "/my-files"
+// is. Anything deeper must be genuinely present in f.Dirs or implied by
+// f.Files, same as every other path.
+func isBuiltinMountParent(p string) bool {
+	if p == "/my-files" || p == "/devices" {
+		return true
+	}
+	if rest, ok := strings.CutPrefix(p, "/devices/"); ok && rest != "" {
+		return strings.Count(rest, "/") <= 1
+	}
+	return false
+}
+
+// parentExists reports whether p is usable as an EnsureDir parent: a
+// builtin mount namespace, an already-created directory, or a directory
+// implied by some file living underneath it (a file can only exist if its
+// parent folder does).
+func (f *Fake) parentExists(p string) bool {
+	if isBuiltinMountParent(p) {
+		return true
+	}
+	if f.Dirs[p] {
+		return true
+	}
+	prefix := p + "/"
+	for k := range f.Files {
+		if strings.HasPrefix(k, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// EnsureDir is Stat-then-create, mirroring the live CLI's own contract
+// (cli.go: create-folder fails on an existing folder, Stage 1 C5) plus the
+// live create-folder failure the earlier, fully permissive Fake never
+// modelled at all: a name already taken by a FILE, and a parent that does
+// not exist ("Node not found: <parent leaf>", cli.go's notFoundSignature
+// shape). A Fake that accepted either would certify code the live transport
+// rejects.
+func (f *Fake) EnsureDir(p string) error {
+	if f.Dirs[p] {
+		return nil // idempotent: already a directory
+	}
+	if _, ok := f.Files[p]; ok {
+		return fmt.Errorf("create-folder failed: a file exists at %s", p)
+	}
+	parent := path.Dir(p)
+	if !f.parentExists(parent) {
+		return fmt.Errorf("create-folder %s in %s failed: Node not found: %s",
+			path.Base(p), parent, path.Base(parent))
+	}
+	f.Dirs[p] = true
+	return nil
+}
 
 // List reports the direct children of p, from BOTH the file map and the
 // directory set. Reading f.Dirs is not optional bookkeeping: it used to
@@ -164,6 +226,14 @@ func (f *Fake) CreateExclusive(p, local string) (Outcome, error) {
 		f.FailNext = ""
 		return Ambiguous, nil
 	}
+	// A name already taken by a FOLDER is refused the same way a name
+	// already taken by a file is — the D/F collision Task 9b heals; the live
+	// contract row pins the real CLI's shape and this models the
+	// conservative reading. Checked before the Files[p] lookup so both
+	// collisions read the same way to a caller inspecting the Outcome alone.
+	if f.Dirs[p] {
+		return Refused, nil
+	}
 	if _, ok := f.Files[p]; ok {
 		return Refused, nil
 	}
@@ -179,6 +249,10 @@ func (f *Fake) UpdateRevision(p, local string) (Outcome, error) {
 	if err := checkUploadBasename(p, local); err != nil {
 		return Ambiguous, err
 	}
+	// Same D/F collision guard as CreateExclusive, above.
+	if f.Dirs[p] {
+		return Refused, nil
+	}
 	b, err := os.ReadFile(local)
 	if err != nil {
 		return Ambiguous, err
@@ -192,10 +266,38 @@ func (f *Fake) UpdateRevision(p, local string) (Outcome, error) {
 	return Committed, nil
 }
 
+// Trash removes p and, when p is a folder, its ENTIRE subtree — mirroring
+// the wrapper contract (transport.go: implementations Stat first, an absent
+// target is still Committed, the desired end state already holding) rather
+// than the raw CLI's own non-idempotence on folders (spec, component 8,
+// corrected in the same commit as this fix — the wrapper-not-binary
+// precedent ReadTo/C16 already established). Absence — of p itself, or of
+// anything under it — is never an error: found is not consulted for that
+// reason, only kept so a future change has an obvious place to hang a
+// diagnostic without re-deriving it.
 func (f *Fake) Trash(p string) (Outcome, error) {
-	if _, ok := f.Files[p]; !ok {
-		return Committed, nil // already absent is the desired end state
+	found := false
+	if _, ok := f.Files[p]; ok {
+		delete(f.Files, p)
+		found = true
 	}
-	delete(f.Files, p)
+	if f.Dirs[p] {
+		delete(f.Dirs, p)
+		found = true
+	}
+	prefix := p + "/"
+	for k := range f.Files {
+		if strings.HasPrefix(k, prefix) {
+			delete(f.Files, k)
+			found = true
+		}
+	}
+	for k := range f.Dirs {
+		if strings.HasPrefix(k, prefix) {
+			delete(f.Dirs, k)
+			found = true
+		}
+	}
+	_ = found // already-absent is still Committed (desired end state)
 	return Committed, nil
 }

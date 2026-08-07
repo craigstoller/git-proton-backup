@@ -355,6 +355,11 @@ func TestLoop_PoisonedBatch_EmitsWellFormedRefToken(t *testing.T) {
 	var outBuf bytes.Buffer
 	out := bufio.NewWriter(&outBuf)
 	ft := transport.NewFake()
+	// "/remote/root"'s parent "/remote" is not a mount root, so the stricter
+	// EnsureDir (Task 7) needs it seeded as already-existing before "list
+	// for-push" (below) can Bootstrap it — this test is about poisoned-batch
+	// status-line formatting, not about parent validation.
+	ft.Dirs["/remote/root"] = true
 
 	got := loop(ft, "/remote/root", ".", in, out)
 	out.Flush()
@@ -395,6 +400,9 @@ func TestLoop_PoisonedBatch_ColonlessPushLineFailsClosed(t *testing.T) {
 	var outBuf bytes.Buffer
 	out := bufio.NewWriter(&outBuf)
 	ft := transport.NewFake()
+	// See the sibling test above: "/remote/root" needs seeding under the
+	// stricter EnsureDir (Task 7) so "list for-push" can Bootstrap it.
+	ft.Dirs["/remote/root"] = true
 
 	var got int
 	stderr := captureStderr(t, func() { got = loop(ft, "/remote/root", ".", in, out) })

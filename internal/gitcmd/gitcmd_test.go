@@ -512,6 +512,48 @@ func TestSymbolicRef(t *testing.T) {
 	}
 }
 
+// RED. CheckRefFormat does not exist yet. A syntactically valid ref name
+// (per `git check-ref-format`) must report (true, nil) — exit 0.
+func TestCheckRefFormatValid(t *testing.T) {
+	ok, err := CheckRefFormat("refs/heads/main")
+	if err != nil {
+		t.Fatalf("CheckRefFormat: %v", err)
+	}
+	if !ok {
+		t.Error("want ok=true for a valid ref name")
+	}
+}
+
+// RED. Exit 1 from `git check-ref-format` is the CONFIRMED negative answer —
+// (false, nil), not an error. "main" has no "/", which git's default rules
+// refuse (verified live: exit 1, same as the CheckRefName parity fixtures).
+func TestCheckRefFormatInvalid(t *testing.T) {
+	ok, err := CheckRefFormat("main")
+	if err != nil {
+		t.Fatalf("CheckRefFormat: %v", err)
+	}
+	if ok {
+		t.Error("want ok=false for an invalid ref name")
+	}
+}
+
+// RED. Any exit other than 0 or 1 is a tooling failure, not a confirmed
+// verdict, and must surface as (false, err). "--" is the caller-contract-
+// forbidden case the round-2 Codex blocker turned up: every real caller
+// passes a name already required to start with "refs/", so a leading "-"
+// can never occur in production, but passing "--" here directly proves the
+// wrapper does not silently fold git's usage-error exit (129, verified live)
+// into a confirmed "not a valid ref name" answer.
+func TestCheckRefFormatUnexpectedExitIsError(t *testing.T) {
+	ok, err := CheckRefFormat("--")
+	if err == nil {
+		t.Fatalf("want a non-nil error for an unexpected exit code, got ok=%v err=nil", ok)
+	}
+	if ok {
+		t.Fatal("want ok=false alongside the error, got true")
+	}
+}
+
 // RED (fix round 1, I1). PackObjectsFromList does not exist yet — it is the
 // extraction of WritePack's own exec site so repo.consolidateAndInstall gets
 // the same WaitDelay / ErrWaitDelay / multi-pack-rejection guards WritePack

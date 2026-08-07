@@ -44,6 +44,10 @@ func TestTracedReadToFailureLogsNothing(t *testing.T) {
 // RED: every other method delegates verbatim and logs nothing.
 func TestTracedDelegatesSilently(t *testing.T) {
 	f := NewFake()
+	// "/r" is not a mount root, so the stricter EnsureDir (Task 7) needs it
+	// seeded as already-existing — this test is about Traced's delegation and
+	// silence, not about parent validation.
+	f.Dirs["/r"] = true
 	var buf strings.Builder
 	tr := NewTraced(f, &buf)
 	if err := tr.EnsureDir("/r/d"); err != nil {

@@ -153,6 +153,10 @@ func TestBootstrapRefusesForeignData(t *testing.T) {
 // against Proton.
 func TestBootstrapRefusesFoldersWithNoMarker(t *testing.T) {
 	f := transport.NewFake()
+	// "/my-files/r" is not itself a mount root (only "/my-files" is), so the
+	// stricter EnsureDir (Task 7) needs it seeded as already-existing before
+	// this test's own setup calls below can create children under it.
+	f.Dirs["/my-files/r"] = true
 	if err := f.EnsureDir("/my-files/r/refs"); err != nil {
 		t.Fatalf("EnsureDir: %v", err)
 	}
@@ -393,6 +397,7 @@ func TestAcquireLockRefusalOnUnreadableLockIsDistinct(t *testing.T) {
 
 func TestWriteAndListRefs(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "1111111111111111111111111111111111111111"
 	if out, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil || out != transport.Committed {
@@ -409,6 +414,7 @@ func TestWriteAndListRefs(t *testing.T) {
 
 func TestListRefsRejectsCorruptRefFile(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	f.Files["/r/refs/heads/bad"] = []byte("not-a-sha\n")
 	if _, err := ListRefs(f, "/r"); err == nil {
@@ -423,6 +429,7 @@ func TestListRefsRejectsCorruptRefFile(t *testing.T) {
 // outright rather than passed through.
 func TestWriteRefRefusesNonSha(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	out, err := WriteRef(f, "/r", "refs/heads/main", "not-a-sha", false)
 	if err == nil {
@@ -451,6 +458,7 @@ func TestWriteRefRefusesNonSha(t *testing.T) {
 // desynchronise git's read of the batch.
 func TestPushResolveFailureCarriesGitsOwnReason(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	gitDir := newGitRepoForPush(t)
 
@@ -498,6 +506,7 @@ func (l lyingWriteTransport) CreateExclusive(p, local string) (transport.Outcome
 // and report Ambiguous with an error, never Committed.
 func TestWriteRefCatchesReadBackMismatch(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	lying := lyingWriteTransport{f}
 	sha := "1111111111111111111111111111111111111111"
@@ -517,6 +526,7 @@ func TestWriteRefCatchesReadBackMismatch(t *testing.T) {
 // the name into something stageable, and nothing must reach the transport.
 func TestWriteRefRejectsHostileLeaf(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "1111111111111111111111111111111111111111"
 	if out, err := WriteRef(f, "/r", "refs/heads/con", sha, false); err == nil {
@@ -655,6 +665,7 @@ func headOf(t *testing.T, d string) string {
 // is "fetch first".
 func TestPushRejectsNonFastForward(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	old := "1111111111111111111111111111111111111111"
 	_, _ = WriteRef(f, "/r", "refs/heads/main", old, false)
@@ -677,6 +688,7 @@ func TestPushRejectsNonFastForward(t *testing.T) {
 // above is deliberate, not an oversight.
 func TestPushDeleteRef(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "2222222222222222222222222222222222222222"
 	_, _ = WriteRef(f, "/r", "refs/heads/tmp", sha, false)
@@ -716,6 +728,7 @@ func countPackFiles(f *transport.Fake, root string) (packs, idxs int) {
 // object range is packed.
 func TestPushOrderingPackAndIdxLandBeforeRef(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	gitDir := newGitRepoForPush(t)
 	head := headOf(t, gitDir)
@@ -762,6 +775,7 @@ func (a ambiguousPackUploadTransport) CreateExclusive(p, local string) (transpor
 // both -> ref" is a promise on paper only.
 func TestPushRefNotPublishedWhenPackUploadIsAmbiguous(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	gitDir := newGitRepoForPush(t)
 	amb := ambiguousPackUploadTransport{f}
@@ -800,6 +814,7 @@ func assertNothingUploaded(t *testing.T, f *transport.Fake, root string) {
 // limitation, and an orphan pack left on the remote.
 func TestPushRejectsHierarchicalDestinationBeforePacking(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	gitDir := newGitRepoForPush(t)
 
@@ -833,6 +848,7 @@ func TestPushRejectsPseudorefDestination(t *testing.T) {
 	for _, dst := range []string{"refs/stash", "HEAD", "refs/heads", "refs/heads/", "refs/notes/commits"} {
 		t.Run(dst, func(t *testing.T) {
 			f := transport.NewFake()
+			f.Dirs["/r"] = true
 			_ = Bootstrap(f, "/r")
 			ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: dst}}
 			res := Push(f, "/r", gitDir, ups, map[string]string{})
@@ -854,6 +870,7 @@ func TestPushRejectsPseudorefDestination(t *testing.T) {
 // drops its remote-tracking ref on the strength of it.
 func TestPushRejectsUnsupportedDeleteDestination(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "2222222222222222222222222222222222222222"
 	f.Files["/r/refs/stash"] = []byte(sha + "\n")
@@ -880,6 +897,7 @@ func TestPushRejectsUnsupportedDeleteDestination(t *testing.T) {
 // merely happening not to trip it.
 func TestPushForceSkipsAncestryCheck(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	gitDir := newGitRepoForPush(t)
 	head := headOf(t, gitDir)
@@ -938,6 +956,7 @@ func (r refusedRefCreateTransport) CreateExclusive(p, local string) (transport.O
 // our sha was never written to the ref path.
 func TestPushReportsFailureWhenRefCreateLosesConcurrentRace(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	gitDir := newGitRepoForPush(t)
 	stub := refusedRefCreateTransport{f}
@@ -958,6 +977,7 @@ func TestPushReportsFailureWhenRefCreateLosesConcurrentRace(t *testing.T) {
 // RED. Unpatched, Stat sees the corrupt pack and the ref is published.
 func TestPushRefusedCorruptPackIsRejected(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	d := newGitRepoForPush(t)
 	head := headOfPushRepo(t, d)
@@ -980,6 +1000,7 @@ func TestPushRefusedCorruptPackIsRejected(t *testing.T) {
 // RED. Unpatched, Stat sees the corrupt index and the ref is published.
 func TestPushRefusedCorruptIdxIsRejected(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	d := newGitRepoForPush(t)
 	head := headOfPushRepo(t, d)
@@ -1007,6 +1028,7 @@ func TestPushRefusedCorruptIdxIsRejected(t *testing.T) {
 // future change tightens publishIdx, this test is what catches it.
 func TestPushRefusedValidButDifferentIdxIsAccepted(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	d := newGitRepoForPush(t)
 	head := headOfPushRepo(t, d)
@@ -1065,6 +1087,7 @@ func TestPushRefusedValidButDifferentIdxIsAccepted(t *testing.T) {
 // GUARD. A refused pack with no remote index is an orphan this push repairs.
 func TestPushRefusedPackWithNoRemoteIdxRepairsTheOrphan(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	d := newGitRepoForPush(t)
 	head := headOfPushRepo(t, d)
@@ -1330,6 +1353,7 @@ func TestDeriveHEAD(t *testing.T) {
 // RED. WriteHEAD/ReadHEAD do not exist.
 func TestWriteAndReadHEAD(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 
 	if _, ok, err := ReadHEAD(f, "/r"); err != nil || ok {
@@ -1354,6 +1378,7 @@ func TestWriteAndReadHEAD(t *testing.T) {
 // and a garbage HEAD must be fatal rather than coerced.
 func TestReadHEADRejectsCorruptContent(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	f.Files["/r/HEAD"] = []byte("1111111111111111111111111111111111111111\n")
 	if _, _, err := ReadHEAD(f, "/r"); err == nil {
@@ -1379,6 +1404,7 @@ func TestReadHEADRejectsCorruptContent(t *testing.T) {
 // path — is identical.
 func TestWriteHEADFailsClosedOnUnrecognisedOutcome(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	tr := unknownOutcomeTransport{Fake: f, forPath: "/r/" + HeadName}
 
@@ -1404,6 +1430,7 @@ func TestWriteHEADFailsClosedOnUnrecognisedOutcome(t *testing.T) {
 // uses CreateExclusive and not UpdateRevision.
 func TestWriteHEADNeverOverwritesExistingHEAD(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	f.Files["/r/HEAD"] = []byte("ref: refs/heads/existing\n")
 
@@ -1424,6 +1451,7 @@ func TestWriteHEADNeverOverwritesExistingHEAD(t *testing.T) {
 // would consume it before WriteHEAD ever runs.
 func TestWriteHEADAmbiguousOutcomeIsReported(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	f.FailNext = "inject"
 
@@ -1439,6 +1467,7 @@ func TestWriteHEADAmbiguousOutcomeIsReported(t *testing.T) {
 // TestWriteRefRefusesNonSha already pins for WriteRef.
 func TestWriteHEADRefusesNonBranchTarget(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 
 	if out, err := WriteHEAD(f, "/r", "refs/tags/v1"); err == nil {
@@ -1455,6 +1484,7 @@ func TestWriteHEADRefusesNonBranchTarget(t *testing.T) {
 // break a HEAD written or touched by a CRLF-writing tool.
 func TestReadHEADAcceptsCRLF(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	f.Files["/r/HEAD"] = []byte("ref: refs/heads/main\r\n")
 
@@ -1474,6 +1504,7 @@ func TestReadHEADAcceptsCRLF(t *testing.T) {
 // 1  UpdateHEAD overwrites an existing HEAD and verifies by read-back.
 func TestUpdateHEADOverwritesExistingAndVerifiesByReadBack(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	f.Files["/r/HEAD"] = []byte("ref: refs/heads/old\n")
 
@@ -1496,6 +1527,7 @@ func TestUpdateHEADOverwritesExistingAndVerifiesByReadBack(t *testing.T) {
 // 2  UpdateHEAD creates HEAD when absent (the headless-remote rescue).
 func TestUpdateHEADCreatesWhenAbsent(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 
 	out, err := UpdateHEAD(f, "/r", "refs/heads/main")
@@ -1514,6 +1546,7 @@ func TestUpdateHEADCreatesWhenAbsent(t *testing.T) {
 // 3  UpdateHEAD refuses a non-branch target (mirrors WriteHEAD's rule).
 func TestUpdateHEADRefusesNonBranchTarget(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 
 	if out, err := UpdateHEAD(f, "/r", "refs/tags/v1"); err == nil {
@@ -1548,6 +1581,7 @@ func (a ambiguousUpdateTransport) UpdateRevision(p, local string) (transport.Out
 //	above.
 func TestUpdateHEADAmbiguousOutcomeOnUpdatePath(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	f.Files["/r/HEAD"] = []byte("ref: refs/heads/old\n")
 	tr := ambiguousUpdateTransport{Fake: f, forPath: "/r/" + HeadName}
@@ -1587,6 +1621,7 @@ func (u unknownOutcomeUpdateTransport) UpdateRevision(p, local string) (transpor
 func TestUpdateHEADFailsClosedOnUnrecognisedOutcome(t *testing.T) {
 	t.Run("create path", func(t *testing.T) {
 		f := transport.NewFake()
+		f.Dirs["/r"] = true
 		_ = Bootstrap(f, "/r")
 		tr := unknownOutcomeTransport{Fake: f, forPath: "/r/" + HeadName}
 
@@ -1607,6 +1642,7 @@ func TestUpdateHEADFailsClosedOnUnrecognisedOutcome(t *testing.T) {
 
 	t.Run("update path", func(t *testing.T) {
 		f := transport.NewFake()
+		f.Dirs["/r"] = true
 		_ = Bootstrap(f, "/r")
 		f.Files["/r/HEAD"] = []byte("ref: refs/heads/old\n")
 		tr := unknownOutcomeUpdateTransport{Fake: f, forPath: "/r/" + HeadName}
@@ -1667,6 +1703,7 @@ func (r refusedHeadCreateTransport) CreateExclusive(p, local string) (transport.
 func TestUpdateHEADRefusedOutcomeIsAnError(t *testing.T) {
 	t.Run("update path", func(t *testing.T) {
 		f := transport.NewFake()
+		f.Dirs["/r"] = true
 		_ = Bootstrap(f, "/r")
 		f.Files["/r/HEAD"] = []byte("ref: refs/heads/main\n")
 
@@ -1685,6 +1722,7 @@ func TestUpdateHEADRefusedOutcomeIsAnError(t *testing.T) {
 
 	t.Run("create path", func(t *testing.T) {
 		f := transport.NewFake()
+		f.Dirs["/r"] = true
 		_ = Bootstrap(f, "/r")
 		tr := refusedHeadCreateTransport{Fake: f, forPath: "/r/" + HeadName}
 
@@ -1723,6 +1761,7 @@ func assertLockReleased(t *testing.T, f *transport.Fake, root string) {
 //	back refs/heads/b; returns "refs/heads/b".
 func TestSetHeadSucceeds(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "1111111111111111111111111111111111111111"
 	if _, err := WriteRef(f, "/r", "refs/heads/a", sha, false); err != nil {
@@ -1794,6 +1833,7 @@ func (c *countingTransport) Trash(p string) (transport.Outcome, error) {
 //	succeeds WITHOUT uploading a new HEAD.
 func TestSetHeadIdempotentMakesNoHeadWrite(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "1111111111111111111111111111111111111111"
 	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
@@ -1840,6 +1880,7 @@ func TestSetHeadIdempotentMakesNoHeadWrite(t *testing.T) {
 //	naming a since-deleted branch would short-circuit straight to success.
 func TestSetHeadRefusesDanglingHead(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "1111111111111111111111111111111111111111"
 	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
@@ -1858,6 +1899,7 @@ func TestSetHeadRefusesDanglingHead(t *testing.T) {
 // 10 Unknown branch refuses, error names existing branches.
 func TestSetHeadRefusesUnknownBranch(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "1111111111111111111111111111111111111111"
 	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
@@ -1879,6 +1921,7 @@ func TestSetHeadRefusesUnknownBranch(t *testing.T) {
 //	first".
 func TestSetHeadRefusesEmptyRepo(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 
 	_, err := SetHead(f, "/r", "main")
@@ -1894,6 +1937,7 @@ func TestSetHeadRefusesEmptyRepo(t *testing.T) {
 // 12 Hierarchical name ("feature/x") refuses naming Stage 5.
 func TestSetHeadRefusesHierarchicalName(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "1111111111111111111111111111111111111111"
 	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
@@ -1913,6 +1957,7 @@ func TestSetHeadRefusesHierarchicalName(t *testing.T) {
 // 13 Tag target ("refs/tags/v1") refuses: HEAD points at branches only.
 func TestSetHeadRefusesTagTarget(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "1111111111111111111111111111111111111111"
 	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
@@ -1950,6 +1995,7 @@ func TestSetHeadRefusesNoMarker(t *testing.T) {
 //	every refusal path that got far enough to acquire one.
 func TestSetHeadRefusesWhenLockHeld(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	held, err := AcquireLock(f, "/r")
 	if err != nil {
@@ -1975,6 +2021,7 @@ func TestSetHeadRefusesWhenLockHeld(t *testing.T) {
 func TestSetHeadNormalizesShortName(t *testing.T) {
 	build := func() *transport.Fake {
 		f := transport.NewFake()
+		f.Dirs["/r"] = true
 		_ = Bootstrap(f, "/r")
 		sha := "1111111111111111111111111111111111111111"
 		if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
@@ -2007,6 +2054,7 @@ func TestSetHeadNormalizesShortName(t *testing.T) {
 //	repo is headless and SetHead's create path applies.
 func TestSetHeadRefusesCorruptHead(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "1111111111111111111111111111111111111111"
 	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
@@ -2027,6 +2075,7 @@ func TestSetHeadRefusesCorruptHead(t *testing.T) {
 // RED. Push does not write HEAD at all today.
 func TestPushWritesHeadOnFirstPush(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	d := newGitRepoForPush(t)
 	head := headOfPushRepo(t, d)
@@ -2044,6 +2093,7 @@ func TestPushWritesHeadOnFirstPush(t *testing.T) {
 // candidate set is every remote branch — not just what this push published.
 func TestPushBackfillsHeadFromAllRemoteBranches(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	d := newGitRepoForPush(t)
 	head := headOfPushRepo(t, d)
@@ -2067,6 +2117,7 @@ func TestPushBackfillsHeadFromAllRemoteBranches(t *testing.T) {
 // GUARD. An existing HEAD is never rewritten.
 func TestPushNeverRewritesAnExistingHead(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	d := newGitRepoForPush(t)
 	head := headOfPushRepo(t, d)
@@ -2084,6 +2135,7 @@ func TestPushNeverRewritesAnExistingHead(t *testing.T) {
 // GUARD. A tag-only push leaves the repo headless — a defined state.
 func TestPushTagOnlyLeavesRepoHeadless(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	d := newGitRepoForPush(t)
 	head := headOfPushRepo(t, d)
@@ -2109,6 +2161,7 @@ func TestPushTagOnlyLeavesRepoHeadless(t *testing.T) {
 // error out of Push.
 func TestPushRefusesToDeleteTheBranchHeadPointsAt(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "2222222222222222222222222222222222222222"
 	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
@@ -2146,6 +2199,7 @@ func TestPushRefusesToDeleteTheBranchHeadPointsAt(t *testing.T) {
 // delete" would pass the test above.
 func TestPushDeletesABranchHeadDoesNotPointAt(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "2222222222222222222222222222222222222222"
 	for _, ref := range []string{"refs/heads/main", "refs/heads/dev"} {
@@ -2175,6 +2229,7 @@ func TestPushDeletesABranchHeadDoesNotPointAt(t *testing.T) {
 // rule above exists to refuse.
 func TestPushDeleteFailsClosedOnAnUnreadableHead(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "2222222222222222222222222222222222222222"
 	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
@@ -2206,6 +2261,7 @@ func TestPushDeleteFailsClosedOnAnUnreadableHead(t *testing.T) {
 // perfectly good branch on it.
 func TestPushDeleteThenRecreateInOneBatchStillDerivesHead(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	d := newGitRepoForPush(t)
 	head := headOfPushRepo(t, d)
@@ -2236,6 +2292,7 @@ func TestPushDeleteThenRecreateInOneBatchStillDerivesHead(t *testing.T) {
 // nothing fails.
 func TestPushDeleteOfTheOnlyBranchLeavesTheRepoHeadless(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "2222222222222222222222222222222222222222"
 	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
@@ -2339,6 +2396,10 @@ func assertSamePackDir(t *testing.T, context, want, got string) {
 // marker, refs, and one pack pair under packs/.
 func plantRepoOnFake(t *testing.T, f *transport.Fake, root, gitDir, sha string) {
 	t.Helper()
+	// root's own parent may not be a mount root (every caller here passes
+	// "/r"), so the stricter EnsureDir (Task 7) needs root seeded as
+	// already-existing before Bootstrap can create things under it.
+	f.Dirs[root] = true
 	if err := Bootstrap(f, root); err != nil {
 		t.Fatal(err)
 	}
@@ -2502,9 +2563,9 @@ func TestFetchRejectsACorruptPackAndInstallsNothing(t *testing.T) {
 // RED. Fetch is read-only: no marker means refuse, never initialise.
 func TestFetchRefusesAnUnmarkedRemote(t *testing.T) {
 	f := transport.NewFake()
-	if err := f.EnsureDir("/r"); err != nil {
-		t.Fatal(err)
-	}
+	// "/r"'s parent "/" is not a mount root, so the stricter EnsureDir
+	// (Task 7) needs it seeded as already-existing.
+	f.Dirs["/r"] = true
 	dst := emptyGitRepo(t)
 	if _, err := Fetch(f, "/r", dst, "", []string{"1111111111111111111111111111111111111111"}); err == nil {
 		t.Error("fetch must refuse a folder with no marker, not initialise it")
@@ -2650,6 +2711,10 @@ func TestFetchWithARelativeGitDirInstallsCorrectly(t *testing.T) {
 // ref left at the LAST sha. Returns the stems in history order.
 func plantIncrementalPacks(t *testing.T, f *transport.Fake, root, src string, shas []string) []string {
 	t.Helper()
+	// root's own parent may not be a mount root (every caller here passes
+	// "/r"), so the stricter EnsureDir (Task 7) needs root seeded as
+	// already-existing before Bootstrap can create things under it.
+	f.Dirs[root] = true
 	if err := Bootstrap(f, root); err != nil {
 		t.Fatal(err)
 	}
@@ -2838,6 +2903,7 @@ func TestFetchFrontierDeepensThroughHandBuiltPacks(t *testing.T) {
 	tree := out("rev-parse", sha+"^{tree}")
 	blobList := out("rev-list", "--objects", sha)
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	if err := Bootstrap(f, "/r"); err != nil {
 		t.Fatal(err)
 	}

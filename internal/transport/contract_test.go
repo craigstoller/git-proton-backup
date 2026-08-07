@@ -221,6 +221,122 @@ var contractCases = []contractCase{
 			t.Errorf("want an empty listing, got %d nodes", len(nodes))
 		}
 	}},
+
+	// Task 7: folder fidelity. Fake half asserted now (fake.go's Trash and
+	// EnsureDir were both bare, permissive implementations before this task);
+	// the live half runs only at the gate (GPB_LIVE_ACCOUNT), never here.
+
+	{"trash on an empty folder is committed and the folder is gone", func(t *testing.T, tr Transport, root string, stage func(string, string) string) {
+		d := root + "/trash-empty"
+		if err := tr.EnsureDir(d); err != nil {
+			t.Fatalf("EnsureDir: %v", err)
+		}
+		out, err := tr.Trash(d)
+		if err != nil {
+			t.Fatalf("Trash: %v", err)
+		}
+		if out != Committed {
+			t.Errorf("Trash of an empty folder: want Committed, got %v", out)
+		}
+		if _, ok, statErr := tr.Stat(d); statErr != nil || ok {
+			t.Errorf("the folder must be gone after Trash: ok=%v err=%v", ok, statErr)
+		}
+	}},
+
+	{"trash on a folder with children removes the whole subtree", func(t *testing.T, tr Transport, root string, stage func(string, string) string) {
+		d := root + "/trash-subtree"
+		if err := tr.EnsureDir(d); err != nil {
+			t.Fatalf("EnsureDir: %v", err)
+		}
+		child := d + "/child.txt"
+		if out, err := tr.CreateExclusive(child, stage("child.txt", "x")); err != nil || out != Committed {
+			t.Fatalf("seed create: %v %v", out, err)
+		}
+		out, err := tr.Trash(d)
+		if err != nil {
+			t.Fatalf("Trash: %v", err)
+		}
+		if out != Committed {
+			t.Errorf("Trash of a non-empty folder: want Committed, got %v", out)
+		}
+		if _, ok, statErr := tr.Stat(d); statErr != nil || ok {
+			t.Errorf("the folder must be gone after Trash: ok=%v err=%v", ok, statErr)
+		}
+		if _, ok, statErr := tr.Stat(child); statErr != nil || ok {
+			t.Errorf("a child under the trashed folder must be gone too (subtree removal): ok=%v err=%v", ok, statErr)
+		}
+	}},
+
+	{"create-folder refuses a name already taken by a file", func(t *testing.T, tr Transport, root string, stage func(string, string) string) {
+		p := root + "/file-vs-folder"
+		if out, err := tr.CreateExclusive(p, stage("file-vs-folder", "hello")); err != nil || out != Committed {
+			t.Fatalf("seed create: %v %v", out, err)
+		}
+		if err := tr.EnsureDir(p); err == nil {
+			t.Error("EnsureDir onto a path already occupied by a file must error")
+		}
+		if node, ok, statErr := tr.Stat(p); statErr != nil || !ok || node.IsDir {
+			t.Errorf("the file must survive a refused EnsureDir, unchanged: node=%+v ok=%v err=%v", node, ok, statErr)
+		}
+	}},
+
+	// Upload of a file colliding with an existing folder name. UNVERIFIED ON
+	// THE REAL CLI UNTIL THE GATE (Task 7 brief) — the Fake models the
+	// conservative reading, Refused with no error, mirroring the D/F
+	// collision rule CreateExclusive already applies to a name taken by a
+	// FILE. The assertion below only pins the invariant every reading must
+	// satisfy regardless of the live CLI's exact outcome/error shape: the
+	// upload must not silently succeed as Committed, and the folder must
+	// survive.
+	{"upload of a file colliding with an existing folder name does not silently succeed", func(t *testing.T, tr Transport, root string, stage func(string, string) string) {
+		d := root + "/folder-vs-file"
+		if err := tr.EnsureDir(d); err != nil {
+			t.Fatalf("EnsureDir: %v", err)
+		}
+		out, err := tr.CreateExclusive(d, stage("folder-vs-file", "hello"))
+		if err == nil && out == Committed {
+			t.Errorf("a name already taken by a folder must not silently succeed as Committed")
+		}
+		if node, ok, statErr := tr.Stat(d); statErr != nil || !ok || !node.IsDir {
+			t.Errorf("the folder must survive an upload attempt onto its name: node=%+v ok=%v err=%v", node, ok, statErr)
+		}
+	}},
+
+	{"nested list reports folders and files with the correct IsDir", func(t *testing.T, tr Transport, root string, stage func(string, string) string) {
+		d := root + "/nested"
+		if err := tr.EnsureDir(d); err != nil {
+			t.Fatalf("EnsureDir: %v", err)
+		}
+		sub := d + "/sub"
+		if err := tr.EnsureDir(sub); err != nil {
+			t.Fatalf("EnsureDir: %v", err)
+		}
+		if out, err := tr.CreateExclusive(d+"/leaf.txt", stage("leaf.txt", "x")); err != nil || out != Committed {
+			t.Fatalf("seed create: %v %v", out, err)
+		}
+		nodes, err := tr.List(d)
+		if err != nil {
+			t.Fatalf("List: %v", err)
+		}
+		var gotDir, gotFile bool
+		for _, n := range nodes {
+			switch n.Name {
+			case "sub":
+				if !n.IsDir {
+					t.Errorf("sub must list as a directory, got %+v", n)
+				}
+				gotDir = true
+			case "leaf.txt":
+				if n.IsDir {
+					t.Errorf("leaf.txt must list as a file, got %+v", n)
+				}
+				gotFile = true
+			}
+		}
+		if !gotDir || !gotFile {
+			t.Errorf("want both a folder entry (sub) and a file entry (leaf.txt), got %+v", nodes)
+		}
+	}},
 }
 
 // runContract executes the table against one implementation. root must already
@@ -246,6 +362,12 @@ func TestContractFake(t *testing.T) {
 	runContract(t, func(t *testing.T) (Transport, string) {
 		f := NewFake()
 		root := "/r"
+		// "/r"'s parent, "/", is not a mount root (only "/my-files" and
+		// "/devices" are — Task 7), so the stricter EnsureDir needs it seeded
+		// as already-existing; the subsequent EnsureDir call below is then an
+		// idempotent no-op, same as it would be against a root a real
+		// Bootstrap had already created.
+		f.Dirs[root] = true
 		if err := f.EnsureDir(root); err != nil {
 			t.Fatal(err)
 		}
