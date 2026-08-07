@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 — 2026-08-07
 
 - **git-remote-proton:** hierarchical refs are fully supported — nested branch and tag names
   (`refs/heads/feature/x`), plus `refs/notes/*`, `refs/replace/*`, and every other valid
