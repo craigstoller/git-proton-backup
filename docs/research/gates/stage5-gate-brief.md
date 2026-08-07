@@ -22,12 +22,26 @@ against a locally-built exe. Tags are never moved after artifacts exist. The pub
 closure (`docs/releasing.md` step 7) is a separate, later, read-only pass after Craig publishes —
 outline step 7 below.
 
+**Remote naming convention used throughout this brief — do not conflate the two.** `proton::<path>`
+is the URL **scheme** `git-remote-proton` registers with git (`README.md:97`). Use the literal
+scheme for every command that talks to the helper before any local git remote exists for that
+path, and for direct invocations of the helper binary itself: the first `git clone -o proton-v2
+proton::...` in a given local repo, `git ls-remote proton::...`, and every `git-remote-proton
+--set-head proton::...` call. `proton-v2` is a **local remote alias**, not a URL scheme — it exists
+only after `git clone -o proton-v2 proton::...` or `git remote add proton-v2 "proton::..."` has run
+in that specific local repo, and every subsequent git command in that repo (`git push proton-v2
+...`, `git fetch proton-v2 ...`) uses the alias. **`proton-v2::` is never valid anywhere** — git
+would look for a nonexistent `git-remote-proton-v2` binary and fail outright. Every command below
+has been checked against this distinction.
+
 ---
 
 ## Preconditions
 
 1. **CLI / git versions.** Record `proton-drive --version` (must be the certified
-   `cli-drive@0.7.0+5174900c` build — see the allowlist note below) and `git --version`.
+   `cli-drive@0.7.0+5174900c` build) and `git --version`. See "Allowlist — not re-provoked live
+   this stage" immediately below for why this gate only records the version rather than also
+   re-running the refusal/override provocation.
 2. **PATH shadow check** (Stage 4 lesson, still binding): in a genuinely fresh shell
    (`$env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' +
    [Environment]::GetEnvironmentVariable('Path','User')`), confirm `(Get-Command
@@ -46,6 +60,22 @@ outline step 7 below.
    Untouchables (`GitBackups`, `Sensitive Project Sources`, `Project Repo Bundles`, `ChatGPT
    Export Text Backup`) are read-only: they may appear only as rows in listings, never named in any
    write command.
+
+### Allowlist — not re-provoked live this stage
+
+The certified-CLI allowlist (`internal/transport/cli.go`'s version check; refusal naming the
+uncertified build plus `GPB_UNCERTIFIED_CLI`, loud-warning override) is **untouched by any Stage 5
+task** — no code in that path changed. It was already proven live, against the real certified CLI
+and a scripted shim standing in for an uncertified one, at the Stage 4 gate
+(`docs/research/gates/stage4-gate.md`, run 2, steps 2a/2b). Task 13 (this stage's stretch task)
+additionally built a **hermetic** end-to-end harness for the identical refusal/override path
+(`internal/testcli`, `cmd/git-remote-proton/shim_test.go`) that runs on every `go test ./...`, no
+live account required. Given both, this gate's Preconditions step 1 only needs to **confirm the
+installed CLI is the certified build** (the ordinary case every other step already depends on) —
+re-running the shim-based refusal/override provocation live here would re-prove something already
+proven live once and covered hermetically ever since, for no new information. If a future stage
+changes the allowlist logic itself, that change should get its own live provocation here; this
+stage's changes never touch it.
 
 ---
 
@@ -83,26 +113,55 @@ recorded string.
 Per spec component 8 outline item 1, and covering Component 1/2's advertisement and fetch
 behavior:
 
-1. Bootstrap a fresh remote at `/my-files/GitRemotes/<demo>` (creating the parent `GitRemotes` if
-   absent, per the write-confinement authorization above).
-2. Push, in one or more batches: `refs/heads/feature/x` (a nested branch), a nested **tag**
-   (e.g. `refs/tags/release/v1`), and a `refs/notes/*` ref (e.g. `refs/notes/commits`, pointing at
-   a note object).
-3. **Advertisement assertion via `git ls-remote proton-v2::/my-files/GitRemotes/<demo>`** — this is
+1. **Bootstrap a fresh remote and land the initial branch** — creates
+   `/my-files/GitRemotes/<demo>` (the parent `GitRemotes` created first if absent, per the
+   write-confinement authorization above), the repo marker, and `refs/heads/main`. Spelled out
+   exactly, run from a fresh local working directory — a runner must never improvise this step,
+   since outline step 3 below is the load-bearing check immediately downstream of it:
+   ```
+   git init <demo>
+   cd <demo>
+   git commit --allow-empty -m "gate: stage5 initial commit"
+   git remote add proton-v2 "proton::/my-files/GitRemotes/<demo>"
+   git push -u proton-v2 main
+   ```
+2. **Push the nested branch, a nested tag, and a `refs/notes/*` ref** — same repo as item 1, same
+   `proton-v2` alias, each an explicit command:
+   ```
+   git switch -c feature/x
+   git commit --allow-empty -m "gate: nested branch commit"
+   git push proton-v2 feature/x
+   git tag release/v1
+   git push proton-v2 release/v1
+   git notes add -m "gate: note on the feature/x commit"
+   git push proton-v2 refs/notes/commits:refs/notes/commits
+   ```
+   (`git notes add` without `-r` annotates whatever commit is currently checked out — `feature/x`'s
+   commit at this point in the sequence; which commit it annotates is incidental, since this step
+   only needs the ref to exist and carry a verifiable OID, not any particular note content.)
+3. **Advertisement assertion via `git ls-remote proton::/my-files/GitRemotes/<demo>`** — note the
+   URL **scheme** here, not the `proton-v2` alias: `ls-remote` takes a URL directly and does not
+   need (and at this point in a fresh shell may not even have) a local remote configured. This is
    the load-bearing check, not a clone. Assert all three pushed refs appear in the advertisement
    (`refs/heads/feature/x`, the nested tag, `refs/notes/commits`), because **a plain `git clone`
    does NOT prove namespace coverage** — git's own clone only fetches `refs/heads/*` (+ HEAD) by
    default and never touches `refs/notes/*`, so a clone succeeding would be silent on whether notes
    were ever advertised at all.
-4. `git clone proton-v2::/my-files/GitRemotes/<demo>` into a short local path (Stage 4's R2-2
-   MAX_PATH lesson — keep the clone destination shallow). Confirm the nested branch and tag are
-   present locally; confirm `refs/notes/commits` is **absent** locally (clone alone does not fetch
-   it — this is expected, not a defect).
-5. **Explicit fetch of the notes namespace**: `git fetch proton-v2 "refs/notes/*:refs/notes/*"`.
-   Verify the resulting local `refs/notes/commits` OID matches exactly what was pushed in step 2.
-6. **Incremental fetch**: push one more small change (e.g. a new commit on `feature/x`), then
-   `git fetch proton-v2` again from the same clone and confirm only the new object(s) download —
-   this doubles as a lead-in to outline step 4's quarantine no-regression check.
+4. `git clone -o proton-v2 proton::/my-files/GitRemotes/<demo> <short-local-path>` into a short
+   local path (Stage 4's R2-2 MAX_PATH lesson — keep the clone destination shallow). The `-o
+   proton-v2` names the new clone's remote to match every later step's assumption — a plain `git
+   clone <url>` names it `origin`, which item 5's `git fetch proton-v2 ...` would not find. Confirm
+   the nested branch and tag are present locally; confirm `refs/notes/commits` is **absent**
+   locally (clone alone does not fetch it — this is expected, not a defect).
+5. **Explicit fetch of the notes namespace**, run inside the item-4 clone (where the remote is
+   named `proton-v2` because of `-o proton-v2` above): `git fetch proton-v2
+   "refs/notes/*:refs/notes/*"`. Verify the resulting local `refs/notes/commits` OID matches
+   exactly what was pushed in item 2.
+6. **Incremental fetch**: back in the ORIGINAL gate repo from items 1–2 (not the item-4 clone),
+   push one more small change (`git commit --allow-empty -m "gate: incremental commit"; git push
+   proton-v2 feature/x`); then, in the item-4 clone, `git fetch proton-v2` again and confirm only
+   the new object(s) download — this doubles as a lead-in to outline step 4's quarantine
+   no-regression check.
 
 ## Outline step 2 — D/F workflow, including self-heal live
 
@@ -111,7 +170,8 @@ Per spec component 8 outline item 2, exercising `internal/repo/push.go`'s prune
 `create → Stat → List → Trash → retry` path the design doc calls out as exactly where this
 project's history says seams lie.
 
-1. Delete `feature/x` (`git push proton-v2 --delete feature/x`). **Observe prune in the listing**:
+1. Delete `feature/x` (from the original gate repo, outline step 1 items 1–2's `proton-v2` alias:
+   `git push proton-v2 --delete feature/x`). **Observe prune in the listing**:
    `proton-drive filesystem list /my-files/GitRemotes/<demo>/refs/heads --json` (or the parent
    `feature` folder specifically) must show the `feature` folder **gone**, not merely empty — prune
    trashes the folder itself, it does not just empty it (checklist item 7, and see "trash
@@ -197,8 +257,17 @@ Per spec component 8 outline item 5, exercising `internal/repo/parents.go`'s `En
 1. **Unset (default) — actionable refusal, listing unchanged as a ROW SET.** Point a fresh push at
    a repo root whose immediate parent does not exist yet
    (e.g. `/my-files/GitRemotes/<demo>-parents/nested/repo`, where `GitRemotes` exists but
-   `<demo>-parents` and `<demo>-parents/nested` do not). With `GPB_CREATE_PARENTS` unset, run
-   `git push proton-v2 main`. Expect **exit non-zero**, and stderr containing the exact actionable
+   `<demo>-parents` and `<demo>-parents/nested` do not). This is a **different** remote path than
+   outline steps 1–4's `<demo>`, so it needs its own local repo and its own `proton-v2` alias —
+   reusing outline step 1's repo/remote here would push to the wrong URL. Set up explicitly:
+   ```
+   git init <demo>-parents-test
+   cd <demo>-parents-test
+   git commit --allow-empty -m "gate: parents-test initial commit"
+   git remote add proton-v2 "proton::/my-files/GitRemotes/<demo>-parents/nested/repo"
+   ```
+   With `GPB_CREATE_PARENTS` unset, run `git push proton-v2 main`. Expect **exit non-zero**, and
+   stderr containing the exact actionable
    grammar (`internal/repo/parents.go`):
    `"parent folder /my-files/GitRemotes/<demo>-parents does not exist; create it first (proton-drive
    filesystem create-folder /my-files/GitRemotes <demo>-parents, or the web UI), or set
@@ -207,8 +276,9 @@ Per spec component 8 outline item 5, exercising `internal/repo/parents.go`'s `En
    immediately before this push attempt (checklist item 1 — compare `uid`/`name`/`type`/
    `creationTime`/`modificationTime`/`parentUid` fields, never raw JSON byte equality) — nothing was
    created.
-2. **Set — parents created with loud stderr, torn down in cleanup.** Set `GPB_CREATE_PARENTS=1` for
-   this one shell/command only (never persist it), retry the same push. Expect **exit 0**, and
+2. **Set — parents created with loud stderr, torn down in cleanup.** Same `<demo>-parents-test`
+   repo and `proton-v2` alias as item 1. Set `GPB_CREATE_PARENTS=1` for this one shell/command only
+   (never persist it), retry the same push (`git push proton-v2 main`). Expect **exit 0**, and
    stderr containing one loud line **per created parent**, exact wording
    (`internal/repo/parents.go`): `"git-remote-proton: created parent folder
    /my-files/GitRemotes/<demo>-parents (GPB_CREATE_PARENTS=1)"` followed by the same for
