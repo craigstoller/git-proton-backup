@@ -708,6 +708,10 @@ func TestPushPackFailureFailsCreatesButDeletionsProceed(t *testing.T)
 //   unrelated deletion proceed past a failed create — this pins that the
 //   behaviour SURVIVES the restructure, with the new all-creates-share-one-
 //   failure shape asserted on top.
+func TestPushNonBranchDeleteProceedsUnderUnreadableHEAD(t *testing.T)
+//   RED (plan round 3, Codex): HEAD unreadable (corrupt bytes in the Fake);
+//   deleting refs/tags/v1 succeeds — HEAD protection is branches-only — while
+//   deleting refs/heads/main in the same batch fails closed.
 func TestPushDeleteOfHEADBranchRefusedAtPreflight(t *testing.T)
 //   RED (round-1 Codex): batch deletes the branch HEAD names AND creates a
 //   child under it. The delete must be refused in PHASE 2 (non-mutating
@@ -758,8 +762,15 @@ func Push(t transport.Transport, root, gitDir string, ups []protocol.RefUpdate, 
 			failed(i, "duplicate destination in one batch"); continue
 		}
 		if u.Src == "" {
-			if headErr != nil { failed(i, /* unreadable-HEAD refusal, wording from pushOne */ ""); continue }
-			if hasHead && head == u.Dst { failed(i, /* HEAD-protection refusal, wording from pushOne */ ""); continue }
+			// HEAD protection is BRANCHES-ONLY (spec §1; plan round 3, Codex):
+			// an unreadable HEAD must not block deleting tags/notes/etc. —
+			// HEAD can only ever name a branch. (Shipped pushOne gated every
+			// delete on the HEAD read; this narrows it per the spec — flag in
+			// the task report as an alignment.)
+			if isBranch(u.Dst) {
+				if headErr != nil { failed(i, /* unreadable-HEAD refusal, wording from pushOne */ ""); continue }
+				if hasHead && head == u.Dst { failed(i, /* HEAD-protection refusal, wording from pushOne */ ""); continue }
+			}
 			valid[i] = true
 			continue
 		}
@@ -872,6 +883,10 @@ func TestCreateRefusesFolderWithForeignFileUntouched(t *testing.T)
 func TestCreateRefusesFolderWithLiveSubRefs(t *testing.T)
 // GUARD: heal's diagnostic Stat/List failing → that transport error, no heal.
 func TestSelfHealAbortsOnDiagnosticFailure(t *testing.T)
+// RED (plan round 3, Codex): a folder in the collision subtree with an INVALID
+// component name (a{b}) → heal fails closed: error returned, no List call
+// names the invalid path (trace assert), nothing trashed.
+func TestSelfHealFailsClosedOnInvalidComponentInSubtree(t *testing.T)
 
 // EnsureDir node-type + contradiction (cli_test.go, helper roles):
 // RED (the round-1 blocker): role answers info→FILE node at the path:
@@ -925,7 +940,12 @@ Call from the delete arm after a Committed Trash of the ref file. `parentOf` = `
 // folder (recursive walk via t.List; folders alone do not count). Used by
 // self-heal's residue test: the rule is "contains no files OF ANY KIND" — a
 // foreign file makes the subtree not-residue and must never be trashed
-// (spec §2c, round 3).
+// (spec §2c, round 3). Like the ListRefs walk, it applies checkComponent to
+// every child BEFORE recursing (plan round 3, Codex): an invalid component —
+// a foreign folder named a{b}, say — returns an ERROR, which makes the heal
+// FAIL CLOSED (no recursion into an unverifiable remote path, no trash over
+// an incompletely-enumerated subtree). A trace test pins that no List ever
+// names the invalid path and nothing is trashed.
 func subtreeFiles(t transport.Transport, folder string) ([]string, error)
 
 func createRefHealingCollision(t transport.Transport, root, ref, sha string) (transport.Outcome, error) {
@@ -960,7 +980,7 @@ func createRefHealingCollision(t transport.Transport, root, ref, sha string) (tr
 Phase 5 uses this for creates (`exists == false`) only; updates keep plain `WriteRef`.
 
 - [ ] **Step 5: Implement the `EnsureDir` fixes** in cli.go — TWO defects, and the first is a round-1 Codex BLOCKER in the current shipped code path this stage starts depending on:
-  1. **The initial Stat must branch on node type.** Today `EnsureDir` returns `nil` for ANY existing node (`cli.go:221-225` never reads `Node.IsDir`), so a ref FILE at the path reads as a usable folder and the reverse-D/F failure surfaces later with a wrong diagnostic. Fix: `ok && n.IsDir` → `nil`; `ok && !n.IsDir` → `fmt.Errorf("cannot use %s as a folder: a file occupies that name", p)` (the error text Task 9a's reverse-D/F rewrap keys on — keep them consistent); absent → create. Helper-role test + the Task 7 fake/live contract case (`EnsureDir` onto a file) cover both implementations.
+  1. **The initial Stat must branch on node type.** Today `EnsureDir` returns `nil` for ANY existing node (`cli.go:221-225` never reads `Node.IsDir`), so a ref FILE at the path reads as a usable folder and the reverse-D/F failure surfaces later with a wrong diagnostic. Fix: `ok && n.IsDir` → `nil`; `ok && !n.IsDir` → `fmt.Errorf("cannot use %s as a folder: a file occupies that name", p)` — **exact wording is free: Task 9a's reverse-D/F detection is TYPED (it re-`Stat`s on failure), never error-text matching** (plan round 3, Codex: an earlier sentence here said the rewrap "keys on" this text, contradicting the round-2 fix; a test where the transport's `EnsureDir` returns arbitrary wording while `Stat` reports a file pins the typed classification); absent → create. Helper-role test + the Task 7 fake/live contract case (`EnsureDir` onto a file) cover both implementations.
   2. **The contradiction re-observation:** on `code != 0` from create-folder, `if strings.Contains(out, alreadyExistsSignature)` → re-observe via a **raw `c.run("filesystem","info",p,"--json")`, NOT the `Stat` wrapper** (round-2 Codex: `Stat` deliberately discards the CLI's output on the not-found path, so the wrapper cannot supply the verbatim second observation the diagnostic must quote). Classify the raw result: parses as a folder node → `return nil`; parses as a file node → the a-file-occupies-that-name error; carries `notFoundSignature` → error quoting BOTH the create-folder output AND the info output verbatim (the C17 signature, fully diagnosable); anything else → error quoting both outputs as undetermined. `const alreadyExistsSignature = "already exists"` — **hypothesis about the CLI's wording; the helper role pins the code path, the live contract row (add it now, gate-run later) pins the real text.** Comment must carry the C17b framing: generic robustness, never a validated live fix.
 
 - [ ] **Step 6: Run full suite + deliberate regressions:** (a) change `subtreeFiles`' rule to first-level-only → nested-empty test fails; (b) change it to ref-files-only → foreign-file test fails; (c) remove the prune call → prune tests fail. Revert each.
@@ -1215,6 +1235,17 @@ ancestry ran; reverse-D/F detection and the EnsureDir contradiction diagnostic s
 error text — parent-walk failures re-`Stat` (typed), and the contradiction path re-observes via
 raw `filesystem info` so both observations can be quoted verbatim (the `Stat` wrapper
 deliberately discards not-found output).
+
+**Round 3 (Codex + Gemini, 2026-08-06, final round) — Gemini: no new blocker/major findings,
+explicitly. Codex: three majors, all applied:** `subtreeFiles` applies `checkComponent` before
+recursing and an invalid component fails the heal CLOSED — no List of an unverifiable path, no
+trash over an incomplete enumeration — with a trace test; the phase-2 HEAD guard is gated on
+`isBranch` so an unreadable HEAD never blocks tag/notes deletions (narrows shipped pushOne's
+every-delete gating to the spec's branches-only protection; flagged as an alignment for the
+task report); the stale "keys on this text" sentence in Task 9b contradicted round 2's typed
+reverse-D/F detection and is corrected, with an arbitrary-wording test pinning that
+classification is typed. The loop ends at the three-round cap with every tracked finding
+applied or rejected-with-reason and none deferred.
 
 ## Self-Review Notes (run before handing the plan to review)
 
