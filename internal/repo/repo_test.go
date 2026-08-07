@@ -422,6 +422,221 @@ func TestListRefsRejectsCorruptRefFile(t *testing.T) {
 	}
 }
 
+// TestListRefsRecursesAllNamespaces is Task 8's headline case: nested
+// branches, tags, notes, and refs/stash must all be advertised under their
+// FULL name, not just the direct children of refs/heads and refs/tags the
+// old two-namespace walk saw.
+func TestListRefsRecursesAllNamespaces(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	seed := []string{
+		"refs/heads/main",
+		"refs/heads/feature/x",
+		"refs/tags/v1/rc",
+		"refs/notes/commits",
+		"refs/stash",
+	}
+	for _, name := range seed {
+		f.Files["/r/"+name] = []byte(sha + "\n")
+	}
+
+	refs, err := ListRefs(f, "/r")
+	if err != nil {
+		t.Fatalf("ListRefs: %v", err)
+	}
+	for _, name := range seed {
+		if refs[name] != sha {
+			t.Errorf("refs[%q] = %q, want %q (full map: %v)", name, refs[name], sha, refs)
+		}
+	}
+	if len(refs) != len(seed) {
+		t.Errorf("got %d refs, want exactly %d: %v", len(refs), len(seed), refs)
+	}
+}
+
+// TestListRefsSkipsInvalidNamesWithNoteNeverFatal: a foreign junk LEAF name
+// must be skipped, never fatal — one stray web-UI file must not brick the
+// whole repo's advertisement (spec round 2). Per the brief, this test
+// asserts the MAP result only; the note's exact text is pinned separately in
+// TestSkipNoteText below, against an injected io.Writer rather than the real
+// os.Stderr.
+func TestListRefsSkipsInvalidNamesWithNoteNeverFatal(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	f.Files["/r/refs/heads/main"] = []byte(sha + "\n")
+	// "a{b}" is a valid git ref-name COMPONENT (CheckRefName accepts braces)
+	// but not advertisable — checkComponent (via checkStageableLeaf) refuses
+	// "{" and "}" for this transport (probe C13). It is a well-named LEAF
+	// file, not a folder, so this exercises advertisableName's skip path
+	// specifically; the folder-skip path is the next test.
+	f.Files["/r/refs/heads/a{b}"] = []byte(sha + "\n")
+
+	var refs map[string]string
+	var err error
+	captureStderr(t, func() { refs, err = ListRefs(f, "/r") })
+
+	if err != nil {
+		t.Fatalf("a foreign junk name must never be fatal: %v", err)
+	}
+	if refs["refs/heads/main"] != sha {
+		t.Errorf("the well-named sibling must still be advertised, got %v", refs)
+	}
+	if _, ok := refs["refs/heads/a{b}"]; ok {
+		t.Errorf("the junk name must not be advertised, got %v", refs)
+	}
+}
+
+// tracedListTransport wraps a Fake and records every path passed to List, so
+// TestListRefsNeverListsBeneathAnInvalidFolderName can assert a braced path
+// was never handed to a remote List() call at all.
+type tracedListTransport struct {
+	*transport.Fake
+	listed []string
+}
+
+func (tr *tracedListTransport) List(p string) ([]transport.Node, error) {
+	tr.listed = append(tr.listed, p)
+	return tr.Fake.List(p)
+}
+
+// TestListRefsNeverListsBeneathAnInvalidFolderName covers round-2 Codex: an
+// invalid FOLDER name must skip its whole subtree WITHOUT recursing into it
+// — checkComponent runs on every node, directories included, BEFORE
+// recursion, precisely so a folder named ".hidden" or "a{b}" never reaches a
+// List() argument. Braces are valid to git (CheckRefName accepts them), but
+// this transport's remote-glob behaviour on "{" in a List() path is
+// UNVERIFIED (probe C13 only confirmed LOCAL glob-expansion on upload) —
+// never probing it is the point, not an incidental property of
+// skip-with-note.
+func TestListRefsNeverListsBeneathAnInvalidFolderName(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	f.Files["/r/refs/heads/main"] = []byte(sha + "\n")
+	// Both junk entries are FOLDERS (a nested file underneath, so the Fake's
+	// List synthesises a directory node for each) — ".hidden" fails the
+	// leading-dot component rule, "a{b}" fails checkStageableLeaf's brace
+	// refusal. Neither must ever be handed to List().
+	f.Files["/r/refs/heads/.hidden/x"] = []byte(sha + "\n")
+	f.Files["/r/refs/heads/a{b}/y"] = []byte(sha + "\n")
+
+	tr := &tracedListTransport{Fake: f}
+	var refs map[string]string
+	var err error
+	captureStderr(t, func() { refs, err = ListRefs(tr, "/r") })
+
+	if err != nil {
+		t.Fatalf("an invalid folder name must never be fatal: %v", err)
+	}
+	if refs["refs/heads/main"] != sha {
+		t.Errorf("the valid sibling must still be advertised, got %v", refs)
+	}
+	if len(refs) != 1 {
+		t.Errorf("only the valid sibling must be advertised, got %v", refs)
+	}
+	for _, p := range tr.listed {
+		if strings.Contains(p, "a{b}") {
+			t.Errorf("List() must never be called with the braced path, but got %q (all calls: %v)", p, tr.listed)
+		}
+		if strings.Contains(p, ".hidden") {
+			t.Errorf("List() must never be called beneath the invalid folder, but got %q (all calls: %v)", p, tr.listed)
+		}
+	}
+}
+
+// TestSkipNoteText pins the skip-note's exact wording via an injected
+// io.Writer rather than capturing the real os.Stderr — the convention is
+// that notes always go to os.Stderr in production (ListRefs above always
+// calls skipNote with os.Stderr), but the TEXT itself is a focused unit test
+// of the helper in isolation.
+func TestSkipNoteText(t *testing.T) {
+	var buf strings.Builder
+	skipNote(&buf, "/r", "refs/heads/a{b}", fmt.Errorf("boom"))
+	want := "git-remote-proton: skipping /r/refs/heads/a{b}: boom\n"
+	if buf.String() != want {
+		t.Errorf("skipNote wrote %q, want %q", buf.String(), want)
+	}
+}
+
+// TestListRefsMalformedContentStillFatal pins the readRef tightening: the
+// OLD TrimRight(sha, "\r\n") tolerated a bare sha with no trailing newline, a
+// CRLF terminator, and (because TrimRight strips a whole trailing run of
+// \r/\n bytes) even a double-LF terminator — none of those are bytes v2
+// itself ever writes (WriteRef always writes sha+"\n"), so all three are
+// foreign or damaged data and must be fatal under the spec's exact grammar:
+// 40 lowercase hex plus a single trailing newline, nothing else.
+func TestListRefsMalformedContentStillFatal(t *testing.T) {
+	sha := "1111111111111111111111111111111111111111"
+	cases := []struct {
+		name    string
+		content []byte
+	}{
+		{"no trailing newline", []byte(sha)},
+		{"CRLF terminator", []byte(sha + "\r\n")},
+		{"double-LF terminator", []byte(sha + "\n\n")},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := transport.NewFake()
+			f.Dirs["/r"] = true
+			_ = Bootstrap(f, "/r")
+			f.Files["/r/refs/heads/bad"] = c.content
+			if _, err := ListRefs(f, "/r"); err == nil {
+				t.Errorf("%s must be fatal under the exact grammar, got no error", c.name)
+			}
+		})
+	}
+}
+
+// TestListRefsIgnoresEmptyFolders: a folder with nothing under it
+// contributes nothing and must not error — the walk's base case.
+func TestListRefsIgnoresEmptyFolders(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	if err := f.EnsureDir("/r/refs/heads/empty"); err != nil {
+		t.Fatalf("EnsureDir: %v", err)
+	}
+	refs, err := ListRefs(f, "/r")
+	if err != nil {
+		t.Fatalf("ListRefs: %v", err)
+	}
+	if len(refs) != 0 {
+		t.Errorf("an empty tree must advertise nothing, got %v", refs)
+	}
+}
+
+// captureStderr redirects os.Stderr to a temp file for the duration of fn,
+// then returns what was written. Mirrors cmd/git-remote-proton/main_test.go's
+// helper of the same name — that one lives in a different package, so this
+// package needs its own copy.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "stderr-*")
+	if err != nil {
+		t.Fatalf("temp file: %v", err)
+	}
+	orig := os.Stderr
+	os.Stderr = f
+	defer func() { os.Stderr = orig }()
+
+	fn()
+
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	b, err := os.ReadFile(f.Name())
+	if err != nil {
+		t.Fatalf("read back stderr: %v", err)
+	}
+	return string(b)
+}
+
 // TestWriteRefRefusesNonSha covers the brief's guard directly: WriteRef must
 // reject a non-sha value before ever touching the transport, not attempt to
 // stage or upload it. A ref file that is not exactly 40 lowercase hex plus a
@@ -804,48 +1019,64 @@ func assertNothingUploaded(t *testing.T, f *transport.Fake, root string) {
 	}
 }
 
-// TestPushRejectsHierarchicalDestinationBeforePacking covers the ref shape git
-// accepts and users create constantly — refs/heads/feat/x — against a repo
-// layer whose only prefix logic was isBranch. ListRefs is non-recursive
-// (refs.go documents this), so the ref was invisible to the advertisement,
-// exists came back false, the ancestry check was SKIPPED, a full pack was
-// built and uploaded, and only then did WriteRef fail because refs/heads/feat
-// does not exist — with a message naming neither the ref shape nor the
-// limitation, and an orphan pack left on the remote.
-func TestPushRejectsHierarchicalDestinationBeforePacking(t *testing.T) {
+// TestPushAcceptsHierarchicalDestinationNowThatListRefsRecurses closes the
+// loop this test used to describe as a standing limitation (it was named
+// TestPushRejectsHierarchicalDestinationBeforePacking): before Task 8,
+// refs/heads/feat/x was invisible to a non-recursive ListRefs, so exists
+// came back false, the ancestry check was skipped, a full pack was built and
+// uploaded, and only then did WriteRef fail because refs/heads/feat did not
+// exist — with a message naming neither the ref shape nor the limitation,
+// and an orphan pack left on the remote. ListRefs now recurses the whole
+// refs/ tree and checkDst admits any advertisable name under refs/, so this
+// push must succeed outright, AND the ref it wrote must be visible to a
+// FOLLOWING ListRefs call — proving the write and the read agree, which is
+// the whole point of the fix.
+func TestPushAcceptsHierarchicalDestinationNowThatListRefsRecurses(t *testing.T) {
 	f := transport.NewFake()
 	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
 
 	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feat/x"}}
 	res := Push(f, "/r", gitDir, ups, map[string]string{})
 
-	if len(res) != 1 || res[0].OK {
-		t.Fatalf("a hierarchical destination must be rejected, got %+v", res)
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("a hierarchical destination must now be accepted, got %+v", res)
 	}
-	if !strings.Contains(res[0].Err, "refs/heads/feat/x") {
-		t.Errorf("rejection must name the destination, got %q", res[0].Err)
+	if packs, idxs := countPackFiles(f, "/r"); packs == 0 || idxs == 0 {
+		t.Errorf("a successful push must still upload a pack/idx pair, got pack=%d idx=%d", packs, idxs)
 	}
-	if !strings.Contains(res[0].Err, "refs/heads/<name>") {
-		t.Errorf("rejection must name the actual limitation, got %q", res[0].Err)
+	refs, err := ListRefs(f, "/r")
+	if err != nil {
+		t.Fatalf("ListRefs: %v", err)
 	}
-	assertNothingUploaded(t, f, "/r")
+	if refs["refs/heads/feat/x"] != head {
+		t.Errorf("the ref just published must be advertised back, got %v", refs)
+	}
 }
 
 // TestPushRejectsPseudorefDestination covers the design's error-table row
 // "Pseudorefs and unsupported destinations | Explicit rejection with a named
-// reason". Before the guard, `git push proton-v2 main:refs/stash` wrote
-// <root>/refs/stash, reported ok, and created a ref ListRefs will never
-// advertise — so the NEXT push of it failed with "ref changed concurrently",
-// a message describing a race that never happened.
+// reason" for what is STILL rejected after Task 8's namespace re-enable.
+//
+// Task 8 retired checkDst's old "exactly refs/heads/<name> or
+// refs/tags/<name>" narrowing: "refs/stash" and "refs/notes/commits" are now
+// legitimate, advertisable destinations (TestPushAcceptsNamespacedDestinations
+// below), and bare "refs/heads" (no trailing slash) is a syntactically valid
+// ref name to git that checkDst no longer refuses up front — it still fails,
+// just later, at publish, not here
+// (TestPushToRefsHeadsItselfFailsAtPublishNotAtCheckDst below). What is left
+// genuinely unsupported at the checkDst boundary is HEAD (no "refs/" prefix
+// at all) and "refs/heads/" (git's own check-ref-format refuses the trailing
+// "/").
 func TestPushRejectsPseudorefDestination(t *testing.T) {
 	gitDir := newGitRepoForPush(t)
 
 	// A fresh Fake per subtest: assertNothingUploaded inspects the whole
 	// Files map, so a shared one would let the first leak taint every later
 	// case (or, worse, pass because a sibling already uploaded).
-	for _, dst := range []string{"refs/stash", "HEAD", "refs/heads", "refs/heads/", "refs/notes/commits"} {
+	for _, dst := range []string{"HEAD", "refs/heads/"} {
 		t.Run(dst, func(t *testing.T) {
 			f := transport.NewFake()
 			f.Dirs["/r"] = true
@@ -863,28 +1094,143 @@ func TestPushRejectsPseudorefDestination(t *testing.T) {
 	}
 }
 
-// TestPushRejectsUnsupportedDeleteDestination covers the delete path, which
-// returned OK: true for any ref it could not see — and it can never see a
-// pseudoref, because ListRefs does not advertise one. Reporting success for a
-// deletion that certainly did not happen is worse than a plain failure: git
-// drops its remote-tracking ref on the strength of it.
+// TestPushAcceptsNamespacedDestinations is the positive half of Task 8's
+// "namespace re-enable": a push to refs/notes/commits or refs/stash must now
+// succeed end-to-end and be visible to a following ListRefs, closing the old
+// v6.1 narrowing's gap the hard way (a real Push, not just a checkDst call).
+func TestPushAcceptsNamespacedDestinations(t *testing.T) {
+	for _, dst := range []string{"refs/notes/commits", "refs/stash"} {
+		t.Run(dst, func(t *testing.T) {
+			f := transport.NewFake()
+			f.Dirs["/r"] = true
+			_ = Bootstrap(f, "/r")
+			gitDir := newGitRepoForPush(t)
+
+			ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: dst}}
+			res := Push(f, "/r", gitDir, ups, map[string]string{})
+			if len(res) != 1 || !res[0].OK {
+				t.Fatalf("%q must now be accepted, got %+v", dst, res)
+			}
+			refs, err := ListRefs(f, "/r")
+			if err != nil {
+				t.Fatalf("ListRefs: %v", err)
+			}
+			if _, ok := refs[dst]; !ok {
+				t.Errorf("%q must be advertised back after publish, got %v", dst, refs)
+			}
+		})
+	}
+}
+
+// TestPushToRefsHeadsItselfFailsAtPublishNotAtCheckDst pins a real
+// consequence of admitting any advertisable name under refs/: "refs/heads"
+// (no trailing slash — distinct from the malformed "refs/heads/" checked
+// above) is syntactically a valid ref name to both git and advertisableName,
+// so checkDst no longer refuses it up front. It still cannot be PUBLISHED,
+// though — Bootstrap already created refs/heads as a FOLDER, and WriteRef's
+// leaf-named upload to that exact path collides with it (the same D/F guard
+// Task 7 gave the Fake) — so the push still fails, just later, and after a
+// pack upload the old all-or-nothing narrowing would have avoided. Pinned
+// deliberately rather than left uncovered: a future checkDst that makes this
+// SUCCEED (writing a ref file where refs/heads/<branch> folders live) would
+// be wrong.
+func TestPushToRefsHeadsItselfFailsAtPublishNotAtCheckDst(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	if err := checkDst("refs/heads"); err != nil {
+		t.Fatalf(`checkDst("refs/heads") = %v, want nil (git accepts this ref name)`, err)
+	}
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads"}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("must still fail (D/F collision with the refs/heads folder), got %+v", res)
+	}
+	if _, ok := f.Files["/r/refs/heads"]; ok {
+		t.Error("must not be written to the remote")
+	}
+}
+
+// TestPushRejectsUnsupportedDeleteDestination covers the delete path against
+// a destination checkDst still refuses (HEAD has no "refs/" prefix at all)
+// — it must be rejected outright, never reported OK: true just because the
+// caller-supplied remote map happens to say the destination does not exist.
+// Before Task 8, this used "refs/stash" as the example destination; that is
+// no longer unsupported (TestPushAcceptsNamespacedDestinations above), so
+// the target moved to one that still is.
 func TestPushRejectsUnsupportedDeleteDestination(t *testing.T) {
 	f := transport.NewFake()
 	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
-	sha := "2222222222222222222222222222222222222222"
-	f.Files["/r/refs/stash"] = []byte(sha + "\n")
 
-	// The remote map is empty on purpose: this is what ListRefs actually
-	// returns for a pseudoref, so !exists is the branch that used to fire.
-	ups := []protocol.RefUpdate{{Src: "", Dst: "refs/stash"}}
+	ups := []protocol.RefUpdate{{Src: "", Dst: "HEAD"}}
 	res := Push(f, "/r", t.TempDir(), ups, map[string]string{})
 
 	if len(res) != 1 || res[0].OK {
-		t.Fatalf("deleting an unsupported destination must be rejected, not reported ok for a ref we cannot see, got %+v", res)
+		t.Fatalf("deleting an unsupported destination must be rejected, not reported ok, got %+v", res)
 	}
-	if _, ok := f.Files["/r/refs/stash"]; !ok {
-		t.Error("a rejected delete must not have trashed anything")
+}
+
+// TestCheckDstAdmitsAnyAdvertisableNameUnderRefs pins the namespace
+// re-enable this task is named for directly against checkDst, independent of
+// Push: the old v6.1 narrowing (exactly refs/heads/<name> or
+// refs/tags/<name>, one component) is retired now that ListRefs recurses the
+// whole tree and can actually advertise these names back.
+func TestCheckDstAdmitsAnyAdvertisableNameUnderRefs(t *testing.T) {
+	for _, dst := range []string{
+		"refs/heads/main",
+		"refs/heads/feat/x",
+		"refs/tags/v1/rc",
+		"refs/notes/commits",
+		"refs/stash",
+	} {
+		if err := checkDst(dst); err != nil {
+			t.Errorf("checkDst(%q) = %v, want nil", dst, err)
+		}
+	}
+}
+
+// TestCheckDstStillRejects pins what stays refused after the namespace
+// re-enable: destinations with no "refs/" prefix at all (git's own authority
+// has nothing to check there), and names that fail either git's real
+// check-ref-format or this transport's stageability rules.
+func TestCheckDstStillRejects(t *testing.T) {
+	for _, dst := range []string{
+		"HEAD",
+		"refs/heads/",        // git check-ref-format itself refuses a trailing "/"
+		"refs/heads/.hidden", // leading-dot component
+		"refs/heads/a{b}",    // not stageable (probe C13)
+	} {
+		if err := checkDst(dst); err == nil {
+			t.Errorf("checkDst(%q) = nil, want a refusal", dst)
+		}
+	}
+}
+
+// TestRequiresForce pins the design's conservative other-namespace rule.
+// requiresForce is dead code until Task 9a wires it in (see the "wired in
+// Task 9a" comment on it, push.go) — this test exists now, ahead of any
+// caller, so the behaviour is pinned before it has one, per the brief.
+func TestRequiresForce(t *testing.T) {
+	cases := []struct {
+		dst  string
+		want bool
+	}{
+		{"refs/heads/main", false},
+		{"refs/heads/feat/x", false},
+		{"refs/tags/v1", false},
+		{"refs/notes/commits", true},
+		{"refs/stash", true},
+		{"refs/heads", true}, // no trailing "/" — not actually under refs/heads/
+		{"refs/tags", true},  // same, for refs/tags/
+	}
+	for _, c := range cases {
+		if got := requiresForce(c.dst); got != c.want {
+			t.Errorf("requiresForce(%q) = %v, want %v", c.dst, got, c.want)
+		}
 	}
 }
 

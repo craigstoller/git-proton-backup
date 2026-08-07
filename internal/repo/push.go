@@ -120,14 +120,18 @@ func pushOne(t transport.Transport, root, gitDir string,
 
 	// --- destination namespace ----------------------------------------------
 	// FIRST, before resolve and before any packing. Rejecting early is what
-	// stops a doomed push from costing a pack upload to the user's paid Drive
-	// (and leaving an orphan behind — Stage 2 has no GC). Without this guard
-	// refs/heads/feat/x was invisible to the non-recursive ListRefs, so
-	// exists came back false, the ancestry check was skipped, a full pack was
-	// built and uploaded, and only then did WriteRef fail on a
-	// refs/heads/feat folder nobody had created. It also covers the delete
-	// path, which otherwise reported OK: true for any destination ListRefs
-	// cannot see — including every pseudoref.
+	// stops a doomed push from costing a pack upload to the user's paid
+	// Drive (and leaving an orphan behind — Stage 2 has no GC). Before Task
+	// 8, refs/heads/feat/x was invisible to a non-recursive ListRefs, so
+	// exists came back false, the ancestry check was skipped, a full pack
+	// was built and uploaded, and only then did WriteRef fail on a
+	// refs/heads/feat folder nobody had created — that specific failure is
+	// gone now that ListRefs recurses and checkDst admits any advertisable
+	// name under refs/. The early placement still matters for whatever
+	// checkDst DOES reject (pseudorefs, non-refs/ destinations, names git or
+	// this transport cannot stage), and for the delete path below, which
+	// otherwise reported OK: true for any destination checkDst refuses —
+	// including every pseudoref.
 	if err := checkDst(u.Dst); err != nil {
 		return fail(err.Error())
 	}
@@ -276,31 +280,40 @@ func pushOne(t transport.Transport, root, gitDir string,
 
 func isBranch(ref string) bool { return strings.HasPrefix(ref, "refs/heads/") }
 
-// checkDst is the design's "Pseudorefs and unsupported destinations | Explicit
-// rejection with a named reason" row. Stage 2 serves exactly two shapes:
-// refs/heads/<name> and refs/tags/<name>, with <name> a single non-empty path
-// component.
-//
-// The limitation is real, not conservatism for its own sake. refs.go documents
-// that ListRefs lists the direct children of each namespace NON-RECURSIVELY
-// and skips directories, so anything deeper is invisible to the advertisement,
-// and WriteRef has the mirror-image gap — it would upload into a parent folder
-// this package never creates. Anything outside refs/heads and refs/tags is
-// worse still: it would be written, reported ok, and then never advertised
-// again, so the next push of it fails claiming a concurrent change that never
-// happened. Recursive listing and the wider ref namespace belong to Stage 3,
-// which owns clone/fetch.
+// checkDst admits any advertisable name under refs/. The v6.1 narrowing is
+// retired: recursive ListRefs (Task 8) erased its first justification, batch
+// preflight (Task 9a) its second. Pseudorefs and non-refs/ destinations stay
+// rejected.
 func checkDst(dst string) error {
-	parts := strings.Split(dst, "/")
-	if len(parts) == 3 && parts[0] == "refs" && parts[2] != "" &&
-		(parts[1] == "heads" || parts[1] == "tags") {
-		return nil
+	if !strings.HasPrefix(dst, "refs/") {
+		return fmt.Errorf("unsupported destination %q: only refs under refs/ are served "+
+			"(pseudorefs and other destinations have no representation on this remote)", dst)
 	}
-	return fmt.Errorf("unsupported destination %q: this remote helper serves only "+
-		"refs/heads/<name> and refs/tags/<name> with a single name component; "+
-		"hierarchical refs, pseudorefs and other namespaces are not supported "+
-		"(the remote ref listing is non-recursive, so such a ref could be written "+
-		"but never advertised back)", dst)
+	// AUTHORITY FIRST (spec §1, both round-1 engines): the push boundary runs
+	// the REAL git check-ref-format; the in-process validator covers only
+	// stageability afterwards. Order matters for diagnosability too — a name
+	// git rejects gets git's verdict, not the in-process approximation's.
+	ok, err := gitcmd.CheckRefFormat(dst)
+	if err != nil {
+		return fmt.Errorf("cannot validate ref name %q with git: %w", dst, err)
+	}
+	if !ok {
+		return fmt.Errorf("invalid ref name %q (git check-ref-format)", dst)
+	}
+	return advertisableName(dst)
+}
+
+// requiresForce: the design's conservative deviation — any move outside
+// refs/heads/* and refs/tags/* requires force (v2 does not inspect object
+// types the way git's own namespace rules do; conservative cannot lose
+// data). Dead code until Task 9a wires it in — the comment below is
+// deliberate, so this task's reviewer does not flag it as unused: it has
+// its own unit test (TestRequiresForce, repo_test.go) even though nothing
+// calls it yet.
+//
+// wired in Task 9a
+func requiresForce(dst string) bool {
+	return !strings.HasPrefix(dst, "refs/heads/") && !strings.HasPrefix(dst, "refs/tags/")
 }
 
 // oneLine collapses every run of whitespace — newlines included — into a
