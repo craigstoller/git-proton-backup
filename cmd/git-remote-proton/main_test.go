@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1075,6 +1076,36 @@ func TestDispatchUtility_NoArgsAtAll_DoesNotHandle(t *testing.T) {
 	}
 	if stdout.Len() != 0 || stderr.Len() != 0 {
 		t.Errorf("stdout=%q stderr=%q, want both empty", stdout.String(), stderr.String())
+	}
+}
+
+// RED: pins the dispatchUtility→runSetHead call site — argv routing, argument
+// order, exit-code propagation, and WRITER PLUMBING (the stub writes to the
+// stdout writer dispatchUtility passed it; the assertion proves that writer
+// reaches the callee — it deliberately does NOT pin runSetHead's real message
+// text, which no hermetic test can reach without the Task 13 shim; that text
+// stays pinned by the live gate). Until Stage 5 this call site was pinned
+// only by live gates (hermetic tests stopped at dispatchUtility's arity arm).
+func TestDispatchRoutesSetHeadArgsInOrder(t *testing.T) {
+	orig := runSetHeadFn
+	defer func() { runSetHeadFn = orig }()
+	var gotAddr, gotBranch string
+	runSetHeadFn = func(addr, branch string, stdout, stderr io.Writer) int {
+		gotAddr, gotBranch = addr, branch
+		fmt.Fprintln(stdout, "HEAD is now refs/heads/x")
+		return 42
+	}
+	var out, errb bytes.Buffer
+	handled, code := dispatchUtility(
+		[]string{"git-remote-proton", "--set-head", "proton::/my-files/r/repo", "feature/x"}, &out, &errb)
+	if !handled || code != 42 {
+		t.Fatalf("handled=%v code=%d, want true/42", handled, code)
+	}
+	if gotAddr != "proton::/my-files/r/repo" || gotBranch != "feature/x" {
+		t.Fatalf("args routed as (%q,%q)", gotAddr, gotBranch)
+	}
+	if !strings.Contains(out.String(), "HEAD is now") {
+		t.Fatalf("stdout not forwarded: %q", out.String())
 	}
 }
 

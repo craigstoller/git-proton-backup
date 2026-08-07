@@ -36,6 +36,14 @@ func main() {
 	os.Exit(run())
 }
 
+// runSetHeadFn exists ONLY as a test seam pinning the dispatchUtility→
+// runSetHead wiring (argv routing, argument order, exit-code propagation,
+// writer plumbing) for hermetic tests that cannot reach the real
+// runSetHead (it constructs a live *transport.CLI). Nothing else may
+// reassign it — production always calls through the real runSetHead via
+// this variable's initializer.
+var runSetHeadFn = runSetHead
+
 // dispatchUtility handles the CLOSED set of direct-invocation modes. Only
 // exact matches dispatch: a prefix match would misroute a remote whose
 // configured name begins with "--" (git passes the remote NAME as argv[1]),
@@ -57,7 +65,7 @@ func dispatchUtility(args []string, stdout, stderr io.Writer) (bool, int) {
 			fmt.Fprintln(stderr, "usage: git-remote-proton --set-head <proton::address> <branch>")
 			return true, 1
 		}
-		return true, runSetHead(args[2], args[3], stdout, stderr)
+		return true, runSetHeadFn(args[2], args[3], stdout, stderr)
 	}
 	return false, 0
 }
