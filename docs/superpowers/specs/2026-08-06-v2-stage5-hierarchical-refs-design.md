@@ -33,18 +33,33 @@ lowercase hex plus `\n`; violations remain fatal, never coerced.
   depth-first. Every well-formed ref file found is advertised under its full
   `refs/...` name. Folders containing no ref files contribute nothing — empty parents are
   benign to every read path (they matter only to the create path; see component 2).
-- **Discovered names are validated at the read boundary, not only on push.** Every full name
-  assembled during recursion is checked with `git check-ref-format` before advertisement; a
-  violation is fatal naming the exact remote path — the design's existing "malformed ref name
-  → fatal, never coerced" rule applied where names now first enter the system. A non-v2 actor
-  (web UI, another client) can create nodes under `refs/` with names git cannot accept, and
-  those must never reach the protocol stream.
-- **Cost is linear in folder count and stated, not hidden.** Each folder is one CLI
-  subprocess, serially. Typical ref trees are shallow and small; a pathological tree makes
-  advertisement slow, not wrong. This is the same accepted posture as the design's "discovery
-  cost grows linearly with pack count" note, and the v6.5 edit records it beside that note.
-  No parallel listing in Stage 5 (concurrent CLI *startups* collide — A7/A8 — and the retry
-  machinery to exploit the post-startup window is not worth building for this).
+- **Discovered names are validated at the read boundary — skip-with-note, never fatal.** A
+  non-v2 actor (web UI, another client) can create nodes under `refs/` with names git cannot
+  accept, and those must never reach the protocol stream. But making a bad *name* fatal would
+  hand any stray web-UI file the power to brick every helper operation on the repo until
+  manual cleanup — advertisement runs first, so clone, fetch, and push would all die. So the
+  read boundary follows the design's own packs-directory precedent (non-packish nodes are
+  skipped with a stderr note): a discovered name that fails validation is **skipped with a
+  loud per-name stderr note naming the exact remote path**, never advertised, never touched.
+  The existing "malformed ref-file *contents* → fatal" rule is unchanged — it applies to refs
+  that were advertised. v2 itself can never create a skipped name (2a refuses them on push),
+  so a skip always marks foreign data.
+- **Read-boundary validation is in-process, push-boundary validation stays authoritative.**
+  The read-side check enforces protocol-stream safety and git's documented ref-name rules
+  structurally (no control characters, space, `~^:?*[\`, no `..` or `@{`, no leading/trailing
+  or doubled `/`, no trailing `.` or `.lock` suffix, not `@`) without spawning a process per
+  ref — `git check-ref-format` takes one name per invocation, and a flat folder of thousands
+  of tags must not mean thousands of subprocess launches during advertisement. The push path
+  keeps the real `git check-ref-format` (batches are small; authority matters more there),
+  so any drift between the two checks errs toward skipping at read and refusing at push —
+  both safe directions.
+- **Cost is stated, not hidden: one CLI `List` subprocess per folder plus in-process name
+  checks per ref.** Serial, deliberately. Typical ref trees are shallow and small; a
+  pathological tree makes advertisement slow, not wrong. This is the same accepted posture as
+  the design's "discovery cost grows linearly with pack count" note, and the v6.5 edit
+  records it beside that note. No parallel listing in Stage 5 (concurrent CLI *startups*
+  collide — A7/A8 — and the retry machinery to exploit the post-startup window is not worth
+  building for this).
 - **The v6.1 namespace rejection is retired.** Recursion makes `refs/notes/*`,
   `refs/replace/*`, `refs/stash`, and other valid namespaces visible without a filter, so they
   are advertised and pushable. v6.1's first justification (non-recursive `ListRefs`) is erased
@@ -77,29 +92,41 @@ also glob-expanded has never been probed; components appear in remote paths on e
 `EnsureDir`; (3) future-proofing — any later code path that mirrors components into local
 paths (fetch staging, caches) would meet the device-name and brace hazards on Windows.
 
-**2b. Batch execution order, normative.** The buffered batch executes in five phases; no
-mutation of any kind precedes phase 4:
+**2b. Batch execution order, normative.** The buffered batch executes in five phases. The
+invariant, stated precisely: **no ref mutation and no destructive operation precedes phase
+4** — phase 3's writes are immutable pack/idx objects, whose worst failure mode is an inert
+orphan pack, the design's existing accepted class.
 
 1. Buffer the complete blank-line-terminated batch; poison-flag enforcement (unchanged).
 2. **Validate the whole batch before anything moves**: `git check-ref-format` plus rule 2a
    for every destination; duplicate destinations refused; and a **final-state D/F preflight**
-   — compute the post-batch ref set and refuse, with a named reason, any create whose name
-   conflicts directory/file-wise with that final state (e.g. `feature` and `feature/x` both
-   created in one batch). Failures here cost nothing: no pack has been built.
+   — compute the post-batch ref set (the advertised refs plus this batch's changes) and
+   refuse, with a named reason, any create whose name conflicts directory/file-wise with
+   that final state (e.g. `feature` and `feature/x` both created in one batch). The
+   preflight sees **refs**, not folders: a collision with residual *empty* folders is
+   invisible here by construction and is resolved at execution time by self-heal (2c) — the
+   preflight claim is "no D/F conflict within the final ref set," nothing stronger.
+   Failures here cost nothing: no pack has been built.
 3. Build, upload, and confirm the pack for the batch's creates/updates (deletions need no
-   objects). A pack failure fails those refs with **nothing yet mutated** — deletions have
-   deliberately not run.
+   objects).
 4. Execute deletions (trash + prune, 2c).
 5. Execute creates and updates.
 
+**Phase-3 failure control flow, explicit:** a pack failure marks every create/update
+`error <dst>` naming the pack failure, and execution **continues to phase 4** — deletions
+are object-independent, individually requested operations and run with their own per-ref
+statuses. This is the design's own non-atomic per-ref posture, not a new promise; the
+alternative (aborting deletions on an unrelated upload failure) was considered and rejected
+as coupling refs the protocol treats as independent. Every ref still receives exactly one
+`ok`/`error`.
+
 Deletions-before-creates is what makes `git push origin :feature feature/x` succeed in one
 batch regardless of the order git sends. Placing deletions **after** pack confirmation is
-what prevents the failure both engines' review flagged: without it, the batch's only bulk
-failure point (the upload) could fire after a destructive change. What this order does
-**not** promise: a create failing in phase 5 does not resurrect a branch deleted in phase 4 —
-the user explicitly requested that deletion, multi-ref batches remain non-atomic per the
-design, and each ref still gets its own `ok`/`error` (response order need not match command
-order).
+what prevents the failure both engines' review flagged: without it, a destructive change
+could precede the batch's riskiest step. What this order does **not** promise: a create
+failing in phase 5 does not resurrect a branch deleted in phase 4 — the user explicitly
+requested that deletion, multi-ref batches remain non-atomic per the design, and each ref
+still gets its own `ok`/`error` (response order need not match command order).
 
 **2c. Parent creation, prune on delete, self-heal on create.**
 
@@ -118,13 +145,18 @@ order).
 - **Self-heal on create (D/F reuse, `feature/x` deleted → `feature` created):** when a
   ref-file create does not commit — `Refused` **or** an error, since the CLI's outcome shape
   for a file upload colliding with a folder is unverified until the new contract row pins it —
-  and a `Stat` shows a **folder** at that name, `List` it
-  under the lock: **empty → verify-then-`Trash` the folder and retry the create once**;
-  non-empty → refuse, naming the live sub-refs as the conflict (git itself refuses this D/F
-  state locally; the refusal is correct even if the create's failure was transient, because
-  the create cannot succeed while the folder exists). If the diagnostic `Stat` or `List`
-  itself fails, report **that** transport failure and heal nothing — self-heal runs only on
-  positive evidence. A `Refused` against an existing ref **file** keeps its current meaning —
+  and a `Stat` shows a **folder** at that name, the folder's **subtree** is enumerated under
+  the lock, and the test is **"contains no ref files," not "first level is empty."** A crash
+  mid-prune after deleting `refs/heads/feature/x/y` can leave `feature/` containing the empty
+  folder `x/` — a first-level emptiness test would misread that as live sub-refs and
+  permanently block branch `feature`, which is precisely the wedge self-heal exists to
+  prevent. So: subtree contains no ref files (only folders) → verify-then-`Trash` the folder
+  and retry the create once; subtree contains ref files → refuse, naming those **actual ref
+  files** as the conflict (git itself refuses this D/F state locally; the refusal is correct
+  even if the create's failure was transient, because the create cannot succeed while the
+  folder exists — and it never names an empty directory as if it were a ref). If the
+  diagnostic `Stat` or any `List` in the enumeration fails, report **that** transport failure
+  and heal nothing — self-heal runs only on positive evidence. A `Refused` against an existing ref **file** keeps its current meaning —
   concurrent creator, report, never overwrite.
 - **Reverse D/F (component blocked by a ref file):** creating `refs/heads/feature/x` when
   branch `feature` exists as a file and is **not** deleted earlier in this batch → refuse with
@@ -216,10 +248,16 @@ structurally.
 ## Component 5 — UX: marker and MAX_PATH diagnostics
 
 - **Marker-absent vs read-failure.** `RequireMarker` (and any path reporting "not a
-  git-remote-proton repo") distinguishes a **confirmed absence** (transport succeeded, node not
-  found → today's message) from a **failed read** (transport errored → "could not read
-  <path>: <cause>"). Kills the Stage 4 gate 2b masquerade where a broken CLI under
-  `GPB_UNCERTIFIED_CLI=1` surfaced as "not a repo".
+  git-remote-proton repo") distinguishes a **confirmed absence** from a **failed read**
+  ("could not read <path>: <cause>"). **The mechanism is the transport contract's existing
+  seam, not output-text classification:** `Stat` already defines absence as
+  `(_, false, nil)` — a first-class non-error — so the marker check is `Stat`-then-read:
+  `Stat` says absent → today's not-a-repo message; `Stat` errors → transport failure,
+  reported as such; `Stat` says present but the read fails → transport failure, never
+  "absent." No new parsing of CLI error text is introduced anywhere on this path, and the
+  certified CLI's not-found signature that `Stat` itself keys on gets a contract row
+  (component 8) so the classification is pinned live, not assumed. Kills the Stage 4 gate 2b
+  masquerade where a broken CLI under `GPB_UNCERTIFIED_CLI=1` surfaced as "not a repo".
 - **MAX_PATH.** README gains a Windows section: deep clone destinations can exceed the
   legacy 260-character limit; remedies are `git config core.longpaths true` (helps for git's
   own file writes) or a shorter destination (always helps), and which applies. Helper-side:
@@ -294,11 +332,17 @@ Missing parents of the repo root (Surprise R2-1: raw `Node not found: GitRemotes
   now depends on: `Trash` on an **empty** folder and on a folder **with children** (outcome
   shape both ways — prune assumes the former, the check-then-act analysis in 2c assumes the
   latter is recursive), `create-folder` colliding with a file and vice versa (error shape),
-  nested `List`, `upload` of a file colliding with a folder name. Fake and CLI halves must
+  nested `List`, `upload` of a file colliding with a folder name, and **`Stat` on a missing
+  node** — pinning the certified CLI's not-found signature that the component-5
+  absent-vs-error split keys on, and that every other failure of the same command classifies
+  as an error, never as absence. Fake and CLI halves must
   agree per the existing decorator pattern.
 - RED/GUARD labelling, which-assertion-fired reporting, and deliberate-regression checks per
-  the runbook — mandatory for prune, self-heal, batch reordering, and the quarantine publish
-  ordering, which are the load-bearing new behaviours.
+  the runbook — mandatory for prune, self-heal, batch ordering, and the quarantine publish
+  ordering, which are the load-bearing new behaviours. The self-heal suite must include the
+  **nested-empty residue** case (a folder containing only empty folders heals; a folder
+  containing a ref file anywhere in its subtree refuses naming that file), and phase-3
+  failure must be pinned continuing into phase 4 with correct per-ref statuses.
 - Sha-collision hygiene in fixtures (pin `GIT_COMMITTER_DATE` where content repeats).
 
 **Live gate (one, at stage end), in outline:**
@@ -397,3 +441,21 @@ failure as a new class (non-atomic batches with per-ref status already cover it)
 is data loss" as framed (a requested deletion honoured before an unrelated create fails is git's
 own non-atomic remote semantics — the real defect was deletions preceding pack confirmation,
 which is fixed).
+
+**Round 2 (Codex + Gemini, 2026-08-06) — applied:** self-heal's emptiness test made recursive
+— "subtree contains no ref files," never first-level emptiness — closing the nested-empty
+residue wedge, with the refusal naming actual ref files and never an empty directory (both
+engines: Codex as Major, Gemini as the diagnostic corollary); read-boundary name validation
+changed from fatal to skip-with-loud-note per the packs-directory precedent — a stray foreign
+name must not brick every operation on the repo (Gemini) — and moved in-process so
+advertisement never spawns one `git check-ref-format` per ref (Codex's O(refs) cost finding);
+push-side validation keeps authoritative `git check-ref-format`; 2b's invariant reworded to "no
+ref mutation and no destructive operation precedes phase 4" (phase 3 writes immutable objects —
+orphan-on-failure is the accepted class), phase-3 failure control flow made explicit — creates/
+updates error, execution continues into phase 4, deletions run with their own statuses
+(adjudicated in Gemini's direction; Codex asked only that it be defined); preflight's claim
+scoped to the final *ref set*, with empty-folder collisions explicitly left to phase-5
+self-heal (Gemini); marker absent-vs-error given its mechanism — the transport contract's
+`Stat` absence seam, no CLI error-text parsing — plus a contract row pinning the certified
+CLI's not-found signature (Codex); component 8 gains the nested-empty hermetic case and the
+phase-3-continues-into-phase-4 pin.
