@@ -91,18 +91,22 @@ func CheckRefName(name string) error {
 // checkComponent validates ONE path component — the caller has already
 // split on "/", so no slash-crossing rule (min-one-slash, no leading/
 // trailing slash, no "//") applies here. It combines checkStageableLeaf
-// (marker.go: empty, ".", "..", any of "{}/\\", and Windows-reserved device
-// names — this transport's own local-staging concern) with git's
-// PER-COMPONENT check-ref-format rules: a component cannot begin with ".",
-// cannot end with ".lock", cannot contain "..", cannot contain "@{", and
-// cannot contain the forbidden-character set.
+// (marker.go: empty, ".", "..", any of "{}/\\<>\"|", and Windows-reserved
+// device names — this transport's own local-staging concern, including the
+// Windows-filename-invalid characters git itself does NOT forbid) with
+// git's PER-COMPONENT check-ref-format rules: a component cannot begin with
+// ".", cannot end with ".lock", cannot contain "..", cannot contain "@{",
+// and cannot contain the forbidden-character set.
 //
 // Deliberately excluded: the "cannot end with a dot" rule. That is a
 // WHOLE-NAME rule in real git — it fires only against the very last
 // character of the complete ref name, not against every slash-separated
-// component (confirmed against real git as part of the parity test) — so a
-// mid-path component ending in "." is not, on its own, invalid, and
-// checkComponent must not reject what CheckRefName does not.
+// component (confirmed against real git: "refs/heads/a./b" is one of
+// refNameFixtures.accept in refname_test.go, so the parity test actually
+// exercises a mid-path component ending in "." against the real binary,
+// not just this claim) — so a mid-path component ending in "." is not, on
+// its own, invalid, and checkComponent must not reject what CheckRefName
+// does not.
 //
 // Task 8's walk applies this to every listed node — folders included —
 // before recursing into it.
@@ -146,6 +150,12 @@ func checkComponent(name string) error {
 // component containing "{" or "}", because cli-drive@0.7.0 still glob-
 // expands "{" locally (probe C13). advertisableName is where that refusal
 // actually happens; CheckRefName alone would let it through.
+//
+// The same split applies to '<', '>', '"', and '|' (Task 7 fix round):
+// verified live that git accepts "refs/heads/a|b" and "refs/heads/a>b", so
+// CheckRefName accepts them too — but a leaf containing any of them cannot
+// be staged as a Windows file, so checkStageableLeaf refuses them and
+// advertisableName is, again, where that refusal actually happens.
 func advertisableName(name string) error {
 	if err := CheckRefName(name); err != nil {
 		return err

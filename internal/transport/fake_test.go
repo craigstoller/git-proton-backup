@@ -479,6 +479,22 @@ func TestFakeEnsureDirMissingParentErrors(t *testing.T) {
 	}
 }
 
+// TestFakeEnsureDirParentImpliedByAFile (Task 7 fix round, cheap minor):
+// parentExists' "implied by Files" branch (fake.go) was dead relative to the
+// suite — every prior test either seeds f.Dirs directly or relies on a
+// builtin mount parent. A file placed directly in f.Files (bypassing
+// EnsureDir/CreateExclusive entirely, the way plantRepoOnFake-style test
+// helpers plant pack files) still proves its own parent folder exists, so
+// EnsureDir under that folder must succeed without the folder ever having
+// been separately created or seeded.
+func TestFakeEnsureDirParentImpliedByAFile(t *testing.T) {
+	f := NewFake()
+	f.Files["/my-files/r/implied/leaf.txt"] = []byte("x")
+	if err := f.EnsureDir("/my-files/r/implied/newdir"); err != nil {
+		t.Errorf("EnsureDir under a parent implied by an existing file must not need separate seeding: %v", err)
+	}
+}
+
 // TestFakeEnsureDirBuiltinMountParentsNeedNoSeeding pins the deliberate
 // exception: the two Proton Drive top-level namespaces, and up to two path
 // components beneath /devices (a device root and one folder inside it), need

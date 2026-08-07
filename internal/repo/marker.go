@@ -313,14 +313,26 @@ var windowsReserved = map[string]bool{
 // interpreted as a subpath. Beyond that, the set is small because git already
 // forbids space, control characters, '?', '*', '[', '~', '^' and ':' in ref
 // names; what remains is brace globbing (probe C13: 0.7.0 still glob-expands
-// '{') and Windows device names. Refusing these is also consistent — such a
-// ref could never be UPDATED on this transport, so accepting the create would
-// promise what the update cannot keep.
+// '{'), the REST of the Windows-reserved filename characters git does NOT
+// forbid itself (Task 7 fix round: verified live that git accepts
+// "refs/heads/a|b" and "refs/heads/a>b" — '<', '>', '"', and '|' are refused
+// here even though git's own rule set allows them, because a leaf containing
+// any of them cannot be staged as a Windows file — probe C11's local-file
+// requirement again), and Windows device names. Refusing these is also
+// consistent — such a ref could never be UPDATED on this transport, so
+// accepting the create would promise what the update cannot keep.
+//
+// This is a DELIBERATE TIGHTENING of the spec's original leaf-rule set
+// (spec section 2a) beyond what was documented before this fix round; it
+// belongs in the Task 12 v6.5 spec edit and should be called out in the
+// merge review. It is consistent with the already-universal con/aux
+// refusal below: both exist because a ref usable only on the machine that
+// happened to push it first is not usable.
 func checkStageableLeaf(leaf string) error {
 	if leaf == "" || leaf == "." || leaf == ".." {
 		return fmt.Errorf("refusing to stage the name %q", leaf)
 	}
-	if strings.ContainsAny(leaf, `{}/\`) {
+	if strings.ContainsAny(leaf, "{}/\\<>\"|") {
 		return fmt.Errorf("%q cannot be expressed as a local staging path", leaf)
 	}
 	stem := strings.ToLower(leaf)

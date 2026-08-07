@@ -32,13 +32,20 @@ func NewFake() *Fake {
 // namespaces this Fake treats as already existing without ever being
 // explicitly created: the two top-level mounts themselves, and up to two
 // path components beneath /devices — a device root ("/devices/<id>") and one
-// folder inside it ("/devices/<id>/<folder>"). This mirrors
-// docs/superpowers/plans/2026-08-06-v2-stage5-hierarchical-refs.md's
-// EnsureParents design (Task 11), where "/devices/<device-id>" is the real
-// protected mount boundary, not "/devices" alone — a lone device id is
-// itself a pre-existing root the CLI cannot create, the same way "/my-files"
-// is. Anything deeper must be genuinely present in f.Dirs or implied by
-// f.Files, same as every other path.
+// folder inside it ("/devices/<id>/<folder>").
+//
+// The depth-1 case ("/devices/<id>" is itself a pre-existing root the CLI
+// cannot create, the same way "/my-files" is) is the part that follows
+// directly from how Proton Drive's namespaces work. The depth-2 allowance
+// ("/devices/<id>/<folder>" also needing no seeding) is a Task-7-brief-
+// mandated Fake-only convenience on top of that, NOT a claim that this
+// mirrors Task 11's EnsureParents design (docs/superpowers/plans/
+// 2026-08-06-v2-stage5-hierarchical-refs.md) — that design's own
+// protectedDepth only ever protects depth 1 ("/devices/<device-id>").
+// Reconciling (or deliberately keeping distinct) the two definitions is
+// Task 11's call to make, not asserted here. Anything deeper than depth 2
+// must be genuinely present in f.Dirs or implied by f.Files, same as every
+// other path.
 func isBuiltinMountParent(p string) bool {
 	if p == "/my-files" || p == "/devices" {
 		return true
@@ -272,32 +279,22 @@ func (f *Fake) UpdateRevision(p, local string) (Outcome, error) {
 // than the raw CLI's own non-idempotence on folders (spec, component 8,
 // corrected in the same commit as this fix — the wrapper-not-binary
 // precedent ReadTo/C16 already established). Absence — of p itself, or of
-// anything under it — is never an error: found is not consulted for that
-// reason, only kept so a future change has an obvious place to hang a
-// diagnostic without re-deriving it.
+// anything under it — is never an error: the desired end state already
+// holds either way, so nothing here needs to track whether anything was
+// actually found.
 func (f *Fake) Trash(p string) (Outcome, error) {
-	found := false
-	if _, ok := f.Files[p]; ok {
-		delete(f.Files, p)
-		found = true
-	}
-	if f.Dirs[p] {
-		delete(f.Dirs, p)
-		found = true
-	}
+	delete(f.Files, p)
+	delete(f.Dirs, p)
 	prefix := p + "/"
 	for k := range f.Files {
 		if strings.HasPrefix(k, prefix) {
 			delete(f.Files, k)
-			found = true
 		}
 	}
 	for k := range f.Dirs {
 		if strings.HasPrefix(k, prefix) {
 			delete(f.Dirs, k)
-			found = true
 		}
 	}
-	_ = found // already-absent is still Committed (desired end state)
 	return Committed, nil
 }
