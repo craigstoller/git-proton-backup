@@ -282,6 +282,11 @@ func longPathHint(paths ...string) string {
 				"260-character MAX_PATH; if this failure is about path length, set "+
 				"`git config core.longpaths true` or use a shorter destination)", len(p))
 		}
+		// SUPERSEDED (Task 5 execution, 2026-08-07): the sample text above lacks
+		// the word "may" that this task's own Step 1 RED spec requires the hint to
+		// contain — an internal plan inconsistency confirmed in review. Shipped
+		// wording: "...this may be why the write failed — try `git config
+		// core.longpaths true`..." (possible-cause framing, both remedies kept).
 	}
 	return ""
 }
