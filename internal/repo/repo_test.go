@@ -3551,9 +3551,15 @@ func TestDeletePrunesEmptyParentsStopsAtNamespaceRoots(t *testing.T) {
 	}
 }
 
-// TestDeletePruneStopsAtNonEmptyParent is RED: prune must stop climbing at
-// the first non-empty parent. feature/ has TWO children (x and y); deleting
-// x must leave feature/ (and y) untouched, because y still occupies it.
+// TestDeletePruneStopsAtNonEmptyParent is a GUARD, not a RED (review round
+// 4, M8): feature/ has TWO children (x and y), so deleting x must leave
+// feature/ (and y) untouched because y still occupies it. This assertion is
+// satisfied by "pruneEmptyParents correctly stops at a non-empty parent" AND
+// by "pruneEmptyParents does not exist at all" — it passed unmodified
+// against the pre-implementation code (see the task report), so it does NOT
+// by itself detect prune's absence or a bug that skips the emptiness check;
+// it only detects a bug that WRONGLY prunes a non-empty parent, a real and
+// distinct failure mode worth guarding against.
 func TestDeletePruneStopsAtNonEmptyParent(t *testing.T) {
 	f := transport.NewFake()
 	f.Dirs["/r"] = true
@@ -3646,10 +3652,16 @@ func (tr trashFailsForPath) Trash(p string) (transport.Outcome, error) {
 	return tr.Fake.Trash(p)
 }
 
-// TestPruneFailureIsAdvisoryOnly is the GUARD: a prune Trash failure is a
+// TestPruneFailureIsAdvisoryOnly is a GUARD (review round 4, M8: relabelled
+// honestly — it is not independently RED either): a prune Trash failure is a
 // stderr note, not a delete failure — the ref deletion itself still reports
 // ok (best-effort rule), and the leftover empty folder survives for a later
-// create to self-heal.
+// create to self-heal. Like its sibling GUARD above, this assertion is
+// equally satisfied by "pruneEmptyParents does not exist at all" (nothing
+// ever calls the forced-failing Trash, so nothing to report either way) —
+// it passed unmodified against the pre-implementation code. It still
+// detects a real and distinct failure mode: prune swallowing a Trash
+// failure into the delete's own result instead of treating it as advisory.
 func TestPruneFailureIsAdvisoryOnly(t *testing.T) {
 	f := transport.NewFake()
 	f.Dirs["/r"] = true
@@ -3684,6 +3696,38 @@ func TestPruneFailureIsAdvisoryOnly(t *testing.T) {
 	}
 	if !f.Dirs["/r/refs/heads/feature"] {
 		t.Error("the folder must survive when its prune Trash fails — best-effort, not a hard delete")
+	}
+}
+
+// TestDeletePruneNeverFiresFromAlreadyAbsentDeleteArm pins the choice
+// documented at push.go's delete-arm call site (review round 4, M9 —
+// previously unpinned in either direction): pruneEmptyParents is called
+// ONLY after a Committed Trash of the ref file itself, never from the
+// already-absent short-circuit a few lines earlier in the same loop, which
+// trashes nothing and has no empty parent of its OWN making to clean up.
+// refs/heads/feature/z was never created, so this delete hits that
+// short-circuit before t.Trash is ever called. pruneEmptyParents' own first
+// action is always a t.List call on the parent — so zero List calls naming
+// "/r/refs/heads/feature" is the proof it never ran.
+func TestDeletePruneNeverFiresFromAlreadyAbsentDeleteArm(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	var calls []string
+	tr := listCallRecorder{Fake: f, calls: &calls}
+
+	ups := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/feature/z"}}
+	res := Push(tr, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("an already-absent delete must still report ok: %+v", res)
+	}
+	for _, c := range calls {
+		if c == "/r/refs/heads/feature" {
+			t.Errorf("pruneEmptyParents must never fire from the already-absent delete arm, "+
+				"but List was called against its would-be parent, got calls=%v", calls)
+		}
 	}
 }
 
@@ -3936,18 +3980,152 @@ func TestSelfHealFailsClosedOnInvalidComponentInSubtree(t *testing.T) {
 	}
 }
 
+// TestSelfHealNamesInvalidNamedFileAsForeignDataNotAnEnumerationFailure is
+// the FILE-side counterpart of TestSelfHealFailsClosedOnInvalidComponentIn-
+// Subtree, added in review round 4 (M6): unlike an invalid FOLDER name — a
+// genuine recursion hazard subtreeFiles must fail closed on — an invalid
+// FILE name is safely nameable without any further remote call (it was
+// already enumerated as part of listing its already-verified parent). It
+// must be treated as an ordinary foreign-data blocker, refusing the create
+// and naming the file, NOT as an "enumerating its subtree...failed"
+// diagnostic (which would wrongly suggest the whole heal aborted rather
+// than correctly refusing on positive evidence).
+func TestSelfHealNamesInvalidNamedFileAsForeignDataNotAnEnumerationFailure(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	if err := f.EnsureDir("/r/refs/heads/feature"); err != nil {
+		t.Fatal(err)
+	}
+	// "{" is refused by checkComponent (probe C13's local glob-expansion
+	// concern) but is a perfectly ordinary filename otherwise — exactly the
+	// shape a non-v2 actor could drop.
+	const badName = "a{b}.txt"
+	f.Files["/r/refs/heads/feature/"+badName] = []byte("not a ref")
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("must be refused: an invalid-named file still blocks the folder collision, got %+v", res)
+	}
+	if !strings.Contains(res[0].Err, badName) {
+		t.Errorf("must name the invalid-named file, got %q", res[0].Err)
+	}
+	if !strings.Contains(res[0].Err, "foreign") {
+		t.Errorf("must classify it as foreign data by name alone, got %q", res[0].Err)
+	}
+	if strings.Contains(res[0].Err, "enumerating") {
+		t.Errorf("must NOT be diagnosed as an enumeration failure — an invalid FILE name is "+
+			"safely nameable without recursion, got %q", res[0].Err)
+	}
+	if _, ok := f.Files["/r/refs/heads/feature/"+badName]; !ok {
+		t.Error("the invalid-named file must survive untouched")
+	}
+}
+
+// TestDescribeBlockersCapsAtMaxAndSummarizesRest is the review round 4,
+// Important 1 fix: describeBlockers must not call readRef (a subprocess
+// plus a temp dir each) or grow its joined message without bound for a
+// FOREIGN-CONTROLLED file list — any non-v2 actor can drop an arbitrary
+// number of files under a collision folder, the same class of untrusted
+// input previewBytes (refs.go, 64 bytes) and bound (cli.go, 200 characters)
+// already cap elsewhere in this codebase. Direct unit test of
+// describeBlockers itself (not routed through Push) so the cap is pinned
+// precisely, independent of how many files a particular Push scenario
+// happens to construct.
+func TestDescribeBlockersCapsAtMaxAndSummarizesRest(t *testing.T) {
+	f := transport.NewFake()
+	var files []string
+	// A large literal, deliberately NOT expressed in terms of
+	// maxDescribedBlockers: a total defined as "maxDescribedBlockers + N"
+	// would make this test self-referential and unable to catch capping
+	// being removed ENTIRELY (as opposed to merely resized) — a fixed,
+	// independent literal is what actually exercises the cap.
+	const total = 37
+	for i := 0; i < total; i++ {
+		p := fmt.Sprintf("/r/refs/heads/feature/foreign-%d.txt", i)
+		f.Files[p] = []byte("not a ref")
+		files = append(files, p)
+	}
+
+	got := describeBlockers(f, "/r", files)
+
+	shown := 0
+	for i := 0; i < total; i++ {
+		if strings.Contains(got, fmt.Sprintf("foreign-%d.txt", i)) {
+			shown++
+		}
+	}
+	// A generous ceiling, well below `total` and independent of
+	// maxDescribedBlockers' exact value: catches capping being removed
+	// entirely (shown would jump to 37) without being coupled to the
+	// constant's current number the way a self-referential total would be.
+	const sanityCeiling = 15
+	if shown == 0 || shown >= sanityCeiling {
+		t.Fatalf("want a small, bounded number of named blockers (capped, not all %d), got %d named in %q",
+			total, shown, got)
+	}
+	if shown > maxDescribedBlockers {
+		t.Errorf("named more blockers (%d) than maxDescribedBlockers (%d)", shown, maxDescribedBlockers)
+	}
+	wantRemaining := total - shown
+	if !strings.Contains(got, fmt.Sprintf("%d more", wantRemaining)) {
+		t.Errorf("want a summary naming %d more, got %q", wantRemaining, got)
+	}
+}
+
 // ================= Task 9b: composed prune-then-heal workflow ===============
+
+// pruneHealOrderTransport records the ORDER of Trash and CreateExclusive
+// calls against ONE watched path. Built specifically to discriminate two
+// otherwise-identical end states in the composed prune-then-heal test below
+// (review round 4, Important 3): "prune's own Trash actually ran in phase 4"
+// vs. "prune never ran, but self-heal covered for its absence in phase 5" —
+// Step 6c's deliberate-regression run (task report) proved these two paths
+// produce the SAME final Fake state and the SAME Push results, so no
+// end-state assertion alone can tell them apart. The call ORDER can: prune
+// fires unconditionally in phase 4, so if it ran, Trash on the watched path
+// precedes any CreateExclusive attempt against it; if prune did not run,
+// phase 5's first move is a CreateExclusive attempt that fails against the
+// still-occupied folder, and only THEN does self-heal's own Trash run —
+// CreateExclusive precedes Trash.
+type pruneHealOrderTransport struct {
+	*transport.Fake
+	watch string
+	calls *[]string
+}
+
+func (p pruneHealOrderTransport) Trash(path string) (transport.Outcome, error) {
+	if path == p.watch {
+		*p.calls = append(*p.calls, "trash")
+	}
+	return p.Fake.Trash(path)
+}
+
+func (p pruneHealOrderTransport) CreateExclusive(path, local string) (transport.Outcome, error) {
+	if path == p.watch {
+		*p.calls = append(*p.calls, "create")
+	}
+	return p.Fake.CreateExclusive(path, local)
+}
 
 // TestPushDeletePrunesThenCreateReusesFolderInOneBatch composes both halves
 // of Task 9b in ONE batch: deleting the only ref under feature/ must prune
 // the now-empty folder in PHASE 4, and creating branch "feature" in the SAME
-// batch's PHASE 5 must then land cleanly through ordinary WriteRef — prune
-// having already cleared the collision before phase 5 ever runs, so self-
-// heal's retry path is not even needed. TestDeletePrunesEmptyParentsStops-
+// batch's PHASE 5 must then land cleanly. TestDeletePrunesEmptyParentsStops-
 // AtNamespaceRoots and TestCreateSelfHealsEmptyFolderCollision each pin one
 // half of this in isolation; this pins the composition the handoff notes
-// call out explicitly: phase-4-before-phase-5 ordering is what makes the
-// D/F reuse workflow deterministic within a single batch.
+// call out explicitly.
+//
+// The end-state assertions below (x gone, feature is now a ref, not a
+// folder) are satisfied EITHER by prune actually running in phase 4 OR by
+// self-heal covering for its absence in phase 5 — Step 6c's deliberate
+// regression proved this directly (task report). pruneHealOrderTransport's
+// call-order trace is the discriminator that actually pins "phase 4 prunes
+// BEFORE phase 5 ever has to heal": it asserts the FIRST call against the
+// watched path is prune's own Trash, not a failed CreateExclusive attempt.
 func TestPushDeletePrunesThenCreateReusesFolderInOneBatch(t *testing.T) {
 	f := transport.NewFake()
 	f.Dirs["/r"] = true
@@ -3970,12 +4148,15 @@ func TestPushDeletePrunesThenCreateReusesFolderInOneBatch(t *testing.T) {
 		}
 	}
 
+	var calls []string
+	tr := pruneHealOrderTransport{Fake: f, watch: "/r/refs/heads/feature", calls: &calls}
+
 	ups := []protocol.RefUpdate{
 		{Src: "", Dst: "refs/heads/feature/x"},
 		{Src: "refs/heads/main", Dst: "refs/heads/feature"},
 	}
 	remote := map[string]string{"refs/heads/main": head, "refs/heads/feature/x": head}
-	res := Push(f, "/r", gitDir, ups, remote)
+	res := Push(tr, "/r", gitDir, ups, remote)
 	for _, r := range res {
 		if !r.OK {
 			t.Fatalf("both the delete and the create must succeed in one batch: %+v", res)
@@ -3990,6 +4171,14 @@ func TestPushDeletePrunesThenCreateReusesFolderInOneBatch(t *testing.T) {
 	}
 	if f.Dirs["/r/refs/heads/feature"] {
 		t.Error("feature must be a FILE now, not a leftover folder")
+	}
+	// The discriminator: prune's own Trash must be the FIRST call against
+	// the watched path — proving phase 4 cleared the collision before phase
+	// 5 ever attempted (and would have needed to heal) a create there.
+	if len(calls) == 0 || calls[0] != "trash" {
+		t.Fatalf("want prune's own Trash of refs/heads/feature to run BEFORE any create "+
+			"attempt against it (this is what distinguishes 'phase 4 pruned it' from "+
+			"'self-heal covered for prune never running'), got call order %v", calls)
 	}
 }
 

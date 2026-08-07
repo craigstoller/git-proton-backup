@@ -308,24 +308,39 @@ func (c *CLI) EnsureDir(p string) error {
 // createOut is create-folder's own trimmed output, already captured by the
 // caller; it is quoted here, never re-derived.
 //
-// Classification, in order: the raw info output parses as a folder node ->
-// resolved, proceed as if the folder was there all along (nil); parses as a
-// file node -> the reverse-D/F refusal, named, not a silent proceed; fails to
-// parse but carries notFoundSignature -> the C17 signature itself, GENERIC
-// ROBUSTNESS ONLY (see alreadyExistsSignature's doc comment: observed once
-// live, never reproduced under provocation — C17b's ruling stands, this can
-// never be claimed as a validated live fix) — error quoting both raw
-// observations verbatim so a genuine recurrence stays diagnosable; anything
-// else -> error quoting both as undetermined.
+// Classification, in order: code == -1 (mirrors Stat's own code==-1 guard,
+// above) -> the CLI executable itself never started for THIS re-observation
+// call, a distinct transport failure, never folded into "not found" or
+// "undetermined" (review round 4, M5 — the original version discarded the
+// exit code entirely and would have misdiagnosed this as one of those two);
+// code == 0 AND the raw output parses as a folder node -> resolved, proceed
+// as if the folder was there all along (nil); code == 0 AND parses as a
+// file node -> the reverse-D/F refusal, named, not a silent proceed; the
+// JSON parse is gated on code == 0 throughout — a nonzero exit is never fed
+// to parseNodeJSON, matching Stat's own contract that a successful parse
+// only ever happens on a confirmed-successful call; carries
+// notFoundSignature -> the C17 signature itself, GENERIC ROBUSTNESS ONLY
+// (see alreadyExistsSignature's doc comment: observed once live, never
+// reproduced under provocation — C17b's ruling stands, this can never be
+// claimed as a validated live fix) — error quoting both raw observations
+// verbatim so a genuine recurrence stays diagnosable; anything else -> error
+// quoting both as undetermined.
 func (c *CLI) reobserveEnsureDirContradiction(p, createOut string) error {
-	infoOut, _, _ := c.run("filesystem", "info", p, "--json")
-	if n, perr := parseNodeJSON([]byte(infoOut)); perr == nil {
-		if n.IsDir {
-			return nil // resolved: a folder genuinely is there now
+	infoOut, infoCode, infoErr := c.run("filesystem", "info", p, "--json")
+	if infoCode == -1 {
+		return fmt.Errorf("contradiction creating folder %s could not be re-observed: the "+
+			"Proton CLI did not start for the follow-up info call: %v (original create-folder "+
+			"output: %q)", p, infoErr, bound(createOut, 200))
+	}
+	if infoCode == 0 {
+		if n, perr := parseNodeJSON([]byte(infoOut)); perr == nil {
+			if n.IsDir {
+				return nil // resolved: a folder genuinely is there now
+			}
+			return fmt.Errorf("cannot use %s as a folder: a file occupies that name "+
+				"(create-folder reported %q; a follow-up info call confirms a file)",
+				p, bound(createOut, 200))
 		}
-		return fmt.Errorf("cannot use %s as a folder: a file occupies that name "+
-			"(create-folder reported %q; a follow-up info call confirms a file)",
-			p, bound(createOut, 200))
 	}
 	trimmedInfo := strings.TrimSpace(infoOut)
 	if strings.Contains(trimmedInfo, notFoundSignature) {

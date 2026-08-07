@@ -525,9 +525,17 @@ func pruneEmptyParents(t transport.Transport, root, ref string) {
 			return
 		}
 		out, err := t.Trash(root + "/" + dir)
-		if err != nil || out != transport.Committed {
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "git-remote-proton: prune: leaving empty folder %s/%s "+
-				"(trash reported %v/%s); a later create at this name self-heals\n", root, dir, err, out)
+				"(trash failed: %v); a later create at this name self-heals\n", root, dir, err)
+			return
+		}
+		if out != transport.Committed {
+			// err is nil here (M10) — report the outcome itself instead of a
+			// useless "trash reported <nil>/...", matching the delete arm's
+			// own earlier fix for the identical shape.
+			fmt.Fprintf(os.Stderr, "git-remote-proton: prune: leaving empty folder %s/%s "+
+				"(trash reported %s); a later create at this name self-heals\n", root, dir, out)
 			return
 		}
 	}
@@ -543,26 +551,38 @@ func pruneEmptyParents(t transport.Transport, root, ref string) {
 // "ref vs. foreign" gets decided, and only for the message, never for
 // whether healing is allowed to proceed.
 //
-// Like the ListRefs walk (refs.go), it applies checkComponent to every
-// child — folders AND files — BEFORE recursing (plan round 3, Codex): an
-// invalid component, a foreign folder named a{b} say, returns an ERROR,
-// which makes the heal FAIL CLOSED (no recursion into an unverifiable
-// remote path, no trash over an incompletely-enumerated subtree). A trace
-// test pins that no List ever names the invalid path and nothing is
-// trashed.
+// checkComponent gates FOLDER names only, BEFORE recursing into them (plan
+// round 3, Codex): an invalid folder component, a{b} say, returns an ERROR,
+// which makes the heal FAIL CLOSED (no List() call is ever made naming an
+// unverifiable remote path — this transport's remote-glob behaviour on
+// characters like "{" is UNVERIFIED, probe C13 only confirmed LOCAL
+// glob-expansion on upload; a trace test pins that no List ever names the
+// invalid path and nothing is trashed). A FILE with an invalid component is
+// NOT gated here (review round 4, M6): including it in the returned slice
+// makes no further remote call — it was already safely enumerated as part
+// of listing its PARENT, an already-verified path — so there is no
+// recursion hazard to guard against. describeBlockers is where an
+// invalid-named file gets classified, by name alone, without ever
+// readRef-ing the suspect path.
 func subtreeFiles(t transport.Transport, folder string) ([]string, error) {
 	nodes, err := t.List(folder)
 	if err != nil {
-		return nil, err
+		// Wrapped with the failing folder's own path (Important 2, review
+		// round 4) — the exact defect ListRefs' own walk (refs.go) already
+		// documents fixing: without it, a List failure several levels into
+		// the subtree surfaces as whatever bare message the transport
+		// happened to return, with nothing here naming WHICH folder in the
+		// recursion actually failed.
+		return nil, fmt.Errorf("listing %s: %w", folder, err)
 	}
 	var out []string
 	for _, n := range nodes {
-		if err := checkComponent(n.Name); err != nil {
-			return nil, fmt.Errorf("subtree of %s contains an unverifiable name %q: %w",
-				folder, n.Name, err)
-		}
 		full := folder + "/" + n.Name
 		if n.IsDir {
+			if err := checkComponent(n.Name); err != nil {
+				return nil, fmt.Errorf("subtree of %s contains an unverifiable folder name %q: %w",
+					folder, n.Name, err)
+			}
 			sub, err := subtreeFiles(t, full)
 			if err != nil {
 				return nil, err
@@ -575,24 +595,58 @@ func subtreeFiles(t transport.Transport, folder string) ([]string, error) {
 	return out, nil
 }
 
-// describeBlockers renders one clause per blocking file, naming each as
-// what it actually IS rather than treating every blocker alike: a file
-// whose content reads back through readRef as a valid 40-hex sha is a
-// genuine conflicting REF; anything else — content a non-v2 actor could
-// have dropped at any advertisable-shaped name, e.g. "feature/notes.txt" —
-// is named as foreign data, never as a ref. Classification is by CONTENT
-// (readRef), not by the file's name shape: a foreign file can sit at a name
-// that is itself perfectly ref-shaped (git ref names may contain dots), so
-// name-shape alone cannot tell the two apart.
+// maxDescribedBlockers caps how many blocking entries describeBlockers
+// actually names and readRef's (review round 4, Important 1): the blockers
+// come from a folder's contents, which is FOREIGN-CONTROLLED — any non-v2
+// actor can drop an arbitrary number of files there — and each described
+// entry costs a readRef (a subprocess plus a temp dir) and grows one joined
+// error string without bound. The codebase caps every other piece of
+// untrusted rendering the same way (previewBytes: 64 bytes, refs.go; bound:
+// 200 characters, cli.go); this is that same discipline applied here.
+const maxDescribedBlockers = 5
+
+// describeBlockers renders one clause per blocking file (capped at
+// maxDescribedBlockers, with the remainder summarised as a count — Important
+// 1), naming each as what it actually IS rather than treating every blocker
+// alike: a file whose content reads back through readRef as a valid 40-hex
+// sha is a genuine conflicting REF; anything else — content a non-v2 actor
+// could have dropped at any advertisable-shaped name, e.g.
+// "feature/notes.txt" — is named as foreign data, never as a ref.
+// Classification is by CONTENT (readRef), not by the file's name shape: a
+// foreign file can sit at a name that is itself perfectly ref-shaped (git
+// ref names may contain dots), so name-shape alone cannot tell the two
+// apart.
+//
+// The ONE exception: a leaf whose OWN component fails checkComponent (M6)
+// is classified as foreign data by NAME alone, without ever calling readRef
+// on it — a structurally invalid ref-name component can never be a
+// legitimate ref regardless of content, so there is nothing to gain by
+// probing it, and every probe on an unverified name carries the same local
+// glob-expansion risk (probe C13) subtreeFiles' folder case guards against.
 func describeBlockers(t transport.Transport, root string, files []string) string {
-	parts := make([]string, 0, len(files))
-	for _, p := range files {
+	shown := files
+	var remaining int
+	if len(files) > maxDescribedBlockers {
+		shown = files[:maxDescribedBlockers]
+		remaining = len(files) - maxDescribedBlockers
+	}
+	parts := make([]string, 0, len(shown)+1)
+	for _, p := range shown {
 		rel := strings.TrimPrefix(p, root+"/")
+		leaf := rel[strings.LastIndex(rel, "/")+1:]
+		if cerr := checkComponent(leaf); cerr != nil {
+			parts = append(parts, fmt.Sprintf("%s (foreign data, not a ref: invalid ref-name "+
+				"component: %v)", rel, cerr))
+			continue
+		}
 		if sha, err := readRef(t, p); err == nil {
 			parts = append(parts, fmt.Sprintf("%s (a conflicting ref, currently %s)", rel, sha))
 		} else {
 			parts = append(parts, fmt.Sprintf("%s (foreign data, not a ref: %v)", rel, err))
 		}
+	}
+	if remaining > 0 {
+		parts = append(parts, fmt.Sprintf("…and %d more", remaining))
 	}
 	return strings.Join(parts, "; ")
 }
@@ -639,16 +693,29 @@ func createRefHealingCollision(t transport.Transport, root, ref, sha string) (tr
 			"trashed", ref, ferr)
 	}
 	if len(files) > 0 {
-		// partition into ref-shaped names vs foreign; name each as what it is
+		// partition into ref-shaped names vs foreign; name each as what it is.
+		// NOTE (M7): this Refused carries a NON-NIL error, unlike WriteRef's
+		// own (Refused, nil) concurrent-creator convention (refs.go) — a
+		// caller must check err FIRST, exactly as Push's phase 5 already
+		// does (`if err != nil || out == transport.Ambiguous` is checked
+		// before the bare `out == transport.Refused` branch).
 		return transport.Refused, fmt.Errorf("a folder occupies %s and its contents block "+
 			"the branch: %s", ref, describeBlockers(t, root, files))
 	}
-	if tout, terr := t.Trash(root + "/" + ref); terr != nil || tout != transport.Committed {
+	tout, terr := t.Trash(root + "/" + ref)
+	if terr != nil {
 		return transport.Ambiguous, fmt.Errorf("empty folder at %s could not be cleared "+
-			"(trash reported %v/%s); refusing to create over unknown state", ref, terr, tout)
+			"(trash failed: %v); refusing to create over unknown state", ref, terr)
 	}
-	fmt.Fprintf(os.Stderr, "git-remote-proton: cleared leftover empty folder at %s "+
-		"(residue of an interrupted delete)\n", ref)
+	if tout != transport.Committed {
+		// terr is nil here, so a bare "%v" would print the useless "trash
+		// failed: <nil>" (M10) — report the outcome itself instead, matching
+		// the delete arm's own earlier fix for the identical shape.
+		return transport.Ambiguous, fmt.Errorf("empty folder at %s could not be cleared "+
+			"(trash reported %s); refusing to create over unknown state", ref, tout)
+	}
+	fmt.Fprintf(os.Stderr, "git-remote-proton: cleared what is likely residue of an "+
+		"interrupted delete — an empty folder at %s\n", ref)
 	return WriteRef(t, root, ref, sha, false) // retry ONCE
 }
 

@@ -1081,14 +1081,25 @@ func ensureDirRoleCLI(t *testing.T, role string) *CLI {
 // EnsureDir returns nil for ANY existing node without ever reading
 // Node.IsDir (cli.go:221-225), so a ref FILE at the path reads as a usable
 // folder and the reverse-D/F failure surfaces later with a wrong diagnostic.
-// The stand-in role answers the initial info call with a FILE node, and the
-// script has exactly ONE scripted response — if EnsureDir wrongly proceeds
-// to call create-folder, the role's own overrun guard fires and the test
-// fails loudly rather than silently exercising an unintended path.
+// The stand-in role answers the initial info call with a FILE node.
+//
+// The script has exactly ONE scripted response, but that alone is NOT what
+// proves EnsureDir didn't wrongly proceed to create-folder (review round 4,
+// M4): a wrongly-proceeding EnsureDir still calls c.run a second time, gets
+// the role's overrun-guard failure, and STILL returns a non-nil error —
+// so a bare err!=nil assertion passes either way. The content check below
+// (the path itself, only ever named by the FIRST-call diagnosis) is what
+// actually discriminates "refused correctly, from the Stat alone" from
+// "proceeded, then failed for an unrelated overrun reason".
 func TestEnsureDirRefusesAFileAtThePath(t *testing.T) {
 	c := ensureDirRoleCLI(t, roleEnsureDirFile)
-	if err := c.EnsureDir("/r/refs/heads/main"); err == nil {
+	const path = "/r/refs/heads/main"
+	err := c.EnsureDir(path)
+	if err == nil {
 		t.Fatal("EnsureDir onto a FILE must error, never return nil")
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Errorf("error must name the path, got %q", err.Error())
 	}
 }
 
