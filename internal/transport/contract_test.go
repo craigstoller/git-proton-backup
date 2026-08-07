@@ -280,6 +280,46 @@ var contractCases = []contractCase{
 		}
 	}},
 
+	// Task 9b: pins the REAL text behind alreadyExistsSignature (cli.go) —
+	// the C17b hypothesis constant EnsureDir's contradiction re-observation
+	// keys on. This is NOT a reproduction of the C17 race itself (observed
+	// once live under genuine check-then-create timing, never reproduced
+	// under deliberate provocation — docs/research/probes/
+	// c17b-provocation-log.md); it only confirms that create-folder's own
+	// ordinary already-exists wording, genuinely provoked here by calling
+	// create-folder on a folder EnsureDir already made, still contains
+	// "already exists" on the certified build. If this ever stops matching,
+	// EnsureDir's contradiction re-observation keys on a constant the live
+	// CLI no longer uses, and this row is what catches that before a real
+	// contradiction is ever misdiagnosed.
+	{"create-folder on an existing folder reports the already-exists signature (Task 9b, C17b)",
+		func(t *testing.T, tr Transport, root string, stage func(string, string) string) {
+			d := root + "/already-there"
+			if err := tr.EnsureDir(d); err != nil {
+				t.Fatalf("EnsureDir: %v", err)
+			}
+			if c, ok := tr.(*CLI); ok {
+				out, code, runErr := c.run("filesystem", "create-folder", root, "already-there")
+				if code == 0 {
+					t.Fatalf("expected a nonzero exit for create-folder on an existing folder, "+
+						"got 0 (out=%q, err=%v)", out, runErr)
+				}
+				t.Logf("live already-exists output (must contain alreadyExistsSignature %q): %q",
+					alreadyExistsSignature, out)
+				if !strings.Contains(out, alreadyExistsSignature) {
+					t.Errorf("the live CLI's already-exists text no longer contains "+
+						"alreadyExistsSignature %q — got %q; update the constant in cli.go "+
+						"before trusting EnsureDir's contradiction re-observation",
+						alreadyExistsSignature, out)
+				}
+			}
+			// Hermetic half, both implementations: EnsureDir itself must stay
+			// idempotent regardless of what the raw create-folder call above did.
+			if err := tr.EnsureDir(d); err != nil {
+				t.Errorf("EnsureDir must remain idempotent on an existing folder: %v", err)
+			}
+		}},
+
 	// Upload of a file colliding with an existing folder name. UNVERIFIED ON
 	// THE REAL CLI UNTIL THE GATE (Task 7 brief) — the Fake models the
 	// conservative reading, Refused with no error, mirroring the D/F

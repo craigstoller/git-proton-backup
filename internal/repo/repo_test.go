@@ -3502,6 +3502,497 @@ func TestPushDeleteOfTheOnlyBranchLeavesTheRepoHeadless(t *testing.T) {
 	}
 }
 
+// ======================= Task 9b: prune on delete ===========================
+
+// TestDeletePrunesEmptyParentsStopsAtNamespaceRoots is RED: deleting
+// refs/heads/feature/x must trash the ref AND the now-empty feature/ folder
+// it leaves behind, while refs/heads itself — a protected namespace root —
+// survives untouched.
+func TestDeletePrunesEmptyParentsStopsAtNamespaceRoots(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
+
+	// refs/heads/main is seeded ALONGSIDE feature/x so remote HEAD backfills
+	// to main (matching gitDir's own local HEAD, DeriveHEAD's tie-break) —
+	// not to feature/x, which would then make the delete under test refuse
+	// itself as "deleting the branch HEAD points at" before ever reaching
+	// prune. This is a test-setup concern, not the code under test.
+	createUps := []protocol.RefUpdate{
+		{Src: "refs/heads/main", Dst: "refs/heads/main"},
+		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"},
+	}
+	res := Push(f, "/r", gitDir, createUps, map[string]string{})
+	for _, r := range res {
+		if !r.OK {
+			t.Fatalf("setup creates must succeed: %+v", res)
+		}
+	}
+	if !f.Dirs["/r/refs/heads/feature"] {
+		t.Fatalf("setup: want feature/ folder to exist before the delete under test")
+	}
+
+	delUps := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/feature/x"}}
+	remote := map[string]string{"refs/heads/main": head, "refs/heads/feature/x": head}
+	res = Push(f, "/r", gitDir, delUps, remote)
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("delete should succeed: %+v", res)
+	}
+	if _, ok := f.Files["/r/refs/heads/feature/x"]; ok {
+		t.Error("ref file must be gone")
+	}
+	if f.Dirs["/r/refs/heads/feature"] {
+		t.Error("the now-empty feature/ folder must be pruned")
+	}
+	if !f.Dirs["/r/refs/heads"] {
+		t.Error("refs/heads itself must survive pruning (protected namespace root)")
+	}
+}
+
+// TestDeletePruneStopsAtNonEmptyParent is RED: prune must stop climbing at
+// the first non-empty parent. feature/ has TWO children (x and y); deleting
+// x must leave feature/ (and y) untouched, because y still occupies it.
+func TestDeletePruneStopsAtNonEmptyParent(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
+
+	// refs/heads/main is seeded too (same reason as the sibling test above):
+	// without it, DeriveHEAD's alphabetical tie-break among feature/x and
+	// feature/y would still point remote HEAD at feature/x, refusing the
+	// delete under test before it ever reaches prune.
+	createUps := []protocol.RefUpdate{
+		{Src: "refs/heads/main", Dst: "refs/heads/main"},
+		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"},
+		{Src: "refs/heads/main", Dst: "refs/heads/feature/y"},
+	}
+	res := Push(f, "/r", gitDir, createUps, map[string]string{})
+	for _, r := range res {
+		if !r.OK {
+			t.Fatalf("setup creates must succeed: %+v", res)
+		}
+	}
+
+	delUps := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/feature/x"}}
+	remote := map[string]string{
+		"refs/heads/main":      head,
+		"refs/heads/feature/x": head,
+		"refs/heads/feature/y": head,
+	}
+	res = Push(f, "/r", gitDir, delUps, remote)
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("delete should succeed: %+v", res)
+	}
+	if _, ok := f.Files["/r/refs/heads/feature/x"]; ok {
+		t.Error("x must be gone")
+	}
+	if !f.Dirs["/r/refs/heads/feature"] {
+		t.Error("feature/ must survive — its sibling y is still present")
+	}
+	if _, ok := f.Files["/r/refs/heads/feature/y"]; !ok {
+		t.Error("y must be untouched")
+	}
+}
+
+// TestDeletePrunesOnDemandNamespaceRoot is RED: unlike refs/heads and
+// refs/tags, an on-demand namespace root such as refs/notes is itself
+// prunable once its last ref is deleted.
+func TestDeletePrunesOnDemandNamespaceRoot(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
+
+	createUps := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/notes/commits"}}
+	res := Push(f, "/r", gitDir, createUps, map[string]string{})
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("setup create failed: %+v", res)
+	}
+	if !f.Dirs["/r/refs/notes"] {
+		t.Fatalf("setup: want refs/notes to exist")
+	}
+
+	delUps := []protocol.RefUpdate{{Src: "", Dst: "refs/notes/commits"}}
+	res = Push(f, "/r", gitDir, delUps, map[string]string{"refs/notes/commits": head})
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("delete should succeed: %+v", res)
+	}
+	if f.Dirs["/r/refs/notes"] {
+		t.Error("refs/notes is a non-heads/tags namespace root and must be pruned when empty")
+	}
+	if !f.Dirs["/r/refs"] {
+		t.Error("refs/ itself must survive (always protected)")
+	}
+}
+
+// trashFailsForPath forces Trash to report Ambiguous for exactly ONE path,
+// leaving every other Trash call — including the ref delete's own — to the
+// wrapped Fake. Built to isolate pruneEmptyParents' own Trash call from the
+// ref delete's Trash call, which must succeed normally.
+type trashFailsForPath struct {
+	*transport.Fake
+	failPath string
+}
+
+func (tr trashFailsForPath) Trash(p string) (transport.Outcome, error) {
+	if p == tr.failPath {
+		return transport.Ambiguous, nil
+	}
+	return tr.Fake.Trash(p)
+}
+
+// TestPruneFailureIsAdvisoryOnly is the GUARD: a prune Trash failure is a
+// stderr note, not a delete failure — the ref deletion itself still reports
+// ok (best-effort rule), and the leftover empty folder survives for a later
+// create to self-heal.
+func TestPruneFailureIsAdvisoryOnly(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
+
+	// refs/heads/main is seeded too, same reason as the prune tests above:
+	// otherwise remote HEAD backfills to feature/x and the delete under test
+	// refuses itself before ever reaching prune.
+	createUps := []protocol.RefUpdate{
+		{Src: "refs/heads/main", Dst: "refs/heads/main"},
+		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"},
+	}
+	res := Push(f, "/r", gitDir, createUps, map[string]string{})
+	for _, r := range res {
+		if !r.OK {
+			t.Fatalf("setup creates must succeed: %+v", res)
+		}
+	}
+
+	tr := trashFailsForPath{Fake: f, failPath: "/r/refs/heads/feature"}
+	delUps := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/feature/x"}}
+	remote := map[string]string{"refs/heads/main": head, "refs/heads/feature/x": head}
+	res = Push(tr, "/r", gitDir, delUps, remote)
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("the ref delete itself must still report ok even though the prune trash "+
+			"failed: %+v", res)
+	}
+	if _, ok := f.Files["/r/refs/heads/feature/x"]; ok {
+		t.Error("ref file must still be gone")
+	}
+	if !f.Dirs["/r/refs/heads/feature"] {
+		t.Error("the folder must survive when its prune Trash fails — best-effort, not a hard delete")
+	}
+}
+
+// ======================= Task 9b: self-heal on create =======================
+
+// TestCreateSelfHealsEmptyFolderCollision is RED: a leftover EMPTY folder at
+// refs/heads/feature (simulating a crashed prune) must not permanently block
+// creating branch "feature" — the create heals the collision (folder
+// trashed, WriteRef retried once) and succeeds.
+func TestCreateSelfHealsEmptyFolderCollision(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
+
+	if err := f.EnsureDir("/r/refs/heads/feature"); err != nil {
+		t.Fatal(err)
+	}
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("self-heal should let the create succeed: %+v", res)
+	}
+	sha, err := readRef(f, "/r/refs/heads/feature")
+	if err != nil || sha != head {
+		t.Fatalf("feature must now be a ref: sha=%q err=%v want=%q", sha, err, head)
+	}
+	if f.Dirs["/r/refs/heads/feature"] {
+		t.Error("feature must be a FILE now, not a leftover folder")
+	}
+}
+
+// TestCreateSelfHealsNestedEmptyResidue is RED (round-2 [Both] catch):
+// leftover feature/ containing ONLY the empty folder feature/x/ (simulating
+// a crash mid-prune after deleting refs/heads/feature/x/y) — nested empties
+// must heal too. The rule is "contains no files ANYWHERE in the subtree",
+// not "the first level is empty": a first-level-only check would see one
+// entry (the dir "x") and wrongly refuse.
+func TestCreateSelfHealsNestedEmptyResidue(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
+
+	if err := f.EnsureDir("/r/refs/heads/feature"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.EnsureDir("/r/refs/heads/feature/x"); err != nil {
+		t.Fatal(err)
+	}
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("self-heal must clear a NESTED empty-folder residue too: %+v", res)
+	}
+	sha, err := readRef(f, "/r/refs/heads/feature")
+	if err != nil || sha != head {
+		t.Fatalf("feature must now be a ref: sha=%q err=%v want=%q", sha, err, head)
+	}
+}
+
+// TestCreateRefusesFolderWithForeignFileUntouched is RED (round-3 Gemini
+// catch): feature/ containing a FOREIGN file (feature/notes.txt, droppable
+// by any non-v2 actor) must refuse the create, name notes.txt AS FOREIGN
+// DATA (never as a ref), and touch NOTHING — the file must survive.
+func TestCreateRefusesFolderWithForeignFileUntouched(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	if err := f.EnsureDir("/r/refs/heads/feature"); err != nil {
+		t.Fatal(err)
+	}
+	const notesContent = "just some notes, not a ref"
+	f.Files["/r/refs/heads/feature/notes.txt"] = []byte(notesContent)
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("must be refused: a foreign file blocks the folder collision, got %+v", res)
+	}
+	if !strings.Contains(res[0].Err, "notes.txt") {
+		t.Errorf("must name notes.txt, got %q", res[0].Err)
+	}
+	if !strings.Contains(res[0].Err, "foreign") {
+		t.Errorf("must name notes.txt as foreign data, not a ref, got %q", res[0].Err)
+	}
+	if strings.Contains(res[0].Err, "conflicting ref") {
+		t.Errorf("must not describe the foreign file as a conflicting ref, got %q", res[0].Err)
+	}
+	got, ok := f.Files["/r/refs/heads/feature/notes.txt"]
+	if !ok || string(got) != notesContent {
+		t.Errorf("the foreign file must survive untouched, got ok=%v content=%q", ok, got)
+	}
+	if !f.Dirs["/r/refs/heads/feature"] {
+		t.Error("the folder must not have been trashed")
+	}
+}
+
+// TestCreateRefusesFolderWithLiveSubRefs is RED: feature/ containing a real
+// sub-ref (refs/heads/feature/x) must refuse the create, naming
+// refs/heads/feature/x as a conflicting ref — and must leave it untouched.
+//
+// The remote map deliberately does NOT know about refs/heads/feature/x (as
+// if from a stale ListRefs, or a concurrent write not yet observed) —
+// mirroring TestPushReverseDFRefusedNamingTheBlockingRef's technique — so
+// phase 2's own finalSet preflight (which only ever consults the
+// caller-supplied remote map) cannot see the conflict and refuse it there;
+// the collision is only discovered when createRefHealingCollision actually
+// enumerates the subtree in phase 5, which is the code path under test.
+func TestCreateRefusesFolderWithLiveSubRefs(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
+
+	seedUps := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature/x"}}
+	if res := Push(f, "/r", gitDir, seedUps, map[string]string{}); len(res) != 1 || !res[0].OK {
+		t.Fatalf("setup create failed: %+v", res)
+	}
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{}) // remote map does NOT know about x
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("must be refused: a live sub-ref blocks the folder collision, got %+v", res)
+	}
+	if !strings.Contains(res[0].Err, "refs/heads/feature/x") {
+		t.Errorf("must name the conflicting sub-ref, got %q", res[0].Err)
+	}
+	if !strings.Contains(res[0].Err, "conflicting ref") {
+		t.Errorf("must describe it as a conflicting ref, got %q", res[0].Err)
+	}
+	sha, err := readRef(f, "/r/refs/heads/feature/x")
+	if err != nil || sha != head {
+		t.Errorf("the live sub-ref must survive untouched: sha=%q err=%v", sha, err)
+	}
+}
+
+// statFailsForPath forces Stat to return a transport error for exactly one
+// path, leaving every other Stat call to the wrapped Fake. Used to exercise
+// self-heal's "diagnostic Stat failed" fail-closed arm without disturbing
+// anything else on the create path (WriteRef's own verification uses
+// readRef/ReadTo, never Stat, so nothing else is affected).
+type statFailsForPath struct {
+	*transport.Fake
+	failPath string
+}
+
+func (s statFailsForPath) Stat(p string) (transport.Node, bool, error) {
+	if p == s.failPath {
+		return transport.Node{}, false, errors.New("simulated stat failure")
+	}
+	return s.Fake.Stat(p)
+}
+
+// TestSelfHealAbortsOnDiagnosticFailure is the GUARD: when self-heal's own
+// diagnostic Stat fails (as opposed to affirmatively confirming a folder or
+// a file), that transport error must be reported and NOTHING healed —
+// self-heal runs only on positive evidence.
+func TestSelfHealAbortsOnDiagnosticFailure(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	if err := f.EnsureDir("/r/refs/heads/feature"); err != nil {
+		t.Fatal(err)
+	}
+	tr := statFailsForPath{Fake: f, failPath: "/r/refs/heads/feature"}
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+	res := Push(tr, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("must fail when the diagnostic Stat errors, got %+v", res)
+	}
+	if !strings.Contains(res[0].Err, "simulated stat failure") {
+		t.Errorf("must surface the diagnostic Stat failure itself, got %q", res[0].Err)
+	}
+	if !f.Dirs["/r/refs/heads/feature"] {
+		t.Error("nothing should have been trashed when the diagnosis itself failed")
+	}
+}
+
+// listCallRecorder records every path passed to List, so a test can assert a
+// specific (invalid) path was never probed — pins subtreeFiles' fail-closed
+// rule: checkComponent runs BEFORE recursion, so an invalid component's own
+// path must never reach List.
+type listCallRecorder struct {
+	*transport.Fake
+	calls *[]string
+}
+
+func (l listCallRecorder) List(p string) ([]transport.Node, error) {
+	*l.calls = append(*l.calls, p)
+	return l.Fake.List(p)
+}
+
+// TestSelfHealFailsClosedOnInvalidComponentInSubtree is RED (plan round 3,
+// Codex): a folder in the collision subtree with an INVALID component name
+// (a{b}, refused by checkComponent — braces glob-expand locally, probe C13)
+// must make the heal FAIL CLOSED: an error is returned, no List call ever
+// names the invalid path (asserted directly via the trace above), and
+// nothing is trashed.
+func TestSelfHealFailsClosedOnInvalidComponentInSubtree(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	if err := f.EnsureDir("/r/refs/heads/feature"); err != nil {
+		t.Fatal(err)
+	}
+	const invalid = "/r/refs/heads/feature/a{b}"
+	f.Dirs[invalid] = true // a foreign folder with an invalid ref component
+
+	var calls []string
+	tr := listCallRecorder{Fake: f, calls: &calls}
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+	res := Push(tr, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("must fail closed on an invalid component in the subtree, got %+v", res)
+	}
+	// Content-check the failure reason, not just OK==false: a bare "ref
+	// changed concurrently" (WriteRef's ordinary concurrent-creator refusal,
+	// which an UNMODIFIED WriteRef would already report for this D/F
+	// collision with no healing logic involved at all) would make this
+	// assertion pass for the wrong reason — the message must actually name
+	// the invalid component, proving subtreeFiles' checkComponent guard is
+	// what fired.
+	if !strings.Contains(res[0].Err, "a{b}") {
+		t.Errorf("must name the invalid component, got %q", res[0].Err)
+	}
+	if strings.Contains(res[0].Err, "concurrently") {
+		t.Errorf("must not be the generic concurrent-creator refusal, got %q", res[0].Err)
+	}
+	for _, c := range calls {
+		if c == invalid {
+			t.Errorf("List must never be called against the invalid path %s, got calls=%v", invalid, calls)
+		}
+	}
+	if !f.Dirs["/r/refs/heads/feature"] || !f.Dirs[invalid] {
+		t.Error("nothing must have been trashed when the heal failed closed")
+	}
+}
+
+// ================= Task 9b: composed prune-then-heal workflow ===============
+
+// TestPushDeletePrunesThenCreateReusesFolderInOneBatch composes both halves
+// of Task 9b in ONE batch: deleting the only ref under feature/ must prune
+// the now-empty folder in PHASE 4, and creating branch "feature" in the SAME
+// batch's PHASE 5 must then land cleanly through ordinary WriteRef — prune
+// having already cleared the collision before phase 5 ever runs, so self-
+// heal's retry path is not even needed. TestDeletePrunesEmptyParentsStops-
+// AtNamespaceRoots and TestCreateSelfHealsEmptyFolderCollision each pin one
+// half of this in isolation; this pins the composition the handoff notes
+// call out explicitly: phase-4-before-phase-5 ordering is what makes the
+// D/F reuse workflow deterministic within a single batch.
+func TestPushDeletePrunesThenCreateReusesFolderInOneBatch(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
+
+	// refs/heads/main is seeded too (same reason as the isolated prune tests
+	// above): otherwise remote HEAD backfills to feature/x and the delete
+	// under test refuses itself before the composed workflow is ever
+	// exercised.
+	seedUps := []protocol.RefUpdate{
+		{Src: "refs/heads/main", Dst: "refs/heads/main"},
+		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"},
+	}
+	seedRes := Push(f, "/r", gitDir, seedUps, map[string]string{})
+	for _, r := range seedRes {
+		if !r.OK {
+			t.Fatalf("setup creates must succeed: %+v", seedRes)
+		}
+	}
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/feature/x"},
+		{Src: "refs/heads/main", Dst: "refs/heads/feature"},
+	}
+	remote := map[string]string{"refs/heads/main": head, "refs/heads/feature/x": head}
+	res := Push(f, "/r", gitDir, ups, remote)
+	for _, r := range res {
+		if !r.OK {
+			t.Fatalf("both the delete and the create must succeed in one batch: %+v", res)
+		}
+	}
+	if _, ok := f.Files["/r/refs/heads/feature/x"]; ok {
+		t.Error("x must be gone")
+	}
+	sha, err := readRef(f, "/r/refs/heads/feature")
+	if err != nil || sha != head {
+		t.Fatalf("feature must now be a ref: sha=%q err=%v want=%q", sha, err, head)
+	}
+	if f.Dirs["/r/refs/heads/feature"] {
+		t.Error("feature must be a FILE now, not a leftover folder")
+	}
+}
+
 // emptyGitRepo returns a repo with NO commits.
 //
 // It exists because newGitRepoForPush builds an identical commit every time —

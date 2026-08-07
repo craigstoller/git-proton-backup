@@ -384,6 +384,13 @@ func Push(t transport.Transport, root, gitDir string,
 			continue
 		}
 		okResult(i)
+		// Best-effort tidiness (Task 9b), called ONLY after a Committed Trash
+		// of the ref file itself — never from the already-absent short-circuit
+		// above, which trashed nothing and has no empty parent of its own
+		// making to clean up. pruneEmptyParents is void and never touches
+		// results[i]: a prune failure is advisory only (see its own doc
+		// comment), and this delete has already reported ok.
+		pruneEmptyParents(t, root, u.Dst)
 	}
 
 	// deletedThisBatch tracks every dst whose delete ACTUALLY COMMITTED in
@@ -430,7 +437,21 @@ func Push(t transport.Transport, root, gitDir string,
 			fail(i, err.Error())
 			continue
 		}
-		out, err := WriteRef(t, root, u.Dst, newShas[i], exists)
+		// CREATES ONLY route through the self-healing wrapper (Task 9b):
+		// exists here is the same batch-aware flag deletedThisBatch's own doc
+		// comment above establishes, so an update against a node this exact
+		// batch just recreated still takes the plain WriteRef/UpdateRevision
+		// path unchanged. Self-heal exists for the D/F folder-collision a
+		// CREATE can hit — a leftover empty folder from a crashed prune, or a
+		// genuine conflicting ref/foreign file underneath — never for an
+		// update against a node already known to be there.
+		var out transport.Outcome
+		var err error
+		if exists {
+			out, err = WriteRef(t, root, u.Dst, newShas[i], true)
+		} else {
+			out, err = createRefHealingCollision(t, root, u.Dst, newShas[i])
+		}
 		if err != nil || out == transport.Ambiguous {
 			fail(i, fmt.Sprintf("ref publish failed: %v", err))
 			continue
@@ -439,11 +460,15 @@ func Push(t transport.Transport, root, gitDir string,
 			// WriteRef (refs.go) returns (Refused, nil) — no error —
 			// specifically when this is a create (exists == false) and a
 			// concurrent creator won the race; it deliberately did not
-			// overwrite. That is not the same as success: our newSha was
-			// never published, so reporting OK: true here would make git
-			// update its remote-tracking ref to a sha that disagrees with
-			// what is actually on the remote, with nothing to signal the
-			// mismatch. It must be reported as a failure.
+			// overwrite. createRefHealingCollision can reach this arm the
+			// same way, via its own inner WriteRef call, whenever the
+			// collision it found was NOT a folder at all (its own doc
+			// comment: "not a folder collision: surface the original
+			// result"). Either way this is not success: our newSha was never
+			// published, so reporting OK: true here would make git update
+			// its remote-tracking ref to a sha that disagrees with what is
+			// actually on the remote, with nothing to signal the mismatch.
+			// It must be reported as a failure.
 			fail(i, "ref changed concurrently; refusing to overwrite")
 			continue
 		}
@@ -457,6 +482,174 @@ func Push(t transport.Transport, root, gitDir string,
 	// branch stays an explicit operation, out of scope for v2.
 	ensureHEAD(t, root, gitDir, ups, remote, results)
 	return results
+}
+
+// parentOf returns ref's parent in "/"-joined REF-NAME space (not a remote
+// path): everything before the last "/", or "" once there is no "/" left at
+// all. In practice pruneEmptyParents' loop below always stops at a protected
+// namespace root ("refs", "refs/heads", "refs/tags") before ever reaching
+// the "" case, since every real ref begins "refs/...".
+func parentOf(ref string) string {
+	i := strings.LastIndex(ref, "/")
+	if i < 0 {
+		return ""
+	}
+	return ref[:i]
+}
+
+// protectedNamespaceRoots are the folders Bootstrap creates as part of the
+// initialised layout ("refs", "refs/heads", "refs/tags") — permanent
+// scaffolding, never residue of anything THIS helper did. Shared by
+// pruneEmptyParents (never prunable, even when momentarily empty) and
+// createRefHealingCollision (never self-healable by trashing): a create
+// whose destination IS one of these names (e.g. a ref quite literally named
+// "refs/heads") collides with a folder git itself needs to exist there, and
+// that is a genuine, permanent D/F conflict — not a leftover from a crashed
+// prune, even on a freshly-bootstrapped repo where the folder happens to be
+// empty because no refs have been pushed into it yet.
+var protectedNamespaceRoots = map[string]bool{"refs": true, "refs/heads": true, "refs/tags": true}
+
+// pruneEmptyParents is BEST-EFFORT tidiness under the batch lock. Check-then-
+// act: no conditional delete exists on this transport (same accepted limit as
+// lock release); the blast radius of the race is bounded — subtree goes to
+// Proton's trash, and only a NON-v2 actor can be racing (v2 writers hold the
+// lock). Self-heal (createRefHealingCollision) is the correctness mechanism;
+// a plan that ships prune without heal reintroduces the wedge (spec §2c).
+func pruneEmptyParents(t transport.Transport, root, ref string) {
+	for dir := parentOf(ref); dir != "" && !protectedNamespaceRoots[dir]; dir = parentOf(dir) {
+		nodes, err := t.List(root + "/" + dir)
+		if err != nil || len(nodes) != 0 {
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "git-remote-proton: prune: cannot list %s/%s: %v\n", root, dir, err)
+			}
+			return
+		}
+		out, err := t.Trash(root + "/" + dir)
+		if err != nil || out != transport.Committed {
+			fmt.Fprintf(os.Stderr, "git-remote-proton: prune: leaving empty folder %s/%s "+
+				"(trash reported %v/%s); a later create at this name self-heals\n", root, dir, err, out)
+			return
+		}
+	}
+}
+
+// subtreeFiles returns the full remote path of every FILE anywhere under
+// folder (recursive walk via t.List; folders alone do not count). Used by
+// self-heal's residue test: the rule is "contains no files OF ANY KIND" — a
+// foreign file makes the subtree not-residue and must never be trashed
+// (spec §2c, round 3). It deliberately does NOT filter by content: a file
+// that fails to read back as a valid ref is still a FILE, and must still
+// block the heal — describeBlockers (below), not this function, is where
+// "ref vs. foreign" gets decided, and only for the message, never for
+// whether healing is allowed to proceed.
+//
+// Like the ListRefs walk (refs.go), it applies checkComponent to every
+// child — folders AND files — BEFORE recursing (plan round 3, Codex): an
+// invalid component, a foreign folder named a{b} say, returns an ERROR,
+// which makes the heal FAIL CLOSED (no recursion into an unverifiable
+// remote path, no trash over an incompletely-enumerated subtree). A trace
+// test pins that no List ever names the invalid path and nothing is
+// trashed.
+func subtreeFiles(t transport.Transport, folder string) ([]string, error) {
+	nodes, err := t.List(folder)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, n := range nodes {
+		if err := checkComponent(n.Name); err != nil {
+			return nil, fmt.Errorf("subtree of %s contains an unverifiable name %q: %w",
+				folder, n.Name, err)
+		}
+		full := folder + "/" + n.Name
+		if n.IsDir {
+			sub, err := subtreeFiles(t, full)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, sub...)
+			continue
+		}
+		out = append(out, full)
+	}
+	return out, nil
+}
+
+// describeBlockers renders one clause per blocking file, naming each as
+// what it actually IS rather than treating every blocker alike: a file
+// whose content reads back through readRef as a valid 40-hex sha is a
+// genuine conflicting REF; anything else — content a non-v2 actor could
+// have dropped at any advertisable-shaped name, e.g. "feature/notes.txt" —
+// is named as foreign data, never as a ref. Classification is by CONTENT
+// (readRef), not by the file's name shape: a foreign file can sit at a name
+// that is itself perfectly ref-shaped (git ref names may contain dots), so
+// name-shape alone cannot tell the two apart.
+func describeBlockers(t transport.Transport, root string, files []string) string {
+	parts := make([]string, 0, len(files))
+	for _, p := range files {
+		rel := strings.TrimPrefix(p, root+"/")
+		if sha, err := readRef(t, p); err == nil {
+			parts = append(parts, fmt.Sprintf("%s (a conflicting ref, currently %s)", rel, sha))
+		} else {
+			parts = append(parts, fmt.Sprintf("%s (foreign data, not a ref: %v)", rel, err))
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
+// createRefHealingCollision wraps WriteRef for a phase-5 CREATE (exists ==
+// false) only — Push's own routing decides that, never this function.
+// pruneEmptyParents' doc comment above explains why a crash mid-prune can
+// leave an EMPTY folder residue at exactly the name a later create wants:
+// this is the correctness half of that pair — prune's best-effort stance is
+// only safe because this exists to clean up what it can leave behind.
+//
+// A non-Committed outcome that is NOT a folder collision (an ordinary
+// concurrent-creator Refused, or any other transport failure) is surfaced
+// unmodified: this function invents no new diagnosis for a failure mode it
+// has no positive evidence for.
+func createRefHealingCollision(t transport.Transport, root, ref, sha string) (transport.Outcome, error) {
+	out, err := WriteRef(t, root, ref, sha, false)
+	if err == nil && out == transport.Committed {
+		return out, nil
+	}
+	n, ok, serr := t.Stat(root + "/" + ref)
+	if serr != nil {
+		return transport.Ambiguous, fmt.Errorf("create of %s did not commit and its "+
+			"diagnosis failed: %v (original: %v)", ref, serr, err)
+	}
+	if !ok || !n.IsDir {
+		return out, err // not a folder collision: surface the original result
+	}
+	if protectedNamespaceRoots[ref] {
+		// A create whose OWN destination is "refs", "refs/heads", or
+		// "refs/tags" collides with permanent Bootstrap scaffolding, not
+		// residue — see protectedNamespaceRoots' doc comment. This can be
+		// EMPTY on a freshly-bootstrapped repo (no refs pushed yet), which
+		// would otherwise look exactly like a healable crashed-prune residue
+		// to the files-based test below; the identity check here has to run
+		// BEFORE that test, not rely on it, because emptiness alone cannot
+		// tell the two apart.
+		return out, err // surface the original result: a genuine, permanent collision
+	}
+	files, ferr := subtreeFiles(t, root+"/"+ref)
+	if ferr != nil {
+		return transport.Ambiguous, fmt.Errorf("create of %s collided with a folder, but "+
+			"enumerating its subtree to check for residue failed: %v; heal aborted, nothing "+
+			"trashed", ref, ferr)
+	}
+	if len(files) > 0 {
+		// partition into ref-shaped names vs foreign; name each as what it is
+		return transport.Refused, fmt.Errorf("a folder occupies %s and its contents block "+
+			"the branch: %s", ref, describeBlockers(t, root, files))
+	}
+	if tout, terr := t.Trash(root + "/" + ref); terr != nil || tout != transport.Committed {
+		return transport.Ambiguous, fmt.Errorf("empty folder at %s could not be cleared "+
+			"(trash reported %v/%s); refusing to create over unknown state", ref, terr, tout)
+	}
+	fmt.Fprintf(os.Stderr, "git-remote-proton: cleared leftover empty folder at %s "+
+		"(residue of an interrupted delete)\n", ref)
+	return WriteRef(t, root, ref, sha, false) // retry ONCE
 }
 
 // ensureHEAD writes HEAD when the remote has none. Failure is reported on
