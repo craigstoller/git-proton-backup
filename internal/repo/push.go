@@ -284,6 +284,11 @@ func isBranch(ref string) bool { return strings.HasPrefix(ref, "refs/heads/") }
 // retired: recursive ListRefs (Task 8) erased its first justification, batch
 // preflight (Task 9a) its second. Pseudorefs and non-refs/ destinations stay
 // rejected.
+//
+// Cost: one `git check-ref-format` subprocess PER DESTINATION, since
+// pushOne calls this once per ref update — worth flagging for whoever builds
+// Task 9a's batch preflight engine, which will call this once per ref in a
+// batch rather than once per push.
 func checkDst(dst string) error {
 	if !strings.HasPrefix(dst, "refs/") {
 		return fmt.Errorf("unsupported destination %q: only refs under refs/ are served "+

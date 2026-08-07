@@ -623,25 +623,34 @@ func TestLoop_PlainList_UnmarkedRootRefusesWithTheMarkerReason(t *testing.T) {
 	}
 }
 
-// listErrTransport makes List fail for the refs namespaces specifically,
-// standing in for what the real CLI reports when it lists a folder that does
-// not exist. The Fake's own List never errors — an untouched path just comes
-// back as an empty slice — which would let ListRefs succeed vacuously on a
-// totally unmarked root and mask the thing this test needs to prove: that a
-// list which genuinely cannot read the remote fails closed rather than
-// silently advertising nothing.
+// listErrTransport makes List fail for the refs namespace, standing in for
+// what the real CLI reports when it lists a folder that does not exist. The
+// Fake's own List never errors — an untouched path just comes back as an
+// empty slice — which would let ListRefs succeed vacuously on a totally
+// unmarked root and mask the thing this test needs to prove: that a list
+// which genuinely cannot read the remote fails closed rather than silently
+// advertising nothing.
 //
-// Only refs/heads and refs/tags are intercepted; List(root) itself (what
-// Bootstrap's own emptiness check would call) is passed straight through and
-// would still succeed. That is deliberate: it is what makes "no marker
-// afterward" a real, discriminating assertion below rather than a tautology —
-// an implementation that (wrongly) called Bootstrap before ListRefs would
-// still have written the marker here, since Bootstrap would have completed
-// before ListRefs' own List call ever fails.
+// Task 8 made ListRefs recurse the whole refs/ tree starting from a single
+// top-level call, t.List(root+"/refs") — before that, it listed
+// refs/heads and refs/tags directly as two separate calls, which is what
+// this originally intercepted. Intercepting only those two suffixes went
+// quietly inert once the walk's first (and, on an empty root, only) List
+// call became "/refs" itself: it would sail straight through to the real
+// Fake and return an empty slice, same as an untouched path always has.
+// "/refs" is intercepted now for that reason; refs/heads and refs/tags stay
+// intercepted too, in case anything ever lists them directly again.
+//
+// List(root) itself (what Bootstrap's own emptiness check would call) is
+// passed straight through and would still succeed. That is deliberate: it is
+// what makes "no marker afterward" a real, discriminating assertion below
+// rather than a tautology — an implementation that (wrongly) called
+// Bootstrap before ListRefs would still have written the marker here, since
+// Bootstrap would have completed before ListRefs' own List call ever fails.
 type listErrTransport struct{ *transport.Fake }
 
 func (l listErrTransport) List(p string) ([]transport.Node, error) {
-	if strings.HasSuffix(p, "/refs/heads") || strings.HasSuffix(p, "/refs/tags") {
+	if strings.HasSuffix(p, "/refs") || strings.HasSuffix(p, "/refs/heads") || strings.HasSuffix(p, "/refs/tags") {
 		return nil, fmt.Errorf("no such folder: %s", p)
 	}
 	return l.Fake.List(p)

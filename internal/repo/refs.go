@@ -55,7 +55,11 @@ func ListRefs(t transport.Transport, root string) (map[string]string, error) {
 	walk = func(rel string) error {
 		nodes, err := t.List(root + "/" + rel)
 		if err != nil {
-			return err
+			// Wrapped with the failing folder's own path: without it, a List
+			// failure five levels into the tree surfaced as whatever bare
+			// message the transport happened to return, with nothing here
+			// naming WHICH folder in the recursion actually failed.
+			return fmt.Errorf("listing %s: %w", root+"/"+rel, err)
 		}
 		for _, n := range nodes {
 			full := rel + "/" + n.Name
@@ -134,9 +138,26 @@ func readRef(t transport.Transport, p string) (string, error) {
 	}
 	if len(raw) != 41 || raw[40] != '\n' || !shaRe.Match(raw[:40]) {
 		return "", fmt.Errorf("corrupt ref file %s: content is not exactly 40 lowercase hex "+
-			"characters plus a single trailing newline (got %q)", p, string(raw))
+			"characters plus a single trailing newline (got %q)", p, previewBytes(raw))
 	}
 	return string(raw[:40]), nil
+}
+
+// previewBytes caps a diagnostic preview at 64 bytes. This error used to
+// embed the WHOLE file via a bare %q on raw — harmless back when every ref
+// file readRef could reach lived under this package's own control (only
+// refs/heads and refs/tags, listed non-recursively). ListRefs' recursion
+// (Task 8) now reaches readRef for any well-NAMED, advertisable ref anywhere
+// under refs/, and a well-named file can still hold arbitrary foreign
+// content — a multi-megabyte accidental upload, binary junk — with nothing
+// here bounding its size. Truncating keeps the error a status line, not a
+// multi-megabyte log entry.
+func previewBytes(b []byte) string {
+	const max = 64
+	if len(b) <= max {
+		return string(b)
+	}
+	return string(b[:max]) + "...(truncated)"
 }
 
 // WriteRef stages under the ref's own LEAF NAME, because `filesystem upload`

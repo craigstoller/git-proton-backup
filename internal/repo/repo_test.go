@@ -477,7 +477,7 @@ func TestListRefsSkipsInvalidNamesWithNoteNeverFatal(t *testing.T) {
 
 	var refs map[string]string
 	var err error
-	captureStderr(t, func() { refs, err = ListRefs(f, "/r") })
+	stderr := captureStderr(t, func() { refs, err = ListRefs(f, "/r") })
 
 	if err != nil {
 		t.Fatalf("a foreign junk name must never be fatal: %v", err)
@@ -487,6 +487,17 @@ func TestListRefsSkipsInvalidNamesWithNoteNeverFatal(t *testing.T) {
 	}
 	if _, ok := refs["refs/heads/a{b}"]; ok {
 		t.Errorf("the junk name must not be advertised, got %v", refs)
+	}
+	// The map assertions above cannot tell "skipped with a note" apart from
+	// "skipped silently" — deleting the skipNote call in ListRefs' walk
+	// leaves both passing (mutation-verified: with that call commented out,
+	// this assertion is the only one of the two ListRefs skip tests that
+	// fails here; TestListRefsNeverListsBeneathAnInvalidFolderName's own
+	// stderr assertion below catches the folder-skip call). A silently
+	// vanishing ref is exactly what the note exists to prevent, so the note
+	// itself must be asserted, not just its absence from the map.
+	if !strings.Contains(stderr, "refs/heads/a{b}") {
+		t.Errorf("skipping the junk name must emit a note naming it, got stderr %q", stderr)
 	}
 }
 
@@ -528,7 +539,7 @@ func TestListRefsNeverListsBeneathAnInvalidFolderName(t *testing.T) {
 	tr := &tracedListTransport{Fake: f}
 	var refs map[string]string
 	var err error
-	captureStderr(t, func() { refs, err = ListRefs(tr, "/r") })
+	stderr := captureStderr(t, func() { refs, err = ListRefs(tr, "/r") })
 
 	if err != nil {
 		t.Fatalf("an invalid folder name must never be fatal: %v", err)
@@ -538,6 +549,18 @@ func TestListRefsNeverListsBeneathAnInvalidFolderName(t *testing.T) {
 	}
 	if len(refs) != 1 {
 		t.Errorf("only the valid sibling must be advertised, got %v", refs)
+	}
+	// Same mutation-visible gap as TestListRefsSkipsInvalidNamesWithNoteNeverFatal
+	// above: the map and the traced-List assertions alone cannot distinguish
+	// "skipped with a note" from "skipped silently" — deleting the skipNote
+	// call in ListRefs' checkComponent-failure branch leaves every other
+	// assertion in this test passing (mutation-verified). Both junk folder
+	// names must be named on stderr.
+	if !strings.Contains(stderr, ".hidden") {
+		t.Errorf("skipping the .hidden folder must emit a note naming it, got stderr %q", stderr)
+	}
+	if !strings.Contains(stderr, "a{b}") {
+		t.Errorf("skipping the braced folder must emit a note naming it, got stderr %q", stderr)
 	}
 	for _, p := range tr.listed {
 		if strings.Contains(p, "a{b}") {
@@ -1129,11 +1152,13 @@ func TestPushAcceptsNamespacedDestinations(t *testing.T) {
 // so checkDst no longer refuses it up front. It still cannot be PUBLISHED,
 // though — Bootstrap already created refs/heads as a FOLDER, and WriteRef's
 // leaf-named upload to that exact path collides with it (the same D/F guard
-// Task 7 gave the Fake) — so the push still fails, just later, and after a
-// pack upload the old all-or-nothing narrowing would have avoided. Pinned
-// deliberately rather than left uncovered: a future checkDst that makes this
-// SUCCEED (writing a ref file where refs/heads/<branch> folders live) would
-// be wrong.
+// Task 7 gave the Fake) — so the push still fails, just later, and AFTER a
+// pack upload the old all-or-nothing narrowing would have avoided — pinned
+// via the pack-count assertion below, which is exactly the orphan the name
+// promises and gives Task 9a's batch-preflight D/F check a concrete
+// regression target to flip to zero. Pinned deliberately rather than left
+// uncovered: a future checkDst that makes this SUCCEED (writing a ref file
+// where refs/heads/<branch> folders live) would be wrong.
 func TestPushToRefsHeadsItselfFailsAtPublishNotAtCheckDst(t *testing.T) {
 	f := transport.NewFake()
 	f.Dirs["/r"] = true
@@ -1152,6 +1177,11 @@ func TestPushToRefsHeadsItselfFailsAtPublishNotAtCheckDst(t *testing.T) {
 	if _, ok := f.Files["/r/refs/heads"]; ok {
 		t.Error("must not be written to the remote")
 	}
+	if packs, idxs := countPackFiles(f, "/r"); packs == 0 || idxs == 0 {
+		t.Errorf("this failure happens AFTER packing, unlike a genuine checkDst "+
+			"rejection — want an orphan pack/idx pair uploaded before the D/F collision "+
+			"was discovered, got pack=%d idx=%d", packs, idxs)
+	}
 }
 
 // TestPushRejectsUnsupportedDeleteDestination covers the delete path against
@@ -1165,12 +1195,21 @@ func TestPushRejectsUnsupportedDeleteDestination(t *testing.T) {
 	f := transport.NewFake()
 	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
+	// Seeded so there is something at "/r/HEAD" a wrongly-permitted delete
+	// could actually trash — an empty Fake would let a Trash call pass
+	// unnoticed (Trash on an absent target is itself Committed, never an
+	// error), which is exactly the silent-success shape this test exists to
+	// catch.
+	f.Files["/r/HEAD"] = []byte("ref: refs/heads/main\n")
 
 	ups := []protocol.RefUpdate{{Src: "", Dst: "HEAD"}}
 	res := Push(f, "/r", t.TempDir(), ups, map[string]string{})
 
 	if len(res) != 1 || res[0].OK {
 		t.Fatalf("deleting an unsupported destination must be rejected, not reported ok, got %+v", res)
+	}
+	if string(f.Files["/r/HEAD"]) != "ref: refs/heads/main\n" {
+		t.Errorf("a rejected delete must not have trashed anything, HEAD now = %q", f.Files["/r/HEAD"])
 	}
 }
 
