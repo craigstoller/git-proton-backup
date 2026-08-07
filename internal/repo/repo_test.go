@@ -3295,8 +3295,9 @@ func TestFetchFatalAfterHealNamesTheOidAndTheRefresh(t *testing.T) {
 
 // residueTransport fails the FIRST download of target, leaving partial bytes
 // at the destination — then, on the retry, REFUSES if those bytes are still
-// there. This pins the residue rule directly: retry correctness must not
-// depend on ReadTo's unpinned overwrite behaviour.
+// there. This pins downloadAndVerifyPack's entry-point removal directly:
+// retry correctness must not depend on ReadTo's unpinned overwrite behaviour
+// onto an existing file.
 type residueTransport struct {
 	*transport.Fake
 	target   string
@@ -3320,17 +3321,27 @@ func (r *residueTransport) ReadTo(p, local string) error {
 	return r.Fake.ReadTo(p, local)
 }
 
-// GUARD, not RED: passed immediately against Task 6's code. Deliberate-
-// regression check: downloadAndVerifyPack removes packPath TWICE — once
-// unconditionally at function entry (before ReadTo), and once again on
-// ReadTo's failure path. Disabling either removal alone left the test green
-// (the other one still cleans up in time for the retry); only disabling BOTH
-// exposed it, failing with "retry found residue at ...; the residue rule is
-// violated" — confirming the assertion is live. Per downloadAndVerifyPack's
-// doc comment (fetch.go), it is the FAILURE-PATH removal that cleans this
-// attempt's own leavings — and in this scenario it had already cleared the
-// residue before the retry began; the entry-point removal is the one that
-// exists for residue from an attempt this process lost track of.
+// GUARD, not RED: passed immediately against Task 6's code. UPDATED for the
+// quarantine refactor: downloadAndVerifyPack no longer removes anything on a
+// failure path (the old residue rule is deleted — see fetch.go); the ONE
+// removal left is the unconditional one at function entry, before ReadTo,
+// and it is now the SOLE thing standing between a healed plan's retry and
+// stale bytes from the attempt this test injects. Without it, the "partial
+// residue" this test's first ReadTo call writes to incomingDir would still
+// be sitting there when the healed round retries the same stem, and
+// residueTransport's second ReadTo call would see it and refuse.
+//
+// Deliberate-regression check: with the entry-point removal disabled
+// (wrapped in `if false {}`), this failed on
+// "Fetch must survive one transient pack-download failure via the heal round
+// (sawStale=true): cannot download pack-....pack: retry found residue at
+// ...\incoming\pack-....pack; the residue rule is violated ... (the sidecar
+// metadata was already refreshed from the remote this run; this indicates
+// genuine remote or transport trouble)" — the err != nil check (repo_test.go,
+// this function's first assertion) fires before the sawStale check is ever
+// reached, because the second failure lands after the one heal round is
+// already spent and Fetch fatals. Confirming the entry-point removal is
+// live and load-bearing. Reverted after confirming.
 func TestFetchRetriesSamePackWithoutResidue(t *testing.T) {
 	src := newGitRepoForPush(t)
 	c1 := headOfPushRepo(t, src)
@@ -3632,6 +3643,15 @@ func TestFetchMidRoundPairRefreshWithTwoPacksCompletes(t *testing.T) {
 // no incoming dir at all and scrubs its packDir download on failure, so
 // "packDir empty" alone would prove nothing about quarantine having ever
 // existed.
+//
+// Deliberate-regression check (mutation-verifies (c) specifically): with the
+// old residue rule temporarily ported back onto this failure path
+// (`os.Remove(inPack)` added right before the checksum-mismatch return in
+// fetch.go), this failed on "the corrupt bytes must remain in the incoming
+// dir, awaiting wholesale teardown: open ...\pack-....pack: The system
+// cannot find the file specified" — confirming (c) actually exercises the
+// quarantine-keeps-its-residue behaviour and is not vacuously true. Reverted
+// after confirming.
 func TestDownloadAndVerifyQuarantinesCorruptPackBytes(t *testing.T) {
 	src := newGitRepoForPush(t)
 	sha := headOfPushRepo(t, src)
@@ -3695,6 +3715,12 @@ func TestDownloadAndVerifyQuarantinesCorruptPackBytes(t *testing.T) {
 // renames swapped, the idx rename fails FIRST and the .pack never lands —
 // the presence assertion flips, which is exactly the Step-5 deliberate
 // regression this test is designed to catch.
+//
+// Also pins MOVE, not copy: incomingDir/<stem>.pack must be GONE after its
+// successful rename. A copyFile-based publishPair would satisfy every other
+// assertion here (packDir/<stem>.pack present, error returned) while
+// silently leaving the source behind — doubling temp-disk use for every
+// published pack and never actually emptying quarantine on success.
 func TestPublishPairRenamesPackBeforeIdx(t *testing.T) {
 	stem := "pack-" + strings.Repeat("e", 40)
 	incomingDir := t.TempDir()
@@ -3718,6 +3744,10 @@ func TestPublishPairRenamesPackBeforeIdx(t *testing.T) {
 	if _, statErr := os.Stat(filepath.Join(packDir, stem+".pack")); statErr != nil {
 		t.Errorf("the .pack must already have landed before the failing .idx rename "+
 			"(pack-before-idx ordering): %v", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(incomingDir, stem+".pack")); !os.IsNotExist(statErr) {
+		t.Errorf("the .pack must be gone from incoming after landing in packDir — "+
+			"publishPair renames (moves), it does not copy: stat err %v", statErr)
 	}
 }
 

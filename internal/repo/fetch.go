@@ -280,12 +280,22 @@ func downloadAndVerifyPack(t transport.Transport, root, incomingDir, packDir, st
 // git discovers packs only via their index, so a pack whose idx has not
 // landed is invisible to the traversal — which is what makes the two renames
 // an atomic publication from the reader's side. Go's os.Rename replaces an
-// existing destination file on Windows (the same fact idxcache.go's
+// existing destination file on Windows — the same fact idxcache.go's
 // installIntoCache already relies on, and which the mid-round pair-refresh
-// exercises via RefreshSidecar's cache write) — relevant here too, since
-// nothing about publishPair's own contract depends on packDir being empty at
-// its destination. Extracted so the ordering is unit-testable
-// (TestPublishPairRenamesPackBeforeIdx).
+// exercises via RefreshSidecar's cache write — but publishPair itself does
+// not depend on it: greedyCover never re-selects an already-downloaded stem,
+// and packDir starts empty every fetch (a fresh os.MkdirTemp), so this
+// function's destination is never occupied. Overwrite is not relied on here,
+// and is not a hazard either.
+//
+// inPack was just held open by gitcmd.IndexPackVerify's `index-pack
+// --verify`; on its ErrWaitDelay path a grandchild may still hold a handle
+// on it, which can turn this rename into a Windows sharing-violation error —
+// left fatal-and-loud on purpose (publishPair's error is never wrapped in
+// errCacheSuspect, so Fetch spends none of its one heal round on it): a held
+// file handle is local trouble a re-download cannot fix.
+//
+// Extracted so the ordering is unit-testable (TestPublishPairRenamesPackBeforeIdx).
 func publishPair(incomingDir, packDir, stem string) error {
 	if err := os.Rename(filepath.Join(incomingDir, stem+".pack"),
 		filepath.Join(packDir, stem+".pack")); err != nil {
