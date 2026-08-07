@@ -59,7 +59,7 @@ jobs:
           Set-Content git-remote-proton.exe.sha256 -Value "$hash  git-remote-proton.exe" -NoNewline
       - name: Upload build artifact (dispatch dry run only — never a release)
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: git-remote-proton-dev
           path: git-remote-proton.exe*
