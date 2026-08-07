@@ -2947,8 +2947,14 @@ func TestSetHeadRefusesEmptyRepo(t *testing.T) {
 	assertLockReleased(t, f, "/r")
 }
 
-// 12 Hierarchical name ("feature/x") refuses naming Stage 5.
-func TestSetHeadRefusesHierarchicalName(t *testing.T) {
+// 12 Hierarchical name ("feature/x") is now a VALID ref name (Task 10 lifts
+//
+//	the blanket Stage 5 refusal — see TestSetHeadAcceptsHierarchicalBranch
+//	below for the happy path) but "feature/x" itself does not exist as a
+//	branch here, so it still refuses — with the ordinary no-such-branch
+//	message, naming the branches that DO exist, never the retired Stage 5
+//	text.
+func TestSetHeadRefusesNonexistentHierarchicalBranch(t *testing.T) {
 	f := transport.NewFake()
 	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
@@ -2959,10 +2965,13 @@ func TestSetHeadRefusesHierarchicalName(t *testing.T) {
 
 	_, err := SetHead(f, "/r", "feature/x")
 	if err == nil {
-		t.Fatal("SetHead must refuse a hierarchical branch name")
+		t.Fatal("SetHead must refuse a branch that does not exist, hierarchical or not")
 	}
-	if !strings.Contains(err.Error(), "Stage 5") {
-		t.Errorf("refusal must name Stage 5, got: %v", err)
+	if strings.Contains(err.Error(), "Stage 5") {
+		t.Errorf("refusal must not be the retired Stage-5 blanket message, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "main") {
+		t.Errorf("refusal must name the branches that DO exist, got: %v", err)
 	}
 	assertLockReleased(t, f, "/r")
 }
@@ -3083,6 +3092,150 @@ func TestSetHeadRefusesCorruptHead(t *testing.T) {
 		t.Errorf("corrupt HEAD must be left untouched, got %q", got)
 	}
 	assertLockReleased(t, f, "/r")
+}
+
+// --- Task 10: SetHead hierarchical names + exact-path verification --------
+//
+// RED before this task: normalizeBranch refused every hierarchical name
+// outright (the retired Stage 5 message above), and SetHead verified
+// existence via a full-tree ListRefs + map lookup rather than an exact-path
+// Stat.
+
+// 18 A hierarchical branch name is accepted end to end: refs/heads/feature/x
+//
+//	exists, SetHead("feature/x") sets HEAD to it and returns the full name.
+func TestSetHeadAcceptsHierarchicalBranch(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	if _, err := WriteRef(f, "/r", "refs/heads/feature/x", sha, false); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := SetHead(f, "/r", "feature/x")
+	if err != nil {
+		t.Fatalf("SetHead: %v", err)
+	}
+	if got != "refs/heads/feature/x" {
+		t.Errorf("SetHead returned %q, want refs/heads/feature/x", got)
+	}
+	branch, ok, err := ReadHEAD(f, "/r")
+	if err != nil || !ok {
+		t.Fatalf("ReadHEAD: %v %v", ok, err)
+	}
+	if branch != "refs/heads/feature/x" {
+		t.Errorf("HEAD = %q, want refs/heads/feature/x", branch)
+	}
+}
+
+// 19 An invalid hierarchical name — a consecutive-slash and a leading-dot
+//
+//	component — refuses with a NAMED reason from advertisableName's
+//	underlying CheckRefName, never the retired blanket Stage-5 message.
+func TestSetHeadRejectsInvalidHierarchicalName(t *testing.T) {
+	cases := []string{"feature//x", "feature/.hidden"}
+	for _, arg := range cases {
+		t.Run(arg, func(t *testing.T) {
+			f := transport.NewFake()
+			f.Dirs["/r"] = true
+			_ = Bootstrap(f, "/r")
+			sha := "1111111111111111111111111111111111111111"
+			if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err := SetHead(f, "/r", arg)
+			if err == nil {
+				t.Fatalf("SetHead must refuse %q", arg)
+			}
+			if strings.Contains(err.Error(), "Stage 5") {
+				t.Errorf("refusal must not be the retired Stage-5 blanket message, got: %v", err)
+			}
+		})
+	}
+}
+
+// setHeadTraceTransport records every path passed to List and to ReadTo, so
+// TestSetHeadVerifyUsesExactPathNotRecursion can assert a successful SetHead
+// never walks the ref tree at all (Stat replaces ListRefs on the happy
+// path) and reads only the target branch's own ref file.
+type setHeadTraceTransport struct {
+	*transport.Fake
+	lists []string
+	reads []string
+}
+
+func (tr *setHeadTraceTransport) List(p string) ([]transport.Node, error) {
+	tr.lists = append(tr.lists, p)
+	return tr.Fake.List(p)
+}
+
+func (tr *setHeadTraceTransport) ReadTo(p, local string) error {
+	tr.reads = append(tr.reads, p)
+	return tr.Fake.ReadTo(p, local)
+}
+
+// 20 GUARD: a successful SetHead verifies the target via an EXACT-PATH Stat
+//
+//	plus readRef, never a full-tree ListRefs walk. A tag and a notes ref sit
+//	alongside two branches so a regression back to the old ListRefs-based
+//	lookup shows up as a List call — none may ever happen on this path, let
+//	alone one naming refs/tags or refs/notes — and the only ref file ever
+//	READ is the target branch itself; refs/heads/other is never touched.
+func TestSetHeadVerifyUsesExactPathNotRecursion(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	for _, ref := range []string{"refs/heads/main", "refs/heads/other", "refs/tags/v1", "refs/notes/commits"} {
+		if _, err := WriteRef(f, "/r", ref, sha, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := WriteHEAD(f, "/r", "refs/heads/other"); err != nil {
+		t.Fatal(err)
+	}
+
+	tr := &setHeadTraceTransport{Fake: f}
+	got, err := SetHead(tr, "/r", "main")
+	if err != nil {
+		t.Fatalf("SetHead: %v", err)
+	}
+	if got != "refs/heads/main" {
+		t.Errorf("SetHead returned %q, want refs/heads/main", got)
+	}
+	for _, p := range tr.lists {
+		t.Errorf("successful SetHead must never call List; got List(%q)", p)
+	}
+	for _, p := range tr.reads {
+		if strings.HasPrefix(p, "/r/refs/") && p != "/r/refs/heads/main" {
+			t.Errorf("successful SetHead must read only the target branch's own ref file, "+
+				"also read %q", p)
+		}
+	}
+}
+
+// 21 GUARD: when the requested branch does not exist, the suggestion list
+//
+//	built on the error path still finds NESTED branches (ListRefs's own
+//	recursion, Task 8), not just direct children of refs/heads.
+func TestSetHeadUnknownBranchListsNestedBranches(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	if _, err := WriteRef(f, "/r", "refs/heads/feature/deep/x", sha, false); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := SetHead(f, "/r", "nope")
+	if err == nil {
+		t.Fatal("SetHead must refuse a branch that does not exist")
+	}
+	if !strings.Contains(err.Error(), "feature/deep/x") {
+		t.Errorf("refusal must name the nested branch that exists, got: %v", err)
+	}
 }
 
 // RED. Push does not write HEAD at all today.
