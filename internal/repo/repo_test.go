@@ -779,7 +779,7 @@ func TestWriteRefRejectsHostileLeaf(t *testing.T) {
 // one commit, mirroring internal/gitcmd/gitcmd_test.go's newRepo helper. That
 // helper lives in a different package and cannot be reused here, so this is a
 // separate copy. Every setup command's error is checked: a bare t.TempDir()
-// is an empty directory, not a git repository, so pushOne's resolve() (which
+// is an empty directory, not a git repository, so Push's resolve() (which
 // shells out to `git rev-parse`) would fail before the ancestry logic under
 // test is ever reached — the brief's original TestPushRejectsNonFastForward
 // passed t.TempDir() directly as gitDir and could not have passed for that
@@ -921,9 +921,10 @@ func TestPushRejectsNonFastForward(t *testing.T) {
 
 // TestPushDeleteRef is fine using t.TempDir() (not a real repo) as gitDir,
 // unlike TestPushRejectsNonFastForward above: a delete update carries an
-// empty Src, so pushOne returns before resolve() — and therefore before any
-// `git` invocation — is ever reached. The asymmetry with the sibling test
-// above is deliberate, not an oversight.
+// empty Src, so Push's phase 2 classifies it and phase 4 executes it without
+// ever calling resolve() — and therefore without any `git` invocation being
+// reached. The asymmetry with the sibling test above is deliberate, not an
+// oversight.
 func TestPushDeleteRef(t *testing.T) {
 	f := transport.NewFake()
 	f.Dirs["/r"] = true
@@ -990,9 +991,9 @@ func TestPushOrderingPackAndIdxLandBeforeRef(t *testing.T) {
 // report Ambiguous for anything staged under packs/, while behaving normally
 // for everything else (the marker, refs, the lock). Fake's FailNext field
 // only fires for the very next mutating call, and Bootstrap and the ref
-// machinery both perform mutations before pushOne ever reaches the pack
-// upload step, so FailNext cannot selectively target only that step; a small
-// local stub — the same technique repo_test.go already uses above for
+// machinery both perform mutations before Push's phase 3 ever reaches the
+// pack upload step, so FailNext cannot selectively target only that step; a
+// small local stub — the same technique repo_test.go already uses above for
 // ambiguousTrashTransport and lyingWriteTransport — is the only way to drive
 // this deterministically against the real transport.Transport interface.
 type ambiguousPackUploadTransport struct {
@@ -1153,12 +1154,23 @@ func TestPushAcceptsNamespacedDestinations(t *testing.T) {
 // though — Bootstrap already created refs/heads as a FOLDER, and WriteRef's
 // leaf-named upload to that exact path collides with it (the same D/F guard
 // Task 7 gave the Fake) — so the push still fails, just later, and AFTER a
-// pack upload the old all-or-nothing narrowing would have avoided — pinned
-// via the pack-count assertion below, which is exactly the orphan the name
-// promises and gives Task 9a's batch-preflight D/F check a concrete
-// regression target to flip to zero. Pinned deliberately rather than left
-// uncovered: a future checkDst that makes this SUCCEED (writing a ref file
-// where refs/heads/<branch> folders live) would be wrong.
+// pack upload the old all-or-nothing narrowing would have avoided.
+//
+// ADJUDICATED (Task 9a): Task 9a's batch-preflight D/F check does NOT flip
+// this to a zero-cost preflight refusal, and that is deliberate, not a gap.
+// The preflight is refs-ONLY: it compares this batch's destinations against
+// the caller-supplied `remote` map (the advertised REFS) plus this batch's
+// own valid changes — it has no visibility into raw transport folder state.
+// "refs/heads" here is a plain pre-existing FOLDER from Bootstrap, never a
+// ref (ListRefs never advertises a folder), so it never appears in `remote`
+// and the preflight has nothing to compare against for this fixture (the
+// batch's remote map is empty). The push therefore still reaches phase 3
+// (builds and uploads a real pack — the orphan pinned below) before phase
+// 5's WriteRef hits the actual Dirs-based collision and fails. Pinned
+// deliberately rather than left uncovered: a future checkDst that makes this
+// SUCCEED (writing a ref file where refs/heads/<branch> folders live) would
+// be wrong, and a future preflight that silently starts inspecting folder
+// state would need this test updated on purpose, not by accident.
 func TestPushToRefsHeadsItselfFailsAtPublishNotAtCheckDst(t *testing.T) {
 	f := transport.NewFake()
 	f.Dirs["/r"] = true
@@ -1276,8 +1288,8 @@ func TestRequiresForce(t *testing.T) {
 // TestPushForceSkipsAncestryCheck drives a forced update whose remote-known
 // old sha does not exist locally at all: without Force, this would be
 // rejected as "fetch first" before ever reaching the pack step (see
-// TestPushRejectsNonFastForward above). With Force set, pushOne must skip the
-// ancestry gate entirely and still go through pack upload and ref
+// TestPushRejectsNonFastForward above). With Force set, Push's phase 2 must
+// skip the ancestry gate entirely and still go through pack upload and ref
 // publication — proving Force actually short-circuits the check rather than
 // merely happening not to trip it.
 func TestPushForceSkipsAncestryCheck(t *testing.T) {
@@ -1658,6 +1670,78 @@ func TestPushPreflightDFAgainstExistingRefs(t *testing.T) {
 	}
 }
 
+// TestPushFinalStateDFPreflightOrderIndependentOfInputOrder is RED (fix
+// round I1, Important): the final-state preflight is SET ALGEBRA (remote
+// minus every valid delete, plus every valid non-delete) and must not depend
+// on the order ups happens to list entries in. Concretely: remote has
+// refs/heads/feature; the batch UPDATES feature, DELETES feature (same
+// name, update listed FIRST), and CREATES the dependent feature/x. A single
+// pass over ups in input order gets this wrong: it applies the update (a
+// no-op re-add of "feature", already present from remote), then the delete
+// (removes "feature" from finalSet entirely), and nothing re-adds it
+// afterward — so the dependent create sails through the preflight with
+// nothing left to conflict against, costs a pack upload, and only fails
+// LATE at ensureRefParents. Set algebra says "feature" survives regardless
+// of input order (the delete does not "win" merely by being listed after
+// the update — execution order is always phase-4-deletes-then-phase-5-
+// writes, so the update's value is what's actually there afterward), so the
+// dependent create must be refused AT THE CHEAP PREFLIGHT either way. This
+// also exercises fix round M4 along the way: the update and the same-name
+// delete both succeed (phase 5's exists is batch-aware, so the update
+// routes through CreateExclusive against the node phase 4 just trashed,
+// not UpdateRevision).
+func TestPushFinalStateDFPreflightOrderIndependentOfInputOrder(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	sha := headOf(t, gitDir)
+	if _, err := WriteRef(f, "/r", "refs/heads/feature", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	remote := map[string]string{"refs/heads/feature": sha}
+
+	ups := []protocol.RefUpdate{
+		{Src: "refs/heads/main", Dst: "refs/heads/feature", Force: true}, // update, listed FIRST
+		{Src: "", Dst: "refs/heads/feature"},                             // delete, listed SECOND
+		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"},            // dependent create
+	}
+	res := Push(f, "/r", gitDir, ups, remote)
+	if len(res) != 3 {
+		t.Fatalf("want 3 results, got %+v", res)
+	}
+	if !res[0].OK || !res[1].OK {
+		t.Fatalf("the update and the delete must each succeed on their own: %+v", res[:2])
+	}
+	if res[2].OK {
+		t.Fatalf("the dependent create must be refused, got %+v", res[2])
+	}
+	if !strings.Contains(res[2].Err, "refs/heads/feature") {
+		t.Errorf("must name the conflicting ref, got %q", res[2].Err)
+	}
+	// Caught at the CHEAP preflight (its own wording: "conflicts with ...
+	// leaf and a folder"), never the expensive late ensureRefParents path
+	// ("occupies that name") — the whole point of the fix.
+	if !strings.Contains(res[2].Err, "conflicts with") {
+		t.Errorf("must be refused by the preflight, not a late runtime D/F failure, got %q", res[2].Err)
+	}
+	if _, ok := f.Files["/r/refs/heads/feature/x"]; ok {
+		t.Error("the refused create must not have been written")
+	}
+	sha2, err := readRef(f, "/r/refs/heads/feature")
+	if err != nil {
+		t.Fatalf("readRef: %v", err)
+	}
+	if sha2 != sha {
+		// Force:true update resolved "refs/heads/main", which IS `sha` in
+		// this fixture (newGitRepoForPush's only commit) — same value,
+		// different code path (CreateExclusive after the same-batch
+		// delete), so the content assertion is trivially satisfied; the
+		// real pin is the code-path assertion above via M4's routing.
+		t.Errorf("refs/heads/feature = %q, want %q", sha2, sha)
+	}
+}
+
 // TestPushOtherNamespaceRequiresForce covers the design's conservative
 // other-namespace rule end to end: a create needs no force (it is not a
 // move), an unforced update is refused naming the force requirement, and a
@@ -1734,6 +1818,34 @@ func TestPushTagUpdateRequiresForceNoAncestry(t *testing.T) {
 	}
 	if !strings.Contains(res[0].Err, "force") {
 		t.Errorf("must name the force requirement, got %q", res[0].Err)
+	}
+}
+
+// TestPushTagAcceptsNonCommitObjectWithForce is RED (fix round M6): pins the
+// OTHER half of the design table's tag row. "no ancestry check" already has
+// TestPushTagUpdateRequiresForceNoAncestry above; this pins that the tag arm
+// also applies NO OBJECT-TYPE RESTRICTION — real git allows a tag to point
+// at any object (a lightweight tag over a tree or blob is legal), unlike a
+// branch, which the design's own table restricts to commits. Before this
+// test nothing exercised that the tag arm's absence of an object-type check
+// was intentional rather than merely untested. Mirrors
+// TestPushOtherNamespaceRequiresForce's non-commit-target subtest.
+func TestPushTagAcceptsNonCommitObjectWithForce(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	blobSha := hashObjectBlob(t, gitDir, "tag payload")
+	absentOld := "9999999999999999999999999999999999999999"
+
+	ups := []protocol.RefUpdate{{Src: blobSha, Dst: "refs/tags/v1", Force: true}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{"refs/tags/v1": absentOld})
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("a forced tag update must accept a non-commit object with no object-type check: %+v", res)
+	}
+	sha, err := readRef(f, "/r/refs/tags/v1")
+	if err != nil || sha != blobSha {
+		t.Fatalf("tag not published correctly: sha=%q err=%v want=%q", sha, err, blobSha)
 	}
 }
 
@@ -3185,6 +3297,83 @@ func TestPushDeleteThenRecreateInOneBatchStillDerivesHead(t *testing.T) {
 	if got := string(f.Files["/r/HEAD"]); got != "ref: refs/heads/main\n" {
 		t.Errorf("HEAD = %q, want ref: refs/heads/main — a branch deleted and recreated in "+
 			"one batch is still a candidate", got)
+	}
+}
+
+// refWriteMethodTransport wraps a Fake and records which write method —
+// CreateExclusive or UpdateRevision — was actually invoked for ONE chosen
+// remote path. Used to pin fix round M4's batch-aware `exists` flip
+// directly: a Fake's UpdateRevision against an already-absent path silently
+// succeeds as a blind write (see fake.go), so outcomes alone cannot
+// distinguish "took the create path" from "took the update path and got
+// lucky against the Fake's permissive behaviour" — this makes the actual
+// method call observable.
+type refWriteMethodTransport struct {
+	*transport.Fake
+	watch  string
+	method *string
+}
+
+func (r refWriteMethodTransport) CreateExclusive(p, local string) (transport.Outcome, error) {
+	if p == r.watch {
+		*r.method = "create"
+	}
+	return r.Fake.CreateExclusive(p, local)
+}
+
+func (r refWriteMethodTransport) UpdateRevision(p, local string) (transport.Outcome, error) {
+	if p == r.watch {
+		*r.method = "update"
+	}
+	return r.Fake.UpdateRevision(p, local)
+}
+
+// TestPushDeleteThenRecreateInOneBatchOrderIndependent is RED (fix round I1
+// + M4): the sibling test above already pins "delete X, recreate X" with
+// the DELETE listed first; this reverses the order — the update/recreate is
+// listed FIRST, the delete SECOND — to actually exercise the order-
+// independence claim rather than merely assert it in a comment (fix round
+// I1's finding: a naive single in-order pass over ups only gets this shape
+// right when the delete happens to be listed first). It also pins fix round
+// M4 directly: phase 5's `exists` must be BATCH-AWARE, so the update routes
+// through CreateExclusive — the one combination live-verified against the
+// real CLI (C17b, create-after-trash, 30/30) — rather than UpdateRevision
+// against a node phase 4 already trashed, which was never verified live.
+func TestPushDeleteThenRecreateInOneBatchOrderIndependent(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	d := newGitRepoForPush(t)
+	head := headOfPushRepo(t, d)
+	if _, err := WriteRef(f, "/r", "refs/heads/main", head, false); err != nil {
+		t.Fatal(err)
+	}
+	remote := map[string]string{"refs/heads/main": head}
+
+	var method string
+	tr := refWriteMethodTransport{Fake: f, watch: "/r/refs/heads/main", method: &method}
+
+	ups := []protocol.RefUpdate{
+		{Src: head, Dst: "refs/heads/main"}, // update/recreate, listed FIRST
+		{Src: "", Dst: "refs/heads/main"},   // delete, listed SECOND
+	}
+	res := Push(tr, "/r", d, ups, remote)
+	for _, r := range res {
+		if !r.OK {
+			t.Fatalf("both updates must succeed regardless of input order: %+v", res)
+		}
+	}
+	if method != "create" {
+		t.Errorf("phase 5 must route through CreateExclusive after a same-batch delete "+
+			"(fix round M4), got method=%q", method)
+	}
+	sha, err := readRef(f, "/r/refs/heads/main")
+	if err != nil || sha != head {
+		t.Fatalf("ref not published correctly: sha=%q err=%v want=%q", sha, err, head)
+	}
+	if got := string(f.Files["/r/HEAD"]); got != "ref: refs/heads/main\n" {
+		t.Errorf("HEAD = %q, want ref: refs/heads/main — the ensureHEAD candidate-set "+
+			"arithmetic must also be order-independent (fix round I1)", got)
 	}
 }
 

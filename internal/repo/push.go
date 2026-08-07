@@ -76,17 +76,36 @@ func Push(t transport.Transport, root, gitDir string,
 	// illustrative pseudocode (which counts every entry regardless of
 	// delete/non-delete), flagged in the task report.
 	dstCount := map[string]int{}
+	// hasBranchDelete is computed in the same pre-scan pass so the HEAD read
+	// below can be gated on it (fix round M1): a create-only, tag-only, or
+	// notes-only batch has no delete for HEAD protection to ever apply to,
+	// and ReadHEAD is a real remote round-trip — paying it unconditionally on
+	// every push, including ones with no delete at all, was avoidable cost.
+	hasBranchDelete := false
 	for _, u := range ups {
 		if u.Src != "" {
 			dstCount[u.Dst]++
+		} else if isBranch(u.Dst) {
+			hasBranchDelete = true
 		}
 	}
 
 	// HEAD is read ONCE, non-mutating, for the whole batch (the caller holds
 	// the repo lock for the whole Push call), so a delete of the HEAD branch
 	// is refused HERE — before it can distort the final-state preflight or
-	// cost a pack upload (round-1 Codex).
-	head, hasHead, headErr := ReadHEAD(t, root)
+	// cost a pack upload (round-1 Codex) — but ONLY when the batch actually
+	// contains a branch delete (M1): HEAD can only ever name a branch (spec
+	// §1), so nothing else in the batch can ever consult these three values,
+	// and their zero values (headErr == nil, hasHead == false) are never read
+	// on a batch where hasBranchDelete is false — every read of them below is
+	// itself gated behind isBranch(u.Dst) on a delete entry, which can only be
+	// true if hasBranchDelete is also true.
+	var head string
+	var hasHead bool
+	var headErr error
+	if hasBranchDelete {
+		head, hasHead, headErr = ReadHEAD(t, root)
+	}
 
 	valid := make([]bool, len(ups))
 	isDelete := make([]bool, len(ups))
@@ -206,6 +225,24 @@ func Push(t transport.Transport, root, gitDir string,
 		valid[i] = true
 	}
 
+	// deletedThisBatch tracks every dst with a VALID delete in this batch
+	// (fix round M4). Phase 4 always trashes before phase 5 writes, so by the
+	// time phase 5 runs, a dst in this set genuinely no longer exists on the
+	// remote regardless of what the PRE-BATCH `remote` map says about it —
+	// phase 5 uses this to route such a dst through CreateExclusive rather
+	// than UpdateRevision. This matters because CreateExclusive-after-trash is
+	// the ONE combination that has actually been live-verified (C17b, 30/30);
+	// UpdateRevision against a node phase 4 just trashed was never verified
+	// live, and blindly taking that path would also silently drop WriteRef's
+	// own concurrent-creator Refused protection for what is, execution-order,
+	// really a create.
+	deletedThisBatch := map[string]bool{}
+	for i, u := range ups {
+		if valid[i] && isDelete[i] {
+			deletedThisBatch[u.Dst] = true
+		}
+	}
+
 	// Final-state D/F preflight over REFS ONLY (empty folders are runtime,
 	// self-heal's job — Task 9b). finalSet is the ref namespace as it will
 	// read immediately after this batch: every currently-advertised ref,
@@ -217,13 +254,27 @@ func Push(t transport.Transport, root, gitDir string,
 	for ref := range remote {
 		finalSet[ref] = true
 	}
+	// TWO PASSES, deliberately, not one interleaved pass keyed on ups' own
+	// order (fix round I1): finalSet is SET ALGEBRA — remote minus every
+	// valid delete, plus every valid non-delete — and must be independent of
+	// which order ups happens to list them in. A single pass that applies
+	// each entry in input order gets this wrong whenever a delete and a
+	// non-delete target the SAME name in one batch: "update X, delete X"
+	// (update listed first) folds correctly under set algebra (X survives,
+	// carrying the update's new value — the delete does not "win" merely by
+	// being processed second), but a naive single in-order pass would apply
+	// the update then the delete and lose X, when the batch's actual EXECUTION
+	// order (phase 4 deletes, then phase 5 creates/updates) means X survives
+	// either way. Subtracting every delete FIRST, then adding every
+	// non-delete, makes the non-delete always win a same-name collision,
+	// matching execution order and being independent of ups' own order.
 	for i, u := range ups {
-		if !valid[i] {
-			continue
-		}
-		if isDelete[i] {
+		if valid[i] && isDelete[i] {
 			delete(finalSet, u.Dst)
-		} else {
+		}
+	}
+	for i, u := range ups {
+		if valid[i] && !isDelete[i] {
 			finalSet[u.Dst] = true
 		}
 	}
@@ -270,7 +321,15 @@ func Push(t transport.Transport, root, gitDir string,
 		// haves is built from the ref list as it stood when the batch
 		// started (the known cost pushOne's own comment documented: a
 		// larger pack is never wrong, and one pack per BATCH means this
-		// cost is paid once, not once per ref).
+		// cost is paid once, not once per ref). This deliberately includes
+		// the tips of refs THIS SAME BATCH is about to delete (fix round
+		// M5): harmless today, because v2 has no object GC and an excluded-
+		// but-still-reachable-elsewhere object costs nothing extra. Flag for
+		// whoever eventually extends prune/self-heal (Task 9b's territory)
+		// to objects, not just refs/folders: at that point a have drawn from
+		// a ref this batch deletes could build a pack excluding a closure
+		// that is about to become unreachable, which would need its own
+		// answer before objects are ever actually reclaimed.
 		haves := make([]string, 0, len(remote))
 		for _, s := range remote {
 			if gitcmd.HasObject(gitDir, s) {
@@ -350,7 +409,15 @@ func Push(t transport.Transport, root, gitDir string,
 		if !valid[i] || isDelete[i] {
 			continue
 		}
-		_, exists := remote[u.Dst]
+		// exists is BATCH-AWARE (fix round M4), not a bare read of the
+		// pre-batch remote map: a same-batch valid delete of this exact dst
+		// already ran in phase 4, so by now the node genuinely does not
+		// exist on the remote regardless of what remote[u.Dst] said before
+		// the batch started — WriteRef must take the CreateExclusive path,
+		// not UpdateRevision, for exactly the reason deletedThisBatch's own
+		// doc comment above gives.
+		_, preExists := remote[u.Dst]
+		exists := preExists && !deletedThisBatch[u.Dst]
 		if err := ensureRefParents(t, root, u.Dst); err != nil {
 			fail(i, err.Error())
 			continue
@@ -412,12 +479,23 @@ func ensureHEAD(t transport.Transport, root, gitDir string,
 			okNow[r.Ref] = true
 		}
 	}
+	// TWO PASSES, deliberately (fix round I1, the same set-algebra fix as
+	// finalSet above, and for the identical reason): subtract every
+	// successful delete FIRST, then add every successful non-delete, so the
+	// result is independent of which order ups lists them in. A single pass
+	// keyed on ups' own order got "create main, delete main" (create listed
+	// first, no remote HEAD) wrong — it left `seen` empty and the repo
+	// headless even though refs/heads/main demonstrably exists after the
+	// push; a batch listing them in the other order was already correct by
+	// coincidence, which is exactly the kind of order-dependence set algebra
+	// must not have.
 	for _, u := range ups {
 		if u.Src == "" && okNow[u.Dst] {
 			delete(seen, u.Dst) // a successful delete removes a candidate
-			continue
 		}
-		if okNow[u.Dst] {
+	}
+	for _, u := range ups {
+		if u.Src != "" && okNow[u.Dst] {
 			seen[u.Dst] = true
 		}
 	}
