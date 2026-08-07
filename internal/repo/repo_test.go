@@ -1707,13 +1707,20 @@ func TestSetHeadSucceeds(t *testing.T) {
 	}
 }
 
-// countingTransport wraps a Fake and counts CreateExclusive/UpdateRevision
-// calls PER PATH, so an idempotence test can assert zero writes to HEAD
-// specifically rather than zero writes overall — AcquireLock/Release always
-// perform their own CreateExclusive/Trash against the .lock path, so a
-// global counter would never read zero. transport.NewTraced is not usable
+// countingTransport wraps a Fake and counts CreateExclusive/UpdateRevision/
+// Trash calls PER PATH, so an idempotence test can assert zero mutations to
+// HEAD specifically rather than zero mutations overall — AcquireLock/Release
+// always perform their own CreateExclusive/Trash against the .lock path, so
+// a global counter would never read zero. transport.NewTraced is not usable
 // here: it only instruments ReadTo, so it would report zero writes even when
-// writes happen (peer-review finding).
+// writes happen (peer-review finding). Trash is wrapped alongside the two
+// write methods because an earlier version of this decorator left it
+// uncounted: a Trash injected into SetHead's idempotent branch went
+// undetected by the "zero writes" loop below even though it silently
+// destroyed a branch ref (review mutation finding). EnsureDir is the one
+// remaining Transport mutator this decorator does not wrap; SetHead's
+// idempotent path never calls it, but a future caller that did would not be
+// counted here.
 type countingTransport struct {
 	*transport.Fake
 	writes map[string]int
@@ -1731,6 +1738,11 @@ func (c *countingTransport) CreateExclusive(p, local string) (transport.Outcome,
 func (c *countingTransport) UpdateRevision(p, local string) (transport.Outcome, error) {
 	c.writes[p]++
 	return c.Fake.UpdateRevision(p, local)
+}
+
+func (c *countingTransport) Trash(p string) (transport.Outcome, error) {
+	c.writes[p]++
+	return c.Fake.Trash(p)
 }
 
 // 8  Same-target idempotence: SetHead to the branch HEAD already names
@@ -1755,8 +1767,24 @@ func TestSetHeadIdempotentMakesNoHeadWrite(t *testing.T) {
 	if got != "refs/heads/main" {
 		t.Errorf("SetHead returned %q, want refs/heads/main", got)
 	}
-	if n := c.writes["/r/HEAD"]; n != 0 {
-		t.Errorf("same-target SetHead must not write HEAD, got %d write(s)", n)
+	// Zero CreateExclusive/UpdateRevision/Trash calls to EVERYTHING except the
+	// lock path — AcquireLock's CreateExclusive and Release's Trash against
+	// .lock are legitimate housekeeping. Asserting only /r/HEAD (as this test
+	// originally did) would miss an idempotent run that mutated some OTHER
+	// path — a ref, the marker — as a side effect, and counting only the two
+	// write methods (an earlier version of this decorator) would miss a
+	// Trash of that other path, since Trash is destructive but was not a
+	// "write" the decorator counted (review mutation finding). EnsureDir is
+	// the only remaining Transport mutator this loop does not cover.
+	for p, n := range c.writes {
+		if p != "/r/"+LockName && n != 0 {
+			t.Errorf("same-target SetHead must write nothing but the lock; got %d write(s) to %s", n, p)
+		}
+	}
+	// And the HEAD bytes really are untouched — zero counted writes proves
+	// nothing about mutation through a path the decorator does not count.
+	if head := string(f.Files["/r/HEAD"]); head != "ref: refs/heads/main\n" {
+		t.Errorf("HEAD = %q after idempotent SetHead, want %q", head, "ref: refs/heads/main\n")
 	}
 }
 
@@ -3532,6 +3560,17 @@ func TestFetchMidRoundPairRefreshWithTwoPacksCompletes(t *testing.T) {
 	if got := strings.Count(trace.String(), "/packs/"+stem1+".idx"); got < 1 {
 		t.Errorf("the mid-round refresh never re-downloaded the lying sidecar; "+
 			"the mid-loop pair-refresh path was not reached; trace:\n%s", trace.String())
+	}
+	// Ordering makes the mid-round-vs-pre-loop distinction self-contained:
+	// the lying sidecar is a cache HIT that passes show-index, so the
+	// pre-loop heal never downloads stem1's .idx — the only .idx entry the
+	// trace can hold for stem1 is the mid-loop refresh, and that fires only
+	// AFTER stem1's real pack bytes arrived and failed pair verification.
+	// An .idx download BEFORE the .pack is the pre-loop heal's shape.
+	if pi, ii := strings.Index(trace.String(), "/packs/"+stem1+".pack"),
+		strings.Index(trace.String(), "/packs/"+stem1+".idx"); pi >= 0 && ii >= 0 && ii < pi {
+		t.Errorf("stem1's .idx re-download precedes its .pack download — that is "+
+			"the pre-loop heal, not the mid-loop pair-refresh; trace:\n%s", trace.String())
 	}
 	for _, stem := range []string{stem1, stem2} {
 		if got := strings.Count(trace.String(), "/packs/"+stem+".pack"); got < 1 || got > 2 {

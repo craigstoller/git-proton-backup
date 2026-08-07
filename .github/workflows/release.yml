@@ -38,6 +38,8 @@ jobs:
         run: |
           Install-Module Pester -MinimumVersion 5.5 -Force -SkipPublisherCheck -Scope CurrentUser -AllowClobber
           Import-Module Pester -MinimumVersion 5.5
+          # CI-only belt-and-braces on a throwaway VM — never copy to a dev
+          # machine; test repos set their own repo-scoped identity (see ci.yml).
           git config --global user.email 'ci@ci'; git config --global user.name 'ci'
           Invoke-Pester -Path tests -CI
       - name: Version

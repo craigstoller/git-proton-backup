@@ -523,9 +523,9 @@ Describe 'install.ps1 helper block' {
     # pointed at a TestDrive: subdir. No test may ever write to the real Documents modules
     # directory or the real LOCALAPPDATA (an earlier draft had exactly that contamination bug).
     # $env:LOCALAPPDATA only sandboxes the filesystem side — install.ps1's PATH persistence is a
-    # direct HKCU\Environment registry write via [Environment]::SetEnvironmentVariable(...,
-    # 'User') that no process-env override contains. Every invocation below therefore also
-    # passes -SkipPathUpdate so no test run ever touches the real user PATH (SUPERSEDED banner,
+    # direct HKCU\Environment registry write (Microsoft.Win32.Registry SetValue) that no
+    # process-env override contains. Every invocation below therefore also passes
+    # -SkipPathUpdate so no test run ever touches the real user PATH (SUPERSEDED banner,
     # Task 6 review).
     BeforeAll {
         function New-InstallerSandbox {

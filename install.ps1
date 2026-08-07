@@ -38,14 +38,49 @@ if (Test-Path $HelperExe) {
     if ($SkipPathUpdate) {
         Write-Host "Skipping user PATH update (-SkipPathUpdate)."
     } else {
-        # PATH check tolerates empty user PATHs (no leading semicolon) and
-        # trailing-backslash variants (no duplicate entries) — peer-reviewed.
-        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-        $entries = @(($userPath -split ';') | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') })
-        if ($entries -notcontains $helperDir.TrimEnd('\')) {
-            $newPath = if ([string]::IsNullOrEmpty($userPath)) { $helperDir } else { "$userPath;$helperDir" }
-            [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
-            Write-Host "Added $helperDir to your user PATH. Open a NEW terminal for it to take effect (this script cannot change its caller's session)."
+        # Read-modify-write goes through the registry directly, NOT
+        # [Environment]::GetEnvironmentVariable/SetEnvironmentVariable: those expand every
+        # %VAR% reference on read and write plain REG_SZ back, so one install would freeze
+        # e.g. %USERPROFILE%...\WindowsApps (stock Windows 11 ships the user Path as
+        # REG_EXPAND_SZ) into literal paths for good. DoNotExpandEnvironmentNames keeps the
+        # raw value; the write keeps the value's existing kind (ExpandString for a fresh one).
+        $envKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+        if (-not $envKey) { throw "Cannot open HKCU\Environment for writing — user PATH not updated." }
+        try {
+            $rawUserPath = ''
+            $kind = [Microsoft.Win32.RegistryValueKind]::ExpandString
+            if ($null -ne $envKey.GetValue('Path')) {
+                $rawUserPath = [string]$envKey.GetValue('Path', '',
+                    [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                $kind = $envKey.GetValueKind('Path')
+            }
+            # PATH check tolerates empty user PATHs (no leading semicolon), trailing-backslash
+            # variants (no duplicate entries) — peer-reviewed — and %VAR%-spelled entries
+            # (each raw entry is expanded before comparing).
+            $entries = @(($rawUserPath -split ';') | Where-Object { $_ } | ForEach-Object {
+                    [Environment]::ExpandEnvironmentVariables($_).TrimEnd('\') })
+            if ($entries -notcontains $helperDir.TrimEnd('\')) {
+                $newPath = if ([string]::IsNullOrEmpty($rawUserPath)) { $helperDir } else { "$rawUserPath;$helperDir" }
+                $envKey.SetValue('Path', $newPath, $kind)
+                # [Environment]::SetEnvironmentVariable used to broadcast WM_SETTINGCHANGE so
+                # Explorer — hence any NEW terminal it spawns — re-reads the environment; a raw
+                # registry write does not. Best-effort parity: a failed broadcast only means the
+                # new PATH waits for the next logon.
+                try {
+                    $sig = '[DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]' +
+                        'public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);'
+                    $native = Add-Type -MemberDefinition $sig -Name 'NativeMethods' -Namespace 'GpbInstall' -PassThru
+                    [UIntPtr]$broadcastResult = [UIntPtr]::Zero
+                    # HWND_BROADCAST (0xffff), WM_SETTINGCHANGE (0x1A), SMTO_ABORTIFHUNG (0x2)
+                    $null = $native::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero,
+                        'Environment', 0x2, 5000, [ref]$broadcastResult)
+                } catch {
+                    Write-Verbose "Environment-change broadcast failed (PATH is written; it applies at next logon): $_"
+                }
+                Write-Host "Added $helperDir to your user PATH. Open a NEW terminal for it to take effect (this script cannot change its caller's session)."
+            }
+        } finally {
+            $envKey.Close()
         }
     }
     Write-Host "Helper installed: $helperDir\git-remote-proton.exe"
