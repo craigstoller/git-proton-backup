@@ -921,3 +921,27 @@ func TestPackObjectsFailureCarriesLongPathHint(t *testing.T) {
 		t.Errorf("want the MAX_PATH hint appended to the error, got %v", err)
 	}
 }
+
+// RED then GUARD: pins the OTHER wired branch — WritePack's own rev-list
+// failure, not PackObjectsFromList's. rev-list runs as `git -C gitDir ...`
+// exactly like every other exec site in this package, so a deep gitDir can
+// make rev-list itself the spawn that hits MAX_PATH, before pack-objects is
+// ever reached. A nonexistent gitDir makes `git -C gitDir rev-list ...` fail
+// immediately — the same "need not exist to be long" technique as the
+// PackObjectsFromList wiring test above, aimed at the earlier failure point.
+func TestWritePackRevListFailureCarriesLongPathHint(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("longPathHint is a Windows-only diagnostic")
+	}
+	gitDir := `C:\` + strings.Repeat("nonexistent-dir\\", 20) // well over 240 chars, never created
+	_, _, err := WritePack(gitDir, "HEAD", nil, t.TempDir())
+	if err == nil {
+		t.Fatal("want an error for a gitDir that does not exist")
+	}
+	if !strings.Contains(err.Error(), "rev-list") {
+		t.Fatalf("expected this to fail at rev-list (before pack-objects is ever reached), got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "core.longpaths") {
+		t.Errorf("want the MAX_PATH hint appended to the error, got %v", err)
+	}
+}

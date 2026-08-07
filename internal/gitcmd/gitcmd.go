@@ -243,10 +243,16 @@ func WritePack(gitDir, want string, haves []string, outDir string) (string, stri
 	}
 	objs, code, err := git(gitDir, revArgs...)
 	if code != 0 {
+		// rev-list runs as `git -C gitDir ...`, the same exec shape every other
+		// call in this package uses, so a deep gitDir with a short outDir can
+		// make THIS spawn the one that hits MAX_PATH — not just the later
+		// pack-write steps below. outDir is included too (already absolutised
+		// above); no emitted pack path exists yet at this point, so it is
+		// omitted from the tuple rather than passed empty.
 		if err != nil {
-			return "", "", fmt.Errorf("rev-list failed: %s: %w", objs, err)
+			return "", "", fmt.Errorf("rev-list failed: %s: %w%s", objs, err, longPathHint(gitDir, outDir))
 		}
-		return "", "", fmt.Errorf("rev-list failed: %s", objs)
+		return "", "", fmt.Errorf("rev-list failed: %s%s", objs, longPathHint(gitDir, outDir))
 	}
 	// The one caller of git() where truncated output would be silently WRONG
 	// rather than merely noisy: this list IS the pack's contents, so a short
@@ -283,7 +289,7 @@ func WritePack(gitDir, want string, haves []string, outDir string) (string, stri
 	}
 	if _, err := os.Stat(idxPath); err != nil {
 		return "", "", fmt.Errorf("pack-objects reported %s but the idx file is missing: %w%s",
-			idxPath, err, longPathHint(gitDir, outDir, packPath))
+			idxPath, err, longPathHint(gitDir, outDir, idxPath))
 	}
 	return packPath, idxPath, nil
 }
