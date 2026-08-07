@@ -3624,6 +3624,103 @@ func TestFetchMidRoundPairRefreshWithTwoPacksCompletes(t *testing.T) {
 	}
 }
 
+// RED (structural + behavioural): downloadAndVerifyPack with a corrupt
+// remote pack must (a) return the checksum error, (b) leave packDir with
+// ZERO entries, and (c) leave the corrupt bytes IN THE INCOMING DIR — the
+// quarantined residue awaiting wholesale teardown. (c) is the discriminator
+// a same-shaped test against unpatched code would lack: unpatched code has
+// no incoming dir at all and scrubs its packDir download on failure, so
+// "packDir empty" alone would prove nothing about quarantine having ever
+// existed.
+func TestDownloadAndVerifyQuarantinesCorruptPackBytes(t *testing.T) {
+	src := newGitRepoForPush(t)
+	sha := headOfPushRepo(t, src)
+	packPath, idxPath, err := gitcmd.WritePack(src, sha, nil, t.TempDir())
+	if err != nil || packPath == "" {
+		t.Fatalf("WritePack: %v", err)
+	}
+	stem := strings.TrimSuffix(filepath.Base(packPath), ".pack")
+	f := transport.NewFake()
+	for _, p := range []string{packPath, idxPath} {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.Files["/r/packs/"+filepath.Base(p)] = b
+	}
+	// Corrupt the REMOTE pack bytes so the checksum-vs-basename comparison
+	// fails once downloaded — the stem's name is the ORIGINAL content's
+	// checksum, so any bit flip makes the comparison fail deterministically.
+	corrupt := append([]byte{}, f.Files["/r/packs/"+stem+".pack"]...)
+	corrupt[len(corrupt)/2] ^= 0xff
+	f.Files["/r/packs/"+stem+".pack"] = corrupt
+
+	pm, err := buildPackMap(f, "/r", "", t.TempDir(), []string{stem})
+	if err != nil {
+		t.Fatalf("buildPackMap: %v", err)
+	}
+	incomingDir := t.TempDir()
+	packDir := t.TempDir()
+
+	_, err = downloadAndVerifyPack(f, "/r", incomingDir, packDir, stem, pm)
+	if err == nil {
+		t.Fatal("a corrupt remote pack must return an error")
+	}
+	if !errors.Is(err, errCacheSuspect) || !strings.Contains(err.Error(), "recomputes to") {
+		t.Errorf("must return the checksum-mismatch error wrapping errCacheSuspect: %v", err)
+	}
+	entries, rerr := os.ReadDir(packDir)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if len(entries) != 0 {
+		t.Errorf("packDir must have ZERO entries after a corrupt-pack failure, got %d: %v",
+			len(entries), entries)
+	}
+	got, rerr := os.ReadFile(filepath.Join(incomingDir, stem+".pack"))
+	if rerr != nil {
+		t.Fatalf("the corrupt bytes must remain in the incoming dir, awaiting wholesale "+
+			"teardown: %v", rerr)
+	}
+	if !bytes.Equal(got, corrupt) {
+		t.Error("the quarantined pack bytes must be exactly what was downloaded")
+	}
+}
+
+// RED: publishPair renames .pack before .idx — observed via deterministic
+// second-rename failure: a DIRECTORY is pre-created at packDir/<stem>.idx so
+// the idx rename must fail (os.Rename onto an existing directory errors on
+// this platform). Assert: error returned, AND packDir/<stem>.pack IS present
+// (the pack landed first, before the idx rename that failed). With the
+// renames swapped, the idx rename fails FIRST and the .pack never lands —
+// the presence assertion flips, which is exactly the Step-5 deliberate
+// regression this test is designed to catch.
+func TestPublishPairRenamesPackBeforeIdx(t *testing.T) {
+	stem := "pack-" + strings.Repeat("e", 40)
+	incomingDir := t.TempDir()
+	packDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(incomingDir, stem+".pack"), []byte("pack-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(incomingDir, stem+".idx"), []byte("idx-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Force the SECOND rename to fail deterministically: a directory sits
+	// where the .idx destination must land.
+	if err := os.MkdirAll(filepath.Join(packDir, stem+".idx"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	err := publishPair(incomingDir, packDir, stem)
+	if err == nil {
+		t.Fatal("publishPair must fail when the .idx rename cannot land on a directory")
+	}
+	if _, statErr := os.Stat(filepath.Join(packDir, stem+".pack")); statErr != nil {
+		t.Errorf("the .pack must already have landed before the failing .idx rename "+
+			"(pack-before-idx ordering): %v", statErr)
+	}
+}
+
 // GUARD, not RED: passed immediately against Task 6's code. A genuinely
 // mismatched REMOTE pair — same-OIDs alt-packing idx planted as the remote's
 // own sidecar, so the map is right but the pair can never verify — is fatal
