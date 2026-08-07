@@ -11,10 +11,10 @@ forgotten for the v0.3.x releases. Follow it in order; do not skip or reorder st
    reviewed.
 
 2. **Flip `CHANGELOG.md`'s `[Unreleased]` section to `[vX.Y.Z] — YYYY-MM-DD` and commit — BEFORE
-   tagging.** This step was manual and was forgotten for the v0.3.x releases (v0.3.1's dated
-   entry had to be corrected after the fact); it is the reason this document exists. Do this
-   commit first, and tag it in the next step — never tag a commit whose CHANGELOG still says
-   `[Unreleased]`.
+   tagging.** This step was manual and was forgotten for the v0.3.x releases — the 0.3.1 entry
+   was only dated after publication, in a separate commit (`50704a6`), rather than before
+   tagging; it is the reason this document exists. Do this commit first, and tag it in the next
+   step — never tag a commit whose CHANGELOG still says `[Unreleased]`.
 
 3. **Tag `vX.Y.Z` on the flipped commit.** The tag must point at the commit from step 2, not a
    later one. Push the tag only on Craig's word — do not push a release tag unilaterally.
