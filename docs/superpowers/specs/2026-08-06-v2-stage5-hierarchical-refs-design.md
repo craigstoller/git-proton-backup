@@ -335,8 +335,11 @@ Missing parents of the repo root (Surprise R2-1: raw `Node not found: GitRemotes
 
 **Hermetic:**
 - The in-memory fake transport gains full folder fidelity: nested create/trash, folder-vs-file
-  collisions on both sides, emptiness observable via `List`, `Trash` non-idempotence on
-  folders — everything components 1–2 depend on.
+  collisions on both sides, emptiness observable via `List`, and folder `Trash` per the
+  **wrapper** contract (absent → `Committed`, matching the interface's Stat-first rule — the
+  fake models the wrapper, not the raw CLI, same precedent as ReadTo/C16; an earlier draft of
+  this line said "non-idempotence", which named the raw binary's behaviour and contradicted
+  the transport contract) — everything components 1–2 depend on.
 - New live **contract-table rows** (run at gates only, `GPB_LIVE_ACCOUNT=1`) for behaviours v2
   now depends on: `Trash` on an **empty** folder and on a folder **with children** (outcome
   shape both ways — prune assumes the former, the check-then-act analysis in 2c assumes the

@@ -91,7 +91,7 @@ git commit -m "docs: release procedure (CHANGELOG flip step) and standing gate-b
 - Consumes: current `install.ps1` params (`-Force`, `-SkipPathUpdate`, `-HelperExe`, `-EffectivePath`).
 - Produces: new parameter `-EnvironmentKey` (object with `GetValue($name, $default, $options)`, `GetValueKind($name)`, `SetValue($name, $value, $kind)`, `Close()`); `$null` default opens the real `HKCU\Environment`. Tests never touch the real registry (isolation rule — this is the entire point of the task).
 
-- [ ] **Step 1: Write the failing Pester tests** in `tests/InstallHelper.Tests.ps1`. Build a mock key as a `PSCustomObject` with `Add-Member -MemberType ScriptMethod` for the four methods, backed by a hashtable `@{ Path = '%USERPROFILE%\bin'; Kind = 'ExpandString' }` plus a `$script:setCalls` recorder. Cases (each asserts on the recorder, and a final `AfterAll` asserts the REAL user PATH is byte-unchanged — read it via `[Microsoft.Win32.Registry]` with `DoNotExpandEnvironmentNames` before/after the whole file):
+- [ ] **Step 1: Write the failing Pester tests** in `tests/InstallHelper.Tests.ps1`. **Containment first (round-1 Codex blocker): the script must be run as a COPY under TestDrive, never from the repo root** — beside the repo the `GitProtonBackup` payload directory exists, so the module block would write into the REAL Documents modules dir; a TestDrive copy has no payload and takes the skip branch. Additionally set `$env:LOCALAPPDATA` to a TestDrive dir in `BeforeAll` (restore the saved value in `AfterAll`) so the helper `Copy-Item` lands in TestDrive, not the real `%LOCALAPPDATA%\Programs\git-proton-backup`. (The runbook's warning that env overrides do not contain REGISTRY writes is exactly why the registry goes through the mock, not the env.) Guards: `AfterAll` asserts the real user PATH (read via `[Microsoft.Win32.Registry]` with `DoNotExpandEnvironmentNames`), the real `%LOCALAPPDATA%\Programs\git-proton-backup` fingerprint, and the real Documents module dir are all byte-unchanged. Build a mock key as a `PSCustomObject` with `Add-Member -MemberType ScriptMethod` for the four methods, backed by a hashtable `@{ Path = '%USERPROFILE%\bin'; Kind = 'ExpandString' }` plus a `$script:setCalls` recorder. Cases (each asserts on the recorder):
   - RED `preserves REG_EXPAND_SZ kind on append` — existing `ExpandString` value; expect one `SetValue` call with kind `ExpandString` and value `<old>;<helperDir>`.
   - RED `preserves REG_SZ kind` — same with `String` kind.
   - RED `no-op when helperDir already present` (including a `%VAR%`-spelled entry that expands to helperDir) — expect zero `SetValue` calls.
@@ -131,8 +131,12 @@ git commit -m "test(install): injectable registry seam; hermetic PATH value-kind
 - [ ] **Step 1: Write the failing test** in `main_test.go`:
 ```go
 // RED: pins the dispatchUtility→runSetHead call site — argv routing, argument
-// order, and exit-code propagation — which until Stage 5 was pinned only by
-// live gates (hermetic tests stopped at dispatchUtility's arity arm).
+// order, exit-code propagation, and WRITER PLUMBING (the stub writes to the
+// stdout writer dispatchUtility passed it; the assertion proves that writer
+// reaches the callee — it deliberately does NOT pin runSetHead's real message
+// text, which no hermetic test can reach without the Task 13 shim; that text
+// stays pinned by the live gate). Until Stage 5 this call site was pinned
+// only by live gates (hermetic tests stopped at dispatchUtility's arity arm).
 func TestDispatchRoutesSetHeadArgsInOrder(t *testing.T) {
 	orig := runSetHeadFn
 	defer func() { runSetHeadFn = orig }()
@@ -179,6 +183,7 @@ git commit -m "test(main): seam and hermetic pin for the --set-head dispatch wir
 - Modify: `internal/transport/cli_test.go` (helper-process roles)
 - Modify: `internal/transport/fake.go` (no behaviour change — Fake's `(_, false, nil)` is already the confirmed-absence model; add a comment)
 - Modify: `internal/transport/contract_test.go` (new row)
+- Modify: `internal/repo/repo_test.go` (Step 4's RequireMarker end-to-end check)
 
 **Interfaces:**
 - Consumes: `CLI.run(args...) (string, int, error)`; existing role-based fake-CLI infrastructure in `cli_test.go` (`TestMain`/`runHelperRole`).
@@ -213,6 +218,12 @@ if code != 0 {
 	if strings.Contains(out, notFoundSignature) {
 		return Node{}, false, nil // the certified CLI's confirmed-absence signature
 	}
+	// Preserve the underlying error per the transport convention List and
+	// EnsureDir already follow (round-1 Gemini: dropping c.run's err breaks
+	// the %w chain).
+	if err != nil {
+		return Node{}, false, fmt.Errorf("info %s failed: %s: %w", p, strings.TrimSpace(bound(out, 200)), err)
+	}
 	return Node{}, false, fmt.Errorf("info %s failed: %s", p, strings.TrimSpace(bound(out, 200)))
 }
 ```
@@ -226,7 +237,7 @@ Note `c.run` returns combined output — confirm not-found text lands in `out` (
 
 - [ ] **Step 7: Commit.**
 ```bash
-git add internal/transport docs
+git add internal/transport internal/repo/repo_test.go
 git commit -m "fix(transport): Stat classifies not-found vs failure; kills the marker masquerade"
 ```
 
@@ -275,7 +286,7 @@ func longPathHint(paths ...string) string {
 	return ""
 }
 ```
-Append `longPathHint(...)` to the error returns of `WritePack` (paths: `outDir` plus the emitted pack path) and `PackObjectsFromList` (path: `outStem`). Keep it out of success paths.
+Two round-1 corrections baked in: `len()` counts UTF-8 bytes, not UTF-16 path units — acceptable for a possible-cause hint and part of why 240 is conservative; say so in the comment. Append `longPathHint(...)` to the error returns of `WritePack` (paths: `gitDir`, `outDir`, the emitted pack path) and `PackObjectsFromList` (paths: `gitDir`, `outStem`) — **`gitDir` included**: every spawned command runs `git -C gitDir`, and a deep repo with a short temp dir is the likelier real-world shape. Keep it out of success paths. Add one wiring test proving a failed command actually carries the hint: `TestPackObjectsFailureCarriesLongPathHint` — call `PackObjectsFromList` with a nonexistent `gitDir` whose STRING is ≥240 chars (the path need not exist to be long); assert the returned error contains "core.longpaths".
 
 - [ ] **Step 4: README.** Add a "Windows path length" subsection: deep clone destinations can exceed 260 chars; `core.longpaths=true` helps for git's own writes, a shorter destination always helps; checkout-phase failures (after the helper exits) can only be fixed by these, no helper hint is possible there.
 
@@ -297,33 +308,37 @@ git commit -m "feat(gitcmd): best-effort MAX_PATH hint on pack-write failures; R
 - Consumes: `Fetch(t, root, gitDir, cacheDir, wants)`; `downloadAndVerifyPack(t, root, packDir, stem, pm)`; `packMap.sidecars`.
 - Produces: `downloadAndVerifyPack(t transport.Transport, root, incomingDir, packDir string, stem string, pm *packMap) (bool, error)` — verifies in `incomingDir`, publishes verified pairs into `packDir` by `os.Rename`, `.pack` first, `.idx` second (the pair's commit point: git discovers packs only via `.idx`, so an unpublished index makes the pack invisible to the traversal). The residue rule is GONE: nothing unverified ever exists under `packDir`.
 
-- [ ] **Step 1: Write the failing tests** (repo_test.go, driving `Fetch` against a Fake with fault injection):
+- [ ] **Step 1: Write the failing tests** (repo_test.go). **Round-1 Codex blocker applied: the original drafts of these tests passed against unpatched code** (the residue rule also leaves packDir clean after a failure, and end-state pair-completeness can't see rename order), so the tests below are written against the NEW extracted seam and use discriminating observations:
 ```go
-// RED: a pack that fails checksum/pair verification must leave the ALTERNATE's
-// pack dir EMPTY — quarantine's whole point. Pre-quarantine code wrote into
-// packDir and cleaned up per the residue rule; this asserts the class is gone,
-// not patched: inject a corrupt remote pack, let Fetch fail (or heal), and
-// assert packDir contains no trace of the corrupt stem at any point observable
-// after the failure.
-func TestQuarantineFailedVerificationNeverTouchesTheAlternate(t *testing.T)
+// RED (structural + behavioural): downloadAndVerifyPack with a corrupt remote
+// pack must (a) return the checksum error, (b) leave packDir with ZERO
+// entries, and (c) leave the corrupt bytes IN THE INCOMING DIR — the
+// quarantined residue awaiting wholesale teardown. (c) is the discriminator
+// the round-1 draft lacked: unpatched code has no incoming dir at all and
+// scrubs its packDir download, so "packDir empty" alone proved nothing.
+func TestDownloadAndVerifyQuarantinesCorruptPackBytes(t *testing.T)
 
-// RED: publication order — .pack must exist in packDir before its .idx does.
-// Assert structurally: wrap os.Rename? No — assert the END state plus the
-// invariant via a verify-failure injected BETWEEN members (corrupt idx, good
-// pack): after the heal path re-verifies, packDir holds either nothing or a
-// complete pair; never an .idx without its .pack.
-func TestQuarantinePublishesPackThenIdxNeverIdxAlone(t *testing.T)
+// RED: publishPair renames .pack before .idx — observed via deterministic
+// second-rename failure: pre-create a DIRECTORY at packDir/<stem>.idx so the
+// idx rename must fail. Assert: error returned, AND packDir/<stem>.pack IS
+// present (pack landed first). With the renames swapped, the idx rename fails
+// FIRST and the .pack never lands — the assertion flips, which is exactly the
+// Step-5 deliberate regression.
+func TestPublishPairRenamesPackBeforeIdx(t *testing.T)
 
-// RED: two-pack pair-refresh — the retro-Codex gap. Fixture with TWO remote
-// packs; corrupt the CACHED sidecar of pack B only. Fetch must succeed,
-// re-download B's sidecar (trace shows the .pack-before-refreshed-.idx order
-// the Stage 4 polish test pins for one pack), and the plan's restart must
-// re-select pack A WITHOUT re-downloading its verified bytes into the
-// alternate twice. Pin restart-vs-resume empirically: assert A's pack is
-// downloaded exactly once across the whole fetch (count trace lines).
-func TestTwoPackPairRefreshRestartsPlanWithoutRedownloadingVerifiedPacks(t *testing.T)
+// GUARD (behaviour preserved through the refactor): the EXISTING
+// TestFetchMidRoundPairRefreshWithTwoPacksCompletes (repo_test.go:3516, from
+// the Stage 4 polish wave) and the trace-ordering pair-refresh test must pass
+// UNMODIFIED. Note for the ledger: that existing test already provides the
+// retro-Codex "two-pack pair-refresh fixture", and its own comments document
+// that restart-vs-resume cannot be empirically discriminated with the
+// downloaded-map design (the map makes both paths download each verified pack
+// exactly once). The spec sentence promising an empirical restart-vs-resume
+// pin is therefore satisfied to the extent reality allows; record the
+// residual honestly in the v6.5 edit rather than inventing a test that
+// cannot discriminate (round-1 [Both] finding).
 ```
-Build the two-pack fixture by two sequential pushes to the Fake remote (distinct commits — pin committer dates). Reuse the existing trace-assertion helpers from the Stage 4 polish tests (find them by `git grep -n "pair refresh" internal/repo`).
+Fixtures with distinct histories pin committer dates (global constraint). Reuse the existing trace-assertion helpers (`git grep -n "pair refresh" internal/repo`).
 
 - [ ] **Step 2: Run, expect FAIL:** `go test ./internal/repo/ -run "Quarantine|TwoPack" -count=1`.
 
@@ -353,23 +368,33 @@ func downloadAndVerifyPack(t transport.Transport, root, incomingDir, packDir, st
 		// paths under incomingDir; final failure returns the pair-corrupt error.
 		refreshed = true
 	}
-	// PUBLISH: only a fully verified pair leaves quarantine. Pack first, then
-	// idx — the idx rename is the commit point (git cannot see a pack without
-	// its index), which is what makes the two renames atomic to the traversal.
-	if err := os.Rename(inPack, filepath.Join(packDir, packName)); err != nil {
-		return refreshed, err
-	}
-	if err := os.Rename(inIdx, filepath.Join(packDir, stem+".idx")); err != nil {
+	// PUBLISH: only a fully verified pair leaves quarantine.
+	if err := publishPair(incomingDir, packDir, stem); err != nil {
 		return refreshed, err
 	}
 	return refreshed, nil
+}
+
+// publishPair moves a VERIFIED pair from quarantine into the alternate's pack
+// dir: .pack first, then .idx — the idx rename is the commit point (git
+// discovers packs only via their index, so a pack whose idx has not landed is
+// invisible to the traversal), which is what makes the two renames an atomic
+// publication from the reader's side. Extracted so the ordering is unit-
+// testable (TestPublishPairRenamesPackBeforeIdx).
+func publishPair(incomingDir, packDir, stem string) error {
+	if err := os.Rename(filepath.Join(incomingDir, stem+".pack"),
+		filepath.Join(packDir, stem+".pack")); err != nil {
+		return err
+	}
+	return os.Rename(filepath.Join(incomingDir, stem+".idx"),
+		filepath.Join(packDir, stem+".idx"))
 }
 ```
 (The sketch compresses the existing heal branch — keep its exact semantics, relocated to incoming paths; `os.Rename` replaces an existing destination file on Windows in Go, which the mid-round refresh relies on.) Update `Fetch`'s call site with the extra arg. Delete the now-dead removal choreography and the RESIDUE RULE comment block, replacing it with a two-line quarantine comment pointing at the spec.
 
 - [ ] **Step 4: Run the full repo suite** (`go test ./internal/repo/ -count=1`) — the Stage 4 polish trace test (`.pack` before re-downloaded `.idx`) must still pass unmodified; if it needed edits, the refactor changed observable ordering and is wrong.
 
-- [ ] **Step 5: Deliberate regression.** Temporarily swap the two renames (idx first) and confirm `TestQuarantinePublishesPackThenIdxNeverIdxAlone` fails; revert.
+- [ ] **Step 5: Deliberate regression.** Temporarily swap `publishPair`'s two renames (idx first) and confirm `TestPublishPairRenamesPackBeforeIdx` fails (the pre-created directory now blocks the FIRST rename, so the `.pack` never lands and the presence assertion trips); revert.
 
 - [ ] **Step 6: Commit.**
 ```bash
@@ -405,7 +430,10 @@ git commit -m "refactor(fetch): quarantine staging — verify in incoming, publi
 // round-3 catch), refs/heads/a..b, refs/heads/a.lock, refs/heads/a/, refs//x,
 // refs/heads/a\b, refs/heads/@{, refs/heads/a b, refs/heads/a:b, refs/heads/a~b,
 // refs/heads/a^b, refs/heads/a?b, refs/heads/a*b, refs/heads/a[b, @, refs/heads/a.,
-// control chars, empty, "/refs/heads/x".
+// control chars, empty, "/refs/heads/x", AND the one-level names "main",
+// "refs", "HEAD" — git's default rules require at least one '/' (round-1
+// Codex: the first draft omitted this rule and had no one-level fixture to
+// catch it).
 func TestCheckRefNameRules(t *testing.T)
 
 // RED (parity — the round-3 mandate): every fixture above, accept AND reject,
@@ -428,7 +456,8 @@ func TestAdvertisableName(t *testing.T)
 // 3: a prose list omitted leading-dot components); the parity test in
 // refname_test.go is what keeps this honest — extend fixtures before logic.
 func CheckRefName(name string) error {
-	if name == "" || name == "@" || strings.HasPrefix(name, "/") ||
+	if name == "" || name == "@" || !strings.Contains(name, "/") ||
+		strings.HasPrefix(name, "/") ||
 		strings.HasSuffix(name, "/") || strings.Contains(name, "//") {
 		return fmt.Errorf("invalid ref name %q", name)
 	}
@@ -463,6 +492,7 @@ func (f *Fake) Trash(p string) (Outcome, error) {
 	return Committed, nil
 }
 ```
+On idempotence: the spec's component-8 phrase "`Trash` non-idempotence on folders" described the RAW CLI; the Fake models the WRAPPER contract (`transport.go`: implementations Stat first, absent → `Committed`) — the same wrapper-not-binary precedent as ReadTo/C16. The spec line is corrected in the same commit (see the spec's Revisions note); flagged to Craig rather than silently chosen (round-1 Codex).
 `EnsureDir`: error if `Files[p]` exists ("create-folder failed: a file exists at %s"); error if the parent (`path.Dir(p)`) is neither a mount root (`/my-files`, `/devices`, or depth ≤ 2 under `/devices`) nor present in `Dirs`/implied by `Files` — message `create-folder %s in %s failed: Node not found: %s` mirroring the live shape. **Expect fixture churn:** existing repo tests that relied on lax `EnsureDir` may now need their Fake seeded with the root's parents — seed via `f.Dirs["/my-files/r"] = true`-style lines in test setup, never by weakening the Fake.
 `CreateExclusive`/`UpdateRevision`: before the `Files[p]` check, `if f.Dirs[p] { return Refused, nil }` (name taken by a folder — the D/F collision Task 9b heals; the live contract row pins the real CLI's shape and this models the conservative reading).
 
@@ -481,8 +511,8 @@ git commit -m "feat: in-process ref-name validator with git parity; Fake folder 
 ### Task 8: Recursive `ListRefs` with skip-notes + namespace re-enable in `checkDst`
 
 **Files:**
-- Modify: `internal/repo/refs.go:20-51` (`ListRefs`)
-- Modify: `internal/repo/push.go:277-304` (`isBranch` untouched; `checkDst` rewritten)
+- Modify: `internal/repo/refs.go:20-78` (`ListRefs`; `readRef` grammar tightened to exact 40-hex+LF)
+- Modify: `internal/repo/push.go:277-304` (`isBranch` untouched; `checkDst` rewritten with authoritative `gitcmd.CheckRefFormat` first)
 - Modify: `internal/repo/repo_test.go`
 
 **Interfaces:**
@@ -507,7 +537,14 @@ func TestListRefsSkipsInvalidNamesWithNoteNeverFatal(t *testing.T)
 // present, junk absent) and pin the note text in a focused unit test of the
 // skip helper with an injected writer).
 
-// GUARD: malformed CONTENTS of a well-named ref stay fatal (existing rule).
+// GUARD+RED: malformed CONTENTS of a well-named ref stay fatal (existing
+// rule) — WITH the boundary fixtures the current lax readRef accepts (round-1
+// Codex): exactly-40-hex with NO trailing newline, CRLF terminator, and a
+// double-LF terminator must all be fatal under the spec's exact grammar
+// ("40 lowercase hex plus \n"). This step also TIGHTENS readRef: replace the
+// TrimRight tolerance with an exact match — len(raw)==41, raw[40]=='\n',
+// shaRe on raw[:40] — v2 itself always writes sha+"\n", so only foreign or
+// damaged files are affected, and those are exactly what must be fatal.
 func TestListRefsMalformedContentStillFatal(t *testing.T)
 
 // RED: empty folders contribute nothing and do not error.
@@ -567,6 +604,17 @@ func checkDst(dst string) error {
 	if !strings.HasPrefix(dst, "refs/") {
 		return fmt.Errorf("unsupported destination %q: only refs under refs/ are served "+
 			"(pseudorefs and other destinations have no representation on this remote)", dst)
+	}
+	// AUTHORITY FIRST (spec §1, both round-1 engines): the push boundary runs
+	// the REAL git check-ref-format; the in-process validator covers only
+	// stageability afterwards. Order matters for diagnosability too — a name
+	// git rejects gets git's verdict, not the in-process approximation's.
+	ok, err := gitcmd.CheckRefFormat(dst)
+	if err != nil {
+		return fmt.Errorf("cannot validate ref name %q with git: %w", dst, err)
+	}
+	if !ok {
+		return fmt.Errorf("invalid ref name %q (git check-ref-format)", dst)
 	}
 	return advertisableName(dst)
 }
@@ -630,6 +678,17 @@ func TestPushPackFailureFailsCreatesButDeletionsProceed(t *testing.T)
 //   FailNext on the pack upload: every create/update errors naming the pack
 //   failure; the batch's deletion still executes and reports its own ok
 //   (spec: phase-3 failure CONTINUES into phase 4 — adjudicated round 2).
+//   GUARD, not RED (round-1 Gemini): today's per-ref pushOne already lets an
+//   unrelated deletion proceed past a failed create — this pins that the
+//   behaviour SURVIVES the restructure, with the new all-creates-share-one-
+//   failure shape asserted on top.
+func TestPushDeleteOfHEADBranchRefusedAtPreflight(t *testing.T)
+//   RED (round-1 Codex): batch deletes the branch HEAD names AND creates a
+//   child under it. The delete must be refused in PHASE 2 (non-mutating
+//   ReadHEAD), the refused delete must NOT be subtracted from the preflight's
+//   final set, so the dependent create fails the D/F preflight too — and NO
+//   pack is built (assert no /packs children added). Without the phase-2 HEAD
+//   read, this batch uploads a pack, then fails twice downstream.
 func TestPushDeleteThenCreateSameNameOneBatch(t *testing.T)
 //   remote has refs/heads/feature; batch deletes it and creates
 //   refs/heads/feature/x → both ok (deletes-before-creates makes room; the
@@ -653,16 +712,31 @@ func Push(t transport.Transport, root, gitDir string, ups []protocol.RefUpdate, 
 	failed := func(i int, msg string) { results[i] = Result{Ref: ups[i].Dst, Err: oneLine(msg)} }
 
 	// ---- phase 2: whole-batch validation, nothing has moved --------------
-	seenDst := map[string]int{}
+	// Duplicates PRE-SCANNED so EVERY holder of a duplicated dst is refused —
+	// a first-seen-wins loop leaves the first duplicate valid and lets it
+	// mutate (round-1 Codex).
+	dstCount := map[string]int{}
+	for _, u := range ups {
+		dstCount[u.Dst]++
+	}
+	// HEAD read ONCE, non-mutating, under the batch's lock, so a delete of
+	// the HEAD branch is refused HERE — before it can distort the final-state
+	// preflight or cost a pack upload (round-1 Codex). ReadHEAD failure fails
+	// every delete closed, per the existing per-ref rule.
+	head, hasHead, headErr := ReadHEAD(t, root)
 	valid := make([]bool, len(ups))
 	newShas := make([]string, len(ups))
 	for i, u := range ups {
 		if err := checkDst(u.Dst); err != nil { failed(i, err.Error()); continue }
-		if j, dup := seenDst[u.Dst]; dup {
-			failed(i, fmt.Sprintf("duplicate destination (also update %d)", j)); continue
+		if dstCount[u.Dst] > 1 {
+			failed(i, "duplicate destination in one batch"); continue
 		}
-		seenDst[u.Dst] = i
-		if u.Src == "" { valid[i] = true; continue } // deletes validate name-only here
+		if u.Src == "" {
+			if headErr != nil { failed(i, /* unreadable-HEAD refusal, wording from pushOne */ ""); continue }
+			if hasHead && head == u.Dst { failed(i, /* HEAD-protection refusal, wording from pushOne */ ""); continue }
+			valid[i] = true
+			continue
+		}
 		// resolve + object-type + ancestry + force rule: lifted from pushOne
 		// verbatim (resolve, isBranch/ObjectType, HasObject/IsAncestor), plus:
 		if requiresForce(u.Dst) && !u.Force {
@@ -685,7 +759,9 @@ func Push(t transport.Transport, root, gitDir string, ups []protocol.RefUpdate, 
 	// publishIdx. On ANY failure: mark every valid non-delete failed with the
 	// pack error; deletions still proceed (phase-3-continues rule).
 
-	// ---- phase 4: deletions (HEAD guard verbatim from pushOne) ------------
+	// ---- phase 4: deletions (phase 2 already refused HEAD-branch deletes;
+	// keep pushOne's per-delete HEAD re-check as defense-in-depth — it is one
+	// cheap read and covers a HEAD written between phases by a non-v2 actor) --
 	// ---- phase 5: creates/updates: ensureRefParents + WriteRef (+Task 9b heal)
 	// ensureHEAD(...) unchanged, after all phases.
 	return results
@@ -751,7 +827,10 @@ func TestCreateRefusesFolderWithLiveSubRefs(t *testing.T)
 // GUARD: heal's diagnostic Stat/List failing → that transport error, no heal.
 func TestSelfHealAbortsOnDiagnosticFailure(t *testing.T)
 
-// EnsureDir contradiction (cli_test.go, helper roles):
+// EnsureDir node-type + contradiction (cli_test.go, helper roles):
+// RED (the round-1 blocker): role answers info→FILE node at the path:
+// EnsureDir must error naming the file, never return nil.
+func TestEnsureDirRefusesAFileAtThePath(t *testing.T)
 // RED: role answers info→not-found then create-folder→"already exists" then
 // info→folder: EnsureDir succeeds (re-Stat found it).
 func TestEnsureDirContradictionResolvedByReStatFolder(t *testing.T)
@@ -834,7 +913,9 @@ func createRefHealingCollision(t transport.Transport, root, ref, sha string) (tr
 ```
 Phase 5 uses this for creates (`exists == false`) only; updates keep plain `WriteRef`.
 
-- [ ] **Step 5: Implement the `EnsureDir` re-Stat** in cli.go: on `code != 0` from create-folder, `if strings.Contains(out, alreadyExistsSignature)` → re-`Stat(p)`: `(dir,true)` → `return nil`; `(file,true)` → error `create-folder %s: a file occupies that name`; `(_,false)` → error quoting both the create-folder output and the re-Stat verbatim. `const alreadyExistsSignature = "already exists"` — **hypothesis about the CLI's wording; the helper role pins the code path, the live contract row (add it now, gate-run later) pins the real text.** Comment must carry the C17b framing: generic robustness, never a validated live fix.
+- [ ] **Step 5: Implement the `EnsureDir` fixes** in cli.go — TWO defects, and the first is a round-1 Codex BLOCKER in the current shipped code path this stage starts depending on:
+  1. **The initial Stat must branch on node type.** Today `EnsureDir` returns `nil` for ANY existing node (`cli.go:221-225` never reads `Node.IsDir`), so a ref FILE at the path reads as a usable folder and the reverse-D/F failure surfaces later with a wrong diagnostic. Fix: `ok && n.IsDir` → `nil`; `ok && !n.IsDir` → `fmt.Errorf("cannot use %s as a folder: a file occupies that name", p)` (the error text Task 9a's reverse-D/F rewrap keys on — keep them consistent); absent → create. Helper-role test + the Task 7 fake/live contract case (`EnsureDir` onto a file) cover both implementations.
+  2. **The contradiction re-Stat:** on `code != 0` from create-folder, `if strings.Contains(out, alreadyExistsSignature)` → re-`Stat(p)`: `(dir,true)` → `return nil`; `(file,true)` → the same a-file-occupies-that-name error; `(_,false)` → error quoting both the create-folder output and the re-Stat verbatim. `const alreadyExistsSignature = "already exists"` — **hypothesis about the CLI's wording; the helper role pins the code path, the live contract row (add it now, gate-run later) pins the real text.** Comment must carry the C17b framing: generic robustness, never a validated live fix.
 
 - [ ] **Step 6: Run full suite + deliberate regressions:** (a) change `subtreeFiles`' rule to first-level-only → nested-empty test fails; (b) change it to ref-files-only → foreign-file test fails; (c) remove the prune call → prune tests fail. Revert each.
 
@@ -906,10 +987,14 @@ func TestEnsureParentsRefusalIsActionable(t *testing.T)
 func TestEnsureParentsCreatesWithLoudNotes(t *testing.T)
 //   root /my-files/a/b/repo → creates a then b (repo itself is Bootstrap's,
 //   NOT created here — assert absent), two stderr lines.
-// RED: walk bounds — never creates the mounts themselves.
+// RED: walk bounds — never creates the mounts themselves, and an ABSENT mount
+// is the actionable refusal in BOTH modes (round-1 Gemini: the draft let a
+// missing mount fall through to the raw CLI error).
 func TestEnsureParentsNeverCreatesMountRoots(t *testing.T)
-//   /my-files: parent walk starts BELOW it. /devices/<id>/x/repo: <id> missing
-//   → refusal even with create=true (a device mount is not creatable storage).
+//   /my-files: parent walk starts BELOW it. /devices/<id>/x/repo with <id>
+//   missing → named refusal even with create=true; nothing created.
+// RED: a FILE occupying a parent name → named cannot-use-as-folder error.
+func TestEnsureParentsRefusesFileOccupyingParentName(t *testing.T)
 // GUARD: no rollback — creation fails at b after a succeeded → a remains,
 // stderr says what was created (spec: rollback would be the unsafe race).
 func TestEnsureParentsPartialCreationIsKeptAndReported(t *testing.T)
@@ -930,13 +1015,31 @@ func EnsureParents(t transport.Transport, root string, create bool, stderr io.Wr
 		protectedDepth = 2              // /devices/<device-id>
 	}
 	prefix := "/" + strings.Join(parts[:protectedDepth], "/")
+	// The MOUNT ITSELF is checked first and is never creatable (round-1, both
+	// engines): absent mount → the actionable refusal in BOTH modes, naming it
+	// and stating it cannot be created by the helper (a device mount is not
+	// creatable storage; /my-files existing is an account invariant, so an
+	// absent one is a real transport/account problem the user must see).
+	if n, ok, err := t.Stat(prefix); err != nil {
+		return fmt.Errorf("checking mount %s: %w", prefix, err)
+	} else if !ok {
+		return fmt.Errorf("mount %s does not exist or is not reachable; the helper never "+
+			"creates mounts (%s does not apply here)", prefix, "GPB_CREATE_PARENTS")
+	} else if !n.IsDir {
+		return fmt.Errorf("mount %s is not a folder", prefix)
+	}
 	for i := protectedDepth; i < len(parts)-1; i++ { // parents ONLY; the leaf is Bootstrap's
 		prefix += "/" + parts[i]
-		_, ok, err := t.Stat(prefix)
+		n, ok, err := t.Stat(prefix)
 		if err != nil {
 			return fmt.Errorf("checking parent folder %s: %w", prefix, err)
 		}
 		if ok {
+			if !n.IsDir {
+				// A FILE where a parent folder must stand (round-1 Codex: the
+				// draft accepted any existing node as a usable folder).
+				return fmt.Errorf("cannot use %s as a parent folder: a file occupies that name", prefix)
+			}
 			continue
 		}
 		if !create {
@@ -950,10 +1053,6 @@ func EnsureParents(t transport.Transport, root string, create bool, stderr io.Wr
 		}
 		fmt.Fprintf(stderr, "git-remote-proton: created parent folder %s (GPB_CREATE_PARENTS=1)\n", prefix)
 	}
-	// The mount itself missing (e.g. /devices/<id> absent) surfaces naturally:
-	// the first child Stat errors or the leaf EnsureDir in Bootstrap fails with
-	// the CLI's own Node-not-found — with create=false the loop above already
-	// refused at the first absent parent below the mount.
 	return nil
 }
 ```
@@ -1023,6 +1122,37 @@ git commit -m "chore(release): v0.4.0 CHANGELOG flip; Stage 5 live gate brief"
 ```
 
 ---
+
+## Revisions
+
+*Scaffolding for the review loop; delete before execution dispatch.*
+
+**Round 1 (Codex + Gemini, 2026-08-06) — applied:** authoritative `git check-ref-format` wired
+into `checkDst` ahead of the in-process check ([Both] — the spec's push-boundary rule had no
+implementing call); `CLI.EnsureDir`'s initial Stat branches on node type (Codex blocker: a file
+read as a usable folder); Task 6's tests rewritten against the extracted `publishPair` seam with
+discriminating observations (Codex blocker: the drafts passed against unpatched code — residue
+rule also leaves packDir clean; end-state pair-completeness cannot see rename order), and the
+two-pack pair-refresh claim corrected — the Stage 4 polish wave already added
+`TestFetchMidRoundPairRefreshWithTwoPacksCompletes`, whose own comments document that
+restart-vs-resume cannot be empirically discriminated under the downloaded-map design ([Both];
+residual recorded for the v6.5 edit instead of a non-discriminating test); Task 2 contained
+(Codex blocker: script now runs as a TestDrive copy with `$env:LOCALAPPDATA` redirected, real
+install/module/registry fingerprints guarded); duplicate-dst pre-scan refuses every holder
+(Codex: first-seen-wins left the first duplicate mutable); HEAD-branch deletes refused in phase
+2 via one non-mutating ReadHEAD so the D/F preflight's final set is computed correctly and no
+pack is wasted (Codex); `EnsureParents` Stats the mount first — absent mount is the actionable
+refusal in both modes, never creatable — and checks `IsDir` on every existing parent (Codex +
+Gemini); `readRef` grammar tightened to exact 40-hex+LF with boundary fixtures (Codex: TrimRight
+accepted no-LF/CRLF/double-LF); `CheckRefName` gains git's at-least-one-slash rule plus
+one-level fixtures (Codex); `longPathHint` includes `gitDir`, notes the UTF-8-byte caveat, and
+gains a failure-path wiring test (Codex); Task 3's stdout assertion reframed as writer-plumbing
+(Codex: it tested the stub's text); Task 4 preserves `c.run`'s error in the `%w` chain (Gemini)
+and its Files/commit lists gain `repo_test.go` (Codex); `TestPushPackFailureFailsCreatesButDeletionsProceed`
+relabelled GUARD (Gemini: per-ref pushOne already behaves so). **Spec touched once, disclosed:**
+component 8's "`Trash` non-idempotence on folders" corrected to the wrapper contract
+(absent → Committed) — the phrase named the raw binary and contradicted `transport.go`'s
+Stat-first rule the Fake models (Codex).
 
 ## Self-Review Notes (run before handing the plan to review)
 
