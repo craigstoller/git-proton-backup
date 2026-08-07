@@ -416,9 +416,10 @@ git commit -m "refactor(fetch): quarantine staging — verify in incoming, publi
 - Consumes: `checkStageableLeaf` (marker.go) — reused per component.
 - Produces:
   - `repo.CheckRefName(name string) error` — full documented `git-check-ref-format` rule set, in-process, no subprocess.
-  - `repo.advertisableName(name string) error` — `CheckRefName` + per-component `checkStageableLeaf` (components split on `/` first, so the leaf check's `/\` rejection never fires spuriously). Used by Task 8's read boundary and Task 9a's push validation.
-  - `gitcmd.CheckRefFormat(name string) (bool, error)` — runs `git check-ref-format -- <name>`; `(true,nil)` exit 0, `(false,nil)` exit 1, error otherwise. Authority at the push boundary and the parity oracle.
-  - Fake fidelity: `Trash` on a folder removes the folder and its entire subtree (Committed); `CreateExclusive`/`UpdateRevision` where `Dirs[p]` → `Refused`; `EnsureDir` where `Files[p]` exists → error containing "a file exists at"; `EnsureDir` with a missing parent → error containing `notFoundSignature`'s text shape (`Node not found: <name>`) — Tasks 9–11 depend on all four.
+  - `repo.checkComponent(name string) error` — validates ONE path component: `checkStageableLeaf` plus git's per-component rules (leading dot, `.lock` suffix, forbidden characters, `..`, `@{`). Task 8's walk applies it to every listed node — folders included — before recursing.
+  - `repo.advertisableName(name string) error` — `CheckRefName` + `checkComponent` over each `/`-split component. Used by Task 8's read boundary (files) and Task 9a's push validation.
+  - `gitcmd.CheckRefFormat(name string) (bool, error)` — runs `git check-ref-format <name>` — **NO `--` separator: verified live 2026-08-06, `check-ref-format -- refs/heads/main` exits 129 (usage) while the bare form exits 0/1 correctly** (round-2 Codex blocker). No argument-injection exposure: every caller passes names already required to start with `refs/`, so a leading `-` cannot occur. Contract: `(true,nil)` exit 0, `(false,nil)` exit 1, error on any other exit (129 included — an unexpected-exit test pins this). Authority at the push boundary and the parity oracle; wrapper gets its own three tests (valid, invalid, unexpected-exit via a name the caller contract forbids).
+  - Fake fidelity: `Trash` on a folder removes the folder and its entire subtree (Committed); `CreateExclusive`/`UpdateRevision` where `Dirs[p]` → `Refused`; `EnsureDir` where `Files[p]` exists → error naming the file (exact wording free — reverse-D/F detection is typed via `Stat`, per the round-2 fix, so Fake and CLI messages need not match); `EnsureDir` with a missing parent → error containing `notFoundSignature`'s text shape (`Node not found: <name>`) — Tasks 9–11 depend on all four.
 
 - [ ] **Step 1: Write the failing validator tests** (refname_test.go):
 ```go
@@ -530,6 +531,13 @@ func TestListRefsRecursesAllNamespaces(t *testing.T)
 // path, and everything else still advertises — one stray web-UI file must not
 // brick the repo (spec round 2).
 func TestListRefsSkipsInvalidNamesWithNoteNeverFatal(t *testing.T)
+
+// RED (round-2 Codex): an invalid FOLDER name skips its whole subtree WITHOUT
+// recursing — assert via the traced transport that no List call ever names the
+// braced path (refs/heads/a{b}), while a valid sibling still advertises. The
+// remote-glob behaviour of braces in List arguments is unverified; never
+// probing it is the point.
+func TestListRefsNeverListsBeneathAnInvalidFolderName(t *testing.T)
 // Seed refs/heads/.hidden and refs/heads/a{b} beside refs/heads/main; capture
 // stderr (ListRefs writes via a package-level warn func? NO — it writes to
 // os.Stderr today per convention; route the note through an io.Writer param?
@@ -565,6 +573,15 @@ func ListRefs(t transport.Transport, root string) (map[string]string, error) {
 		}
 		for _, n := range nodes {
 			full := rel + "/" + n.Name
+			// COMPONENT validation runs for EVERY node — directories included,
+			// BEFORE recursion (round-2 Codex): descending into a folder named
+			// a{b} would put braces into a remote path handed to List, which is
+			// precisely the unverified remote-glob hazard rule 2a exists to
+			// sidestep. An invalid folder skips its WHOLE subtree with a note.
+			if err := checkComponent(n.Name); err != nil {
+				fmt.Fprintf(os.Stderr, "git-remote-proton: skipping %s/%s: %v\n", root, full, err)
+				continue
+			}
 			if n.IsDir {
 				if err := walk(full); err != nil {
 					return err
@@ -668,6 +685,15 @@ func TestPushPreflightDFAgainstExistingRefs(t *testing.T)
 func TestPushOtherNamespaceRequiresForce(t *testing.T)
 //   update refs/notes/commits without force → error naming the force requirement;
 //   with Force=true → ok. Create without force → ok (create is not a move).
+//   The unforced-update case uses a notes ref whose OLD tip is ABSENT locally
+//   and whose target is a NON-COMMIT — proving no ancestry machinery ran
+//   (round-2 Codex: the generic block would say "fetch first" or error on the
+//   object type before the force refusal).
+func TestPushTagUpdateRequiresForceNoAncestry(t *testing.T)
+//   RED: unforced fast-forwardable tag update → refused "requires force"
+//   (design table row; NOTE: shipped pushOne runs ancestry on tags instead —
+//   this test pins the table-aligned behaviour and the divergence is flagged
+//   in the task report).
 
 // Phase ordering:
 func TestPushDeletionsRunAfterPackConfirmBeforeCreates(t *testing.T)
@@ -737,13 +763,33 @@ func Push(t transport.Transport, root, gitDir string, ups []protocol.RefUpdate, 
 			valid[i] = true
 			continue
 		}
-		// resolve + object-type + ancestry + force rule: lifted from pushOne
-		// verbatim (resolve, isBranch/ObjectType, HasObject/IsAncestor), plus:
-		if requiresForce(u.Dst) && !u.Force {
-			if _, exists := remote[u.Dst]; exists {
+		// resolve first (lifted from pushOne verbatim). THEN branch by
+		// namespace BEFORE any ancestry logic (round-2 Codex): the design's
+		// ref-transition table gives each namespace different rules, and
+		// running pushOne's generic HasObject/IsAncestor block first would
+		// surface "fetch first" or an ancestry-tooling error on refs the rule
+		// says need only a force check — and would run rev-list machinery on
+		// non-commit objects (notes trees, replace blobs).
+		_, exists := remote[u.Dst]
+		switch {
+		case isBranch(u.Dst):
+			// commit-type check + (exists && !Force → HasObject/IsAncestor),
+			// all lifted verbatim from pushOne.
+		case strings.HasPrefix(u.Dst, "refs/tags/"):
+			// Design table: "Tag update | Requires force, matching git's rule;
+			// no ancestry check." NOTE (flag in the task report): shipped
+			// pushOne has no tag arm and runs the generic ancestry block on
+			// tag updates — a pre-existing divergence from the design table
+			// that this restructure ALIGNS rather than preserves.
+			if exists && !u.Force {
+				failed(i, "tag update requires force"); continue
+			}
+		default: // other namespaces — the conservative deviation
+			if exists && !u.Force {
 				failed(i, "updating refs outside refs/heads/ and refs/tags/ requires force "+
 					"(conservative rule; see design)"); continue
 			}
+			// no ancestry check, no object-type restriction (per the table)
 		}
 		newShas[i] = /* resolved sha */ ""
 		valid[i] = true
@@ -767,7 +813,7 @@ func Push(t transport.Transport, root, gitDir string, ups []protocol.RefUpdate, 
 	return results
 }
 ```
-`ensureRefParents`: split `ref` on `/`, walk `root+"/refs"`, `root+"/refs/heads"`, … `EnsureDir` each prefix above the leaf (the first two exist from init; `EnsureDir` is Stat-then-create so that's one Stat each — acceptable; do NOT special-case them away, partial init is a real state). An `EnsureDir` error whose text names a file collision ("a file exists at" from the Fake / the live shape from the contract row) is rewrapped: `creating %s requires folder %s, but branch/ref %s occupies that name (directory/file conflict; delete it first)`.
+`ensureRefParents`: split `ref` on `/`, walk `root+"/refs"`, `root+"/refs/heads"`, … `EnsureDir` each prefix above the leaf (the first two exist from init; `EnsureDir` is Stat-then-create so that's one Stat each — acceptable; do NOT special-case them away, partial init is a real state). **Reverse-D/F detection is TYPED, never error-text matching** (round-2 Codex: the Fake and CLI would need byte-identical phrases forever): on any `EnsureDir` failure, `Stat` the failing prefix; `(file, true)` → the named refusal `creating %s requires folder %s, but a ref file occupies that name (directory/file conflict; delete it first)`; anything else → the original `EnsureDir` error stands. Works identically over Fake and CLI regardless of their message wording.
 
 - [ ] **Step 5: Run the full suite** — expect fallout in every existing push test that asserted per-ref pack behaviour; adapt assertions to batch-level (the multi-ref same-commit reconciliation-cost tests from Stage 3b: one pack now uploads ONCE — those tests' premise is obsolete; update them to assert the new single-upload behaviour and note it in the task report as a deliberate design-doc-aligned change).
 
@@ -915,7 +961,7 @@ Phase 5 uses this for creates (`exists == false`) only; updates keep plain `Writ
 
 - [ ] **Step 5: Implement the `EnsureDir` fixes** in cli.go — TWO defects, and the first is a round-1 Codex BLOCKER in the current shipped code path this stage starts depending on:
   1. **The initial Stat must branch on node type.** Today `EnsureDir` returns `nil` for ANY existing node (`cli.go:221-225` never reads `Node.IsDir`), so a ref FILE at the path reads as a usable folder and the reverse-D/F failure surfaces later with a wrong diagnostic. Fix: `ok && n.IsDir` → `nil`; `ok && !n.IsDir` → `fmt.Errorf("cannot use %s as a folder: a file occupies that name", p)` (the error text Task 9a's reverse-D/F rewrap keys on — keep them consistent); absent → create. Helper-role test + the Task 7 fake/live contract case (`EnsureDir` onto a file) cover both implementations.
-  2. **The contradiction re-Stat:** on `code != 0` from create-folder, `if strings.Contains(out, alreadyExistsSignature)` → re-`Stat(p)`: `(dir,true)` → `return nil`; `(file,true)` → the same a-file-occupies-that-name error; `(_,false)` → error quoting both the create-folder output and the re-Stat verbatim. `const alreadyExistsSignature = "already exists"` — **hypothesis about the CLI's wording; the helper role pins the code path, the live contract row (add it now, gate-run later) pins the real text.** Comment must carry the C17b framing: generic robustness, never a validated live fix.
+  2. **The contradiction re-observation:** on `code != 0` from create-folder, `if strings.Contains(out, alreadyExistsSignature)` → re-observe via a **raw `c.run("filesystem","info",p,"--json")`, NOT the `Stat` wrapper** (round-2 Codex: `Stat` deliberately discards the CLI's output on the not-found path, so the wrapper cannot supply the verbatim second observation the diagnostic must quote). Classify the raw result: parses as a folder node → `return nil`; parses as a file node → the a-file-occupies-that-name error; carries `notFoundSignature` → error quoting BOTH the create-folder output AND the info output verbatim (the C17 signature, fully diagnosable); anything else → error quoting both outputs as undetermined. `const alreadyExistsSignature = "already exists"` — **hypothesis about the CLI's wording; the helper role pins the code path, the live contract row (add it now, gate-run later) pins the real text.** Comment must carry the C17b framing: generic robustness, never a validated live fix.
 
 - [ ] **Step 6: Run full suite + deliberate regressions:** (a) change `subtreeFiles`' rule to first-level-only → nested-empty test fails; (b) change it to ref-files-only → foreign-file test fails; (c) remove the prune call → prune tests fail. Revert each.
 
@@ -1153,6 +1199,22 @@ relabelled GUARD (Gemini: per-ref pushOne already behaves so). **Spec touched on
 component 8's "`Trash` non-idempotence on folders" corrected to the wrapper contract
 (absent → Committed) — the phrase named the raw binary and contradicted `transport.go`'s
 Stat-first rule the Fake models (Codex).
+
+**Round 2 (Codex at high effort after an xhigh timeout; Gemini) — Gemini reported NO new
+blocker/major findings and validated each round-1 fix; Codex found one blocker + three majors,
+all verified and applied:** `CheckRefFormat` drops the `--` separator — verified live,
+`check-ref-format -- refs/heads/main` exits 129 (usage) while the bare form exits 0/1 — with an
+unexpected-exit test and a no-dash-injection note (blocker); the recursive walk validates every
+COMPONENT before recursing, so an invalid folder name skips its whole subtree with a note and
+braces never reach a `List` argument (the unverified remote-glob hazard), pinned by a
+no-List-beneath-invalid-folder trace test; phase-2 validation branches by namespace BEFORE any
+ancestry machinery — branches keep commit-type+ancestry, tag updates require force with no
+ancestry (aligning a pre-existing shipped divergence from the design table, flagged for the
+task report), other namespaces force-only — with non-commit/absent-old-tip fixtures proving no
+ancestry ran; reverse-D/F detection and the EnsureDir contradiction diagnostic stop keying on
+error text — parent-walk failures re-`Stat` (typed), and the contradiction path re-observes via
+raw `filesystem info` so both observations can be quoted verbatim (the `Stat` wrapper
+deliberately discards not-found output).
 
 ## Self-Review Notes (run before handing the plan to review)
 
