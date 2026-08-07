@@ -145,6 +145,87 @@ func TestLoop_LockReleaseFailureIsReportedButDoesNotFailThePush(t *testing.T) {
 	}
 }
 
+// TestLoop_ListForPush_CreateParentsEnvCreatesParents is RED (Task 11): the
+// protocol path honours GPB_CREATE_PARENTS, set via t.Setenv exactly as the
+// task's environment rules require — read fresh from the real process
+// environment through createParentsEnv, the same route production's run()
+// uses, never injected as a parameter. Missing parents above the repo root
+// are created with loud stderr notes, and the push still completes
+// end-to-end (Bootstrap runs afterward and writes the marker).
+func TestLoop_ListForPush_CreateParentsEnvCreatesParents(t *testing.T) {
+	t.Setenv(createParentsEnv, "1")
+	ft := transport.NewFake()
+	ft.Dirs["/my-files"] = true // the mount; "GitRemotes" deliberately not seeded
+	root := "/my-files/GitRemotes/repo"
+
+	in := bufio.NewScanner(strings.NewReader("list for-push\n\n"))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(ft, root, ".", in, out) })
+	out.Flush()
+
+	if got != 0 {
+		t.Fatalf("loop() = %d, want 0: stderr=%q", got, stderr)
+	}
+	if !ft.Dirs["/my-files/GitRemotes"] {
+		t.Error("the missing parent must have been created")
+	}
+	if !strings.Contains(stderr, "created parent folder /my-files/GitRemotes") {
+		t.Errorf("stderr = %q, want a loud note naming the created parent", stderr)
+	}
+	if !strings.Contains(stderr, "GPB_CREATE_PARENTS=1") {
+		t.Errorf("stderr = %q, want the loud note to name the env var responsible", stderr)
+	}
+	// The push must still have gone on to Bootstrap the repo itself —
+	// EnsureParents creating the parent is not the whole story.
+	if _, ok := ft.Files[root+"/"+repo.MarkerName]; !ok {
+		t.Error("Bootstrap must still run after EnsureParents succeeds: no marker was written")
+	}
+}
+
+// TestLoop_ListForPush_MissingParentWithoutEnvGivesActionableMessageNotRawError
+// is the brief's Step 3 confirmation, RED (Task 11): a fresh Fake with only
+// "/my-files" present (its GitRemotes subfolder never seeded) and NO
+// GPB_CREATE_PARENTS set must fail the push with EnsureParents' actionable
+// refusal — never Bootstrap's raw "Node not found: GitRemotes" (Surprise
+// R2-1's original, remedy-less failure). t.Setenv pins the var explicitly
+// unset so this is hermetic regardless of the real process environment.
+func TestLoop_ListForPush_MissingParentWithoutEnvGivesActionableMessageNotRawError(t *testing.T) {
+	t.Setenv(createParentsEnv, "")
+	ft := transport.NewFake()
+	ft.Dirs["/my-files"] = true
+	root := "/my-files/GitRemotes/repo"
+
+	in := bufio.NewScanner(strings.NewReader("list for-push\n\n"))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(ft, root, ".", in, out) })
+	out.Flush()
+
+	if got != 1 {
+		t.Fatalf("loop() = %d, want 1: a missing parent with the env unset must be refused", got)
+	}
+	if !strings.Contains(stderr, "proton-drive filesystem create-folder /my-files GitRemotes") {
+		t.Errorf("stderr = %q, want the actionable remedy in the CLI's real grammar", stderr)
+	}
+	if !strings.Contains(stderr, "GPB_CREATE_PARENTS=1") {
+		t.Errorf("stderr = %q, want the env var named as the other remedy", stderr)
+	}
+	if strings.Contains(stderr, "Node not found") {
+		t.Errorf("stderr = %q, must not leak the raw create-folder failure text (Surprise R2-1)", stderr)
+	}
+	if ft.Dirs["/my-files/GitRemotes"] {
+		t.Error("a refused push must not create anything")
+	}
+	if _, ok := ft.Files[root+"/"+repo.MarkerName]; ok {
+		t.Error("a refused push must never reach Bootstrap")
+	}
+}
+
 // TestRun_RefusesUnsupportedAddress proves the canonicalisation is actually
 // WIRED IN, not merely present: run() must reject the address and return
 // non-zero before it reaches the command loop. /shared-with-me is the case
@@ -355,13 +436,17 @@ func TestLoop_PoisonedBatch_EmitsWellFormedRefToken(t *testing.T) {
 	var outBuf bytes.Buffer
 	out := bufio.NewWriter(&outBuf)
 	ft := transport.NewFake()
-	// "/remote/root"'s parent "/remote" is not a mount root, so the stricter
-	// EnsureDir (Task 7) needs it seeded as already-existing before "list
-	// for-push" (below) can Bootstrap it — this test is about poisoned-batch
-	// status-line formatting, not about parent validation.
-	ft.Dirs["/remote/root"] = true
+	// The root must be CANONICAL ("/my-files/..." or "/devices/<id>/..."):
+	// Task 11 wired repo.EnsureParents into "list for-push" ahead of
+	// Bootstrap, and EnsureParents Stats the MOUNT directly, trusting the
+	// same canonical-root invariant repo.CanonicalRoot enforces in
+	// production before loop() is ever reached. "/my-files" itself needs no
+	// seeding (transport.Fake's builtin-mount leniency, fake.go); this test
+	// is about poisoned-batch status-line formatting, not about parent
+	// validation.
+	root := "/my-files/root"
 
-	got := loop(ft, "/remote/root", ".", in, out)
+	got := loop(ft, root, ".", in, out)
 	out.Flush()
 
 	if got != 0 {
@@ -373,8 +458,8 @@ func TestLoop_PoisonedBatch_EmitsWellFormedRefToken(t *testing.T) {
 	if strings.Contains(outBuf.String(), "error push ") {
 		t.Fatalf("stdout = %q, contains the malformed pre-fix ref token (\"push \" prefix leaked into the ref field)", outBuf.String())
 	}
-	if _, ok := ft.Files["/remote/root/refs/heads/main"]; ok {
-		t.Fatalf("a poisoned batch must not write the ref: found /remote/root/refs/heads/main in the fake transport")
+	if _, ok := ft.Files[root+"/refs/heads/main"]; ok {
+		t.Fatalf("a poisoned batch must not write the ref: found %s/refs/heads/main in the fake transport", root)
 	}
 }
 
@@ -400,12 +485,12 @@ func TestLoop_PoisonedBatch_ColonlessPushLineFailsClosed(t *testing.T) {
 	var outBuf bytes.Buffer
 	out := bufio.NewWriter(&outBuf)
 	ft := transport.NewFake()
-	// See the sibling test above: "/remote/root" needs seeding under the
-	// stricter EnsureDir (Task 7) so "list for-push" can Bootstrap it.
-	ft.Dirs["/remote/root"] = true
+	// See the sibling test above: the root must be CANONICAL for Task 11's
+	// EnsureParents wiring ahead of Bootstrap.
+	root := "/my-files/root"
 
 	var got int
-	stderr := captureStderr(t, func() { got = loop(ft, "/remote/root", ".", in, out) })
+	stderr := captureStderr(t, func() { got = loop(ft, root, ".", in, out) })
 	out.Flush()
 
 	if got != 1 {
@@ -420,7 +505,7 @@ func TestLoop_PoisonedBatch_ColonlessPushLineFailsClosed(t *testing.T) {
 	if !strings.Contains(stderr, "malformed refspec") {
 		t.Errorf("stderr = %q, want the parse failure reported", stderr)
 	}
-	if _, ok := ft.Files["/remote/root/refs/heads/main"]; ok {
+	if _, ok := ft.Files[root+"/refs/heads/main"]; ok {
 		t.Error("a malformed batch must not write the ref")
 	}
 }

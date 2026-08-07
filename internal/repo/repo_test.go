@@ -5969,3 +5969,267 @@ func TestFetchSucceedsWithUnusableCacheDir(t *testing.T) {
 		t.Error("objects missing")
 	}
 }
+
+// ============================================================================
+// Task 11: GPB_CREATE_PARENTS opt-in parent auto-create (EnsureParents)
+// ============================================================================
+//
+// All of these seed the MOUNT ("/my-files" or "/devices/<id>") explicitly in
+// f.Dirs, even though transport.Fake's EnsureDir has always treated it as
+// present without seeding: EnsureParents Stats the mount PREFIX directly
+// (parents.go), and — per the Task 11 reconciliation of Task 7's Fake-parent-
+// fidelity handoff note, see transport/fake.go's isBuiltinMountParent and
+// Stat doc comments — Fake.Stat now agrees with EnsureDir's own leniency
+// about what counts as a builtin mount. Seeding it explicitly here anyway
+// keeps these tests readable as "the mount exists, everything below it
+// doesn't" without depending on the reader already knowing that fact.
+
+// TestEnsureParentsRefusalIsActionable is RED (Task 11, default create=false):
+// a missing parent must produce an ACTIONABLE refusal — naming the FIRST
+// missing parent and an executable remedy in the CLI's REAL grammar.
+// `proton-drive filesystem create-folder` takes a PARENT plus a NAME, not a
+// path (Surprise R2-1: the raw "Node not found: GitRemotes" reached an
+// operator with no remedy at all).
+func TestEnsureParentsRefusalIsActionable(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/my-files"] = true // the mount; "GitRemotes" deliberately not seeded
+
+	var stderr strings.Builder
+	err := EnsureParents(f, "/my-files/GitRemotes/repo", false, &stderr)
+	if err == nil {
+		t.Fatal("a missing parent with create=false must be refused")
+	}
+	if !strings.Contains(err.Error(), "proton-drive filesystem create-folder /my-files GitRemotes") {
+		t.Errorf("refusal must give the CLI's real grammar (parent + name, not a path), got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "GPB_CREATE_PARENTS=1") {
+		t.Errorf("refusal must name the opt-in env var, got: %v", err)
+	}
+	if f.Dirs["/my-files/GitRemotes"] {
+		t.Error("a refused EnsureParents must not create anything")
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("a refusal writes no loud notes, got stderr %q", stderr.String())
+	}
+}
+
+// TestEnsureParentsCreatesWithLoudNotes is RED (Task 11, create=true): missing
+// parents are created one at a time, each announced on stderr, and the LEAF
+// itself ("repo") is never touched — that is Bootstrap's job, not
+// EnsureParents'.
+func TestEnsureParentsCreatesWithLoudNotes(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/my-files"] = true
+	var stderr strings.Builder
+
+	if err := EnsureParents(f, "/my-files/a/b/repo", true, &stderr); err != nil {
+		t.Fatalf("EnsureParents: %v", err)
+	}
+	if !f.Dirs["/my-files/a"] {
+		t.Error("parent 'a' must be created")
+	}
+	if !f.Dirs["/my-files/a/b"] {
+		t.Error("parent 'b' must be created")
+	}
+	if f.Dirs["/my-files/a/b/repo"] {
+		t.Error("the leaf is Bootstrap's job, not EnsureParents' — it must not be created here")
+	}
+	if _, ok := f.Files["/my-files/a/b/repo"]; ok {
+		t.Error("the leaf must not exist as a file either")
+	}
+	out := stderr.String()
+	if got := strings.Count(out, "\n"); got != 2 {
+		t.Errorf("stderr = %q, want exactly two loud notes (one per created folder), got %d lines", out, got)
+	}
+	// "folder /my-files/a (" rather than a bare "/my-files/a" contains check:
+	// "/my-files/a" is a PREFIX of "/my-files/a/b", so a bare substring check
+	// would pass on the "a/b" line alone and never actually prove the "a"
+	// line exists on its own.
+	if !strings.Contains(out, "folder /my-files/a (GPB_CREATE_PARENTS=1)") {
+		t.Errorf("stderr must announce 'a' created, got %q", out)
+	}
+	if !strings.Contains(out, "folder /my-files/a/b (GPB_CREATE_PARENTS=1)") {
+		t.Errorf("stderr must announce 'b' created, got %q", out)
+	}
+}
+
+// absentMountTransport wraps a Fake but forces Stat to report ONE specific
+// path as confirmed-absent, overriding even transport.Fake's own builtin-
+// mount leniency (fake.go's isBuiltinMountParent, which Task 11 wired into
+// Stat precisely so an ordinary "/devices/<id>" reads as present without
+// seeding). That leniency treats EVERY possible device id as a pre-existing
+// mount — a deliberate convenience so tests don't need to seed the common
+// case — which means a genuinely UNREGISTERED device cannot be modelled with
+// a plain Fake at all: this wrapper is the only way to simulate one.
+type absentMountTransport struct {
+	*transport.Fake
+	absent string
+}
+
+func (a absentMountTransport) Stat(p string) (transport.Node, bool, error) {
+	if p == a.absent {
+		return transport.Node{}, false, nil
+	}
+	return a.Fake.Stat(p)
+}
+
+// TestEnsureParentsNeverCreatesMountRoots is RED (Task 11, round-1 Gemini
+// finding: an earlier draft let a missing MOUNT fall through to the raw CLI
+// error instead of the actionable refusal). Two things pinned together:
+//   - a root that is a direct mount child walks ZERO parents — the mount
+//     itself is Stat-checked, never handed to EnsureDir, even with
+//     create=true;
+//   - an absent device mount is refused in BOTH modes, naming it, and
+//     nothing gets created even though create=true was asked for.
+func TestEnsureParentsNeverCreatesMountRoots(t *testing.T) {
+	t.Run("direct mount child: no parent walk below the mount itself", func(t *testing.T) {
+		f := transport.NewFake()
+		f.Dirs["/my-files"] = true
+		var stderr strings.Builder
+
+		if err := EnsureParents(f, "/my-files/repo", true, &stderr); err != nil {
+			t.Fatalf("EnsureParents: %v", err)
+		}
+		if len(f.Dirs) != 1 { // only the seeded mount itself; nothing else created
+			t.Errorf("nothing besides the seeded mount may exist, got Dirs=%v", f.Dirs)
+		}
+		if stderr.Len() != 0 {
+			t.Errorf("no parent walk happens below a direct mount child; stderr must be empty, got %q", stderr.String())
+		}
+	})
+
+	t.Run("absent device mount refuses in both modes; nothing created", func(t *testing.T) {
+		f := transport.NewFake()
+		tr := absentMountTransport{Fake: f, absent: "/devices/laptop"} // a genuinely missing/unregistered device
+		var stderr strings.Builder
+
+		err := EnsureParents(tr, "/devices/laptop/x/repo", true, &stderr)
+		if err == nil {
+			t.Fatal("an absent device mount must be refused even with create=true")
+		}
+		if !strings.Contains(err.Error(), "/devices/laptop") {
+			t.Errorf("refusal must name the missing mount, got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "GPB_CREATE_PARENTS") {
+			t.Errorf("refusal must state that GPB_CREATE_PARENTS does not apply to mounts, got: %v", err)
+		}
+		if len(f.Dirs) != 0 || len(f.Files) != 0 {
+			t.Errorf("nothing may be created when the mount itself is missing, got Dirs=%v Files=%v", f.Dirs, f.Files)
+		}
+		if stderr.Len() != 0 {
+			t.Errorf("no loud notes when nothing was created, got %q", stderr.String())
+		}
+	})
+}
+
+// TestEnsureParentsRefusesFileOccupyingParentName is RED (Task 11, round-1
+// Codex finding: an earlier draft accepted ANY existing node — including a
+// file — as a usable parent folder). A file occupying a parent's name is
+// refused, naming the path, in BOTH modes: GPB_CREATE_PARENTS cannot resolve
+// a name collision, so the check runs before the create/refuse branch.
+func TestEnsureParentsRefusesFileOccupyingParentName(t *testing.T) {
+	for _, create := range []bool{false, true} {
+		t.Run(fmt.Sprintf("create=%v", create), func(t *testing.T) {
+			f := transport.NewFake()
+			f.Dirs["/my-files"] = true
+			f.Files["/my-files/a"] = []byte("i am a file, not a folder")
+			var stderr strings.Builder
+
+			err := EnsureParents(f, "/my-files/a/repo", create, &stderr)
+			if err == nil {
+				t.Fatal("a file occupying a parent name must be refused")
+			}
+			if !strings.Contains(err.Error(), "/my-files/a") {
+				t.Errorf("refusal must name the offending path, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), "file") {
+				t.Errorf("refusal must say a FILE occupies the name, got: %v", err)
+			}
+			if stderr.Len() != 0 {
+				t.Errorf("a refusal writes no loud notes, got stderr %q", stderr.String())
+			}
+		})
+	}
+}
+
+// failingEnsureDirTransport wraps a Fake but makes EnsureDir fail for exactly
+// one path, letting every other call through unchanged. Used to force
+// EnsureParents into a PARTIAL creation — one folder made, then a later one
+// fails — without EnsureDir itself ever having a genuine reason to fail on an
+// otherwise-valid create. Same technique this file already uses for
+// unknownOutcomeTransport, ambiguousTrashTransport, statErrorTransport, etc.
+type failingEnsureDirTransport struct {
+	*transport.Fake
+	failFor string
+}
+
+func (f failingEnsureDirTransport) EnsureDir(p string) error {
+	if p == f.failFor {
+		return fmt.Errorf("simulated create-folder failure at %s", p)
+	}
+	return f.Fake.EnsureDir(p)
+}
+
+// TestEnsureParentsPartialCreationIsKeptAndReported is a GUARD, not a RED:
+// the design spec states plainly that partial creation is KEPT, never rolled
+// back — rollback would be exactly the unsafe folder-removal race push.go's
+// prune logic bounds so carefully, for zero benefit. Creation succeeds at
+// "a" and then fails at "b": "a" must remain, and stderr must show what WAS
+// created before the failure, not merely a bare error.
+func TestEnsureParentsPartialCreationIsKeptAndReported(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/my-files"] = true
+	tr := failingEnsureDirTransport{Fake: f, failFor: "/my-files/a/b"}
+	var stderr strings.Builder
+
+	err := EnsureParents(tr, "/my-files/a/b/repo", true, &stderr)
+	if err == nil {
+		t.Fatal("a failed create at 'b' must be reported as an error")
+	}
+	if !strings.Contains(err.Error(), "/my-files/a/b") {
+		t.Errorf("the error must name the folder that actually failed, got: %v", err)
+	}
+	if !f.Dirs["/my-files/a"] {
+		t.Error("no rollback: 'a', created before the failure, must remain")
+	}
+	if f.Dirs["/my-files/a/b"] {
+		t.Error("'b' was never actually created; it must not appear as if it were")
+	}
+	out := stderr.String()
+	// Same "/my-files/a" is a PREFIX of "/my-files/a/b" caveat as
+	// TestEnsureParentsCreatesWithLoudNotes above.
+	if !strings.Contains(out, "folder /my-files/a (GPB_CREATE_PARENTS=1)") {
+		t.Errorf("stderr must report what WAS created before the failure, got %q", out)
+	}
+	if strings.Contains(out, "folder /my-files/a/b (GPB_CREATE_PARENTS=1)") {
+		t.Errorf("stderr must not claim 'b' was created when it failed, got %q", out)
+	}
+}
+
+// TestSetHeadNeverCreatesParents is a GUARD pinning the OTHER half of Task
+// 11's wiring rule: EnsureParents is called ONLY from cmd's "list for-push"
+// arm, never from SetHead/runSetHead (design spec, component 3/6 — a repo
+// cannot exist below a missing parent, so honouring the var here could only
+// manufacture folder trees and then fail on the marker anyway). SetHead
+// simply never references EnsureParents at all (sethead.go), so this is a
+// regression guard: a set-head against a root whose PARENTS are ALSO
+// missing (not merely an unmarked existing folder, the case
+// TestSetHeadRefusesNoMarker already covers) must still fail with exactly
+// RequireMarker's refusal, and must create NOTHING — not even a partial
+// parent chain — proving no parent-creation side effect ever occurs on this
+// path regardless of GPB_CREATE_PARENTS.
+func TestSetHeadNeverCreatesParents(t *testing.T) {
+	f := transport.NewFake() // nothing seeded at all: mount, parents, and marker all absent
+
+	_, err := SetHead(f, "/my-files/GitRemotes/repo", "main")
+	if err == nil {
+		t.Fatal("SetHead against a missing tree must refuse")
+	}
+	if !strings.Contains(err.Error(), MarkerName) {
+		t.Errorf("refusal must be RequireMarker's own reason, not a parent-creation message, got: %v", err)
+	}
+	if len(f.Dirs) != 0 || len(f.Files) != 0 {
+		t.Errorf("a set-head against a missing tree must create NOTHING — no parent chain, "+
+			"no lock, no marker — got Dirs=%v Files=%v", f.Dirs, f.Files)
+	}
+}

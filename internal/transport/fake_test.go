@@ -496,14 +496,21 @@ func TestFakeEnsureDirParentImpliedByAFile(t *testing.T) {
 }
 
 // TestFakeEnsureDirBuiltinMountParentsNeedNoSeeding pins the deliberate
-// exception: the two Proton Drive top-level namespaces, and up to two path
-// components beneath /devices (a device root and one folder inside it), need
-// no prior seeding — EnsureDir may create directly under them, mirroring the
-// real mount points the CLI itself cannot create. Anything deeper under
-// /devices does need seeding, same as everywhere else. Each case uses a
-// FRESH Fake so a pass can only be explained by the builtin allowance
-// itself, never by an earlier call in the same test having already seeded
-// the parent.
+// exception: the two Proton Drive top-level namespaces, and exactly one path
+// component beneath /devices (a device root, "/devices/<id>"), need no prior
+// seeding — EnsureDir may create directly under them, mirroring the real
+// mount points the CLI itself cannot create. Anything deeper under /devices
+// does need seeding, same as everywhere else. Each case uses a FRESH Fake so
+// a pass can only be explained by the builtin allowance itself, never by an
+// earlier call in the same test having already seeded the parent.
+//
+// Task 11 (internal/repo/parents.go, EnsureParents) TIGHTENED this from an
+// earlier version that also allowed a second component ("/devices/<id>/
+// <folder>") for free — see isBuiltinMountParent's doc for the full
+// reconciliation rationale against EnsureParents' protectedDepth, which has
+// only ever protected this same one-component depth. The former depth-2 case
+// is now folded into TestFakeEnsureDirMissingParentErrors' sibling assertion
+// below instead of asserting success.
 func TestFakeEnsureDirBuiltinMountParentsNeedNoSeeding(t *testing.T) {
 	if err := NewFake().EnsureDir("/my-files/newrepo"); err != nil {
 		t.Errorf("EnsureDir under /my-files must not need seeding: %v", err)
@@ -514,10 +521,28 @@ func TestFakeEnsureDirBuiltinMountParentsNeedNoSeeding(t *testing.T) {
 	if err := NewFake().EnsureDir("/devices/dev1/onefolder"); err != nil {
 		t.Errorf("EnsureDir at depth 1 under /devices (a device root) must not need seeding: %v", err)
 	}
-	if err := NewFake().EnsureDir("/devices/dev2/onefolder/twolevel"); err != nil {
-		t.Errorf("EnsureDir at depth 2 under /devices (one folder inside a device root) must not need seeding: %v", err)
+	if err := NewFake().EnsureDir("/devices/dev2/onefolder/twolevel"); err == nil {
+		t.Error("EnsureDir at depth 2 under /devices is now beyond the builtin allowance (Task 11 tightening) and must still require an existing parent")
 	}
 	if err := NewFake().EnsureDir("/devices/dev3/onefolder/twolevel/threelevel"); err == nil {
 		t.Error("EnsureDir at depth 3 under /devices is beyond the builtin allowance and must still require an existing parent")
+	}
+}
+
+// TestFakeStatSeesBuiltinMountsWithoutSeeding is Task 11's companion to the
+// EnsureDir test above: EnsureParents (internal/repo/parents.go) Stats the
+// mount prefix DIRECTLY, as its first move, so Stat must agree with
+// EnsureDir's own parentExists about what counts as a builtin mount needing
+// no seeding — otherwise every existing test that roots a push under an
+// un-seeded "/my-files/..." would newly fail EnsureParents' mount check.
+func TestFakeStatSeesBuiltinMountsWithoutSeeding(t *testing.T) {
+	f := NewFake()
+	for _, p := range []string{"/my-files", "/devices", "/devices/dev1"} {
+		if _, ok, err := f.Stat(p); err != nil || !ok {
+			t.Errorf("Stat(%q) = ok=%v err=%v, want ok=true err=nil: a builtin mount must Stat as present without seeding", p, ok, err)
+		}
+	}
+	if _, ok, _ := f.Stat("/devices/dev1/onefolder"); ok {
+		t.Error("Stat(\"/devices/dev1/onefolder\") = present, want absent: a folder BENEATH a device root is ordinary content, not part of the mount")
 	}
 }

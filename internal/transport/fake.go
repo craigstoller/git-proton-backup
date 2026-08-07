@@ -30,28 +30,35 @@ func NewFake() *Fake {
 
 // isBuiltinMountParent reports whether p is one of the Proton Drive
 // namespaces this Fake treats as already existing without ever being
-// explicitly created: the two top-level mounts themselves, and up to two
-// path components beneath /devices — a device root ("/devices/<id>") and one
-// folder inside it ("/devices/<id>/<folder>").
+// explicitly created: the two top-level mounts themselves, and exactly one
+// path component beneath /devices — a device root ("/devices/<id>").
 //
-// The depth-1 case ("/devices/<id>" is itself a pre-existing root the CLI
-// cannot create, the same way "/my-files" is) is the part that follows
-// directly from how Proton Drive's namespaces work. The depth-2 allowance
-// ("/devices/<id>/<folder>" also needing no seeding) is a Task-7-brief-
-// mandated Fake-only convenience on top of that, NOT a claim that this
-// mirrors Task 11's EnsureParents design (docs/superpowers/plans/
-// 2026-08-06-v2-stage5-hierarchical-refs.md) — that design's own
-// protectedDepth only ever protects depth 1 ("/devices/<device-id>").
-// Reconciling (or deliberately keeping distinct) the two definitions is
-// Task 11's call to make, not asserted here. Anything deeper than depth 2
-// must be genuinely present in f.Dirs or implied by f.Files, same as every
-// other path.
+// Task 11 (EnsureParents, internal/repo/parents.go) settles a divergence
+// Task 7 flagged but deliberately left open: an EARLIER version of this
+// function also allowed a SECOND component beneath /devices
+// ("/devices/<id>/<folder>", a Task-7-brief-mandated convenience on top of
+// the depth-1 case) as a Fake-only convenience, while EnsureParents'
+// protectedDepth has only ever protected depth 1 ("/devices/<device-id>" —
+// see the design spec, component 6: "never a /devices/<device-id> node (a
+// device mount is not creatable storage)" names ONLY that one level).
+// Task 11 TIGHTENS rather than documents-as-legitimate, for two reasons:
+// (1) this file's own module doc says a Fake more permissive than the CLI
+// certifies code the live transport would reject, and nothing outside this
+// file's own test ever exercised the depth-2 case; (2) EnsureParents itself
+// now calls Stat directly on this exact prefix (see below) to confirm the
+// mount is reachable before doing anything else, so keeping this function's
+// notion of "the mount" identical to EnsureParents' protectedDepth prefix —
+// rather than one component more generous — is what makes the two
+// mechanisms answer the SAME question ("is this the mount, or content below
+// it") instead of two different ones that happen to overlap by coincidence.
+// Anything beyond depth 1 under /devices must be genuinely present in
+// f.Dirs or implied by f.Files, same as every other path.
 func isBuiltinMountParent(p string) bool {
 	if p == "/my-files" || p == "/devices" {
 		return true
 	}
 	if rest, ok := strings.CutPrefix(p, "/devices/"); ok && rest != "" {
-		return strings.Count(rest, "/") <= 1
+		return !strings.Contains(rest, "/")
 	}
 	return false
 }
@@ -156,11 +163,28 @@ func (f *Fake) Stat(p string) (Node, bool, error) {
 	if f.Dirs[p] {
 		return Node{Name: path.Base(p), IsDir: true}, true, nil
 	}
-	// A map miss is an AFFIRMATIVE absence, never a failure — this Fake has
-	// no notion of a transport error on Stat at all, so every miss is
-	// confirmed-absence by construction. This already matches the Task 4
-	// contract (*CLI.Stat's not-found/error split, cli.go): (_, false, nil)
-	// models "confirmed does not exist", the same meaning the certified
+	// A builtin mount (see isBuiltinMountParent) reports present without ever
+	// being seeded, the same leniency EnsureDir's parentExists already
+	// applies. Added for Task 11 (internal/repo/parents.go): EnsureParents
+	// Stats the mount PREFIX directly, as its very first move, before any
+	// parent walk — without this, every one of this codebase's many existing
+	// tests that root a push under an un-seeded "/my-files/..." (never
+	// explicitly creating "/my-files" itself, relying on EnsureDir's own
+	// leniency instead) would newly fail EnsureParents' mount check with a
+	// spurious "mount does not exist", despite modelling exactly the ordinary
+	// case where the account's own /my-files genuinely exists. Tests that
+	// need a SPECIFIC mount reported absent (Task 11: an unregistered device)
+	// use a wrapping transport that overrides Stat for that one path — this
+	// builtin leniency cannot be turned off per-instance, by design, the same
+	// way EnsureDir's cannot.
+	if isBuiltinMountParent(p) {
+		return Node{Name: path.Base(p), IsDir: true}, true, nil
+	}
+	// A map miss on anything else is an AFFIRMATIVE absence, never a failure
+	// — this Fake has no notion of a transport error on Stat at all, so every
+	// miss is confirmed-absence by construction. This already matches the
+	// Task 4 contract (*CLI.Stat's not-found/error split, cli.go): (_, false,
+	// nil) models "confirmed does not exist", the same meaning the certified
 	// CLI's own not-found signature carries, not "any failure whatsoever".
 	return Node{}, false, nil
 }
