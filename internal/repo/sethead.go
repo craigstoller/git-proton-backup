@@ -48,31 +48,49 @@ func SetHead(t transport.Transport, root, branchArg string) (string, error) {
 	// This still runs BEFORE the idempotence short-circuit below, for the
 	// same round-3 peer-review reason as before: a HEAD already naming a
 	// since-deleted branch must refuse, not short-circuit to success.
-	if _, ok, err := t.Stat(root + "/" + branch); err != nil {
+	node, ok, err := t.Stat(root + "/" + branch)
+	if err != nil {
 		return "", err
-	} else if !ok {
-		refs, lerr := ListRefs(t, root)
+	}
+	// A hierarchical name that resolves to a FOLDER (some deeper branch
+	// lives beneath it — e.g. requesting "feature" when only
+	// refs/heads/feature/x exists, a state hierarchical push routinely
+	// creates) must be refused HERE, before readRef ever sees it. Stat
+	// affirmatively confirms presence, so falling through to readRef would
+	// call t.ReadTo on a DIRECTORY — against the Fake that just reads as a
+	// misleading generic "not found", and against the live CLI it has NO
+	// verified contract at all (`filesystem download` on a directory is
+	// unprobed; peer-review finding on this task). The branch check must
+	// come first.
+	if ok && node.IsDir {
+		branches, lerr := existingBranchNames(t, root)
 		if lerr != nil {
 			return "", lerr
 		}
-		var branches []string
-		for name := range refs {
-			if strings.HasPrefix(name, "refs/heads/") {
-				branches = append(branches, strings.TrimPrefix(name, "refs/heads/"))
-			}
+		if len(branches) == 0 {
+			return "", fmt.Errorf("cannot set HEAD to %q: %s is a namespace folder containing "+
+				"other branches, not a branch itself", branchArg, branch)
+		}
+		return "", fmt.Errorf("cannot set HEAD to %q: %s is a namespace folder containing "+
+			"other branches, not a branch itself; branches that exist: %s",
+			branchArg, branch, strings.Join(branches, ", "))
+	}
+	if !ok {
+		branches, lerr := existingBranchNames(t, root)
+		if lerr != nil {
+			return "", lerr
 		}
 		if len(branches) == 0 {
 			return "", fmt.Errorf("cannot set HEAD to %q: no branches exist; push a branch first", branchArg)
 		}
-		sort.Strings(branches)
 		return "", fmt.Errorf("cannot set HEAD to %q: no such branch; branches that exist: %s",
 			branchArg, strings.Join(branches, ", "))
 	}
-	// Confirmed present by Stat above; readRef verifies it is actually a
-	// well-formed ref file (exact 40-hex-plus-newline grammar). A
-	// present-but-corrupt ref is FATAL here, never coerced into "does not
-	// exist" — the same fail-closed rule readRef always applies to content
-	// it reaches.
+	// Confirmed present as a FILE by the ok/IsDir checks above; readRef
+	// verifies it is actually a well-formed ref file (exact
+	// 40-hex-plus-newline grammar). A present-but-corrupt ref is FATAL
+	// here, never coerced into "does not exist" — the same fail-closed rule
+	// readRef always applies to content it reaches.
 	if _, err := readRef(t, root+"/"+branch); err != nil {
 		return "", err
 	}
@@ -95,6 +113,29 @@ func SetHead(t transport.Transport, root, branchArg string) (string, error) {
 		return "", err
 	}
 	return branch, nil
+}
+
+// existingBranchNames returns every refs/heads/* branch's leaf name (the
+// refs/heads/ prefix stripped), sorted — the "branches that exist"
+// suggestion list shared by SetHead's error-path arms (target absent;
+// target present but only as a namespace folder, not a branch itself).
+// Built from ListRefs, which walks the WHOLE ref tree (Task 8), so nested
+// branches are included — e.g. a request for the folder "feature" itself
+// suggests "feature/x" if that is the real branch living beneath it. Only
+// ever called on an error path: SetHead's happy path never calls this.
+func existingBranchNames(t transport.Transport, root string) ([]string, error) {
+	refs, err := ListRefs(t, root)
+	if err != nil {
+		return nil, err
+	}
+	var branches []string
+	for name := range refs {
+		if strings.HasPrefix(name, "refs/heads/") {
+			branches = append(branches, strings.TrimPrefix(name, "refs/heads/"))
+		}
+	}
+	sort.Strings(branches)
+	return branches, nil
 }
 
 // normalizeBranch turns the user's argument into a full refs/heads/ name.

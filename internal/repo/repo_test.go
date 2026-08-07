@@ -3238,6 +3238,60 @@ func TestSetHeadUnknownBranchListsNestedBranches(t *testing.T) {
 	}
 }
 
+// 22 GUARD (peer-review finding on this task): a branch name that Stat
+//
+//	confirms present but ONLY as a NAMESPACE FOLDER — refs/heads/feature/x
+//	exists, "feature" itself does not, so refs/heads/feature is a folder
+//	node, not a ref file — must refuse with a NAMED reason, and must never
+//	reach readRef's ReadTo-on-a-directory call: that has a misleading
+//	generic "not found" against the Fake and NO verified contract at all
+//	against the live CLI. The IsDir branch must fire strictly BEFORE
+//	readRef, so the folder path itself is never handed to ReadTo — traced
+//	directly via setHeadTraceTransport, the same tracer
+//	TestSetHeadVerifyUsesExactPathNotRecursion uses.
+//
+//	Setup goes through Push (not a direct WriteRef) deliberately: the Fake's
+//	Stat only reports IsDir for a path actually present in f.Dirs, and only
+//	ensureRefParents' EnsureDir walk (Task 9a, exercised end to end via
+//	Push, the same setup TestPushCreatesNestedBranchCreatingParents uses)
+//	populates that — a bare WriteRef("refs/heads/feature/x", ...) never
+//	touches f.Dirs at all, so Stat("refs/heads/feature") would report
+//	absence, not a folder, and this test would not actually exercise the
+//	hazard the fix addresses.
+func TestSetHeadRefusesNamespaceFolderBranch(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature/x"}}
+	if res := Push(f, "/r", gitDir, ups, map[string]string{}); len(res) != 1 || !res[0].OK {
+		t.Fatalf("setup push failed: %+v", res)
+	}
+	if !f.Dirs["/r/refs/heads/feature"] {
+		t.Fatal("setup invariant broken: refs/heads/feature must be a folder in f.Dirs")
+	}
+
+	tr := &setHeadTraceTransport{Fake: f}
+	_, err := SetHead(tr, "/r", "feature")
+	if err == nil {
+		t.Fatal("SetHead must refuse a name that is only a namespace folder, not a branch")
+	}
+	if !strings.Contains(err.Error(), "namespace folder") {
+		t.Errorf("refusal must name the namespace-folder situation, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "feature/x") {
+		t.Errorf("refusal must suggest the real branch living beneath the folder, got: %v", err)
+	}
+	for _, p := range tr.reads {
+		if p == "/r/refs/heads/feature" {
+			t.Errorf("must never ReadTo the folder path itself — the hazard this fix removes; "+
+				"got reads=%v", tr.reads)
+		}
+	}
+	assertLockReleased(t, f, "/r")
+}
+
 // RED. Push does not write HEAD at all today.
 func TestPushWritesHeadOnFirstPush(t *testing.T) {
 	f := transport.NewFake()
