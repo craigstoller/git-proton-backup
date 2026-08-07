@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -170,6 +171,33 @@ func RevParse(gitDir string, args ...string) (string, int, error) {
 	return out, code, err
 }
 
+// longPathHint returns a one-line POSSIBLE-cause note when any involved path
+// approaches Windows' legacy 260-character MAX_PATH (threshold 240,
+// deliberately conservative: the limit counts a terminator and directory
+// operations fail below it). len() counts UTF-8 bytes, not the UTF-16 path
+// units Windows itself counts against MAX_PATH — an undercount for any
+// non-ASCII path segment, and acceptable for exactly that reason: it only
+// makes the already-conservative 240 threshold MORE conservative, never
+// less, so the byte/unit mismatch cannot cause a genuinely long path to go
+// unflagged. Path-length arithmetic only — git's own messages are localised,
+// so matching against stderr text is a non-starter. Checkout-phase failures
+// happen after this helper has already exited (git itself, not this
+// package, does the checkout) and are documented in README instead; no
+// helper hint is reachable there.
+func longPathHint(paths ...string) string {
+	if runtime.GOOS != "windows" {
+		return ""
+	}
+	for _, p := range paths {
+		if len(p) >= 240 {
+			return fmt.Sprintf(" (note: a path involved is %d characters, near Windows' "+
+				"260-character MAX_PATH; this may be why the write failed — try `git config "+
+				"core.longpaths true` or a shorter destination)", len(p))
+		}
+	}
+	return ""
+}
+
 // WritePack builds a NON-THIN pack containing the objects reachable from
 // want but not from any of haves, and writes it into outDir. --no-thin is
 // deliberate: a thin pack would depend on delta bases the remote may not
@@ -250,10 +278,12 @@ func WritePack(gitDir, want string, haves []string, outDir string) (string, stri
 	// a pack or index that was never actually written, which would not be
 	// fetch-discoverable.
 	if _, err := os.Stat(packPath); err != nil {
-		return "", "", fmt.Errorf("pack-objects reported %s but the pack file is missing: %w", packPath, err)
+		return "", "", fmt.Errorf("pack-objects reported %s but the pack file is missing: %w%s",
+			packPath, err, longPathHint(gitDir, outDir, packPath))
 	}
 	if _, err := os.Stat(idxPath); err != nil {
-		return "", "", fmt.Errorf("pack-objects reported %s but the idx file is missing: %w", idxPath, err)
+		return "", "", fmt.Errorf("pack-objects reported %s but the idx file is missing: %w%s",
+			idxPath, err, longPathHint(gitDir, outDir, packPath))
 	}
 	return packPath, idxPath, nil
 }
@@ -334,7 +364,8 @@ func PackObjectsFromList(gitDir, altObjects, objs, outStem string) (string, erro
 				"pipe open after %s, so the pack name it printed cannot be trusted to be "+
 				"complete; refusing to guess which pack it wrote", waitDelay)
 		}
-		return "", fmt.Errorf("pack-objects: %s: %w", strings.TrimSpace(stderr.String()), err)
+		return "", fmt.Errorf("pack-objects: %s: %w%s", strings.TrimSpace(stderr.String()), err,
+			longPathHint(gitDir, outStem))
 	}
 	name := strings.TrimSpace(stdout.String())
 

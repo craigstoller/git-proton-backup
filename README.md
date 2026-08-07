@@ -124,6 +124,27 @@ trash, items whose names collide with the repo's remote path, and retry. The adv
 those homonyms — never "empty your trash" wholesale, which would take unrelated recoverable
 files with it.
 
+### Windows path length
+
+A deep clone destination can exceed Windows' legacy 260-character `MAX_PATH` limit — the full
+path to an object inside `.git\objects\pack\` adds up fast once the repo's own history is long and
+the destination is nested a few folders deep. When that happens, two remedies apply:
+
+- **`git config core.longpaths true`** (repo-local or `--global`) lets git's own writes exceed the
+  limit. This is separate from — and required in addition to — Windows' own
+  `LongPathsEnabled` registry setting: the OS-level setting alone does not make git itself opt in.
+- **A shorter destination** always helps, regardless of `core.longpaths`, since it's the total
+  path length that matters.
+
+`git-remote-proton` (v2) does its own pack writing inside `internal/gitcmd`, and a failure there
+that involves a path 240 characters or longer gets a best-effort hint appended naming both
+remedies — a *possible* cause, since the same failure can have other causes, never asserted as
+certain. That hint can only fire while the helper itself is running (advertise/fetch/push). The
+**checkout phase** — git materializing files into your working tree after a clone or fetch
+completes — happens entirely after the helper has already exited, so no helper hint is possible
+there; if a `git clone` or `git checkout` fails with a "Filename too long" style error, the same
+two remedies above are the only fix.
+
 ## Why PowerShell?
 
 Because the domain is Windows, and PowerShell is what Windows already speaks.

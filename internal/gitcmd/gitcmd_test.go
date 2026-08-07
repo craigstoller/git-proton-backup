@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -856,5 +857,67 @@ func TestParseMissingOIDs(t *testing.T) {
 	}
 	if _, err := parseMissingOIDs("?nothex\n"); err == nil {
 		t.Error("a malformed ?-line must be a hard error")
+	}
+}
+
+// RED. longPathHint does not exist yet. It must fire for a path AT the
+// 240-char threshold, phrased as a POSSIBLE cause (never asserting path
+// length IS the problem — a possible-cause hint that claimed certainty would
+// be wrong every time the failure is actually unrelated), and name the
+// `core.longpaths` remedy so a user can act on it without decoding the raw
+// git error themselves.
+//
+// Gated on GOOS: the helper itself only fires on Windows (Windows' MAX_PATH
+// is not a thing on other platforms), but this suite's own platform IS
+// Windows (see the task's binding environment), so the gate skips nothing
+// here — it exists so this test does not regress into a false failure if the
+// suite is ever run cross-platform.
+func TestLongPathHintFiresNear240(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("longPathHint is a Windows-only diagnostic")
+	}
+	p := strings.Repeat("a", 240)
+	got := longPathHint(p)
+	if got == "" {
+		t.Fatal("want a non-empty hint for a 240-char path on Windows")
+	}
+	if !strings.Contains(got, "may") {
+		t.Errorf("hint must be phrased as a POSSIBLE cause (want it to contain \"may\"): %q", got)
+	}
+	if !strings.Contains(got, "core.longpaths") {
+		t.Errorf("hint must name the core.longpaths remedy: %q", got)
+	}
+}
+
+// RED. Every path under the threshold must stay silent — a hint on an
+// ordinary-length failure would misdirect a user chasing an unrelated bug.
+func TestLongPathHintSilentOnShortPaths(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("longPathHint is a Windows-only diagnostic")
+	}
+	if got := longPathHint("short", strings.Repeat("b", 239)); got != "" {
+		t.Errorf("want \"\" when every path is under the 240-char threshold, got %q", got)
+	}
+	if got := longPathHint(); got != "" {
+		t.Errorf("want \"\" for no paths at all, got %q", got)
+	}
+}
+
+// RED then GUARD: proves the hint is actually WIRED into a real failure
+// return, not just a standalone helper nothing calls. gitDir need not exist
+// on disk to be long — `git -C <gitDir>` fails immediately either way, which
+// is exactly the failure PackObjectsFromList's own error return must carry
+// the hint on.
+func TestPackObjectsFailureCarriesLongPathHint(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("longPathHint is a Windows-only diagnostic")
+	}
+	gitDir := `C:\` + strings.Repeat("nonexistent-dir\\", 20) // well over 240 chars, never created
+	_, err := PackObjectsFromList(gitDir, "", "", filepath.Join(t.TempDir(), "pack"))
+	if err == nil {
+		t.Fatal("want an error for a gitDir that does not exist")
+	}
+	if !strings.Contains(err.Error(), "core.longpaths") {
+		t.Errorf("want the MAX_PATH hint appended to the error, got %v", err)
 	}
 }
