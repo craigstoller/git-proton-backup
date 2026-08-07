@@ -14,7 +14,14 @@ param(
     [string]$EffectivePath = (
         [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
         [Environment]::GetEnvironmentVariable('Path', 'User')
-    )
+    ),
+    # Injectable HKCU\Environment handle: an object exposing GetValue($name, $default,
+    # $options), GetValueKind($name), SetValue($name, $value, $kind), Close(). $null (the
+    # default) opens the real key. Overridable so tests can supply a mock and pin the
+    # REG_EXPAND_SZ/REG_SZ value-kind logic without ever writing the real registry (same
+    # Stage 4 lesson as -EffectivePath above — a mock object is the only channel an env-var
+    # override cannot fake, since [Environment]::SetEnvironmentVariable writes HKCU directly).
+    [object]$EnvironmentKey = $null
 )
 $ErrorActionPreference = 'Stop'
 
@@ -44,7 +51,8 @@ if (Test-Path $HelperExe) {
         # e.g. %USERPROFILE%...\WindowsApps (stock Windows 11 ships the user Path as
         # REG_EXPAND_SZ) into literal paths for good. DoNotExpandEnvironmentNames keeps the
         # raw value; the write keeps the value's existing kind (ExpandString for a fresh one).
-        $envKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+        $envKey = if ($null -ne $EnvironmentKey) { $EnvironmentKey }
+                  else { [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true) }
         if (-not $envKey) { throw "Cannot open HKCU\Environment for writing — user PATH not updated." }
         try {
             $rawUserPath = ''
@@ -65,17 +73,20 @@ if (Test-Path $HelperExe) {
                 # [Environment]::SetEnvironmentVariable used to broadcast WM_SETTINGCHANGE so
                 # Explorer — hence any NEW terminal it spawns — re-reads the environment; a raw
                 # registry write does not. Best-effort parity: a failed broadcast only means the
-                # new PATH waits for the next logon.
-                try {
-                    $sig = '[DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]' +
-                        'public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);'
-                    $native = Add-Type -MemberDefinition $sig -Name 'NativeMethods' -Namespace 'GpbInstall' -PassThru
-                    [UIntPtr]$broadcastResult = [UIntPtr]::Zero
-                    # HWND_BROADCAST (0xffff), WM_SETTINGCHANGE (0x1A), SMTO_ABORTIFHUNG (0x2)
-                    $null = $native::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero,
-                        'Environment', 0x2, 5000, [ref]$broadcastResult)
-                } catch {
-                    Write-Verbose "Environment-change broadcast failed (PATH is written; it applies at next logon): $_"
+                # new PATH waits for the next logon. Only broadcast against the REAL key: a
+                # mocked -EnvironmentKey run (Pester) must never touch Explorer/session state.
+                if ($null -eq $EnvironmentKey) {
+                    try {
+                        $sig = '[DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]' +
+                            'public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);'
+                        $native = Add-Type -MemberDefinition $sig -Name 'NativeMethods' -Namespace 'GpbInstall' -PassThru
+                        [UIntPtr]$broadcastResult = [UIntPtr]::Zero
+                        # HWND_BROADCAST (0xffff), WM_SETTINGCHANGE (0x1A), SMTO_ABORTIFHUNG (0x2)
+                        $null = $native::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero,
+                            'Environment', 0x2, 5000, [ref]$broadcastResult)
+                    } catch {
+                        Write-Verbose "Environment-change broadcast failed (PATH is written; it applies at next logon): $_"
+                    }
                 }
                 Write-Host "Added $helperDir to your user PATH. Open a NEW terminal for it to take effect (this script cannot change its caller's session)."
             }
