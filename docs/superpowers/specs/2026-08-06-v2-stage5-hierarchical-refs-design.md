@@ -45,14 +45,19 @@ lowercase hex plus `\n`; violations remain fatal, never coerced.
   that were advertised. v2 itself can never create a skipped name (2a refuses them on push),
   so a skip always marks foreign data.
 - **Read-boundary validation is in-process, push-boundary validation stays authoritative.**
-  The read-side check enforces protocol-stream safety and git's documented ref-name rules
-  structurally (no control characters, space, `~^:?*[\`, no `..` or `@{`, no leading/trailing
-  or doubled `/`, no trailing `.` or `.lock` suffix, not `@`) without spawning a process per
-  ref — `git check-ref-format` takes one name per invocation, and a flat folder of thousands
-  of tags must not mean thousands of subprocess launches during advertisement. The push path
-  keeps the real `git check-ref-format` (batches are small; authority matters more there),
-  so any drift between the two checks errs toward skipping at read and refusing at push —
-  both safe directions.
+  The read-side check implements **the full documented `git-check-ref-format` rule set** —
+  the normative bar is the rule set, not any prose list here; illustratively: no control
+  characters, space, `~^:?*[\`, no `..` or `@{`, no component beginning with `.` (which an
+  earlier draft of this bullet omitted — `refs/heads/.hidden` is exactly the kind of miss a
+  partial list invites), no leading/trailing or doubled `/`, no trailing `.` or `.lock`
+  suffix, not `@` — without spawning a process per
+  ref: `git check-ref-format` takes one name per invocation, and a flat folder of thousands
+  of tags must not mean thousands of subprocess launches during advertisement. **Agreement is
+  proven, not assumed:** a hermetic parity test runs the in-process validator's accept and
+  reject fixtures through the real `git check-ref-format` and requires identical verdicts, so
+  drift is a test failure rather than a silent advertisement of a name git rejects. The push
+  path keeps the real `git check-ref-format` (batches are small; authority matters more
+  there).
 - **Cost is stated, not hidden: one CLI `List` subprocess per folder plus in-process name
   checks per ref.** Serial, deliberately. Typical ref trees are shallow and small; a
   pathological tree makes advertisement slow, not wrong. This is the same accepted posture as
@@ -146,15 +151,19 @@ still gets its own `ok`/`error` (response order need not match command order).
   ref-file create does not commit — `Refused` **or** an error, since the CLI's outcome shape
   for a file upload colliding with a folder is unverified until the new contract row pins it —
   and a `Stat` shows a **folder** at that name, the folder's **subtree** is enumerated under
-  the lock, and the test is **"contains no ref files," not "first level is empty."** A crash
-  mid-prune after deleting `refs/heads/feature/x/y` can leave `feature/` containing the empty
-  folder `x/` — a first-level emptiness test would misread that as live sub-refs and
-  permanently block branch `feature`, which is precisely the wedge self-heal exists to
-  prevent. So: subtree contains no ref files (only folders) → verify-then-`Trash` the folder
-  and retry the create once; subtree contains ref files → refuse, naming those **actual ref
-  files** as the conflict (git itself refuses this D/F state locally; the refusal is correct
-  even if the create's failure was transient, because the create cannot succeed while the
-  folder exists — and it never names an empty directory as if it were a ref). If the
+  the lock, and the test is **"contains no files of any kind," not "first level is empty."**
+  A crash mid-prune after deleting `refs/heads/feature/x/y` can leave `feature/` containing
+  the empty folder `x/` — a first-level emptiness test would misread that as live sub-refs
+  and permanently block branch `feature`, which is precisely the wedge self-heal exists to
+  prevent. The test is deliberately "no **files**," not "no **ref** files": a foreign file
+  (say `feature/notes.txt`, droppable by any non-v2 actor) makes the subtree not-residue —
+  trashing it would destroy foreign data this design promises never to touch. So: subtree
+  contains no files at all (only folders) → verify-then-`Trash` the folder and retry the
+  create once; subtree contains any file → refuse, naming the blocking entries **as what
+  they are** — ref files as conflicting refs, anything else as foreign data (git itself
+  refuses this D/F state locally; the refusal is correct even if the create's failure was
+  transient, because the create cannot succeed while the folder exists — and it never names
+  an empty directory or a foreign file as if it were a ref). If the
   diagnostic `Stat` or any `List` in the enumeration fails, report **that** transport failure
   and heal nothing — self-heal runs only on positive evidence. A `Refused` against an existing ref **file** keeps its current meaning —
   concurrent creator, report, never overwrite.
@@ -340,9 +349,13 @@ Missing parents of the repo root (Surprise R2-1: raw `Node not found: GitRemotes
 - RED/GUARD labelling, which-assertion-fired reporting, and deliberate-regression checks per
   the runbook — mandatory for prune, self-heal, batch ordering, and the quarantine publish
   ordering, which are the load-bearing new behaviours. The self-heal suite must include the
-  **nested-empty residue** case (a folder containing only empty folders heals; a folder
-  containing a ref file anywhere in its subtree refuses naming that file), and phase-3
-  failure must be pinned continuing into phase 4 with correct per-ref statuses.
+  **nested-empty residue** case (a folder containing only empty folders heals), the
+  **conflicting-ref** case (a ref file anywhere in the subtree refuses naming that file),
+  and the **foreign-file** case (a non-ref file anywhere in the subtree refuses naming it as
+  foreign data, and nothing is trashed); phase-3
+  failure must be pinned continuing into phase 4 with correct per-ref statuses; and the
+  read-boundary validator carries the **parity test** against real `git check-ref-format`
+  (component 1).
 - Sha-collision hygiene in fixtures (pin `GIT_COMMITTER_DATE` where content repeats).
 
 **Live gate (one, at stage end), in outline:**
@@ -386,8 +399,12 @@ One revision entry, edits in place per house style:
 - Utility modes: `--set-head` hierarchical grammar; slash-refusal text superseded.
 - New env var documented alongside `GPB_UNCERTIFIED_CLI`; error-table rows for the missing-
   parent refusal (both modes), marker read-failure vs absence, MAX_PATH hint.
-- Error table: folder-collision rows updated for self-heal (empty-folder case no longer
-  simply "fatal with the specific path").
+- Error table: folder-collision rows updated for self-heal (residue case no longer simply
+  "fatal with the specific path"); and the **"Malformed ref name or ref-file contents →
+  Fatal" row split in two** — malformed *contents* of an advertised ref stay fatal; a
+  malformed discovered *name* is skipped with a loud note at the read boundary and refused
+  at the push boundary. Leaving the merged row as-is would keep a normative rule that
+  contradicts component 1 and can reintroduce the bricking behaviour the skip rule removes.
 
 ## Out of scope (unchanged verdicts)
 
@@ -459,3 +476,16 @@ self-heal (Gemini); marker absent-vs-error given its mechanism — the transport
 `Stat` absence seam, no CLI error-text parsing — plus a contract row pinning the certified
 CLI's not-found signature (Codex); component 8 gains the nested-empty hermetic case and the
 phase-3-continues-into-phase-4 pin.
+
+**Round 3 (Codex + Gemini, 2026-08-06, final round) — applied:** self-heal's subtree test
+tightened from "no ref files" to "no files of any kind" — a foreign file makes the subtree
+not-residue, and trashing it would destroy data the design promises never to touch; refusals
+name blocking entries as what they are, ref or foreign (Gemini); the read-boundary validator's
+normative bar restated as the full documented `git check-ref-format` rule set (the prose list
+had omitted leading-dot components, disproving the "drift is fail-safe" claim as written) with
+a mandatory hermetic parity test against the real command (Codex); component 9 now explicitly
+splits the v6.4 error-table "malformed ref name or ref-file contents → fatal" row so the v6.5
+edit cannot leave the old merged rule contradicting the skip-with-note boundary (Codex);
+component 8 gains the foreign-file self-heal case and the parity test. Both engines otherwise
+reported the round-2 fixes structurally sound; the loop ends at the three-round cap with every
+tracked finding applied or rejected-with-reason and none deferred.
