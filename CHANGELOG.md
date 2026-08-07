@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- **git-remote-proton:** hierarchical refs are fully supported — nested branch and tag names
+  (`refs/heads/feature/x`), plus `refs/notes/*`, `refs/replace/*`, and every other valid
+  namespace beyond `refs/heads/` and `refs/tags/`, are now advertised, fetchable, and pushable.
+- **git-remote-proton:** deleting a ref now prunes the empty parent folders it leaves behind, and
+  creating a ref that collides with such a leftover folder self-heals (trash the folder, retry)
+  instead of refusing permanently.
+- **git-remote-proton:** `GPB_CREATE_PARENTS=1` opts a push into creating missing parent folders
+  above the repo root; unset (the default) stays an actionable refusal naming the exact
+  `proton-drive filesystem create-folder` command to run by hand — see the README for the trade
+  this makes.
+- **git-remote-proton:** marker and "not a git-remote-proton repo" diagnostics now distinguish a
+  confirmed absence from a failed read, so a broken CLI (e.g. under `GPB_UNCERTIFIED_CLI=1`) no
+  longer masquerades as an empty remote.
+- **git-remote-proton:** on Windows, a failure involving a near-limit path now gets a best-effort
+  hint naming the legacy `MAX_PATH` remedies (`core.longpaths`, a shorter destination) — see the
+  README's Windows path length section.
+- **git-remote-proton:** fetch downloads now land and verify in a per-fetch quarantine directory
+  before publishing into the local object store, replacing the previous failed-attempt
+  residue-deletion rule (internal; no user-visible behaviour change).
+
 ## 0.3.1 — 2026-08-06
 
 One version line covers both tools in this repository: the GitProtonBackup

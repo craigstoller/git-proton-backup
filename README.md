@@ -98,6 +98,14 @@ git clone -o proton-v2 proton::/my-files/GitRemotes/myrepo
 git push proton-v2 main
 ```
 
+`git-remote-proton` serves the whole `refs/` tree, not just flat `refs/heads/` and `refs/tags/` —
+hierarchical branch and tag names (`refs/heads/feature/x`), `refs/notes/*`, `refs/replace/*`, and
+any other valid namespace are all advertised, fetchable, and pushable.
+
+Cloning a deeply nested repo on Windows can hit the legacy `MAX_PATH` limit — see
+[Windows path length](#windows-path-length) below if a clone, fetch, or push fails with a
+"Filename too long" style error.
+
 Wiring both onto one repo is safe: install v1 as usual (`Install-ProtonBackup`), then add the
 `proton-v2` remote alongside it. Full design: [docs/v2-remote-helper-design.md](docs/v2-remote-helper-design.md).
 
@@ -123,6 +131,30 @@ that capture is what turns a one-off into something reproducible. Only then remo
 trash, items whose names collide with the repo's remote path, and retry. The advice is scoped to
 those homonyms — never "empty your trash" wholesale, which would take unrelated recoverable
 files with it.
+
+### Environment variables
+
+`git-remote-proton` (v2) reads two opt-in environment variables. Both are read fresh from the
+environment on every invocation — never cached, never remembered across runs — so setting or
+unsetting one takes effect on the very next command.
+
+- **`GPB_UNCERTIFIED_CLI=1`** overrides the certified-CLI allowlist. By default the helper refuses
+  to run against anything but the exact certified Proton Drive CLI build, naming what it found
+  versus what's certified. Setting this proceeds anyway, printing a loud stderr warning naming the
+  untested (or undetermined) CLI version on every invocation. Meant for troubleshooting a CLI
+  upgrade, not for routine use.
+- **`GPB_CREATE_PARENTS=1`** lets a `push` create missing parent folders above the repo root (for
+  example `/my-files/GitRemotes` when only `/my-files` exists), instead of the default: an
+  actionable refusal naming the exact `proton-drive filesystem create-folder` command to run by
+  hand. **This is a real trade, not a free convenience: a typo'd remote address fails loudly by
+  default, and setting this variable trades that safety net away** — a mistyped path no longer
+  gets caught before it creates something, it just gets a folder tree built at the wrong location.
+  Missing parents are created one at a time, each logged to stderr as it happens, bounded to
+  strictly below the Drive mount (`/my-files` or `/devices/<id>` themselves are never created,
+  since a mount isn't creatable storage). There is no rollback if a later step fails — whatever
+  was already created stays created, and the stderr lines are the record of what happened. Applies
+  to `push` only; `--set-head` never honours it, since it only ever points HEAD at a branch that
+  must already exist.
 
 ### Windows path length
 
