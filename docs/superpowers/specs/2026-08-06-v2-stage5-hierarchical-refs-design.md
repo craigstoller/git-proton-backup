@@ -33,11 +33,27 @@ lowercase hex plus `\n`; violations remain fatal, never coerced.
   depth-first. Every well-formed ref file found is advertised under its full
   `refs/...` name. Folders containing no ref files contribute nothing — empty parents are
   benign to every read path (they matter only to the create path; see component 2).
+- **Discovered names are validated at the read boundary, not only on push.** Every full name
+  assembled during recursion is checked with `git check-ref-format` before advertisement; a
+  violation is fatal naming the exact remote path — the design's existing "malformed ref name
+  → fatal, never coerced" rule applied where names now first enter the system. A non-v2 actor
+  (web UI, another client) can create nodes under `refs/` with names git cannot accept, and
+  those must never reach the protocol stream.
+- **Cost is linear in folder count and stated, not hidden.** Each folder is one CLI
+  subprocess, serially. Typical ref trees are shallow and small; a pathological tree makes
+  advertisement slow, not wrong. This is the same accepted posture as the design's "discovery
+  cost grows linearly with pack count" note, and the v6.5 edit records it beside that note.
+  No parallel listing in Stage 5 (concurrent CLI *startups* collide — A7/A8 — and the retry
+  machinery to exploit the post-startup window is not worth building for this).
 - **The v6.1 namespace rejection is retired.** Recursion makes `refs/notes/*`,
   `refs/replace/*`, `refs/stash`, and other valid namespaces visible without a filter, so they
   are advertised and pushable. v6.1's first justification (non-recursive `ListRefs`) is erased
-  by this component; its second (expensive misleading failure, orphan packs) is erased by
-  parent creation in component 2. The push rule for these namespaces is the design's existing
+  by this component. Its second (expensive misleading late failure, orphan packs) is
+  **addressed but not erased**: batch preflight (2b) now validates every name and D/F
+  conflict before anything is packed, so the *foreseeable* failures move ahead of the pack
+  upload — but a runtime folder failure after the pack is uploaded (permission, transport)
+  still leaves an inert orphan pack, the design's existing accepted class, and the v6.5 text
+  must not claim otherwise. The push rule for these namespaces is the design's existing
   conservative deviation, unchanged in wording: **`CreateExclusive` on create, force required
   for any move, no ancestry check**; delete goes through the same trash+prune path as branches.
   The deviation-from-git note (v2 stricter than git's object-type-aware rules) stays in the
@@ -61,12 +77,29 @@ also glob-expanded has never been probed; components appear in remote paths on e
 `EnsureDir`; (3) future-proofing — any later code path that mirrors components into local
 paths (fetch staging, caches) would meet the device-name and brace hazards on Windows.
 
-**2b. Deletes before creates within a batch.** The helper reorders each buffered push batch so
-deletions execute before creates and updates, making `git push origin :feature feature/x` (and
-the reverse order git may send) succeed in one batch. Per-ref status responses are unchanged —
-each `ok`/`error` names its `<dst>`, and the protocol does not require response order to match
-command order. The poison-flag rule is unaffected: enforcement still happens after the full
-batch is buffered, before any mutation.
+**2b. Batch execution order, normative.** The buffered batch executes in five phases; no
+mutation of any kind precedes phase 4:
+
+1. Buffer the complete blank-line-terminated batch; poison-flag enforcement (unchanged).
+2. **Validate the whole batch before anything moves**: `git check-ref-format` plus rule 2a
+   for every destination; duplicate destinations refused; and a **final-state D/F preflight**
+   — compute the post-batch ref set and refuse, with a named reason, any create whose name
+   conflicts directory/file-wise with that final state (e.g. `feature` and `feature/x` both
+   created in one batch). Failures here cost nothing: no pack has been built.
+3. Build, upload, and confirm the pack for the batch's creates/updates (deletions need no
+   objects). A pack failure fails those refs with **nothing yet mutated** — deletions have
+   deliberately not run.
+4. Execute deletions (trash + prune, 2c).
+5. Execute creates and updates.
+
+Deletions-before-creates is what makes `git push origin :feature feature/x` succeed in one
+batch regardless of the order git sends. Placing deletions **after** pack confirmation is
+what prevents the failure both engines' review flagged: without it, the batch's only bulk
+failure point (the upload) could fire after a destructive change. What this order does
+**not** promise: a create failing in phase 5 does not resurrect a branch deleted in phase 4 —
+the user explicitly requested that deletion, multi-ref batches remain non-atomic per the
+design, and each ref still gets its own `ok`/`error` (response order need not match command
+order).
 
 **2c. Parent creation, prune on delete, self-heal on create.**
 
@@ -88,17 +121,36 @@ batch is buffered, before any mutation.
   and a `Stat` shows a **folder** at that name, `List` it
   under the lock: **empty → verify-then-`Trash` the folder and retry the create once**;
   non-empty → refuse, naming the live sub-refs as the conflict (git itself refuses this D/F
-  state locally). A `Refused` against an existing ref **file** keeps its current meaning —
+  state locally; the refusal is correct even if the create's failure was transient, because
+  the create cannot succeed while the folder exists). If the diagnostic `Stat` or `List`
+  itself fails, report **that** transport failure and heal nothing — self-heal runs only on
+  positive evidence. A `Refused` against an existing ref **file** keeps its current meaning —
   concurrent creator, report, never overwrite.
 - **Reverse D/F (component blocked by a ref file):** creating `refs/heads/feature/x` when
   branch `feature` exists as a file and is **not** deleted earlier in this batch → refuse with
   a named reason mirroring git's own local directory/file conflict rule. (If the batch deletes
   it, rule 2b makes the create succeed.)
+- **The folder trashes are check-then-act, and this spec says so rather than implying it
+  away.** No conditional delete exists on this transport (the design's lock-release rule
+  already lives with the same limit). Between verifying emptiness and `Trash`, a **non-v2
+  actor** could create a child that the recursive folder trash then carries away — v2 writers
+  cannot, because both paths run under the batch lock. The blast radius is bounded: the
+  subtree goes to Proton's trash (restorable via the web UI), the affected content is ref
+  files whose value-recovery status the design already documents as provisional, and the
+  window exists only during an operation the single-writer model says should not be racing
+  anything. This is the same accepted posture as every other v2 mutation, extended to two new
+  sites — not a new class of promise.
+- **`Trash` outcomes are handled closed-set at both new sites.** Prune is best-effort: a
+  `Refused`/`Ambiguous`/error on a prune trash logs the folder to stderr and stops ascending —
+  the leftover is exactly what self-heal exists for. Self-heal is not best-effort: anything
+  but `Committed` on its trash refuses the create, quoting the outcome, because proceeding
+  would mean creating a ref at a name whose state is unknown.
 
 **2d. `EnsureDir` contradiction handling (generic robustness, NOT a validated C17 fix).** If
 `create-folder` fails with already-exists after a `Stat` reported absent (the C17 signature,
-observed once, never reproduced under provocation — C17b), the helper re-`Stat`s once: present
-→ proceed as if the folder existed all along; still absent → fail, quoting **both**
+observed once, never reproduced under provocation — C17b), the helper re-`Stat`s once: a
+**folder** present → proceed as if it existed all along; a **file** present → the reverse-D/F
+refusal from 2c, named, not a proceed; still absent → fail, quoting **both**
 observations verbatim so the contradiction is diagnosable. Framed exactly this way in code
 comments and the design doc: C17b's ruling stands — this can only be justified as generic
 robustness, never claimed as a live-validated fix.
@@ -108,26 +160,46 @@ robustness, never claimed as a live-validated fix.
 The slash refusal (which names Stage 5 today) is lifted. Short names normalise to
 `refs/heads/<name>` including embedded slashes; full `refs/heads/…` forms accepted as today;
 anything outside `refs/heads/` still refused. Components validated per rule 2a. The remote
-existence check recurses per component 1. Everything else — lock lifecycle,
-verify-branch-before-idempotence-short-circuit, `UpdateHEAD`/`WriteHEAD` split, outcome
-handling — is untouched.
+existence check uses an **exact-path `Stat` and read of the one target ref file** — it does
+not recurse the tree; `--set-head` has no reason to enumerate namespaces it is not touching.
+Everything else — lock lifecycle, verify-branch-before-idempotence-short-circuit,
+`UpdateHEAD`/`WriteHEAD` split, outcome handling — is untouched. `--set-head` does **not**
+honour the parent-create env var (component 6): its precondition is an existing repo with an
+existing branch, and a repo cannot exist below a missing parent — the var could only
+manufacture folders and then fail the marker check, so offering it there would be a trap.
 
 ## Component 4 — Quarantine fetch staging (retro-Codex 3)
 
 Fetch downloads land in a **per-fetch incoming directory**, not in the temp alternate:
 
-- The incoming dir is created at fetch start and **deleted wholesale at fetch end, success or
-  failure**; any residue from a crashed prior fetch at that location is deleted at start.
-  Nothing in it is ever read as repo state.
+- **Placement is normative:** the incoming dir and the temp object dir are siblings under one
+  per-fetch temporary root, so they are on the same filesystem by construction and
+  publication is a plain `rename`, never a cross-volume copy of a repository-sized pack. The
+  root is unique per fetch (no cross-fetch collision to defend against) and is removed
+  wholesale at fetch end, success or failure. A crash leaves one orphaned temp root — inert,
+  never read as repo state, the same residue story the temp object dir has today. There is no
+  delete-at-start of someone else's path.
 - Verification runs **in quarantine**: checksum-vs-basename immediately on a `.pack`'s
   arrival; `index-pack --verify` on the pair as soon as both members are local (unchanged
   timing rules from the error table).
-- Only fully verified pairs are **published** into the temp alternate's `pack/` directory,
-  **pack before idx**, so no reader (rev-list, the map builder) ever observes an unverified or
-  incomplete pair. The Stage 4 polish trace assertion (`.pack` before re-downloaded `.idx` in
-  the mid-round pair refresh) must keep passing — publication preserves that ordering.
-- **Deleted by this refactor:** the failed-attempt residue-deletion rule and the entire F2
-  failure class (partially-downloaded or unverified files visible to planning/mapping code).
+- **The trust boundary is planning vs traversal, and only traversal is protected.** The
+  design's fetch algorithm downloads `.idx` sidecars *before* their packs and plans from
+  them; a lone index is necessarily unverifiable, and the error table already permits exactly
+  that — "the lone index is used only to *plan* which packs to fetch, never as a source of
+  truth about objects." Quarantine keeps that split and gives it a physical address: the
+  planner may read lone, untrusted `.idx` files **in the incoming dir**; the traversal
+  (`rev-list` via the alternate) sees **only** published pairs.
+- Only fully verified pairs are **published** into the temp alternate's `pack/` directory —
+  each member renamed into place, `.pack` first, then `.idx`, and **the `.idx` rename is the
+  pair's commit point**: git discovers packs through their indexes, so a pack whose index has
+  not yet appeared is invisible to the traversal, which is what makes the two renames an
+  atomic publication from the reader's side. The Stage 4 polish trace assertion (`.pack`
+  before re-downloaded `.idx` in the mid-round pair refresh) must keep passing — publication
+  preserves that ordering.
+- **Deleted by this refactor:** the failed-attempt residue-deletion rule, and the F2 failure
+  class **narrowed to what quarantine actually removes** — partial or unverified files
+  visible to the *traversal*. Planning reading untrusted indexes is not residue and not a
+  hazard; it is the algorithm.
   The spec-vs-code note from retro-Codex finding 2 (`listCompletePacks` stderr-notes only
   packish-looking skips) is resolved in the code's favour while touching this path: the design
   doc's letter is aligned to "packish-looking skips get notes" in the v6.5 edit.
@@ -148,28 +220,42 @@ structurally.
   found → today's message) from a **failed read** (transport errored → "could not read
   <path>: <cause>"). Kills the Stage 4 gate 2b masquerade where a broken CLI under
   `GPB_UNCERTIFIED_CLI=1` surfaced as "not a repo".
-- **MAX_PATH.** README gains a Windows section: deep clone destinations can exceed 260 chars;
-  remedies are `git config core.longpaths true` or a shorter destination. Helper-side: when a
-  **spawned git command fails** and a computed relevant target path exceeds 260 characters on
-  Windows, append a one-line hint naming both remedies. The trigger is **path-length
-  arithmetic, never stderr pattern-matching** (git messages are localised; lengths are not).
-  Best-effort: no detection is promised for paths git computes internally beyond what the
-  helper can see.
+- **MAX_PATH.** README gains a Windows section: deep clone destinations can exceed the
+  legacy 260-character limit; remedies are `git config core.longpaths true` (helps for git's
+  own file writes) or a shorter destination (always helps), and which applies. Helper-side:
+  when a **spawned git command fails** and a computed relevant path is **near or over the
+  limit** (threshold ≥ 240 characters, deliberately conservative — the legacy limit counts a
+  terminator and directory operations fail below 260), append a one-line hint phrased as a
+  **possible** cause naming both remedies — the failure may be unrelated, and the hint must
+  not claim otherwise. The trigger is **path-length arithmetic, never stderr
+  pattern-matching** (git messages are localised; lengths are not). Two stated limits: no
+  detection is promised for paths git computes internally beyond what the helper can see, and
+  a clone's **checkout** phase runs after the helper has exited, so checkout-time failures
+  are reachable only by the README, never by the hint.
 
 ## Component 6 — UX: opt-in parent auto-create
 
 Missing parents of the repo root (Surprise R2-1: raw `Node not found: GitRemotes`) become:
 
-- **Default (unset): an actionable refusal.** Names the first missing parent, and both
-  remedies: create it (web UI or `proton-drive filesystem create-folder …`), or set the
-  opt-in env var. Typo'd addresses fail loudly instead of manufacturing folder trees.
+- **Default (unset): an actionable refusal.** Names the first missing parent and gives an
+  **executable** remedy in the CLI's real grammar — `proton-drive filesystem create-folder
+  <parent> <name>` with the actual values filled in (the command takes parent-plus-name, not
+  a path) — alongside the web-UI route and the opt-in env var. Typo'd addresses fail loudly
+  instead of manufacturing folder trees.
 - **`GPB_CREATE_PARENTS=1`** (exact name fixed here; same conventions as
   `GPB_UNCERTIFIED_CLI`: read fresh from the environment every invocation, never cached or
-  remembered): the `EnsureDir` walk extends **above** the repo root, creating each missing
-  parent inside the canonicalised root's bounds (under `/my-files` or `/devices` only —
-  canonicalisation already rejects everything else), with a **loud stderr line per created
-  folder**. Honoured by the push bootstrap and by `--set-head`; an env var, not a flag,
-  because git invokes the helper on the protocol path and the user cannot pass flags.
+  remembered): the `EnsureDir` walk extends **above** the repo root, with a **loud stderr
+  line per created folder**. **Walk bounds are explicit:** it creates only components
+  **strictly below** the mount — never `/my-files` or `/devices` themselves, and never a
+  `/devices/<device-id>` node (a device mount is not creatable storage); if the mount itself
+  is missing the refusal fires as in the default mode. Canonicalisation already rejects
+  everything outside those roots. **Push bootstrap only** — `--set-head` deliberately does
+  not honour it (component 3 says why). An env var, not a flag, because git invokes the
+  helper on the protocol path and the user cannot pass flags.
+- **No rollback, stated.** Parent creation can partially succeed — some folders created, then
+  a later step fails. The created folders remain (deleting them would be exactly the unsafe
+  folder-removal race component 2c bounds so carefully, for zero benefit); the stderr lines
+  say what was created.
 - Gate briefs and tests must account for the confinement consequence: with the var set, the
   helper writes **outside the repo root**. The gate exercises both modes (component 8).
 
@@ -205,20 +291,28 @@ Missing parents of the repo root (Surprise R2-1: raw `Node not found: GitRemotes
   collisions on both sides, emptiness observable via `List`, `Trash` non-idempotence on
   folders — everything components 1–2 depend on.
 - New live **contract-table rows** (run at gates only, `GPB_LIVE_ACCOUNT=1`) for behaviours v2
-  now depends on: `Trash` on a folder (outcome shape), `create-folder` colliding with a file
-  and vice versa (error shape), nested `List`, `upload` of a file colliding with a folder
-  name. Fake and CLI halves must agree per the existing decorator pattern.
+  now depends on: `Trash` on an **empty** folder and on a folder **with children** (outcome
+  shape both ways — prune assumes the former, the check-then-act analysis in 2c assumes the
+  latter is recursive), `create-folder` colliding with a file and vice versa (error shape),
+  nested `List`, `upload` of a file colliding with a folder name. Fake and CLI halves must
+  agree per the existing decorator pattern.
 - RED/GUARD labelling, which-assertion-fired reporting, and deliberate-regression checks per
   the runbook — mandatory for prune, self-heal, batch reordering, and the quarantine publish
   ordering, which are the load-bearing new behaviours.
 - Sha-collision hygiene in fixtures (pin `GIT_COMMITTER_DATE` where content repeats).
 
 **Live gate (one, at stage end), in outline:**
-1. Hierarchical end-to-end: push `feature/x` + a nested tag + a `refs/notes/*` ref; clone
-   (nested refs advertised and checked out correctly); incremental fetch.
-2. The D/F workflow: delete `feature/x` (observe prune — the parent folder is gone from the
-   listing), then push branch `feature` (clean-path create). Provoking the self-heal branch
-   (a leftover folder in the way) is hermetic-only; the live gate asserts the clean path.
+1. Hierarchical end-to-end: push `feature/x` + a nested tag + a `refs/notes/*` ref;
+   **advertisement asserted with `git ls-remote`** (a clone alone does not prove namespace
+   coverage — clone does not fetch notes by default), then clone, then an **explicit fetch of
+   `refs/notes/*` verifying the OID landed**; incremental fetch.
+2. The D/F workflow, **including self-heal live**: delete `feature/x` (observe prune — the
+   parent folder is gone from the listing), push branch `feature` (clean-path create); then,
+   inside the gate repo, manufacture the two collision states by hand (an empty folder at a
+   branch name; a folder containing a ref file) and push against each — asserting the heal
+   (trash + create succeeds, loud stderr) and the refusal (names the live sub-refs). The
+   composed `create → Stat → List → Trash → retry` path is exactly where this project's
+   history says seams lie; it runs live, not only against the fake.
 3. `--set-head` to a nested branch; delete-protection follows HEAD.
 4. Quarantine no-regression: mid-round pair refresh, up-to-date re-fetch with zero `packs/`
    downloads.
@@ -239,7 +333,10 @@ One revision entry, edits in place per house style:
   normative rules (2c); `EnsureDir` contradiction handling (2d).
 - Ref-transition table: other-namespace row un-narrowed (v6.1 note updated to "re-enabled
   Stage 5"); delete row gains prune; new rows for D/F collisions both directions.
-- Push: batch reordering rule (2b).
+- Push: the five-phase batch execution order (2b), including the final-state D/F preflight
+  and pack-before-deletions rule.
+- Advertisement: read-boundary name validation; listing-cost note beside the existing
+  pack-count scaling note.
 - Fetch: quarantine staging replaces the residue rule; `listCompletePacks` stderr-note letter
   aligned to code (packish-looking skips only).
 - Utility modes: `--set-head` hierarchical grammar; slash-refusal text superseded.
@@ -274,3 +371,29 @@ publishing, non-Windows support, multi-writer, shallow/partial clone, SHA-256 re
 | Missing parent UX | Opt-in auto-create via env var, actionable error by default | Message-only; always-on auto-create |
 | Wiring coverage | Injection seam committed, shim harness stretch | Seam-only; shim-only |
 | Structure | Hygiene-first, one gate, v0.4.0 draft-until-gated | Feature-first; two-stage split |
+
+## Revisions
+
+*Scaffolding for the review loop; delete before the spec is treated as final.*
+
+**Round 1 (Codex + Gemini, 2026-08-06) — applied:** batch execution rewritten as a five-phase
+order with final-state D/F preflight and pack-confirmation-before-deletions (both engines);
+quarantine's trust boundary corrected to planning-vs-traversal — lone `.idx` files legitimately
+plan from quarantine, only the traversal is confined to published pairs (Codex); publication
+atomicity specified (same-filesystem siblings, rename, `.idx` as commit point) and incoming-dir
+placement pinned (Codex + Gemini); check-then-act window and blast radius of the two folder
+trashes stated with closed-set `Trash` outcome handling (Codex); read-boundary ref-name
+validation added (Codex); v6.1 orphan-pack justification downgraded from "erased" to "addressed"
+(Codex); `--set-head` dropped from `GPB_CREATE_PARENTS` (no coherent success case — Codex) and
+switched to exact-path verification (Codex + Gemini); parent-walk bounds, executable
+create-folder remedy, and no-rollback note added (Gemini + Codex); MAX_PATH threshold made
+conservative, hint phrased as possible cause, checkout-phase limitation stated (Codex + Gemini);
+2d re-Stat branches on node type (Codex); live gate extended with self-heal provocation,
+`ls-remote` advertisement assertion, explicit notes fetch, and both folder-trash contract rows
+(Codex). **Rejected:** traversal/cancellation limits on listing (YAGNI — cost stated instead;
+ref trees are user-bounded in practice); rollback of partially-created parents (reintroduces the
+unsafe folder-delete race for zero benefit); treating mid-batch namespace-root re-creation
+failure as a new class (non-atomic batches with per-ref status already cover it); "delete-first
+is data loss" as framed (a requested deletion honoured before an unrelated create fails is git's
+own non-atomic remote semantics — the real defect was deletions preceding pack confirmation,
+which is fixed).
