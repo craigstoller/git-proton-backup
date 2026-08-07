@@ -3377,6 +3377,105 @@ func TestPushDeleteThenRecreateInOneBatchOrderIndependent(t *testing.T) {
 	}
 }
 
+// trashFailsAndMethodTracked wraps a Fake, forcing Trash to fail (report
+// Ambiguous, nil — the node is left completely untouched, exactly as if the
+// trash never ran) for ONE chosen path, while also recording which write
+// method — CreateExclusive or UpdateRevision — fires for another chosen
+// path. Built specifically to pin fix round 2's correction to M4: a
+// same-batch delete that FAILS in phase 4 must not flip the paired
+// create/update's routing to CreateExclusive, because the node the delete
+// was supposed to remove is still actually there.
+type trashFailsAndMethodTracked struct {
+	*transport.Fake
+	failTrash string
+	watch     string
+	method    *string
+}
+
+func (tr trashFailsAndMethodTracked) Trash(p string) (transport.Outcome, error) {
+	if p == tr.failTrash {
+		return transport.Ambiguous, nil
+	}
+	return tr.Fake.Trash(p)
+}
+
+func (tr trashFailsAndMethodTracked) CreateExclusive(p, local string) (transport.Outcome, error) {
+	if p == tr.watch {
+		*tr.method = "create"
+	}
+	return tr.Fake.CreateExclusive(p, local)
+}
+
+func (tr trashFailsAndMethodTracked) UpdateRevision(p, local string) (transport.Outcome, error) {
+	if p == tr.watch {
+		*tr.method = "update"
+	}
+	return tr.Fake.UpdateRevision(p, local)
+}
+
+// TestPushUpdateRoutesViaUpdateRevisionWhenSameBatchDeleteFails is RED (fix
+// round 2, Important): deletedThisBatch must be built from phase 4's ACTUAL
+// outcome, not phase-2 validity. A batch deletes refs/heads/main (valid at
+// phase 2) AND updates it in the same batch; the transport's Trash is forced
+// to fail for that exact path (Ambiguous, node left untouched — a HEAD
+// written between phases by a non-v2 actor, or a transient transport fault,
+// would produce the same shape). The delete must report its own failure.
+// The update — which is unrelated to why the delete failed, and whose
+// target node is still genuinely occupied — must still succeed, and it must
+// do so via UpdateRevision (the node is there; nothing concurrent
+// happened), NOT CreateExclusive. Before this fix, deletedThisBatch was
+// built from phase-2 validity alone, so the FAILED delete still flipped the
+// update to CreateExclusive, which then hit the still-present node and
+// reported the wrong diagnosis: "ref changed concurrently; refusing to
+// overwrite" — nothing concurrent happened, the batch's own delete simply
+// failed.
+func TestPushUpdateRoutesViaUpdateRevisionWhenSameBatchDeleteFails(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	d := newGitRepoForPush(t)
+	head := headOfPushRepo(t, d)
+	if _, err := WriteRef(f, "/r", "refs/heads/main", head, false); err != nil {
+		t.Fatal(err)
+	}
+	remote := map[string]string{"refs/heads/main": head}
+	newHead := commitOnPushRepo(t, d, "b.txt", "two") // descends from head: a genuine fast-forward
+
+	var method string
+	tr := trashFailsAndMethodTracked{
+		Fake:      f,
+		failTrash: "/r/refs/heads/main",
+		watch:     "/r/refs/heads/main",
+		method:    &method,
+	}
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/main"},      // delete — will FAIL (Trash forced Ambiguous)
+		{Src: newHead, Dst: "refs/heads/main"}, // update — must still succeed via UpdateRevision
+	}
+	res := Push(tr, "/r", d, ups, remote)
+	if len(res) != 2 {
+		t.Fatalf("want 2 results, got %+v", res)
+	}
+	if res[0].OK {
+		t.Fatalf("the delete must report its own failure, got %+v", res[0])
+	}
+	if !strings.Contains(res[0].Err, "delete failed") {
+		t.Errorf("delete failure must name itself, got %q", res[0].Err)
+	}
+	if !res[1].OK {
+		t.Fatalf("the update must still succeed despite the same-batch delete's failure, got %+v", res[1])
+	}
+	if method != "update" {
+		t.Errorf("the update must route via UpdateRevision — the node is still occupied because "+
+			"the batch's own delete failed, nothing concurrent happened — got method=%q", method)
+	}
+	sha, err := readRef(f, "/r/refs/heads/main")
+	if err != nil || sha != newHead {
+		t.Fatalf("ref not published correctly: sha=%q err=%v want=%q", sha, err, newHead)
+	}
+}
+
 // GUARD (ensureHEAD delete arithmetic). Deleting the only branch leaves no
 // candidates at all, and headless is a DEFINED state: no HEAD is written, and
 // nothing fails.

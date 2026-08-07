@@ -225,24 +225,6 @@ func Push(t transport.Transport, root, gitDir string,
 		valid[i] = true
 	}
 
-	// deletedThisBatch tracks every dst with a VALID delete in this batch
-	// (fix round M4). Phase 4 always trashes before phase 5 writes, so by the
-	// time phase 5 runs, a dst in this set genuinely no longer exists on the
-	// remote regardless of what the PRE-BATCH `remote` map says about it —
-	// phase 5 uses this to route such a dst through CreateExclusive rather
-	// than UpdateRevision. This matters because CreateExclusive-after-trash is
-	// the ONE combination that has actually been live-verified (C17b, 30/30);
-	// UpdateRevision against a node phase 4 just trashed was never verified
-	// live, and blindly taking that path would also silently drop WriteRef's
-	// own concurrent-creator Refused protection for what is, execution-order,
-	// really a create.
-	deletedThisBatch := map[string]bool{}
-	for i, u := range ups {
-		if valid[i] && isDelete[i] {
-			deletedThisBatch[u.Dst] = true
-		}
-	}
-
 	// Final-state D/F preflight over REFS ONLY (empty folders are runtime,
 	// self-heal's job — Task 9b). finalSet is the ref namespace as it will
 	// read immediately after this batch: every currently-advertised ref,
@@ -404,18 +386,44 @@ func Push(t transport.Transport, root, gitDir string,
 		okResult(i)
 	}
 
+	// deletedThisBatch tracks every dst whose delete ACTUALLY COMMITTED in
+	// phase 4 — built from phase 4's real outcome (results[i].OK), NOT from
+	// phase-2 validity (fix round 2, Important): a delete can be VALID at
+	// phase 2 and still fail in phase 4 — the per-delete HEAD re-check can
+	// refuse it, or t.Trash can return non-Committed or an error (a
+	// non-v2 actor wrote HEAD between phases, a transient transport fault,
+	// and so on). A dst whose delete failed is still occupied on the
+	// remote, so a paired same-dst non-delete in phase 5 must NOT be routed
+	// through CreateExclusive on the strength of phase-2 validity alone —
+	// that previously produced the wrong diagnosis ("ref changed
+	// concurrently") for an update that would have succeeded via
+	// UpdateRevision, because nothing concurrent happened; the batch's own
+	// delete simply failed. Computed here, after phase 4 has actually run
+	// and every delete's Result is final, not right after phase 2.
+	deletedThisBatch := map[string]bool{}
+	for i, u := range ups {
+		if isDelete[i] && results[i].OK {
+			deletedThisBatch[u.Dst] = true
+		}
+	}
+
 	// ======================= Phase 5: creates/updates ========================
 	for i, u := range ups {
 		if !valid[i] || isDelete[i] {
 			continue
 		}
-		// exists is BATCH-AWARE (fix round M4), not a bare read of the
-		// pre-batch remote map: a same-batch valid delete of this exact dst
-		// already ran in phase 4, so by now the node genuinely does not
-		// exist on the remote regardless of what remote[u.Dst] said before
-		// the batch started — WriteRef must take the CreateExclusive path,
-		// not UpdateRevision, for exactly the reason deletedThisBatch's own
-		// doc comment above gives.
+		// exists is BATCH-AWARE (fix round M4, corrected in fix round 2), not
+		// a bare read of the pre-batch remote map: when a same-batch delete
+		// of this exact dst actually COMMITTED in phase 4 (deletedThisBatch,
+		// built from phase 4's real outcome, not phase-2 validity), the node
+		// genuinely no longer exists on the remote regardless of what
+		// remote[u.Dst] said before the batch started — WriteRef must take
+		// the CreateExclusive path, not UpdateRevision, for exactly the
+		// reason deletedThisBatch's own doc comment above gives. When the
+		// same-batch delete instead FAILED in phase 4, deletedThisBatch does
+		// not contain the dst, exists falls back to the pre-batch read, and
+		// WriteRef correctly takes UpdateRevision against the node that is
+		// still actually there.
 		_, preExists := remote[u.Dst]
 		exists := preExists && !deletedThisBatch[u.Dst]
 		if err := ensureRefParents(t, root, u.Dst); err != nil {
