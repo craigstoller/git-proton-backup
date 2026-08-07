@@ -46,6 +46,13 @@ const (
 	roleWrongVersion   = "version-wrong"
 	roleNonzeroVersion = "version-nonzero"
 	roleNoToken        = "version-no-token"
+
+	// The two Stat classification stand-ins, below runStatRole (Task 4). Like
+	// the version roles, each ignores its args and just reports a fixed
+	// `filesystem info` failure shape on stderr with exit 1 — the roleNonzero-
+	// Version convention above, mirrored here because both are CLI FAILURES.
+	roleStatNotFound   = "stat-not-found"
+	roleStatOtherError = "stat-other-error"
 )
 
 // helperVersionLine is what the stand-in prints, shaped like the real CLI's
@@ -71,6 +78,8 @@ func TestMain(m *testing.M) {
 		runLingerRole()
 	case roleCertified, roleWrongVersion, roleNonzeroVersion, roleNoToken:
 		runVersionRole(os.Getenv(helperEnv))
+	case roleStatNotFound, roleStatOtherError:
+		runStatRole(os.Getenv(helperEnv))
 	}
 	if err := setupHelper(); err != nil {
 		fmt.Fprintln(os.Stderr, "helper setup:", err)
@@ -136,6 +145,28 @@ func runVersionRole(role string) {
 		fmt.Println("unexpected output with no cli-drive@ token")
 	}
 	os.Exit(0)
+}
+
+// runStatRole is the stand-in proton-drive for the Task 4 Stat classification
+// tests. Like runVersionRole it never spawns a grandchild. run() always calls
+// Stat with "filesystem info ... --json", so there is nothing to branch on in
+// the args; the role alone selects which failure shape comes back. Both
+// failure messages land on stderr, matching runVersionRole's
+// roleNonzeroVersion convention for a CLI failure — and it does not actually
+// matter which stream: run()'s cmd.CombinedOutput() (cli.go:51) merges
+// stdout and stderr into one string before Stat ever sees it, so a role that
+// wrote to stdout instead would exercise the identical code path. It never
+// returns.
+func runStatRole(role string) {
+	switch role {
+	case roleStatNotFound:
+		// The exact shape the Stage 4 gate captured live (docs/research/gates/
+		// stage3b-gate.md, stage4-gate.md): "Node not found: <leaf>".
+		fmt.Fprintln(os.Stderr, "Node not found: gpb-remote.json")
+	case roleStatOtherError:
+		fmt.Fprintln(os.Stderr, "something exploded: quota exceeded")
+	}
+	os.Exit(1)
 }
 
 // setupHelper copies the test binary into a private temp directory. The
@@ -324,6 +355,49 @@ func TestCLIStatStartFailureIsNotConfirmedAbsence(t *testing.T) {
 	}
 	if ok {
 		t.Fatalf("want ok=false alongside the error, got ok=true")
+	}
+}
+
+// TestCLIStatNonNotFoundFailureIsAnErrorNotAbsence is the Stage 4 gate 2b
+// masquerade regression: a CLI that ran and reported a NON-not-found failure
+// must surface as an error, never as confirmed absence. Before this fix, any
+// nonzero `filesystem info` exit was folded into (_, false, nil), so a
+// broken CLI under GPB_UNCERTIFIED_CLI=1 read as "not a git-remote-proton
+// repo" instead of as the transport failure it actually was.
+func TestCLIStatNonNotFoundFailureIsAnErrorNotAbsence(t *testing.T) {
+	t.Setenv(helperEnv, roleStatOtherError)
+	c := &CLI{Exe: os.Args[0]}
+
+	_, ok, err := c.Stat("/whatever")
+
+	if err == nil {
+		t.Fatalf("want a non-nil error for a non-not-found failure, got ok=%v err=nil", ok)
+	}
+	if !strings.Contains(err.Error(), "quota exceeded") {
+		t.Errorf("error must name the underlying failure, got %q", err)
+	}
+	if ok {
+		t.Errorf("want ok=false alongside the error, got ok=true")
+	}
+}
+
+// TestCLIStatNotFoundSignatureIsConfirmedAbsence is the GUARD: the genuine
+// not-found signature — the exact shape the Stage 4 gate captured live —
+// stays confirmed absence.
+func TestCLIStatNotFoundSignatureIsConfirmedAbsence(t *testing.T) {
+	t.Setenv(helperEnv, roleStatNotFound)
+	c := &CLI{Exe: os.Args[0]}
+
+	n, ok, err := c.Stat("/whatever")
+
+	if err != nil {
+		t.Fatalf("want a nil error for the not-found signature, got %v", err)
+	}
+	if ok {
+		t.Errorf("want ok=false for the not-found signature, got true")
+	}
+	if n != (Node{}) {
+		t.Errorf("want a zero Node alongside confirmed absence, got %+v", n)
 	}
 }
 

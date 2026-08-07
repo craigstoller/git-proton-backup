@@ -38,6 +38,48 @@ var contractCases = []contractCase{
 		}
 	}},
 
+	// Task 4: pins the not-found/error split itself, not just the interface-
+	// level "absence is not an error" the row above already covers. Every
+	// implementation must still report a missing path as (_, false, nil),
+	// and — live half only — this ALSO captures the CLI's verbatim
+	// `filesystem info` failure text and asserts it still contains
+	// notFoundSignature (cli.go), so a future CLI build that changes its
+	// not-found wording is caught here at the gate rather than silently
+	// making every Stat failure read as "the CLI is broken" (the Stage 4
+	// gate 2b masquerade this task fixed). The complementary half of the
+	// split — some OTHER failure must be an error, never absence — is
+	// deliberately NOT exercised through this shared table: the Fake has no
+	// notion of a Stat failure at all (fake.go: a map miss is always
+	// confirmed absence), and provoking an arbitrary non-not-found failure
+	// against the LIVE account is not safe to do routinely. That half is
+	// covered hermetically instead, by cli_test.go's role-based
+	// TestCLIStatNonNotFoundFailureIsAnErrorNotAbsence (a stand-in CLI, no
+	// live account) and by repo_test.go's
+	// TestRequireMarkerSurfacesStatFailureDistinctlyFromNoMarker (a stub
+	// Transport) — both hermetic and both required by Step 6's full suite.
+	{"stat not-found is pinned against the certified CLI's own signature (Task 4)", func(t *testing.T, tr Transport, root string, stage func(string, string) string) {
+		missing := root + "/definitely-absent-t4-notfound-signature"
+		if c, ok := tr.(*CLI); ok {
+			out, code, runErr := c.run("filesystem", "info", missing, "--json")
+			if code == 0 {
+				t.Fatalf("expected a nonzero exit for a missing node, got 0 (out=%q, err=%v)", out, runErr)
+			}
+			t.Logf("live not-found output (must contain notFoundSignature %q): %q", notFoundSignature, out)
+			if !strings.Contains(out, notFoundSignature) {
+				t.Errorf("the live CLI's not-found text no longer contains notFoundSignature %q — "+
+					"got %q; update the constant in cli.go before trusting the not-found/error split",
+					notFoundSignature, out)
+			}
+		}
+		_, ok, err := tr.Stat(missing)
+		if err != nil {
+			t.Fatalf("a missing node must be (_, false, nil), got err %v", err)
+		}
+		if ok {
+			t.Error("a node that was never created must not exist")
+		}
+	}},
+
 	// C11 (Task 2 review round 1): upload names the node after the LOCAL
 	// basename, so the caller contract is that the local basename equals the
 	// target leaf. Staging under a DIFFERENT name than the target leaf is

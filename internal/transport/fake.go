@@ -87,6 +87,12 @@ func (f *Fake) Stat(p string) (Node, bool, error) {
 	if f.Dirs[p] {
 		return Node{Name: path.Base(p), IsDir: true}, true, nil
 	}
+	// A map miss is an AFFIRMATIVE absence, never a failure — this Fake has
+	// no notion of a transport error on Stat at all, so every miss is
+	// confirmed-absence by construction. This already matches the Task 4
+	// contract (*CLI.Stat's not-found/error split, cli.go): (_, false, nil)
+	// models "confirmed does not exist", the same meaning the certified
+	// CLI's own not-found signature carries, not "any failure whatsoever".
 	return Node{}, false, nil
 }
 

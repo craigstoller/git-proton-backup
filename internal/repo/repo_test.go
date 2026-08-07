@@ -1234,6 +1234,50 @@ func TestBootstrapFailsClosedOnUnrecognisedMarkerOutcome(t *testing.T) {
 	}
 }
 
+// statErrorTransport wraps a Fake but makes Stat report a transport failure
+// for every path, mimicking a broken or uncertified CLI. transport.Fake's
+// own Stat never errors — a map miss is always confirmed absence (fake.go) —
+// so a small local stub is the only way to drive RequireMarker's err-vs-!ok
+// branches independently against the real transport.Transport interface, the
+// same technique this file already uses above for unknownOutcomeTransport,
+// ambiguousTrashTransport, and lyingWriteTransport.
+type statErrorTransport struct {
+	*transport.Fake
+}
+
+func (s statErrorTransport) Stat(p string) (transport.Node, bool, error) {
+	return transport.Node{}, false, fmt.Errorf("simulated transport failure statting %s", p)
+}
+
+// TestRequireMarkerSurfacesStatFailureDistinctlyFromNoMarker is Task 4's
+// end-to-end check that CLI.Stat's not-found/error split (internal/transport
+// cli.go) actually reaches RequireMarker's two distinct messages up here.
+// marker.go already branches correctly on err vs !ok — the defect this task
+// fixes was entirely inside CLI.Stat folding EVERY nonzero `filesystem info`
+// exit into (_, false, nil), which would have made this test unable to ever
+// observe the transport-failure branch: every Stat failure looked identical
+// to a missing marker, so an operator running against a broken or
+// uncertified CLI saw "it is not a git-remote-proton repo" instead of the
+// real cause. With a transport whose Stat itself errors, RequireMarker must
+// report its "stat ..." wrap (marker.go's err != nil branch), never the
+// "no gpb-remote.json" absence message (the !ok branch) — those are two
+// different failures and must stay distinguishable.
+func TestRequireMarkerSurfacesStatFailureDistinctlyFromNoMarker(t *testing.T) {
+	f := transport.NewFake()
+	stub := statErrorTransport{f}
+
+	err := RequireMarker(stub, "/my-files/r")
+	if err == nil {
+		t.Fatal("want a non-nil error when Stat itself fails")
+	}
+	if !strings.Contains(err.Error(), "stat ") {
+		t.Errorf("a transport failure must surface as RequireMarker's stat-wrap message, got %q", err)
+	}
+	if strings.Contains(err.Error(), "no "+MarkerName) {
+		t.Errorf("a transport failure must not be confused with the absent-marker message, got %q", err)
+	}
+}
+
 // TestAcquireLockFailsClosedOnUnrecognisedOutcome: same exposure on the lock.
 // Falling through reached the read-back verification, which would have
 // reported a held lock had the remote happened to carry our nonce.

@@ -132,6 +132,15 @@ func parseNodeJSON(b []byte) (Node, error) {
 	return n, nil
 }
 
+// notFoundSignature is the certified CLI's confirmed-absence text for
+// `filesystem info`, pinned live at the Stage 4 gate (docs/research/gates/
+// stage3b-gate.md, stage4-gate.md: "Node not found: <leaf>"). It is a
+// hypothesis constant, not a guarantee: Stat's not-found/error split below
+// depends entirely on this string staying accurate for the certified build,
+// which is exactly what contract_test.go's live row pins against reality at
+// the gate.
+const notFoundSignature = "Node not found"
+
 func (c *CLI) Stat(p string) (Node, bool, error) {
 	out, code, err := c.run("filesystem", "info", p, "--json")
 	if code == -1 {
@@ -145,7 +154,22 @@ func (c *CLI) Stat(p string) (Node, bool, error) {
 		return Node{}, false, fmt.Errorf("proton CLI did not start: %w", err)
 	}
 	if code != 0 {
-		return Node{}, false, nil // absence is not an error
+		// Absence is (_, false, nil) ONLY on the certified CLI's own
+		// not-found signature. Every other nonzero exit is a transport
+		// failure and must return an error — this is the Stage 4 gate 2b
+		// masquerade fix: the old blanket "any nonzero exit is absence" read
+		// a BROKEN CLI (e.g. under GPB_UNCERTIFIED_CLI=1) as "not a
+		// git-remote-proton repo" instead of surfacing the real failure.
+		if strings.Contains(out, notFoundSignature) {
+			return Node{}, false, nil // the certified CLI's confirmed-absence signature
+		}
+		// Preserve the underlying error per the transport convention List and
+		// EnsureDir already follow: dropping c.run's err here would break the
+		// %w chain a caller might inspect.
+		if err != nil {
+			return Node{}, false, fmt.Errorf("info %s failed: %s: %w", p, strings.TrimSpace(bound(out, 200)), err)
+		}
+		return Node{}, false, fmt.Errorf("info %s failed: %s", p, strings.TrimSpace(bound(out, 200)))
 	}
 	n, err := parseNodeJSON([]byte(out))
 	if err != nil {
