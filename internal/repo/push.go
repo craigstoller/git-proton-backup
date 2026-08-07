@@ -21,16 +21,358 @@ type Result struct {
 	Err string
 }
 
-// Push applies each ref update in ups independently. Multi-ref batches are
-// NOT atomic: every update gets its own Result, so partial success (some refs
-// updated, others rejected) is expected and correct, never collapsed into a
-// single batch-wide outcome.
+// Push applies the whole batch through a FIVE-PHASE engine (design
+// component 2b), not per-ref independence with a per-ref pack. Multi-ref
+// batches are still NOT atomic: every update gets its own Result, so partial
+// success (some refs updated, others rejected) is expected and correct,
+// never collapsed into a single batch-wide outcome — what changed from the
+// per-ref shipped version is WHEN each ref's fate is decided and how many
+// packs the batch costs, never atomicity itself.
+//
+//  1. (buffering the complete blank-line-terminated batch is the caller's
+//     job, unchanged.)
+//  2. Validate the WHOLE batch before anything moves: destination namespace,
+//     duplicate destinations (every holder of a duplicated destination is
+//     refused, not a first-seen-wins loop), delete-side HEAD protection (one
+//     non-mutating ReadHEAD for the whole batch), namespace-specific
+//     force/ancestry rules, and a final-state directory/file preflight over
+//     the refs that will exist once the batch lands. Failures here cost
+//     nothing: no pack has been built yet.
+//  3. Build, upload, and confirm ONE pack for every valid create/update —
+//     the design's normative "Object transfer per batch", which Stage 2's
+//     per-ref packing quietly diverged from (see gitcmd.WritePack's doc
+//     comment). On any pack failure, every valid create/update is failed
+//     naming it, but execution CONTINUES to phase 4: deletions are
+//     object-independent and must not be held hostage by an unrelated pack
+//     failure.
+//  4. Execute deletions (Stage 4's HEAD-protection logic, verbatim).
+//  5. Execute creates/updates: ensureRefParents, then WriteRef.
+//
+// ensureHEAD runs last, after all five phases, unchanged from the per-ref
+// version.
 func Push(t transport.Transport, root, gitDir string,
 	ups []protocol.RefUpdate, remote map[string]string) []Result {
 
-	results := make([]Result, 0, len(ups))
+	results := make([]Result, len(ups))
+	// fail/okResult flatten every outcome through the same funnel pushOne
+	// used to: Results are rendered by the caller as one
+	// "error <ref> <reason>" status line per update, so an embedded newline
+	// would desynchronise the protocol.
+	fail := func(i int, msg string) { results[i] = Result{Ref: ups[i].Dst, Err: oneLine(msg)} }
+	okResult := func(i int) { results[i] = Result{Ref: ups[i].Dst, OK: true} }
+
+	// ======================= Phase 2: whole-batch validation ================
+
+	// Duplicate destinations are pre-scanned so EVERY holder of a duplicated
+	// dst is refused — a first-seen-wins loop lets the first duplicate
+	// mutate while only later ones are refused (round-1 Codex). Restricted
+	// to non-delete entries: a delete and a create/update sharing one dst
+	// are NOT ambiguous the way two creates are — phase ordering (deletions
+	// always run before creates, phase 4 before phase 5) makes the
+	// composition deterministic regardless of the batch's own input order.
+	// TestPushDeleteThenRecreateInOneBatchStillDerivesHead already pins
+	// "delete X, recreate X" in one batch as a supported idiom, not a
+	// conflict — a deliberate, reasoned divergence from the plan's
+	// illustrative pseudocode (which counts every entry regardless of
+	// delete/non-delete), flagged in the task report.
+	dstCount := map[string]int{}
 	for _, u := range ups {
-		results = append(results, pushOne(t, root, gitDir, u, remote))
+		if u.Src != "" {
+			dstCount[u.Dst]++
+		}
+	}
+
+	// HEAD is read ONCE, non-mutating, for the whole batch (the caller holds
+	// the repo lock for the whole Push call), so a delete of the HEAD branch
+	// is refused HERE — before it can distort the final-state preflight or
+	// cost a pack upload (round-1 Codex).
+	head, hasHead, headErr := ReadHEAD(t, root)
+
+	valid := make([]bool, len(ups))
+	isDelete := make([]bool, len(ups))
+	isCreate := make([]bool, len(ups)) // valid non-delete whose dst is not already on the remote
+	newShas := make([]string, len(ups))
+
+	for i, u := range ups {
+		// --- destination namespace, FIRST: see checkDst's own doc comment
+		// for why rejecting early matters (no pack cost, no orphan left
+		// behind on the user's paid Drive).
+		if err := checkDst(u.Dst); err != nil {
+			fail(i, err.Error())
+			continue
+		}
+
+		if u.Src == "" {
+			isDelete[i] = true
+			if _, exists := remote[u.Dst]; !exists {
+				// Already absent: OK without even consulting HEAD, exactly
+				// like shipped pushOne — deleting a name already gone is a
+				// no-op, and its validity can never affect the D/F
+				// preflight below (an absent name was never in finalSet to
+				// begin with, so subtracting it changes nothing).
+				valid[i] = true
+				continue
+			}
+			// HEAD protection is BRANCHES-ONLY (spec §1: HEAD can only ever
+			// name a branch). An unreadable HEAD must not block deleting
+			// tags/notes/etc — shipped pushOne gated EVERY delete on this
+			// read; this NARROWS it per the spec (flagged in the task
+			// report as a deliberate alignment).
+			if isBranch(u.Dst) {
+				if headErr != nil {
+					fail(i, fmt.Sprintf("refusing to delete %s: remote HEAD could not be read, "+
+						"so it is unknown whether HEAD points at this branch: %v", u.Dst, headErr))
+					continue
+				}
+				if hasHead && head == u.Dst {
+					fail(i, fmt.Sprintf("refusing to delete the branch HEAD points at (%s); "+
+						"change the default branch first (git-remote-proton --set-head <url> <branch>)", u.Dst))
+					continue
+				}
+			}
+			valid[i] = true
+			continue
+		}
+
+		if dstCount[u.Dst] > 1 {
+			fail(i, "duplicate destination in one batch")
+			continue
+		}
+
+		newSha, err := resolve(gitDir, u.Src)
+		if err != nil {
+			fail(i, err.Error())
+			continue
+		}
+
+		oldSha, exists := remote[u.Dst]
+
+		// Namespace branching BEFORE any ancestry logic (round-2 Codex): the
+		// design's ref-transition table gives each namespace different
+		// rules, and running the generic HasObject/IsAncestor block first
+		// would surface "fetch first" or an ancestry-tooling error on refs
+		// the table says need only a force check — and would run rev-list
+		// machinery on non-commit objects (notes trees, replace blobs).
+		switch {
+		case isBranch(u.Dst):
+			typ, err := gitcmd.ObjectType(gitDir, newSha)
+			if err != nil {
+				fail(i, "cannot determine object type")
+				continue
+			}
+			if typ != "commit" {
+				fail(i, fmt.Sprintf("branch cannot point at a %s", typ))
+				continue
+			}
+			if exists && !u.Force {
+				if !gitcmd.HasObject(gitDir, oldSha) {
+					fail(i, "fetch first")
+					continue
+				}
+				// IsAncestor distinguishes "not an ancestor" (exit 1) from a
+				// tooling failure. Discarding the error would report a
+				// broken git as a confident non-fast-forward rejection.
+				anc, aerr := gitcmd.IsAncestor(gitDir, oldSha, newSha)
+				if aerr != nil {
+					fail(i, "cannot determine ancestry: "+aerr.Error())
+					continue
+				}
+				if !anc {
+					fail(i, "non-fast-forward")
+					continue
+				}
+			}
+		case strings.HasPrefix(u.Dst, "refs/tags/"):
+			// Design table: "Tag update | Requires force, matching git's
+			// rule; no ancestry check." Shipped pushOne has no tag arm at
+			// all and runs the generic ancestry block on tag updates
+			// instead — a pre-existing divergence from the design table
+			// that this restructure ALIGNS rather than preserves (flagged
+			// in the task report).
+			if exists && !u.Force {
+				fail(i, "tag update requires force")
+				continue
+			}
+		default: // other namespaces — the design's conservative deviation
+			if requiresForce(u.Dst) && exists && !u.Force {
+				fail(i, "updating refs outside refs/heads/ and refs/tags/ requires force "+
+					"(conservative rule; see design)")
+				continue
+			}
+		}
+
+		newShas[i] = newSha
+		isCreate[i] = !exists
+		valid[i] = true
+	}
+
+	// Final-state D/F preflight over REFS ONLY (empty folders are runtime,
+	// self-heal's job — Task 9b). finalSet is the ref namespace as it will
+	// read immediately after this batch: every currently-advertised ref,
+	// minus every VALID delete in this batch (a REFUSED delete is NOT
+	// subtracted — the ref genuinely still exists on the remote, so a
+	// dependent create must still be checked against it), plus every valid
+	// create/update's destination.
+	finalSet := make(map[string]bool, len(remote)+len(ups))
+	for ref := range remote {
+		finalSet[ref] = true
+	}
+	for i, u := range ups {
+		if !valid[i] {
+			continue
+		}
+		if isDelete[i] {
+			delete(finalSet, u.Dst)
+		} else {
+			finalSet[u.Dst] = true
+		}
+	}
+	for i, u := range ups {
+		if !valid[i] || isDelete[i] || !isCreate[i] {
+			continue
+		}
+		for other := range finalSet {
+			if other == u.Dst {
+				continue
+			}
+			if strings.HasPrefix(other, u.Dst+"/") || strings.HasPrefix(u.Dst, other+"/") {
+				fail(i, fmt.Sprintf("%s conflicts with %s: a ref cannot be both a leaf and a "+
+					"folder containing other refs", u.Dst, other))
+				valid[i] = false
+				break
+			}
+		}
+	}
+
+	// ======================= Phase 3: one pack for the whole batch ==========
+
+	var wants []string
+	for i := range ups {
+		if valid[i] && !isDelete[i] {
+			wants = append(wants, newShas[i])
+		}
+	}
+
+	if len(wants) > 0 {
+		// failPending fails every still-valid create/update with msg — the
+		// phase-3-continues rule: on a pack failure every valid non-delete
+		// is failed, but phase 4's deletions still run (adjudicated round
+		// 2; TestPushPackFailureFailsCreatesButDeletionsProceed pins it).
+		failPending := func(msg string) {
+			for i := range ups {
+				if valid[i] && !isDelete[i] {
+					fail(i, msg)
+					valid[i] = false
+				}
+			}
+		}
+
+		// haves is built from the ref list as it stood when the batch
+		// started (the known cost pushOne's own comment documented: a
+		// larger pack is never wrong, and one pack per BATCH means this
+		// cost is paid once, not once per ref).
+		haves := make([]string, 0, len(remote))
+		for _, s := range remote {
+			if gitcmd.HasObject(gitDir, s) {
+				haves = append(haves, s)
+			}
+		}
+
+		tmp, err := os.MkdirTemp("", "gpb-pack-*")
+		if err != nil {
+			failPending(err.Error())
+		} else {
+			defer os.RemoveAll(tmp)
+			packPath, idxPath, perr := gitcmd.WritePack(gitDir, wants, haves, tmp)
+			if perr != nil {
+				failPending("pack failed: " + perr.Error())
+			} else if packPath != "" {
+				// Pack, then index, then CONFIRM BOTH before publishing any
+				// ref. Confirmation is per member: a .pack is named by its
+				// own content checksum, a .idx borrows that name, so they
+				// cannot be checked the same way (design v6.2).
+				packDst := root + "/packs/" + filepathBase(packPath)
+				idxDst := root + "/packs/" + filepathBase(idxPath)
+				if err := publishPack(t, packDst, packPath); err != nil {
+					failPending(err.Error())
+				} else if err := publishIdx(t, idxDst, idxPath, packPath); err != nil {
+					failPending(err.Error())
+				}
+			}
+		}
+	}
+
+	// ======================= Phase 4: deletions ==============================
+	// Phase 2 already refused HEAD-branch deletes via the batch's single
+	// non-mutating ReadHEAD; this per-delete HEAD re-check is defense-in-
+	// depth — one cheap read that covers a HEAD written between phases by a
+	// non-v2 actor. Scoped to branches-only, matching phase 2's narrowing:
+	// applying it unconditionally (as shipped pushOne did) would refuse a
+	// non-branch delete under an unreadable HEAD right back out again,
+	// defeating the branches-only rule phase 2 just implemented.
+	for i, u := range ups {
+		if !valid[i] || !isDelete[i] {
+			continue
+		}
+		if _, exists := remote[u.Dst]; !exists {
+			okResult(i)
+			continue
+		}
+		if isBranch(u.Dst) {
+			h, hasH, herr := ReadHEAD(t, root)
+			if herr != nil {
+				fail(i, fmt.Sprintf("refusing to delete %s: remote HEAD could not be read, "+
+					"so it is unknown whether HEAD points at this branch: %v", u.Dst, herr))
+				continue
+			}
+			if hasH && h == u.Dst {
+				fail(i, fmt.Sprintf("refusing to delete the branch HEAD points at (%s); "+
+					"change the default branch first (git-remote-proton --set-head <url> <branch>)", u.Dst))
+				continue
+			}
+		}
+		out, err := t.Trash(root + "/" + u.Dst)
+		if err != nil {
+			fail(i, fmt.Sprintf("delete failed: %v", err))
+			continue
+		}
+		if out != transport.Committed {
+			// err is nil here, so a bare "%v" would print the useless
+			// "delete failed: <nil>". Report the outcome itself instead.
+			fail(i, fmt.Sprintf("delete failed: outcome %s", out))
+			continue
+		}
+		okResult(i)
+	}
+
+	// ======================= Phase 5: creates/updates ========================
+	for i, u := range ups {
+		if !valid[i] || isDelete[i] {
+			continue
+		}
+		_, exists := remote[u.Dst]
+		if err := ensureRefParents(t, root, u.Dst); err != nil {
+			fail(i, err.Error())
+			continue
+		}
+		out, err := WriteRef(t, root, u.Dst, newShas[i], exists)
+		if err != nil || out == transport.Ambiguous {
+			fail(i, fmt.Sprintf("ref publish failed: %v", err))
+			continue
+		}
+		if out == transport.Refused {
+			// WriteRef (refs.go) returns (Refused, nil) — no error —
+			// specifically when this is a create (exists == false) and a
+			// concurrent creator won the race; it deliberately did not
+			// overwrite. That is not the same as success: our newSha was
+			// never published, so reporting OK: true here would make git
+			// update its remote-tracking ref to a sha that disagrees with
+			// what is actually on the remote, with nothing to signal the
+			// mismatch. It must be reported as a failure.
+			fail(i, "ref changed concurrently; refusing to overwrite")
+			continue
+		}
+		okResult(i)
 	}
 
 	// Complete a missing HEAD. This is the same rule Bootstrap applies to a
@@ -104,180 +446,6 @@ func ensureHEAD(t transport.Transport, root, gitDir string,
 	// advertisement) reports it loudly; this path does not need to.
 }
 
-// pushOne applies a single ref update. Ordering is pack -> idx -> confirm
-// both -> ref: a ref must never point at objects that are not fully
-// uploaded, because a ref whose index is missing is not fetch-discoverable.
-func pushOne(t transport.Transport, root, gitDir string,
-	u protocol.RefUpdate, remote map[string]string) Result {
-
-	// fail flattens msg to a single line. Results are rendered by the caller
-	// as "error <ref> <reason>\n", one status line per update, so an embedded
-	// newline in a reason — and git's own diagnostics are routinely multi-line
-	// — would split one status line into two and desynchronise the protocol.
-	// This is the single funnel every failure passes through, so it is the
-	// right place to guarantee it.
-	fail := func(msg string) Result { return Result{Ref: u.Dst, Err: oneLine(msg)} }
-
-	// --- destination namespace ----------------------------------------------
-	// FIRST, before resolve and before any packing. Rejecting early is what
-	// stops a doomed push from costing a pack upload to the user's paid
-	// Drive (and leaving an orphan behind — Stage 2 has no GC). Before Task
-	// 8, refs/heads/feat/x was invisible to a non-recursive ListRefs, so
-	// exists came back false, the ancestry check was skipped, a full pack
-	// was built and uploaded, and only then did WriteRef fail on a
-	// refs/heads/feat folder nobody had created — that specific failure is
-	// gone now that ListRefs recurses and checkDst admits any advertisable
-	// name under refs/. The early placement still matters for whatever
-	// checkDst DOES reject (pseudorefs, non-refs/ destinations, names git or
-	// this transport cannot stage), and for the delete path below, which
-	// otherwise reported OK: true for any destination checkDst refuses —
-	// including every pseudoref.
-	if err := checkDst(u.Dst); err != nil {
-		return fail(err.Error())
-	}
-
-	oldSha, exists := remote[u.Dst]
-
-	// --- delete -------------------------------------------------------------
-	if u.Src == "" {
-		if !exists {
-			return Result{Ref: u.Dst, OK: true} // already absent
-		}
-		// The design's ref-transition table is normative here: "Delete
-		// (`push :dst`) | Trash; refuse to delete the branch HEAD points at".
-		//
-		// It is not politeness. v2 never rewrites an existing HEAD (ensureHEAD
-		// returns early the moment one is present), so a delete that leaves
-		// HEAD naming a ref that no longer exists is PERMANENT: the remote
-		// goes on advertising a symref to nothing, and a clone fetches the
-		// objects and checks out nothing. Ordinary commands reach it — push
-		// main (HEAD is backfilled to it), push dev, delete main. The plain
-		// `list` arm in cmd/git-remote-proton has the matching guard, which is
-		// what rescues a remote already in that state; this one is what stops
-		// any new remote from entering it.
-		//
-		// An unreadable HEAD fails the delete closed rather than proceeding.
-		// ReadHEAD treats anything that is not a branch symref as fatal and
-		// never coerces it, so "cannot read" genuinely means we do not know
-		// what HEAD names — and the ref about to be trashed may be exactly the
-		// one this rule protects. This is per-ref, so other updates in the
-		// same batch are unaffected.
-		head, hasHead, err := ReadHEAD(t, root)
-		if err != nil {
-			return fail(fmt.Sprintf("refusing to delete %s: remote HEAD could not be read, "+
-				"so it is unknown whether HEAD points at this branch: %v", u.Dst, err))
-		}
-		if hasHead && head == u.Dst {
-			return fail(fmt.Sprintf("refusing to delete the branch HEAD points at (%s); "+
-				"change the default branch first (git-remote-proton --set-head <url> <branch>)", u.Dst))
-		}
-		out, err := t.Trash(root + "/" + u.Dst)
-		if err != nil {
-			return fail(fmt.Sprintf("delete failed: %v", err))
-		}
-		if out != transport.Committed {
-			// err is nil here, so a bare "%v" would print the useless
-			// "delete failed: <nil>". Report the outcome itself instead.
-			return fail(fmt.Sprintf("delete failed: outcome %s", out))
-		}
-		return Result{Ref: u.Dst, OK: true}
-	}
-
-	newSha, err := resolve(gitDir, u.Src)
-	if err != nil {
-		return fail(err.Error())
-	}
-
-	// --- branch targets must be commits ------------------------------------
-	if isBranch(u.Dst) {
-		typ, err := gitcmd.ObjectType(gitDir, newSha)
-		if err != nil {
-			return fail("cannot determine object type")
-		}
-		if typ != "commit" {
-			return fail(fmt.Sprintf("branch cannot point at a %s", typ))
-		}
-	}
-
-	// --- ancestry ----------------------------------------------------------
-	if exists && !u.Force {
-		if !gitcmd.HasObject(gitDir, oldSha) {
-			return fail("fetch first")
-		}
-		// IsAncestor distinguishes "not an ancestor" (exit 1) from a tooling
-		// failure. Discarding the error would report a broken git as a
-		// confident non-fast-forward rejection.
-		ok, err := gitcmd.IsAncestor(gitDir, oldSha, newSha)
-		if err != nil {
-			return fail("cannot determine ancestry: " + err.Error())
-		}
-		if !ok {
-			return fail("non-fast-forward")
-		}
-	}
-
-	// --- pack --------------------------------------------------------------
-	tmp, err := os.MkdirTemp("", "gpb-pack-*")
-	if err != nil {
-		return fail(err.Error())
-	}
-	defer os.RemoveAll(tmp)
-
-	// haves is built from the ref list as it stood when the batch started, and
-	// is NOT updated between refs in a multi-ref batch: ref B re-packs
-	// everything ref A just uploaded. That is a known cost, recorded here so
-	// it is not mistaken for an oversight and "fixed" into a correctness bug.
-	// The design's rule for objects that cannot be confirmed on the remote is
-	// that they are simply not excluded — "larger pack, never wrong". Feeding
-	// B a have that A only just uploaded would mean trusting an upload this
-	// process has not read back, and a wrong have produces a pack missing its
-	// delta bases, which is unrecoverable. Do not restructure without an
-	// answer to that.
-	haves := make([]string, 0, len(remote))
-	for _, s := range remote {
-		if gitcmd.HasObject(gitDir, s) {
-			haves = append(haves, s)
-		}
-	}
-	packPath, idxPath, err := gitcmd.WritePack(gitDir, newSha, haves, tmp)
-	if err != nil {
-		return fail("pack failed: " + err.Error())
-	}
-
-	if packPath != "" {
-		// Pack, then index, then CONFIRM BOTH before publishing the ref.
-		// Confirmation is per member: a .pack is named by its own content
-		// checksum, a .idx borrows that name, so they cannot be checked the
-		// same way (design v6.2).
-		packDst := root + "/packs/" + filepathBase(packPath)
-		idxDst := root + "/packs/" + filepathBase(idxPath)
-
-		if err := publishPack(t, packDst, packPath); err != nil {
-			return fail(err.Error())
-		}
-		if err := publishIdx(t, idxDst, idxPath, packPath); err != nil {
-			return fail(err.Error())
-		}
-	}
-
-	// --- publish ------------------------------------------------------------
-	out, err := WriteRef(t, root, u.Dst, newSha, exists)
-	if err != nil || out == transport.Ambiguous {
-		return fail(fmt.Sprintf("ref publish failed: %v", err))
-	}
-	if out == transport.Refused {
-		// WriteRef (refs.go) returns (Refused, nil) — no error — specifically
-		// when this is a create (exists == false) and a concurrent creator
-		// won the race; it deliberately did not overwrite. That is not the
-		// same as success: our newSha was never published, so reporting
-		// OK: true here would make git update its remote-tracking ref to a
-		// sha that disagrees with what is actually on the remote, with
-		// nothing to signal the mismatch. It must be reported as a failure.
-		return fail("ref changed concurrently; refusing to overwrite")
-	}
-	return Result{Ref: u.Dst, OK: true}
-}
-
 func isBranch(ref string) bool { return strings.HasPrefix(ref, "refs/heads/") }
 
 // checkDst admits any advertisable name under refs/. The v6.1 narrowing is
@@ -285,10 +453,10 @@ func isBranch(ref string) bool { return strings.HasPrefix(ref, "refs/heads/") }
 // preflight (Task 9a) its second. Pseudorefs and non-refs/ destinations stay
 // rejected.
 //
-// Cost: one `git check-ref-format` subprocess PER DESTINATION, since
-// pushOne calls this once per ref update — worth flagging for whoever builds
-// Task 9a's batch preflight engine, which will call this once per ref in a
-// batch rather than once per push.
+// Cost: one `git check-ref-format` subprocess PER DESTINATION — Push's phase
+// 2 calls this once per ref update in the batch, same as the per-ref pushOne
+// it replaced; the batch-preflight restructure did not change this cost,
+// only when the destinations it validates are known.
 func checkDst(dst string) error {
 	if !strings.HasPrefix(dst, "refs/") {
 		return fmt.Errorf("unsupported destination %q: only refs under refs/ are served "+
@@ -311,12 +479,11 @@ func checkDst(dst string) error {
 // requiresForce: the design's conservative deviation — any move outside
 // refs/heads/* and refs/tags/* requires force (v2 does not inspect object
 // types the way git's own namespace rules do; conservative cannot lose
-// data). Dead code until Task 9a wires it in — the comment below is
-// deliberate, so this task's reviewer does not flag it as unused: it has
-// its own unit test (TestRequiresForce, repo_test.go) even though nothing
-// calls it yet.
-//
-// wired in Task 9a
+// data). Called from Push's phase-2 "other namespaces" arm; tags and
+// branches have their own, different force rules (design table) and are
+// dispatched separately before this function is ever consulted, so it is
+// always true by construction on the path that calls it — the call still
+// documents the fact in place rather than asserting it silently.
 func requiresForce(dst string) bool {
 	return !strings.HasPrefix(dst, "refs/heads/") && !strings.HasPrefix(dst, "refs/tags/")
 }

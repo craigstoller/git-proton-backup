@@ -228,20 +228,28 @@ func longPathHint(paths ...string) string {
 	return ""
 }
 
-// WritePack builds a NON-THIN pack containing the objects reachable from
-// want but not from any of haves, and writes it into outDir. --no-thin is
+// WritePack builds a NON-THIN pack containing the objects reachable from any
+// of wants but not from any of haves, and writes it into outDir. --no-thin is
 // deliberate: a thin pack would depend on delta bases the remote may not
 // hold, and the remote here is Proton Drive, not another git repo that can
 // fill in bases on the fly.
+//
+// wants is plural (Task 9a): the batch push engine packs the WHOLE batch's
+// creates/updates in one pack against one set of pre-batch haves, matching
+// the design doc's normative "Object transfer per batch" text rather than
+// Stage 2's per-ref packing. An empty wants means there is nothing to send
+// at all — WritePack returns ("", "", nil) immediately, without even
+// resolving outDir or spawning rev-list, the same legitimate non-error
+// outcome as the "nothing new to send" case below.
 //
 // Ordering guarantee: pack, then idx, then confirm both exist, then (by the
 // caller) the ref. WritePack itself only does the first three steps — it
 // must not report success, or hand back a path, it has not confirmed. A ref
 // pointing at a missing index would not be fetch-discoverable.
 //
-// When rev-list finds nothing to send (want is already covered by haves),
-// WritePack returns ("", "", nil): a legitimate, distinct outcome, not an
-// error.
+// When rev-list finds nothing to send (every want is already covered by
+// haves), WritePack returns ("", "", nil): a legitimate, distinct outcome,
+// not an error.
 //
 // outDir is resolved to an ABSOLUTE path first, and the returned paths are
 // absolute as a result. This is the untreated twin of the path-doubling bug
@@ -256,7 +264,11 @@ func longPathHint(paths ...string) string {
 // anyway because PackObjectsFromList is now a SHARED exec site with two
 // callers holding different path disciplines, and "latent" is a property of
 // today's callers, not of the function.
-func WritePack(gitDir, want string, haves []string, outDir string) (string, string, error) {
+func WritePack(gitDir string, wants []string, haves []string, outDir string) (string, string, error) {
+	if len(wants) == 0 {
+		return "", "", nil // nothing to send; not an error
+	}
+
 	absOut, err := filepath.Abs(outDir)
 	if err != nil {
 		return "", "", fmt.Errorf("cannot resolve pack output directory %q to an absolute "+
@@ -267,7 +279,8 @@ func WritePack(gitDir, want string, haves []string, outDir string) (string, stri
 	// path instead of the one the caller actually passed.
 	outDir = absOut
 
-	revArgs := []string{"rev-list", "--objects", want}
+	revArgs := []string{"rev-list", "--objects"}
+	revArgs = append(revArgs, wants...)
 	for _, h := range haves {
 		revArgs = append(revArgs, "^"+h)
 	}

@@ -166,12 +166,21 @@ func previewBytes(b []byte) string {
 // named reason rather than mangled. It then verifies by read-back, because a
 // byte-identical write is silently skipped.
 //
-// WriteRef does NOT create the ref's parent folder: it uploads into
+// WriteRef does NOT create the ref's parent folder itself: it uploads into
 // <root>/<ref>'s parent as-is, so a hierarchical ref whose parent folder does
-// not yet exist on the remote fails here. This is now independent of
-// ListRefs (Task 8 made listing recurse the whole tree), and is its own,
-// narrower gap: opt-in parent auto-creation is Task 11's job
-// (GPB_CREATE_PARENTS), not this function's.
+// not yet exist on the remote fails here. Callers that need a hierarchical
+// ref's parents created first call ensureRefParents (below) before WriteRef —
+// Push does this unconditionally in its create/update phase (Task 9a).
+//
+// This is UNRELATED to Task 11's GPB_CREATE_PARENTS: that env var gates
+// creating the REPO ROOT's own missing parent folders (e.g. the containing
+// directory of /my-files/GitRemotes/myrepo) before Bootstrap runs, a
+// one-time, opt-in, whole-repo concern wired into the `list for-push` arm in
+// main.go. ensureRefParents is the opposite: unconditional, and scoped to
+// the ref namespace strictly BELOW an already-bootstrapped repo root — an
+// earlier version of this comment conflated the two and claimed hierarchical
+// ref parents were GPB_CREATE_PARENTS' job, which Task 9a's plan review
+// adjudicated otherwise.
 func WriteRef(t transport.Transport, root, ref, sha string, exists bool) (transport.Outcome, error) {
 	if !shaRe.MatchString(sha) {
 		return transport.Ambiguous, fmt.Errorf("refusing to write non-sha %q to %s "+
@@ -206,4 +215,41 @@ func WriteRef(t transport.Transport, root, ref, sha string, exists bool) (transp
 		return transport.Ambiguous, fmt.Errorf("ref %s reads back as %s, expected %s", ref, got, sha)
 	}
 	return transport.Committed, nil
+}
+
+// ensureRefParents creates every folder strictly between root and ref's own
+// leaf — for "refs/heads/feature/deep/x" that is root+"/refs",
+// root+"/refs/heads", root+"/refs/heads/feature", and
+// root+"/refs/heads/feature/deep". The first two exist from Bootstrap, but
+// are walked like any other level rather than special-cased away: partial
+// initialisation (a marker present but subdirs missing, the exact state
+// TestBootstrapCompletesPartialInitialisation exercises) is a real state,
+// not a hypothetical one, so skipping "refs" and "refs/heads" as "always
+// there" would be an unproven assumption. EnsureDir is Stat-then-create, so
+// walking an already-existing level costs one cheap Stat.
+//
+// Reverse-D/F detection is TYPED, never error-text matching (round-2 Codex:
+// the Fake and the real CLI would otherwise need byte-identical phrasing
+// forever, and they do not). On any EnsureDir failure, the failing prefix is
+// Stat'd directly: a FILE there means a ref file already occupies the name a
+// folder now needs — the named refusal below, quoting both the ref being
+// created and the ref blocking it. Anything else (Stat also fails, or the
+// prefix is absent, or turns out to be a folder after all — a transient
+// contradiction) leaves the original EnsureDir error to stand unmodified;
+// this function invents no new diagnosis for a failure mode it cannot
+// positively identify as the D/F collision.
+func ensureRefParents(t transport.Transport, root, ref string) error {
+	comps := strings.Split(ref, "/")
+	prefix := root
+	for _, c := range comps[:len(comps)-1] {
+		prefix = prefix + "/" + c
+		if err := t.EnsureDir(prefix); err != nil {
+			if n, ok, serr := t.Stat(prefix); serr == nil && ok && !n.IsDir {
+				return fmt.Errorf("creating %s requires folder %s, but a ref file occupies "+
+					"that name (directory/file conflict; delete it first)", ref, prefix)
+			}
+			return err
+		}
+	}
+	return nil
 }

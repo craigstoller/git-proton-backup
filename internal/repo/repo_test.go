@@ -861,7 +861,7 @@ func (r *refusingUploadTransport) CreateExclusive(p, local string) (transport.Ou
 func plantPack(t *testing.T, gitDir, head string) (packName, idxName string, packBytes, idxBytes []byte) {
 	t.Helper()
 	tmp := t.TempDir()
-	packPath, idxPath, err := gitcmd.WritePack(gitDir, head, nil, tmp)
+	packPath, idxPath, err := gitcmd.WritePack(gitDir, []string{head}, nil, tmp)
 	if err != nil || packPath == "" {
 		t.Fatalf("WritePack: %v", err)
 	}
@@ -1487,6 +1487,522 @@ func TestPushRefusedPackWithNoRemoteIdxRepairsTheOrphan(t *testing.T) {
 	}
 	if _, ok := f.Files["/r/packs/"+idxName]; !ok {
 		t.Error("the orphan's index must have been uploaded")
+	}
+}
+
+// ============================================================================
+// Task 9a: five-phase batch engine
+// ============================================================================
+
+// hashObjectBlob writes content as a blob via `git hash-object -w --stdin` in
+// gitDir and returns its sha — a NON-COMMIT object, used to prove that the
+// "other namespaces" force rule runs no commit-shaped machinery (ObjectType,
+// HasObject, IsAncestor) at all.
+func hashObjectBlob(t *testing.T, gitDir, content string) string {
+	t.Helper()
+	cmd := exec.Command("git", "-C", gitDir, "hash-object", "-w", "--stdin")
+	cmd.Stdin = strings.NewReader(content)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("hash-object: %v", err)
+	}
+	sha := strings.TrimSpace(string(out))
+	if len(sha) != 40 {
+		t.Fatalf("hash-object returned %q, want a 40-char sha", sha)
+	}
+	return sha
+}
+
+// orderTraceTransport wraps a Fake and appends one labelled entry per
+// mutating call it observes, in the order they actually happen — proving the
+// five-phase engine's EXECUTION ORDER directly, rather than inferring it from
+// outcomes alone. CreateExclusive under packs/ is "pack:", CreateExclusive or
+// UpdateRevision under refs/ is "ref:", Trash is "trash:".
+type orderTraceTransport struct {
+	*transport.Fake
+	trace *[]string
+}
+
+func (o orderTraceTransport) CreateExclusive(p, local string) (transport.Outcome, error) {
+	switch {
+	case strings.HasPrefix(p, "/r/packs/"):
+		*o.trace = append(*o.trace, "pack:"+p)
+	case strings.Contains(p, "/refs/"):
+		*o.trace = append(*o.trace, "ref:"+p)
+	}
+	return o.Fake.CreateExclusive(p, local)
+}
+
+func (o orderTraceTransport) UpdateRevision(p, local string) (transport.Outcome, error) {
+	if strings.Contains(p, "/refs/") {
+		*o.trace = append(*o.trace, "ref:"+p)
+	}
+	return o.Fake.UpdateRevision(p, local)
+}
+
+func (o orderTraceTransport) Trash(p string) (transport.Outcome, error) {
+	*o.trace = append(*o.trace, "trash:"+p)
+	return o.Fake.Trash(p)
+}
+
+// TestPushRefusesDuplicateDestinationsWholeBatchUntouched covers the round-1
+// Codex finding on the plan: duplicates must be PRE-SCANNED so EVERY holder
+// of a duplicated destination is refused, not a first-seen-wins loop that
+// lets the first one mutate while later ones alone are reported as failed.
+// Two different sources target the same "dup" destination (ambiguous — which
+// src should win?); an unrelated ref in the same batch is untouched by the
+// collision and must still succeed.
+func TestPushRefusesDuplicateDestinationsWholeBatchUntouched(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
+
+	ups := []protocol.RefUpdate{
+		{Src: "refs/heads/main", Dst: "refs/heads/dup"},
+		{Src: head, Dst: "refs/heads/dup"},
+		{Src: "refs/heads/main", Dst: "refs/heads/solo"},
+	}
+	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 3 {
+		t.Fatalf("want 3 results, got %+v", res)
+	}
+	if res[0].OK || res[1].OK {
+		t.Fatalf("both holders of the duplicated destination must be refused, got %+v", res[:2])
+	}
+	for i, r := range res[:2] {
+		if !strings.Contains(r.Err, "duplicate destination") {
+			t.Errorf("result %d must name the duplicate, got %q", i, r.Err)
+		}
+	}
+	if !res[2].OK {
+		t.Fatalf("an unrelated ref in the same batch must still succeed, got %+v", res[2])
+	}
+	if _, ok := f.Files["/r/refs/heads/dup"]; ok {
+		t.Error("a duplicated destination must be left completely untouched")
+	}
+}
+
+// TestPushFinalStateDFPreflightRefusesConflictingCreates covers the
+// final-state D/F preflight (design 2b): two BRAND NEW creates in one batch
+// that conflict with EACH OTHER — a ref cannot be both a leaf and a folder
+// containing other refs — must both be refused, with the failure costing
+// NOTHING: no pack is ever built (asserted via the Fake's own packs/
+// children, not merely the reported outcome).
+func TestPushFinalStateDFPreflightRefusesConflictingCreates(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	ups := []protocol.RefUpdate{
+		{Src: "refs/heads/main", Dst: "refs/heads/feature"},
+		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"},
+	}
+	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 2 {
+		t.Fatalf("want 2 results, got %+v", res)
+	}
+	for i, r := range res {
+		if r.OK {
+			t.Fatalf("both conflicting creates must be refused, got %+v", res)
+		}
+		if !strings.Contains(r.Err, "refs/heads/feature") {
+			t.Errorf("result %d must name the conflicting ref, got %q", i, r.Err)
+		}
+	}
+	refs, err := ListRefs(f, "/r")
+	if err != nil {
+		t.Fatalf("ListRefs: %v", err)
+	}
+	if len(refs) != 0 {
+		t.Errorf("remote listing must be unchanged, got %v", refs)
+	}
+	if packs, idxs := countPackFiles(f, "/r"); packs != 0 || idxs != 0 {
+		t.Errorf("no pack may be built when nothing survives the preflight, got pack=%d idx=%d", packs, idxs)
+	}
+}
+
+// TestPushPreflightDFAgainstExistingRefs covers the preflight's OTHER
+// direction: the conflict need not be batch-internal — a create can conflict
+// with a ref that ALREADY exists on the remote (and is not deleted in this
+// batch). An unrelated ref in the same batch is untouched by the collision.
+func TestPushPreflightDFAgainstExistingRefs(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
+	if _, err := WriteRef(f, "/r", "refs/heads/feature/x", head, false); err != nil {
+		t.Fatal(err)
+	}
+	remote := map[string]string{"refs/heads/feature/x": head}
+
+	ups := []protocol.RefUpdate{
+		{Src: "refs/heads/main", Dst: "refs/heads/feature"},
+		{Src: "refs/heads/main", Dst: "refs/heads/unrelated"},
+	}
+	res := Push(f, "/r", gitDir, ups, remote)
+	if len(res) != 2 {
+		t.Fatalf("want 2 results, got %+v", res)
+	}
+	if res[0].OK {
+		t.Fatalf("a create conflicting with an existing ref must fail at preflight, got %+v", res[0])
+	}
+	if !strings.Contains(res[0].Err, "refs/heads/feature/x") {
+		t.Errorf("must name the conflicting existing ref, got %q", res[0].Err)
+	}
+	if !res[1].OK {
+		t.Fatalf("an unrelated ref in the same batch must still succeed, got %+v", res[1])
+	}
+}
+
+// TestPushOtherNamespaceRequiresForce covers the design's conservative
+// other-namespace rule end to end: a create needs no force (it is not a
+// move), an unforced update is refused naming the force requirement, and a
+// forced update succeeds. The unforced-update case deliberately uses an OLD
+// tip absent locally and a target that is a non-commit blob — proving that
+// no ancestry/fetch-first machinery runs at all for this namespace (round-2
+// Codex: the generic block would say "fetch first" or error on the object
+// type before ever reaching the force refusal).
+func TestPushOtherNamespaceRequiresForce(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	blobSha := hashObjectBlob(t, gitDir, "notes content")
+	absentOld := "9999999999999999999999999999999999999999"
+
+	t.Run("create without force is ok", func(t *testing.T) {
+		f := transport.NewFake()
+		f.Dirs["/r"] = true
+		_ = Bootstrap(f, "/r")
+		ups := []protocol.RefUpdate{{Src: blobSha, Dst: "refs/notes/commits"}}
+		res := Push(f, "/r", gitDir, ups, map[string]string{})
+		if len(res) != 1 || !res[0].OK {
+			t.Fatalf("a create in another namespace needs no force: %+v", res)
+		}
+	})
+
+	t.Run("unforced update requires force with no ancestry machinery", func(t *testing.T) {
+		f := transport.NewFake()
+		f.Dirs["/r"] = true
+		_ = Bootstrap(f, "/r")
+		ups := []protocol.RefUpdate{{Src: blobSha, Dst: "refs/notes/commits"}}
+		res := Push(f, "/r", gitDir, ups, map[string]string{"refs/notes/commits": absentOld})
+		if len(res) != 1 || res[0].OK {
+			t.Fatalf("an unforced update outside refs/heads/ and refs/tags/ must require force: %+v", res)
+		}
+		if !strings.Contains(res[0].Err, "force") {
+			t.Errorf("must name the force requirement, got %q", res[0].Err)
+		}
+		if strings.Contains(res[0].Err, "fetch first") || strings.Contains(res[0].Err, "ancestry") ||
+			strings.Contains(res[0].Err, "object type") {
+			t.Errorf("no ancestry/fetch-first/object-type machinery may run for this namespace, got %q", res[0].Err)
+		}
+	})
+
+	t.Run("forced update succeeds despite absent old tip and non-commit target", func(t *testing.T) {
+		f := transport.NewFake()
+		f.Dirs["/r"] = true
+		_ = Bootstrap(f, "/r")
+		ups := []protocol.RefUpdate{{Src: blobSha, Dst: "refs/notes/commits", Force: true}}
+		res := Push(f, "/r", gitDir, ups, map[string]string{"refs/notes/commits": absentOld})
+		if len(res) != 1 || !res[0].OK {
+			t.Fatalf("a forced update outside refs/heads/ and refs/tags/ must succeed: %+v", res)
+		}
+	})
+}
+
+// TestPushTagUpdateRequiresForceNoAncestry pins the design table's own row
+// ("Tag update | Requires force, matching git's rule; no ancestry check")
+// directly: an UNFORCED tag update is refused even though it is genuinely
+// fast-forwardable. Shipped pushOne has no tag arm and runs the generic
+// ancestry block on tag updates instead (it would have ACCEPTED this
+// fast-forward) — a pre-existing divergence from the design table that this
+// restructure ALIGNS rather than preserves; flagged in the task report.
+func TestPushTagUpdateRequiresForceNoAncestry(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	old := headOf(t, gitDir)
+	newSha := commitOnPushRepo(t, gitDir, "b.txt", "two") // old IS an ancestor of newSha
+
+	ups := []protocol.RefUpdate{{Src: newSha, Dst: "refs/tags/v1"}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{"refs/tags/v1": old})
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("an unforced tag update must be refused even though it is fast-forwardable, got %+v", res)
+	}
+	if !strings.Contains(res[0].Err, "force") {
+		t.Errorf("must name the force requirement, got %q", res[0].Err)
+	}
+}
+
+// TestPushDeletionsRunAfterPackConfirmBeforeCreates pins the [Both] round-1
+// ordering rule directly via a call trace, not merely via outcomes: even
+// though the batch lists the CREATE first and the DELETE second (git-order),
+// the engine must upload+confirm the pack, THEN run the delete, THEN write
+// the dependent create's ref — never the reverse.
+func TestPushDeletionsRunAfterPackConfirmBeforeCreates(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	sha := "2222222222222222222222222222222222222222"
+	if _, err := WriteRef(f, "/r", "refs/heads/old", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	remote := map[string]string{"refs/heads/old": sha}
+
+	var trace []string
+	tr := orderTraceTransport{Fake: f, trace: &trace}
+
+	ups := []protocol.RefUpdate{
+		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"}, // create, listed first
+		{Src: "", Dst: "refs/heads/old"},                      // delete, listed second
+	}
+	res := Push(tr, "/r", gitDir, ups, remote)
+	for _, r := range res {
+		if !r.OK {
+			t.Fatalf("both updates must succeed: %+v", res)
+		}
+	}
+
+	packIdx, trashIdx, refIdx := -1, -1, -1
+	for i, e := range trace {
+		switch {
+		case packIdx == -1 && strings.HasPrefix(e, "pack:"):
+			packIdx = i
+		case trashIdx == -1 && strings.HasPrefix(e, "trash:"):
+			trashIdx = i
+		case refIdx == -1 && strings.HasPrefix(e, "ref:"):
+			refIdx = i
+		}
+	}
+	if packIdx == -1 || trashIdx == -1 || refIdx == -1 {
+		t.Fatalf("expected pack, trash, and ref events in the trace, got %v", trace)
+	}
+	if !(packIdx < trashIdx && trashIdx < refIdx) {
+		t.Errorf("want pack < trash < ref (pack confirm, then delete, then create), got trace %v", trace)
+	}
+}
+
+// TestPushPackFailureFailsCreatesButDeletionsProceed is a GUARD, not a RED
+// (round-1 Gemini): today's per-ref pushOne already lets an unrelated
+// deletion proceed past a failed create in the SAME batch. This pins that the
+// behaviour SURVIVES the restructure, with the new all-creates-share-one-
+// pack-failure shape asserted on top — FailNext fires on the very next
+// mutation, which under the new engine is the batch's single pack upload.
+func TestPushPackFailureFailsCreatesButDeletionsProceed(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	sha := "2222222222222222222222222222222222222222"
+	if _, err := WriteRef(f, "/r", "refs/heads/old", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	remote := map[string]string{"refs/heads/old": sha}
+	f.FailNext = "inject"
+
+	ups := []protocol.RefUpdate{
+		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"},
+		{Src: "", Dst: "refs/heads/old"},
+	}
+	res := Push(f, "/r", gitDir, ups, remote)
+	if len(res) != 2 {
+		t.Fatalf("want 2 results, got %+v", res)
+	}
+	if res[0].OK {
+		t.Fatalf("the create must fail when the batch's pack upload is ambiguous, got %+v", res[0])
+	}
+	if !strings.Contains(res[0].Err, "pack") {
+		t.Errorf("must name the pack failure, got %q", res[0].Err)
+	}
+	if !res[1].OK {
+		t.Fatalf("the unrelated deletion must still succeed despite the pack failure, got %+v", res[1])
+	}
+}
+
+// TestPushNonBranchDeleteProceedsUnderUnreadableHEAD is RED (plan round 3,
+// Codex): HEAD protection is BRANCHES-ONLY. HEAD is corrupt/unreadable;
+// deleting refs/tags/v1 must still succeed (HEAD can only ever name a
+// branch), while deleting refs/heads/main in the SAME batch fails closed.
+func TestPushNonBranchDeleteProceedsUnderUnreadableHEAD(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	sha := "2222222222222222222222222222222222222222"
+	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := WriteRef(f, "/r", "refs/tags/v1", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	f.Files["/r/HEAD"] = []byte("this is not a symref\n") // corrupt / unreadable
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/tags/v1"},
+		{Src: "", Dst: "refs/heads/main"},
+	}
+	res := Push(f, "/r", t.TempDir(), ups,
+		map[string]string{"refs/heads/main": sha, "refs/tags/v1": sha})
+
+	if len(res) != 2 {
+		t.Fatalf("want 2 results, got %+v", res)
+	}
+	if !res[0].OK {
+		t.Fatalf("a non-branch delete must succeed despite an unreadable HEAD: %+v", res[0])
+	}
+	if res[1].OK {
+		t.Fatalf("a branch delete must fail closed under an unreadable HEAD: %+v", res[1])
+	}
+	if !strings.Contains(res[1].Err, "HEAD") {
+		t.Errorf("must name the HEAD read failure, got %q", res[1].Err)
+	}
+}
+
+// TestPushDeleteOfHEADBranchRefusedAtPreflight is RED (round-1 Codex): the
+// batch deletes the branch HEAD names AND creates a child underneath it. The
+// delete must be refused in PHASE 2 (the batch's single, non-mutating
+// ReadHEAD) — and, critically, the REFUSED delete must NOT be subtracted from
+// the preflight's final-state set, so the dependent create ALSO fails the D/F
+// preflight — and no pack is ever built. Without the phase-2 HEAD read, this
+// batch would upload a pack and then fail twice downstream instead.
+func TestPushDeleteOfHEADBranchRefusedAtPreflight(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	sha := headOf(t, gitDir)
+	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := WriteHEAD(f, "/r", "refs/heads/main"); err != nil {
+		t.Fatal(err)
+	}
+	remote := map[string]string{"refs/heads/main": sha}
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/main"},
+		{Src: "refs/heads/main", Dst: "refs/heads/main/child"},
+	}
+	res := Push(f, "/r", gitDir, ups, remote)
+	if len(res) != 2 {
+		t.Fatalf("want 2 results, got %+v", res)
+	}
+	if res[0].OK {
+		t.Fatalf("deleting the branch HEAD points at must be refused, got %+v", res[0])
+	}
+	if !strings.Contains(res[0].Err, "HEAD points at") {
+		t.Errorf("must name the HEAD-protection reason, got %q", res[0].Err)
+	}
+	if res[1].OK {
+		t.Fatalf("the dependent create must also fail the D/F preflight, got %+v", res[1])
+	}
+	if !strings.Contains(res[1].Err, "refs/heads/main") {
+		t.Errorf("must name the conflicting ref, got %q", res[1].Err)
+	}
+	if _, ok := f.Files["/r/refs/heads/main"]; !ok {
+		t.Error("the ref file must survive a refused delete")
+	}
+	if packs, idxs := countPackFiles(f, "/r"); packs != 0 || idxs != 0 {
+		t.Errorf("no pack may be built when nothing survives the preflight, got pack=%d idx=%d", packs, idxs)
+	}
+}
+
+// TestPushDeleteThenCreateSameNameOneBatch covers the design's own motivating
+// example for deletions-before-creates ordering: `git push origin :feature
+// feature/x` must succeed in one batch regardless of git's own send order —
+// the delete makes room, and the preflight's final-state set (computed AFTER
+// subtracting the valid delete) contains only feature/x, so there is no
+// conflict left to refuse.
+func TestPushDeleteThenCreateSameNameOneBatch(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	sha := headOf(t, gitDir)
+	if _, err := WriteRef(f, "/r", "refs/heads/feature", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	remote := map[string]string{"refs/heads/feature": sha}
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/feature"},
+		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"},
+	}
+	res := Push(f, "/r", gitDir, ups, remote)
+	for _, r := range res {
+		if !r.OK {
+			t.Fatalf("both the delete and the dependent create must succeed: %+v", res)
+		}
+	}
+	refs, err := ListRefs(f, "/r")
+	if err != nil {
+		t.Fatalf("ListRefs: %v", err)
+	}
+	if _, ok := refs["refs/heads/feature"]; ok {
+		t.Errorf("the deleted ref must be gone, got %v", refs)
+	}
+	if refs["refs/heads/feature/x"] != sha {
+		t.Errorf("the created ref must be present, got %v", refs)
+	}
+}
+
+// TestPushCreatesNestedBranchCreatingParents is the hierarchical-create
+// happy path end to end: creating refs/heads/feature/deep/x on a fresh
+// remote must create the intermediate folders AND the leaf ref file.
+func TestPushCreatesNestedBranchCreatingParents(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature/deep/x"}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("push should succeed: %+v", res)
+	}
+	for _, d := range []string{"/r/refs/heads/feature", "/r/refs/heads/feature/deep"} {
+		if !f.Dirs[d] {
+			t.Errorf("want folder %s to exist, dirs=%v", d, f.Dirs)
+		}
+	}
+	sha, err := readRef(f, "/r/refs/heads/feature/deep/x")
+	if err != nil || sha != head {
+		t.Fatalf("ref not published correctly: sha=%q err=%v want=%q", sha, err, head)
+	}
+}
+
+// TestPushReverseDFRefusedNamingTheBlockingRef exercises ensureRefParents'
+// OWN typed reverse-D/F detection specifically — not the phase-2 preflight.
+// The blocking ref exists on the TRANSPORT but the caller's `remote` snapshot
+// (as if from a stale ListRefs, or a concurrent write the caller has not
+// observed yet) does not know about it, so the conflict is invisible to
+// phase 2 (which only ever consults the caller-supplied remote map) and is
+// only discovered when ensureRefParents' EnsureDir walk actually collides
+// with the existing ref FILE in phase 5.
+func TestPushReverseDFRefusedNamingTheBlockingRef(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	sha := headOf(t, gitDir)
+	if _, err := WriteRef(f, "/r", "refs/heads/feature", sha, false); err != nil {
+		t.Fatal(err)
+	}
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature/x"}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{}) // remote map does NOT know about refs/heads/feature
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("must be refused (D/F collision with an existing ref file), got %+v", res)
+	}
+	if !strings.Contains(res[0].Err, "refs/heads/feature") {
+		t.Errorf("must name the blocking ref, got %q", res[0].Err)
+	}
+	if _, ok := f.Files["/r/refs/heads/feature/x"]; ok {
+		t.Error("the ref must not have been written")
 	}
 }
 
@@ -2788,7 +3304,7 @@ func plantRepoOnFake(t *testing.T, f *transport.Fake, root, gitDir, sha string) 
 	if err := Bootstrap(f, root); err != nil {
 		t.Fatal(err)
 	}
-	packPath, idxPath, err := gitcmd.WritePack(gitDir, sha, nil, t.TempDir())
+	packPath, idxPath, err := gitcmd.WritePack(gitDir, []string{sha}, nil, t.TempDir())
 	if err != nil || packPath == "" {
 		t.Fatalf("WritePack: %v", err)
 	}
@@ -2917,7 +3433,7 @@ func TestFetchRejectsACorruptPackAndInstallsNothing(t *testing.T) {
 	// remote name, gives Fetch a want whose closure is not yet satisfied
 	// locally.
 	second := commitOnPushRepo(t, src, "b.txt", "two")
-	packPath, idxPath, err := gitcmd.WritePack(src, second, []string{sha}, t.TempDir())
+	packPath, idxPath, err := gitcmd.WritePack(src, []string{second}, []string{sha}, t.TempDir())
 	if err != nil || packPath == "" {
 		t.Fatalf("WritePack: %v", err)
 	}
@@ -3109,7 +3625,7 @@ func plantIncrementalPacks(t *testing.T, f *transport.Fake, root, src string, sh
 		if i > 0 {
 			haves = []string{shas[i-1]}
 		}
-		packPath, idxPath, err := gitcmd.WritePack(src, sha, haves, t.TempDir())
+		packPath, idxPath, err := gitcmd.WritePack(src, []string{sha}, haves, t.TempDir())
 		if err != nil || packPath == "" {
 			t.Fatalf("WritePack(%s): %v", sha, err)
 		}
@@ -3252,7 +3768,7 @@ func TestFetchDownloadsOnlyTheNeededPack(t *testing.T) {
 // because Bootstrap and the first WriteRef must not rerun.
 func plantOneMorePack(t *testing.T, f *transport.Fake, root, src, prev, tip string) []string {
 	t.Helper()
-	packPath, idxPath, err := gitcmd.WritePack(src, tip, []string{prev}, t.TempDir())
+	packPath, idxPath, err := gitcmd.WritePack(src, []string{tip}, []string{prev}, t.TempDir())
 	if err != nil || packPath == "" {
 		t.Fatalf("WritePack: %v", err)
 	}
@@ -3563,7 +4079,7 @@ func TestListCompletePacksFiltersGrammarAndPairs(t *testing.T) {
 func TestBuildPackMapMapsOidsToStems(t *testing.T) {
 	src := newGitRepoForPush(t)
 	sha := headOfPushRepo(t, src)
-	packPath, idxPath, err := gitcmd.WritePack(src, sha, nil, t.TempDir())
+	packPath, idxPath, err := gitcmd.WritePack(src, []string{sha}, nil, t.TempDir())
 	if err != nil || packPath == "" {
 		t.Fatalf("WritePack: %v", err)
 	}
@@ -3591,7 +4107,7 @@ func TestBuildPackMapMapsOidsToStems(t *testing.T) {
 func TestBuildPackMapHealsACorruptCachedSidecar(t *testing.T) {
 	src := newGitRepoForPush(t)
 	sha := headOfPushRepo(t, src)
-	packPath, idxPath, err := gitcmd.WritePack(src, sha, nil, t.TempDir())
+	packPath, idxPath, err := gitcmd.WritePack(src, []string{sha}, nil, t.TempDir())
 	if err != nil || packPath == "" {
 		t.Fatalf("WritePack: %v", err)
 	}
@@ -4106,7 +4622,7 @@ func TestFetchMidRoundPairRefreshWithTwoPacksCompletes(t *testing.T) {
 func TestDownloadAndVerifyQuarantinesCorruptPackBytes(t *testing.T) {
 	src := newGitRepoForPush(t)
 	sha := headOfPushRepo(t, src)
-	packPath, idxPath, err := gitcmd.WritePack(src, sha, nil, t.TempDir())
+	packPath, idxPath, err := gitcmd.WritePack(src, []string{sha}, nil, t.TempDir())
 	if err != nil || packPath == "" {
 		t.Fatalf("WritePack: %v", err)
 	}
