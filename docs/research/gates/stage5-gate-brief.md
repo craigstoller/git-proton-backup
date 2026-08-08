@@ -263,8 +263,10 @@ one.
    `ensureRefParents` immediately `EnsureDir`s `refs/heads/heal-refused` **again, at the just-trashed
    name**, before writing `sub2`. Rule 2b permits the batch: valid deletes are subtracted from the
    final set before creates are added, so `sub2` collides with nothing.
-   **Expect exit 0**, `ok refs/heads/heal-refused/sub2`, and a `refs/heads/heal-refused` folder
-   present again containing only `sub2`.
+   **Expect exit 0** and git's own `* [new branch]` line for `heal-refused/sub2` (the helper's
+   `ok refs/heads/heal-refused/sub2` is a protocol line to git, not terminal output — it is only
+   visible under `GIT_TRACE`), and a `refs/heads/heal-refused` folder present again containing
+   only `sub2`.
    **If the push instead fails with any message beginning `"contradiction creating folder ..."`**
    (`internal/transport/cli.go`), that is a live C17 recurrence — the first ever. Record it
    **verbatim** (it quotes both raw observations by design) and report **BLOCKED; do not retry and
@@ -395,7 +397,7 @@ Per spec component 8 outline item 5, exercising `internal/repo/parents.go`'s `En
    outline steps 1–4's `<demo>`, so it needs its own local repo and its own `proton-v2` alias —
    reusing outline step 1's repo/remote here would push to the wrong URL. Set up explicitly:
    ```
-   git init <demo>-parents-test
+   git init -b main <demo>-parents-test
    cd <demo>-parents-test
    git commit --allow-empty -m "gate: parents-test initial commit"
    git remote add proton-v2 "proton::/my-files/GitRemotes/<demo>-parents/nested/repo"
