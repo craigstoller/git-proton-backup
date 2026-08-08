@@ -83,7 +83,13 @@ func ListRefs(t transport.Transport, root string) (map[string]string, error) {
 			}
 			sha, err := readRef(t, root+"/"+full)
 			if err != nil {
-				return err // malformed CONTENT of an advertised ref stays fatal
+				// Malformed CONTENT stays fatal. Note this fires BEFORE the
+				// name is advertised — it is a candidate discovered file, not
+				// an already-advertised ref — and the recursion widened its
+				// reach to any well-named file anywhere under refs/. Recorded
+				// as an open question for the owner in the design doc's v6.5
+				// revision entry; unchanged here by instruction.
+				return err
 			}
 			out[full] = sha
 		}

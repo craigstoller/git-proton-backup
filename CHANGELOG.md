@@ -8,6 +8,16 @@
 - **git-remote-proton:** deleting a ref now prunes the empty parent folders it leaves behind, and
   creating a ref that collides with such a leftover folder self-heals (trash the folder, retry)
   instead of refusing permanently.
+- **git-remote-proton:** `--set-head` now accepts hierarchical branch names
+  (`git-remote-proton --set-head <url> feature/x`) — Stage 4 refused any name containing a slash,
+  and that refusal is lifted. Pointing it at a namespace *folder* (`feature`, when only
+  `feature/x` exists) is refused with a message that says so and suggests the branches that
+  actually exist, instead of a misleading "no such branch".
+- **git-remote-proton:** the ref-file grammar is enforced exactly — a ref file's contents must be
+  40 lowercase hex characters plus a single `\n`, and nothing else. Variants that were previously
+  tolerated (no trailing newline, a CRLF terminator, a doubled newline) are now a hard error
+  naming the remote path. This can only affect a foreign or damaged file: the helper has always
+  written exactly that grammar itself.
 - **git-remote-proton:** `GPB_CREATE_PARENTS=1` opts a push into creating missing parent folders
   above the repo root; unset (the default) stays an actionable refusal naming the exact
   `proton-drive filesystem create-folder` command to run by hand — see the README for the trade

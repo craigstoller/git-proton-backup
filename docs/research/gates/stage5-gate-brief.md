@@ -119,12 +119,14 @@ behavior:
    exactly, run from a fresh local working directory — a runner must never improvise this step,
    since outline step 3 below is the load-bearing check immediately downstream of it:
    ```
-   git init <demo>
+   git init -b main <demo>
    cd <demo>
    git commit --allow-empty -m "gate: stage5 initial commit"
    git remote add proton-v2 "proton::/my-files/GitRemotes/<demo>"
    git push -u proton-v2 main
    ```
+   (`-b main` is explicit rather than relying on `init.defaultBranch`: every later step in this
+   brief names `main` literally, and a shell configured to `master` would derail all of them.)
 2. **Push the nested branch, a nested tag, and a `refs/notes/*` ref** — same repo as item 1, same
    `proton-v2` alias, each an explicit command:
    ```
@@ -170,64 +172,184 @@ Per spec component 8 outline item 2, exercising `internal/repo/push.go`'s prune
 `create → Stat → List → Trash → retry` path the design doc calls out as exactly where this
 project's history says seams lie.
 
-1. Delete `feature/x` (from the original gate repo, outline step 1 items 1–2's `proton-v2` alias:
-   `git push proton-v2 --delete feature/x`). **Observe prune in the listing**:
+**Every command in this step runs from the ORIGINAL gate repo of outline step 1 items 1–2** — the
+one whose `proton-v2` alias points at `/my-files/GitRemotes/<demo>` — not the outline step 1 item 4
+clone. `main` and `feature/x` both still exist as LOCAL branches there; `feature/x` is the checked-out
+one.
+
+1. **Delete `feature/x` and observe the prune.**
+   ```
+   git push proton-v2 --delete feature/x
+   ```
+   Remote HEAD still points at `refs/heads/main` at this point, so delete-protection does not fire
+   (that is outline step 3's business). **Observe prune in the listing**:
    `proton-drive filesystem list /my-files/GitRemotes/<demo>/refs/heads --json` (or the parent
    `feature` folder specifically) must show the `feature` folder **gone**, not merely empty — prune
    trashes the folder itself, it does not just empty it (checklist item 7, and see "trash
    accounting" in Cleanup below).
-2. Push `feature` (a plain branch, not nested) — clean-path create against the now-vacated name
-   space; confirm success.
+   `git push --delete` also removes the local remote-tracking ref `refs/remotes/proton-v2/feature/x`.
+   If it survives for any reason, clear it (`git update-ref -d refs/remotes/proton-v2/feature/x`)
+   before item 2: git cannot create `refs/remotes/proton-v2/feature` while
+   `refs/remotes/proton-v2/feature/x` exists, and that purely LOCAL directory/file failure would
+   look like a helper defect.
+2. **Clean-path create at the just-vacated name** — spec outline item 2's "push branch `feature`",
+   spelled as a **refspec** push:
+   ```
+   git push proton-v2 main:feature
+   ```
+   Confirm success, and confirm `refs/heads/feature` is now a **file** in the `refs/heads` listing.
+   Two reasons for the refspec form rather than a bare `git push proton-v2 feature`:
+   - There is no local branch `feature`, and `git branch feature` would **fail locally** — the
+     local `refs/heads/feature/x` from outline step 1 item 2 is still there (item 1 deleted only
+     the remote copy), and git's own directory/file rule refuses `refs/heads/feature` beside it.
+     `main:feature` needs no local ref of that name.
+   - It keeps the step's actual content intact: this creates a ref **file** at the exact name a
+     **folder** occupied moments earlier, so it only succeeds if item 1's prune genuinely vacated
+     the name rather than leaving a trashed-homonym blocker behind.
 3. **Manufacture the two collision states BY HAND, inside the gate repo only** — never against a
    fresh/foreign repo, and never the foreign-file variant (see below):
-   - **Empty folder at a branch name**: using `proton-drive filesystem create-folder`, create an
-     empty folder at `/my-files/GitRemotes/<demo>/refs/heads/heal-empty` (no ref file inside it —
-     simulating a crashed prune's leftover residue). Then `git push proton-v2 <local-branch>:heal-empty`.
+   - **Empty folder at a branch name (the heal).** Create the folder with
+     `proton-drive filesystem create-folder /my-files/GitRemotes/<demo>/refs/heads heal-empty`
+     (no ref file inside it — simulating a crashed prune's leftover residue). Then:
+     ```
+     git push proton-v2 main:heal-empty
+     ```
      **Expect the heal**: loud stderr containing `"cleared what is likely residue of an interrupted
      delete — an empty folder at refs/heads/heal-empty"` (the exact wording `push.go`'s
      `createRefHealingCollision` emits), the folder trashed, and the push landing successfully on
      retry.
-   - **Folder containing a live ref file**: create
-     `/my-files/GitRemotes/<demo>/refs/heads/heal-refused/sub` as a genuine ref file (upload 40 hex
-     chars + newline, or push a real branch named `heal-refused/sub` first so it's a legitimate
-     nested branch). Then `git push proton-v2 <local-branch>:heal-refused` (colliding at the parent
-     folder). **Expect the refusal**: the push fails, and the error names the live sub-ref path
-     (`refs/heads/heal-refused/sub`) as `"a conflicting ref, currently <sha>"` — per
-     `describeBlockers`'s content-based classification (`internal/repo/push.go`) — and **nothing is
-     trashed** (verify with a `filesystem list` immediately after: `heal-refused/sub` still present).
+   - **Folder containing a live ref file (the refusal) — expect the BATCH PREFLIGHT, not
+     `describeBlockers`.** Create the nested ref by pushing it, then push the colliding parent:
+     ```
+     git push proton-v2 main:heal-refused/sub
+     git push proton-v2 main:heal-refused
+     ```
+     **Expect the second push to be refused by rule 2b, the final-state D/F preflight** — exact
+     text (`internal/repo/push.go`): `"refs/heads/heal-refused conflicts with
+     refs/heads/heal-refused/sub: a ref cannot be both a leaf and a folder containing other refs"`.
+     The push fails, **nothing is trashed, and no pack is even built** — the preflight runs in
+     phase 2, before phase 3. Verify with a `filesystem list` immediately after:
+     `refs/heads/heal-refused/sub` still present, unchanged.
+     **Why not `describeBlockers`' `"a conflicting ref, currently <sha>"` wording**, which an
+     earlier draft of this brief expected here: `refs/heads/heal-refused/sub` is a well-formed,
+     well-named ref, so the helper's own `ListRefs` advertises it, so it is in the batch's final
+     ref set, so rule 2b (Task 9a, written after the spec outline) refuses the create in phase 2 and
+     `createRefHealingCollision` is never reached. Reaching its runtime refusal live would require
+     the blocker to be invisible to the advertisement — either foreign data (hermetic-only, next
+     bullet) or a sub-ref created inside the window between the helper's `ListRefs` and phase 5,
+     which is a race and not deterministically provokable. That path stays hermetic
+     (`TestCreateRefusesFolderWithLiveSubRefs`, `internal/repo/repo_test.go`). What this bullet
+     buys live is rule 2b's **first live evidence**, which is new this stage and worth having.
    - **The foreign-file variant stays hermetic-only.** Do **not** manufacture a non-ref foreign
      file (e.g. a stray `notes.txt`) inside a collision folder live, and do not push against one, to
      "trash-test" it. That case is already covered by `TestCreateRefusesFolderWithForeignFileUntouched`
      against the Fake (Task 9b) — the whole point of that hermetic-only rule is that a live gate must
      never be the first place foreign-data destruction is provoked.
-4. This composed sequence (delete → prune-observed-in-listing → create → manufactured-collision →
-   heal/refuse) is deliberately run **live**, against the real CLI, because the hermetic suite
-   (`internal/repo/repo_test.go`, `TestCreateSelfHealsEmptyFolderCollision` and siblings) exercised
-   this only against `transport.Fake`. This step is the live half Task 9a/9b's reports explicitly
-   flagged as gate territory.
+4. **One-batch prune → create at the same parent. ADDITION beyond the spec's outline** — the spec's
+   component 8 item 2 does not call for this; it is added here because **this is the only shape in
+   the whole gate where `EnsureDir` is asked to create a folder at a name the SAME batch trashed
+   moments earlier** — the trash-homonym that produced the C17 signature, and the sole live target
+   of `reobserveEnsureDirContradiction`, which has never run against a real account.
+   ```
+   git push proton-v2 :refs/heads/heal-refused/sub main:refs/heads/heal-refused/sub2
+   ```
+   **Note the refspec form: `--delete` cannot be used here.** `git push --delete` is defined as
+   "prefix a colon to *all* listed refs", so `git push proton-v2 --delete heal-refused/sub
+   main:heal-refused/sub2` would try to delete both, and `:main:heal-refused/sub2` is not a valid
+   refspec. A mixed delete-and-create batch must spell the delete as a leading-colon refspec, and
+   both destinations are written fully qualified so git has nothing to disambiguate.
+   Trace: phase 4 trashes `refs/heads/heal-refused/sub`, then `pruneEmptyParents` trashes the
+   now-empty `refs/heads/heal-refused` folder (stopping at the protected `refs/heads` root); phase 5's
+   `ensureRefParents` immediately `EnsureDir`s `refs/heads/heal-refused` **again, at the just-trashed
+   name**, before writing `sub2`. Rule 2b permits the batch: valid deletes are subtracted from the
+   final set before creates are added, so `sub2` collides with nothing.
+   **Expect exit 0**, `ok refs/heads/heal-refused/sub2`, and a `refs/heads/heal-refused` folder
+   present again containing only `sub2`.
+   **If the push instead fails with any message beginning `"contradiction creating folder ..."`**
+   (`internal/transport/cli.go`), that is a live C17 recurrence — the first ever. Record it
+   **verbatim** (it quotes both raw observations by design) and report **BLOCKED; do not retry and
+   do not patch**, exactly as for the signature-constant pins above. Note that a *resolved*
+   contradiction is silent by design (`reobserveEnsureDirContradiction` returns nil on a successful
+   re-observation), so a clean exit 0 cannot distinguish "contradiction, resolved" from "no
+   contradiction" — that is expected. The value of this step is the failure it can surface, not a
+   positive signal.
+5. This composed sequence (delete → prune-observed-in-listing → create → manufactured-collision →
+   heal/refuse → one-batch prune-and-recreate) is deliberately run **live**, against the real CLI,
+   because the hermetic suite (`internal/repo/repo_test.go`,
+   `TestCreateSelfHealsEmptyFolderCollision` and siblings) exercised this only against
+   `transport.Fake`. This step is the live half Task 9a/9b's reports explicitly flagged as gate
+   territory.
+
+**State at the end of outline step 2**, for the next step's benefit: remote `refs/heads` holds
+`feature` (a ref FILE, from item 2), `heal-empty`, `heal-refused/sub2`, and `main`; `refs/heads/feature/x`
+is **gone**; `refs/tags/release/v1` and `refs/notes/commits` are untouched; HEAD still names
+`refs/heads/main`.
 
 ## Outline step 3 — `--set-head` to a nested branch + delete-protection + namespace-folder refusal
 
-Per spec component 8 outline item 3, plus the Task 10 fix discovered mid-stage:
+Per spec component 8 outline item 3, plus the Task 10 fix discovered mid-stage.
 
-1. With both `main` (or another existing branch) and `refs/heads/feature/x` on the remote (push it
-   again if step 2 deleted it), run `git-remote-proton --set-head proton::/my-files/GitRemotes/<demo>
-   feature/x`. Expect `HEAD is now refs/heads/feature/x`, exit 0.
-2. Verify via `proton-drive filesystem download .../HEAD` and via `git clone` (fresh clone checks
-   out `feature/x`) — same decisive-postcondition pattern as `stage4-gate.md` run 2 §3.4–3.5.
-3. **Delete-protection follows HEAD**: `git push proton-v2 --delete feature/x` must be **refused**,
-   naming `--set-head` as the remedy — exact text (`internal/repo/push.go`):
+**Repo/alias assumed by every `git push` in this step: the ORIGINAL gate repo of outline step 1
+items 1–2**, whose `proton-v2` alias points at `/my-files/GitRemotes/<demo>` — item 3 below
+included, which an earlier draft left implicit. The `git-remote-proton --set-head` invocations
+(items 1 and 4) take the `proton::` URL **scheme** directly and need no local remote at all; item 2's
+clone creates its own throwaway repo.
+
+0. **Restore the ref state this step requires — two explicit pushes, before anything else.**
+   Outline step 2 left a bare `refs/heads/feature` ref FILE on the remote (its item 2) and **no**
+   `refs/heads/feature/x` (its item 1). Items 1 and 4 below need exactly the opposite:
+   `refs/heads/feature/x` present, no bare `feature`. Leaving this implicit is a false BLOCK waiting
+   to happen — a runner who simply re-pushes `feature/x` over the bare `feature` hits rule 2b's
+   `"refs/heads/feature/x conflicts with refs/heads/feature: a ref cannot be both a leaf and a
+   folder containing other refs"`, which is **correct** behaviour that would get written up as a
+   defect. So, from the original gate repo:
+   ```
+   git push proton-v2 --delete feature
+   git push proton-v2 feature/x
+   ```
+   The local branch `feature/x` still exists (only its remote copy was deleted), carrying outline
+   step 1 item 6's incremental commit. Remote HEAD is still `refs/heads/main` here, so deleting the
+   `feature` branch is not delete-protected. Afterwards, confirm `refs/heads/feature` is a **folder**
+   containing `x`, not a file.
+   Order matters locally as well as remotely, the mirror image of outline step 2 item 1's note: the
+   `--delete` must land first so that `refs/remotes/proton-v2/feature` (a FILE, created by outline
+   step 2 item 2's push) is gone before the second push wants to create
+   `refs/remotes/proton-v2/feature/x` beneath that name. If it lingers, clear it with
+   `git update-ref -d refs/remotes/proton-v2/feature` — again a purely LOCAL directory/file
+   failure, not a helper defect.
+   Two separate pushes deliberately, not the single-batch equivalent (`git push proton-v2
+   :refs/heads/feature feature/x` — again a leading-colon refspec, since `--delete` would apply to
+   both listed refs): that one-batch form would also be legal (rule 2b subtracts valid deletes
+   before adding creates, and phase 4 runs before phase 5), but state restoration must not itself be
+   the thing under test — outline step 2 item 4 already covers the one-batch shape on purpose.
+1. With both `main` and `refs/heads/feature/x` on the remote (guaranteed by item 0), run
+   `git-remote-proton --set-head proton::/my-files/GitRemotes/<demo> feature/x`. Expect
+   `HEAD is now refs/heads/feature/x`, exit 0.
+2. Verify via `proton-drive filesystem download .../HEAD` and via a **fresh** clone into a new short
+   local path — `git clone -o proton-v2 proton::/my-files/GitRemotes/<demo> <short-local-path>-head`,
+   then `git branch --show-current` must report `feature/x` — same decisive-postcondition pattern as
+   `stage4-gate.md` run 2 §3.4–3.5. This is a throwaway repo; nothing later in this brief uses it.
+3. **Delete-protection follows HEAD** (run from the original gate repo, `proton-v2` alias):
+   `git push proton-v2 --delete feature/x` must be **refused**, naming `--set-head` as the remedy —
+   exact text (`internal/repo/push.go`):
    `"refusing to delete the branch HEAD points at (refs/heads/feature/x); change the default branch
-   first (git-remote-proton --set-head <url> <branch>)"`. Deleting the **old** default (whatever
-   HEAD pointed at before step 1) must instead **succeed** — the decisive pair, same as
-   `stage4-gate.md` run 2 §3.6.
-4. **New this stage — the namespace-folder refusal (Task 10's fix)**: with only `refs/heads/feature/x`
-   existing (no bare `feature` branch), run `git-remote-proton --set-head proton::/my-files/GitRemotes/<demo>
-   feature`. Expect a **refusal naming the situation and suggesting the real branch**, not a
-   misleading "not found" — exact wording (`internal/repo/sethead.go`):
+   first (git-remote-proton --set-head <url> <branch>)"`. Deleting the **old** default — which in
+   this sequence is `main`, what HEAD named before item 1 — must instead **succeed**:
+   `git push proton-v2 --delete main`. That is the decisive pair, same as `stage4-gate.md` run 2 §3.6.
+   Note for the steps after this one: **`refs/heads/main` no longer exists on the remote** from here
+   on. Outline step 4's push/fetch cycle must therefore drive `feature/x`, not `main` (it is spelled
+   out there).
+4. **New this stage — the namespace-folder refusal (Task 10's fix)**: `refs/heads/feature/x` exists
+   and there is no bare `feature` branch (item 0 guaranteed it; nothing since re-created one), so run
+   `git-remote-proton --set-head proton::/my-files/GitRemotes/<demo> feature`. Expect a **refusal
+   naming the situation and suggesting the real branches**, not a misleading "not found" — exact
+   wording (`internal/repo/sethead.go`):
    `"cannot set HEAD to \"feature\": refs/heads/feature is a namespace folder containing other
-   branches, not a branch itself; branches that exist: feature/x"` (branch list may include others
-   present on the remote at the time). This is the live half of
+   branches, not a branch itself; branches that exist: feature/x, heal-empty, heal-refused/sub2"`.
+   The suggestion list is **every branch on the remote at that moment, sorted**
+   (`existingBranchNames`); in this brief's sequence that is exactly those three — `main` was deleted
+   in item 3, `feature` in item 0. If a preceding step was skipped or varied, the list varies with
+   it; the fixed part of the assertion is the sentence before the colon. This is the live half of
    `TestSetHeadRefusesNamespaceFolderBranch` (Fake-only, Task 10 fix round) — confirm the live CLI's
    behavior on `filesystem download` of a directory path, which had **no verified contract at all**
    before this gate (Task 10 report, "Concerns" section).
@@ -243,6 +365,18 @@ Per spec component 8 outline item 4, exercising Task 6's per-fetch quarantine st
    mid-round. Confirm the fetch completes without error and without residue in the local `.git`
    (this is the live analogue of `TestFetchMidRoundPairRefreshWithTwoPacksCompletes`, hermetic-only
    until now).
+   **Drive it on `feature/x`, not `main`** — outline step 3 item 3 deleted `refs/heads/main` from
+   the remote as the decisive half of the delete-protection pair, so it is no longer there to push
+   to. From the original gate repo (which still has `feature/x` checked out):
+   ```
+   git commit --allow-empty -m "gate: quarantine no-regression commit"
+   git push proton-v2 feature/x
+   ```
+   then, in the outline step 1 item 4 clone, `git fetch proton-v2`. Repeat the pair once more if a
+   single cycle does not produce a second round. `feature/x` is HEAD on the remote, which protects
+   it against *deletion* only — updating it is unaffected. A stale
+   `refs/remotes/proton-v2/main` in either local repo is expected and harmless (`git fetch` does
+   not prune by default); do not "clean it up" mid-gate.
 2. **Up-to-date re-fetch, zero `packs/` downloads**: immediately re-run `git fetch proton-v2` with
    nothing new to fetch. Confirm exit 0, no error, and — this is the assertion that actually
    matters — **zero `gpb: downloaded .../packs/...` lines** in the output (compare against
@@ -305,10 +439,15 @@ Per spec component 8 outline item 6, and checklist items 1/3/7 inline:
 - **All listing comparisons as row sets** (checklist item 1) — every pre/post comparison in this
   gate, not only the final cleanup one.
 - **Trash accounting counts pruned folders** (checklist item 7, new standing rule this stage): when
-  tallying what this gate run sent to trash for the record, include the folder outline step 2.1's
-  delete-and-prune sent to trash, not just the files pushed and later explicitly trashed in
-  cleanup. A files-only count understates what actually left the account's live tree this stage,
-  since prune (unlike prior stages) now removes folders, not just leaves them empty.
+  tallying what this gate run sent to trash for the record, include every FOLDER this run trashed,
+  not just the files pushed and later explicitly trashed in cleanup. In this brief's sequence that
+  is three folder-trashing events before cleanup even begins — outline step 2 item 1's
+  delete-and-prune of `refs/heads/feature`, outline step 2 item 3's self-heal of the
+  hand-made `refs/heads/heal-empty`, and outline step 2 item 4's in-batch prune of
+  `refs/heads/heal-refused` (which phase 5 then re-creates under the same name, so the live tree
+  shows it again while the trash holds the pruned original). A files-only count understates what
+  actually left the account's live tree this stage, since prune (unlike prior stages) now removes
+  folders, not just leaves them empty.
 - **Post-run `/my-files` listing** must be row-set-identical to the pre-run listing from
   Preconditions step 4 (no `trashTime` on any of the four untouchable rows; same uids, same
   creation/modification times).

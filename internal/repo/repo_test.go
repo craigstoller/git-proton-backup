@@ -5178,8 +5178,13 @@ func TestEnsureSidecarDegradesWhenCacheUnusable(t *testing.T) {
 }
 
 // RefreshSidecar must return FRESH bytes even when a stale cached copy and a
-// stale fallback copy both exist (the residue rule applies to sidecars too:
-// ReadTo's overwrite behaviour is unpinned, so stale files are deleted first).
+// stale fallback copy both exist. This is RefreshSidecar's own cache-refresh
+// contract, not the pack-dir residue rule Task 6 deleted: ReadTo's overwrite
+// behaviour onto an existing file is unpinned (C2's identical-content skip),
+// so a refresh has to clear its own stale copies before downloading or it can
+// hand back the bytes it was called to replace. See RefreshSidecar's doc
+// comment (idxcache.go) for why quarantine staging leaves this the only place
+// a stale copy can survive a fetch.
 func TestRefreshSidecarReplacesStaleCopies(t *testing.T) {
 	f := transport.NewFake()
 	stem := "pack-cccccccccccccccccccccccccccccccccccccccc"

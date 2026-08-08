@@ -231,9 +231,12 @@ invite the one failure mode single-writer cannot survive. The canonical form is 
 `refs/tags/` were the only namespaces Stage 2 served; Stage 5 re-enables the rest (`refs/notes/*`,
 `refs/replace/*`, `refs/stash`, and hierarchical branch/tag names like `refs/heads/feature/x`) by
 making `ListRefs` (`internal/repo/refs.go`) recurse the whole tree — one non-recursive `List` per
-folder, depth-first, serial. The ref-file grammar is unchanged: exactly 40 lowercase hex plus
-`\n`, still fatal and never coerced when it is wrong. Empty folders are benign to every read
-path; they matter only to the create path (self-heal, below).
+folder, depth-first, serial. The ref-file grammar **this document specifies** is unchanged —
+exactly 40 lowercase hex plus `\n`, still fatal and never coerced when it is wrong — but the
+**code** was aligned to it this stage: `readRef` used to `TrimRight` `"\r\n"` before matching, so a
+bare sha with no newline, a CRLF terminator, and a double-LF terminator were all silently
+tolerated. They are newly fatal. Empty folders are benign to every read path; they matter only to
+the create path (self-heal, below).
 
 **Component validation (rule 2a).** Every path component of a ref name — not only the leaf — must
 pass `checkStageableLeaf`'s rules (see above), after `git check-ref-format`. `checkComponent`
@@ -246,8 +249,15 @@ what `List()` does with such a path remotely). A node that fails validation — 
 hold names v2 itself would never create (a foreign tool, a stray web-UI upload), and one such name
 must not deny the advertisement to every other ref in the repo. v2 itself can never create a
 skipped name (rule 2a refuses it at push), so a skip always marks foreign data. This is a
-different failure from malformed **content** of an already-advertised, well-named ref (a corrupt
-sha), which stays fatal exactly as before — see the error table.
+different failure from malformed **content** of a well-named ref file, which stays fatal — but
+"already-advertised" would be the wrong word for it, and the asymmetry it leaves is a recorded
+open question rather than a settled outcome. `readRef` runs on each candidate discovered file
+*during this same walk* (`internal/repo/refs.go:84-87`), so the fatal fires **before**
+advertisement, on a file that may never have been a ref at all; Stage 5 both **widened its reach**
+(any git-valid, stageable-named file anywhere under `refs/`, not just the direct children of
+`refs/heads` and `refs/tags`) and **tightened its grammar** (exactly 40 lowercase hex plus one
+`\n`; the code's old `TrimRight` slack is gone). See the error table for both, and the v6.5
+revision entry for the open question this leaves for the owner.
 
 **Prune on delete, self-heal on create (rule 2c).** These are a deliberate pair; shipping one
 without the other reintroduces the exact wedge they exist to prevent.
@@ -940,7 +950,9 @@ named the problem with no way out.
 | Ref-file create blocked by an existing folder whose subtree holds any file (a conflicting ref, or foreign data) | Refused, naming each blocking entry as what it is — a conflicting ref, or foreign data — never trashed |
 | Folder create (a hierarchical ref's parent) blocked by an existing ref **file** at that name (reverse D/F) | Fatal refusal with a named reason mirroring git's own local directory/file conflict rule, unless the batch's own delete clears the blocker first |
 | A batch create would collide, directory/file-wise, with the **final** ref set the batch produces (e.g. `feature` and `feature/x` both created in one batch) | Refused at batch validation, before anything is packed — the final-state D/F preflight (rule 2b); costs nothing on failure |
-| Malformed **contents** of an already-advertised ref (corrupt sha, wrong grammar) | Fatal; never coerced — unchanged from before Stage 5 |
+| Malformed **contents** of a ref file `readRef` reaches (corrupt sha, wrong grammar) | **Fatal, never coerced — CURRENT behaviour.** Not "already-advertised": `readRef` runs on each candidate discovered file *during* the advertisement walk (`internal/repo/refs.go:84-87`), so the fatal fires **before** advertisement and the file may never have been a ref. **Reach widened in Stage 5** — see the next row |
+| Reach of that fatal, widened by the recursive walk (Stage 5) | Pre-Stage-5, only the direct file *children* of `refs/heads` and `refs/tags` could trip it (subdirectories were skipped outright). Now **any** git-valid, stageable-named file anywhere under `refs/` — `refs/notes/README.md`, `refs/heads/team/desktop.ini` — whose contents are not a sha makes `list`, `list for-push`, and `fetch` all fail, for every caller, until a human **deletes the offending file** (Proton web UI, or `proton-drive filesystem trash <path>`); the error names that exact remote path, so the remedy is always identifiable from the message. Recorded, not defended: see "the tension the skip rule leaves" in the v6.5 revision entry — an open question for the owner, not a promised change |
+| Ref-file **grammar** tightened (Stage 5; code aligned to spec, tightening observable behaviour) | `readRef` now requires **exactly** 40 lowercase hex plus one `\n` (41 bytes) and nothing else. This document always specified that grammar; the **code** previously `TrimRight`-ed `"\r\n"` before matching, so a bare sha with no trailing newline, a CRLF terminator, and a double-LF terminator were silently tolerated. All three are **newly fatal**. Only a foreign or damaged file can be affected — `WriteRef` has always written exactly `sha+"\n"` |
 | Malformed discovered ref **name** under `refs/` (fails full git-check-ref-format validity or per-component stageability) | **Shipped Stage 5, superseding the earlier merged row:** skipped with a loud stderr note naming the exact remote path at the **read** boundary (advertisement), never fatal — v2 itself can never create a skipped name, so a skip always marks foreign data. **Refused** with a named reason at the **push** boundary, before anything is packed |
 | Corrupt or mismatched `.pack`/`.idx` | **Two checks, each run as early as it can be and always before the data it validates is trusted; either failure is fatal.** (1) **Checksum against basename**, immediately on downloading a `.pack` — it needs nothing else, and it is the only check proving the file is the one the name claims. (2) **`git index-pack --verify` on the pair**, as soon as both members are local — it is the only check proving the pack is well-formed and agrees with its index, and it necessarily cannot run on a member that arrives alone. Note fetch downloads `.idx` sidecars first, before their packs: that is permitted, because the lone index is used only to *plan* which packs to fetch, never as a source of truth about objects. **No object from a pack may be trusted until both checks have passed for that pack.** "Before install" would be the wrong gate — fetch never installs the downloaded packs, it consolidates them into a new one |
 | Pack present, `.idx` missing | Incomplete pair — the ref is not published. **Not necessarily an error to be reported and left:** a push that finds its own pack already there with no index completes the pair, repairing the orphan (see Push). Reported only when this push is not the one that can repair it |
@@ -1020,12 +1032,39 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   name that fails full git-check-ref-format validity or per-component stageability is skipped
   with a loud stderr note naming the exact remote path, not advertised, never touched; the same
   shape is refused (not skipped) at the push boundary. This splits the previously-merged error
-  table row "Malformed ref name or ref-file contents → Fatal" in two: malformed *contents* of an
-  already-advertised ref stay fatal, unchanged; a malformed discovered *name* is skip-at-read /
-  refuse-at-push. Leaving the merged row would have kept a rule that directly contradicts the new
-  read-boundary behaviour and could reintroduce the exact bricking failure the skip rule exists to
-  prevent — a stray web-UI file with a name git-check-ref-format rejects must not be able to fail
-  every future clone/fetch/push against the repo.
+  table row "Malformed ref name or ref-file contents → Fatal" in two: malformed *contents* stay
+  fatal; a malformed discovered *name* is skip-at-read / refuse-at-push. Leaving the merged row
+  would have kept a rule that directly contradicts the new read-boundary behaviour and could
+  reintroduce the exact bricking failure the skip rule exists to prevent — a stray web-UI file
+  with a name git-check-ref-format rejects must not be able to fail every future
+  clone/fetch/push against the repo.
+- **The contents-fatal rule is now recorded honestly, not as "unchanged."** An earlier draft of
+  this entry and of the error table said malformed contents were "unchanged from before Stage 5"
+  and scoped the rule to an "already-advertised" ref. Both were wrong about what shipped. The rule
+  itself is unchanged as a *rule* and is not being changed here — what follows records what it
+  actually does now:
+  - **Not "already-advertised."** `readRef` runs on each candidate discovered file *during* the
+    advertisement walk (`internal/repo/refs.go:84-87`), so the fatal fires **before**
+    advertisement, on a file that may never have been a ref at all.
+  - **Reach widened.** Pre-Stage-5 `ListRefs` read only the direct file children of `refs/heads`
+    and `refs/tags` and skipped subdirectories outright, so only those two flat directories could
+    trip it. The recursive walk means any git-valid, stageable-named file anywhere under `refs/` —
+    `refs/notes/README.md`, `refs/heads/team/desktop.ini` — with non-sha contents now fails
+    `list`, `list for-push`, and `fetch` for every caller until a human deletes that file.
+  - **Grammar tightened.** `readRef` now requires exactly 40 lowercase hex plus one `\n`
+    (41 bytes). This document always specified that grammar; the code previously `TrimRight`-ed
+    `"\r\n"` first, so bare-sha, CRLF, and double-LF variants were tolerated and are newly fatal.
+    A **code-to-design alignment that tightens observable behaviour**, not a design change —
+    recorded the same way as the per-ref-packing and tag-force alignments below.
+- **The tension the skip rule leaves is an OPEN question for the owner, deliberately unresolved
+  here.** The skip rule above closes the bricking failure for git-**invalid** names. It does not
+  close it for a git-**valid**-named foreign file with non-ref contents: that file is still read by
+  `readRef` and still fails every read against the repo until a human deletes it. This asymmetry
+  was escalated to the owner during Task 8's execution as a spec-level tension and left unchanged
+  by instruction; it is recorded here rather than defended or quietly resolved. A possible future
+  resolution — skip-with-note for a discovered file that is absent from the *caller's* remote ref
+  map, rather than fatal — may be considered in a later stage. Nothing here promises it; the fatal
+  above is current behaviour.
 - **Component validation is uniform across the whole ref path, not leaf-only** (rule 2a):
   `checkComponent` applies `checkStageableLeaf`'s rules to every path component, folders
   included, before `ListRefs` ever recurses into one — never handing an unvalidated name to a
