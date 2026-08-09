@@ -153,6 +153,10 @@ func TestBootstrapRefusesForeignData(t *testing.T) {
 // against Proton.
 func TestBootstrapRefusesFoldersWithNoMarker(t *testing.T) {
 	f := transport.NewFake()
+	// "/my-files/r" is not itself a mount root (only "/my-files" is), so the
+	// stricter EnsureDir (Task 7) needs it seeded as already-existing before
+	// this test's own setup calls below can create children under it.
+	f.Dirs["/my-files/r"] = true
 	if err := f.EnsureDir("/my-files/r/refs"); err != nil {
 		t.Fatalf("EnsureDir: %v", err)
 	}
@@ -393,6 +397,7 @@ func TestAcquireLockRefusalOnUnreadableLockIsDistinct(t *testing.T) {
 
 func TestWriteAndListRefs(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "1111111111111111111111111111111111111111"
 	if out, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil || out != transport.Committed {
@@ -409,11 +414,250 @@ func TestWriteAndListRefs(t *testing.T) {
 
 func TestListRefsRejectsCorruptRefFile(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	f.Files["/r/refs/heads/bad"] = []byte("not-a-sha\n")
 	if _, err := ListRefs(f, "/r"); err == nil {
 		t.Error("a malformed ref file must be fatal, never coerced")
 	}
+}
+
+// TestListRefsRecursesAllNamespaces is Task 8's headline case: nested
+// branches, tags, notes, and refs/stash must all be advertised under their
+// FULL name, not just the direct children of refs/heads and refs/tags the
+// old two-namespace walk saw.
+func TestListRefsRecursesAllNamespaces(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	seed := []string{
+		"refs/heads/main",
+		"refs/heads/feature/x",
+		"refs/tags/v1/rc",
+		"refs/notes/commits",
+		"refs/stash",
+	}
+	for _, name := range seed {
+		f.Files["/r/"+name] = []byte(sha + "\n")
+	}
+
+	refs, err := ListRefs(f, "/r")
+	if err != nil {
+		t.Fatalf("ListRefs: %v", err)
+	}
+	for _, name := range seed {
+		if refs[name] != sha {
+			t.Errorf("refs[%q] = %q, want %q (full map: %v)", name, refs[name], sha, refs)
+		}
+	}
+	if len(refs) != len(seed) {
+		t.Errorf("got %d refs, want exactly %d: %v", len(refs), len(seed), refs)
+	}
+}
+
+// TestListRefsSkipsInvalidNamesWithNoteNeverFatal: a foreign junk LEAF name
+// must be skipped, never fatal — one stray web-UI file must not brick the
+// whole repo's advertisement (spec round 2). Per the brief, this test
+// asserts the MAP result only; the note's exact text is pinned separately in
+// TestSkipNoteText below, against an injected io.Writer rather than the real
+// os.Stderr.
+func TestListRefsSkipsInvalidNamesWithNoteNeverFatal(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	f.Files["/r/refs/heads/main"] = []byte(sha + "\n")
+	// "a{b}" is a valid git ref-name COMPONENT (CheckRefName accepts braces)
+	// but not advertisable — checkComponent (via checkStageableLeaf) refuses
+	// "{" and "}" for this transport (probe C13). It is a well-named LEAF
+	// file, not a folder, so this exercises advertisableName's skip path
+	// specifically; the folder-skip path is the next test.
+	f.Files["/r/refs/heads/a{b}"] = []byte(sha + "\n")
+
+	var refs map[string]string
+	var err error
+	stderr := captureStderr(t, func() { refs, err = ListRefs(f, "/r") })
+
+	if err != nil {
+		t.Fatalf("a foreign junk name must never be fatal: %v", err)
+	}
+	if refs["refs/heads/main"] != sha {
+		t.Errorf("the well-named sibling must still be advertised, got %v", refs)
+	}
+	if _, ok := refs["refs/heads/a{b}"]; ok {
+		t.Errorf("the junk name must not be advertised, got %v", refs)
+	}
+	// The map assertions above cannot tell "skipped with a note" apart from
+	// "skipped silently" — deleting the skipNote call in ListRefs' walk
+	// leaves both passing (mutation-verified: with that call commented out,
+	// this assertion is the only one of the two ListRefs skip tests that
+	// fails here; TestListRefsNeverListsBeneathAnInvalidFolderName's own
+	// stderr assertion below catches the folder-skip call). A silently
+	// vanishing ref is exactly what the note exists to prevent, so the note
+	// itself must be asserted, not just its absence from the map.
+	if !strings.Contains(stderr, "refs/heads/a{b}") {
+		t.Errorf("skipping the junk name must emit a note naming it, got stderr %q", stderr)
+	}
+}
+
+// tracedListTransport wraps a Fake and records every path passed to List, so
+// TestListRefsNeverListsBeneathAnInvalidFolderName can assert a braced path
+// was never handed to a remote List() call at all.
+type tracedListTransport struct {
+	*transport.Fake
+	listed []string
+}
+
+func (tr *tracedListTransport) List(p string) ([]transport.Node, error) {
+	tr.listed = append(tr.listed, p)
+	return tr.Fake.List(p)
+}
+
+// TestListRefsNeverListsBeneathAnInvalidFolderName covers round-2 Codex: an
+// invalid FOLDER name must skip its whole subtree WITHOUT recursing into it
+// — checkComponent runs on every node, directories included, BEFORE
+// recursion, precisely so a folder named ".hidden" or "a{b}" never reaches a
+// List() argument. Braces are valid to git (CheckRefName accepts them), but
+// this transport's remote-glob behaviour on "{" in a List() path is
+// UNVERIFIED (probe C13 only confirmed LOCAL glob-expansion on upload) —
+// never probing it is the point, not an incidental property of
+// skip-with-note.
+func TestListRefsNeverListsBeneathAnInvalidFolderName(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	f.Files["/r/refs/heads/main"] = []byte(sha + "\n")
+	// Both junk entries are FOLDERS (a nested file underneath, so the Fake's
+	// List synthesises a directory node for each) — ".hidden" fails the
+	// leading-dot component rule, "a{b}" fails checkStageableLeaf's brace
+	// refusal. Neither must ever be handed to List().
+	f.Files["/r/refs/heads/.hidden/x"] = []byte(sha + "\n")
+	f.Files["/r/refs/heads/a{b}/y"] = []byte(sha + "\n")
+
+	tr := &tracedListTransport{Fake: f}
+	var refs map[string]string
+	var err error
+	stderr := captureStderr(t, func() { refs, err = ListRefs(tr, "/r") })
+
+	if err != nil {
+		t.Fatalf("an invalid folder name must never be fatal: %v", err)
+	}
+	if refs["refs/heads/main"] != sha {
+		t.Errorf("the valid sibling must still be advertised, got %v", refs)
+	}
+	if len(refs) != 1 {
+		t.Errorf("only the valid sibling must be advertised, got %v", refs)
+	}
+	// Same mutation-visible gap as TestListRefsSkipsInvalidNamesWithNoteNeverFatal
+	// above: the map and the traced-List assertions alone cannot distinguish
+	// "skipped with a note" from "skipped silently" — deleting the skipNote
+	// call in ListRefs' checkComponent-failure branch leaves every other
+	// assertion in this test passing (mutation-verified). Both junk folder
+	// names must be named on stderr.
+	if !strings.Contains(stderr, ".hidden") {
+		t.Errorf("skipping the .hidden folder must emit a note naming it, got stderr %q", stderr)
+	}
+	if !strings.Contains(stderr, "a{b}") {
+		t.Errorf("skipping the braced folder must emit a note naming it, got stderr %q", stderr)
+	}
+	for _, p := range tr.listed {
+		if strings.Contains(p, "a{b}") {
+			t.Errorf("List() must never be called with the braced path, but got %q (all calls: %v)", p, tr.listed)
+		}
+		if strings.Contains(p, ".hidden") {
+			t.Errorf("List() must never be called beneath the invalid folder, but got %q (all calls: %v)", p, tr.listed)
+		}
+	}
+}
+
+// TestSkipNoteText pins the skip-note's exact wording via an injected
+// io.Writer rather than capturing the real os.Stderr — the convention is
+// that notes always go to os.Stderr in production (ListRefs above always
+// calls skipNote with os.Stderr), but the TEXT itself is a focused unit test
+// of the helper in isolation.
+func TestSkipNoteText(t *testing.T) {
+	var buf strings.Builder
+	skipNote(&buf, "/r", "refs/heads/a{b}", fmt.Errorf("boom"))
+	want := "git-remote-proton: skipping /r/refs/heads/a{b}: boom\n"
+	if buf.String() != want {
+		t.Errorf("skipNote wrote %q, want %q", buf.String(), want)
+	}
+}
+
+// TestListRefsMalformedContentStillFatal pins the readRef tightening: the
+// OLD TrimRight(sha, "\r\n") tolerated a bare sha with no trailing newline, a
+// CRLF terminator, and (because TrimRight strips a whole trailing run of
+// \r/\n bytes) even a double-LF terminator — none of those are bytes v2
+// itself ever writes (WriteRef always writes sha+"\n"), so all three are
+// foreign or damaged data and must be fatal under the spec's exact grammar:
+// 40 lowercase hex plus a single trailing newline, nothing else.
+func TestListRefsMalformedContentStillFatal(t *testing.T) {
+	sha := "1111111111111111111111111111111111111111"
+	cases := []struct {
+		name    string
+		content []byte
+	}{
+		{"no trailing newline", []byte(sha)},
+		{"CRLF terminator", []byte(sha + "\r\n")},
+		{"double-LF terminator", []byte(sha + "\n\n")},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := transport.NewFake()
+			f.Dirs["/r"] = true
+			_ = Bootstrap(f, "/r")
+			f.Files["/r/refs/heads/bad"] = c.content
+			if _, err := ListRefs(f, "/r"); err == nil {
+				t.Errorf("%s must be fatal under the exact grammar, got no error", c.name)
+			}
+		})
+	}
+}
+
+// TestListRefsIgnoresEmptyFolders: a folder with nothing under it
+// contributes nothing and must not error — the walk's base case.
+func TestListRefsIgnoresEmptyFolders(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	if err := f.EnsureDir("/r/refs/heads/empty"); err != nil {
+		t.Fatalf("EnsureDir: %v", err)
+	}
+	refs, err := ListRefs(f, "/r")
+	if err != nil {
+		t.Fatalf("ListRefs: %v", err)
+	}
+	if len(refs) != 0 {
+		t.Errorf("an empty tree must advertise nothing, got %v", refs)
+	}
+}
+
+// captureStderr redirects os.Stderr to a temp file for the duration of fn,
+// then returns what was written. Mirrors cmd/git-remote-proton/main_test.go's
+// helper of the same name — that one lives in a different package, so this
+// package needs its own copy.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "stderr-*")
+	if err != nil {
+		t.Fatalf("temp file: %v", err)
+	}
+	orig := os.Stderr
+	os.Stderr = f
+	defer func() { os.Stderr = orig }()
+
+	fn()
+
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	b, err := os.ReadFile(f.Name())
+	if err != nil {
+		t.Fatalf("read back stderr: %v", err)
+	}
+	return string(b)
 }
 
 // TestWriteRefRefusesNonSha covers the brief's guard directly: WriteRef must
@@ -423,6 +667,7 @@ func TestListRefsRejectsCorruptRefFile(t *testing.T) {
 // outright rather than passed through.
 func TestWriteRefRefusesNonSha(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	out, err := WriteRef(f, "/r", "refs/heads/main", "not-a-sha", false)
 	if err == nil {
@@ -451,6 +696,7 @@ func TestWriteRefRefusesNonSha(t *testing.T) {
 // desynchronise git's read of the batch.
 func TestPushResolveFailureCarriesGitsOwnReason(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	gitDir := newGitRepoForPush(t)
 
@@ -498,6 +744,7 @@ func (l lyingWriteTransport) CreateExclusive(p, local string) (transport.Outcome
 // and report Ambiguous with an error, never Committed.
 func TestWriteRefCatchesReadBackMismatch(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	lying := lyingWriteTransport{f}
 	sha := "1111111111111111111111111111111111111111"
@@ -517,6 +764,7 @@ func TestWriteRefCatchesReadBackMismatch(t *testing.T) {
 // the name into something stageable, and nothing must reach the transport.
 func TestWriteRefRejectsHostileLeaf(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "1111111111111111111111111111111111111111"
 	if out, err := WriteRef(f, "/r", "refs/heads/con", sha, false); err == nil {
@@ -531,7 +779,7 @@ func TestWriteRefRejectsHostileLeaf(t *testing.T) {
 // one commit, mirroring internal/gitcmd/gitcmd_test.go's newRepo helper. That
 // helper lives in a different package and cannot be reused here, so this is a
 // separate copy. Every setup command's error is checked: a bare t.TempDir()
-// is an empty directory, not a git repository, so pushOne's resolve() (which
+// is an empty directory, not a git repository, so Push's resolve() (which
 // shells out to `git rev-parse`) would fail before the ancestry logic under
 // test is ever reached — the brief's original TestPushRejectsNonFastForward
 // passed t.TempDir() directly as gitDir and could not have passed for that
@@ -613,7 +861,7 @@ func (r *refusingUploadTransport) CreateExclusive(p, local string) (transport.Ou
 func plantPack(t *testing.T, gitDir, head string) (packName, idxName string, packBytes, idxBytes []byte) {
 	t.Helper()
 	tmp := t.TempDir()
-	packPath, idxPath, err := gitcmd.WritePack(gitDir, head, nil, tmp)
+	packPath, idxPath, err := gitcmd.WritePack(gitDir, []string{head}, nil, tmp)
 	if err != nil || packPath == "" {
 		t.Fatalf("WritePack: %v", err)
 	}
@@ -655,6 +903,7 @@ func headOf(t *testing.T, d string) string {
 // is "fetch first".
 func TestPushRejectsNonFastForward(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	old := "1111111111111111111111111111111111111111"
 	_, _ = WriteRef(f, "/r", "refs/heads/main", old, false)
@@ -672,11 +921,13 @@ func TestPushRejectsNonFastForward(t *testing.T) {
 
 // TestPushDeleteRef is fine using t.TempDir() (not a real repo) as gitDir,
 // unlike TestPushRejectsNonFastForward above: a delete update carries an
-// empty Src, so pushOne returns before resolve() — and therefore before any
-// `git` invocation — is ever reached. The asymmetry with the sibling test
-// above is deliberate, not an oversight.
+// empty Src, so Push's phase 2 classifies it and phase 4 executes it without
+// ever calling resolve() — and therefore without any `git` invocation being
+// reached. The asymmetry with the sibling test above is deliberate, not an
+// oversight.
 func TestPushDeleteRef(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "2222222222222222222222222222222222222222"
 	_, _ = WriteRef(f, "/r", "refs/heads/tmp", sha, false)
@@ -716,6 +967,7 @@ func countPackFiles(f *transport.Fake, root string) (packs, idxs int) {
 // object range is packed.
 func TestPushOrderingPackAndIdxLandBeforeRef(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	gitDir := newGitRepoForPush(t)
 	head := headOf(t, gitDir)
@@ -739,9 +991,9 @@ func TestPushOrderingPackAndIdxLandBeforeRef(t *testing.T) {
 // report Ambiguous for anything staged under packs/, while behaving normally
 // for everything else (the marker, refs, the lock). Fake's FailNext field
 // only fires for the very next mutating call, and Bootstrap and the ref
-// machinery both perform mutations before pushOne ever reaches the pack
-// upload step, so FailNext cannot selectively target only that step; a small
-// local stub — the same technique repo_test.go already uses above for
+// machinery both perform mutations before Push's phase 3 ever reaches the
+// pack upload step, so FailNext cannot selectively target only that step; a
+// small local stub — the same technique repo_test.go already uses above for
 // ambiguousTrashTransport and lyingWriteTransport — is the only way to drive
 // this deterministically against the real transport.Transport interface.
 type ambiguousPackUploadTransport struct {
@@ -762,6 +1014,7 @@ func (a ambiguousPackUploadTransport) CreateExclusive(p, local string) (transpor
 // both -> ref" is a promise on paper only.
 func TestPushRefNotPublishedWhenPackUploadIsAmbiguous(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	gitDir := newGitRepoForPush(t)
 	amb := ambiguousPackUploadTransport{f}
@@ -790,49 +1043,67 @@ func assertNothingUploaded(t *testing.T, f *transport.Fake, root string) {
 	}
 }
 
-// TestPushRejectsHierarchicalDestinationBeforePacking covers the ref shape git
-// accepts and users create constantly — refs/heads/feat/x — against a repo
-// layer whose only prefix logic was isBranch. ListRefs is non-recursive
-// (refs.go documents this), so the ref was invisible to the advertisement,
-// exists came back false, the ancestry check was SKIPPED, a full pack was
-// built and uploaded, and only then did WriteRef fail because refs/heads/feat
-// does not exist — with a message naming neither the ref shape nor the
-// limitation, and an orphan pack left on the remote.
-func TestPushRejectsHierarchicalDestinationBeforePacking(t *testing.T) {
+// TestPushAcceptsHierarchicalDestinationNowThatListRefsRecurses closes the
+// loop this test used to describe as a standing limitation (it was named
+// TestPushRejectsHierarchicalDestinationBeforePacking): before Task 8,
+// refs/heads/feat/x was invisible to a non-recursive ListRefs, so exists
+// came back false, the ancestry check was skipped, a full pack was built and
+// uploaded, and only then did WriteRef fail because refs/heads/feat did not
+// exist — with a message naming neither the ref shape nor the limitation,
+// and an orphan pack left on the remote. ListRefs now recurses the whole
+// refs/ tree and checkDst admits any advertisable name under refs/, so this
+// push must succeed outright, AND the ref it wrote must be visible to a
+// FOLLOWING ListRefs call — proving the write and the read agree, which is
+// the whole point of the fix.
+func TestPushAcceptsHierarchicalDestinationNowThatListRefsRecurses(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
 
 	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feat/x"}}
 	res := Push(f, "/r", gitDir, ups, map[string]string{})
 
-	if len(res) != 1 || res[0].OK {
-		t.Fatalf("a hierarchical destination must be rejected, got %+v", res)
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("a hierarchical destination must now be accepted, got %+v", res)
 	}
-	if !strings.Contains(res[0].Err, "refs/heads/feat/x") {
-		t.Errorf("rejection must name the destination, got %q", res[0].Err)
+	if packs, idxs := countPackFiles(f, "/r"); packs == 0 || idxs == 0 {
+		t.Errorf("a successful push must still upload a pack/idx pair, got pack=%d idx=%d", packs, idxs)
 	}
-	if !strings.Contains(res[0].Err, "refs/heads/<name>") {
-		t.Errorf("rejection must name the actual limitation, got %q", res[0].Err)
+	refs, err := ListRefs(f, "/r")
+	if err != nil {
+		t.Fatalf("ListRefs: %v", err)
 	}
-	assertNothingUploaded(t, f, "/r")
+	if refs["refs/heads/feat/x"] != head {
+		t.Errorf("the ref just published must be advertised back, got %v", refs)
+	}
 }
 
 // TestPushRejectsPseudorefDestination covers the design's error-table row
 // "Pseudorefs and unsupported destinations | Explicit rejection with a named
-// reason". Before the guard, `git push proton-v2 main:refs/stash` wrote
-// <root>/refs/stash, reported ok, and created a ref ListRefs will never
-// advertise — so the NEXT push of it failed with "ref changed concurrently",
-// a message describing a race that never happened.
+// reason" for what is STILL rejected after Task 8's namespace re-enable.
+//
+// Task 8 retired checkDst's old "exactly refs/heads/<name> or
+// refs/tags/<name>" narrowing: "refs/stash" and "refs/notes/commits" are now
+// legitimate, advertisable destinations (TestPushAcceptsNamespacedDestinations
+// below), and bare "refs/heads" (no trailing slash) is a syntactically valid
+// ref name to git that checkDst no longer refuses up front — it still fails,
+// just later, at publish, not here
+// (TestPushToRefsHeadsItselfFailsAtPublishNotAtCheckDst below). What is left
+// genuinely unsupported at the checkDst boundary is HEAD (no "refs/" prefix
+// at all) and "refs/heads/" (git's own check-ref-format refuses the trailing
+// "/").
 func TestPushRejectsPseudorefDestination(t *testing.T) {
 	gitDir := newGitRepoForPush(t)
 
 	// A fresh Fake per subtest: assertNothingUploaded inspects the whole
 	// Files map, so a shared one would let the first leak taint every later
 	// case (or, worse, pass because a sibling already uploaded).
-	for _, dst := range []string{"refs/stash", "HEAD", "refs/heads", "refs/heads/", "refs/notes/commits"} {
+	for _, dst := range []string{"HEAD", "refs/heads/"} {
 		t.Run(dst, func(t *testing.T) {
 			f := transport.NewFake()
+			f.Dirs["/r"] = true
 			_ = Bootstrap(f, "/r")
 			ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: dst}}
 			res := Push(f, "/r", gitDir, ups, map[string]string{})
@@ -847,39 +1118,183 @@ func TestPushRejectsPseudorefDestination(t *testing.T) {
 	}
 }
 
-// TestPushRejectsUnsupportedDeleteDestination covers the delete path, which
-// returned OK: true for any ref it could not see — and it can never see a
-// pseudoref, because ListRefs does not advertise one. Reporting success for a
-// deletion that certainly did not happen is worse than a plain failure: git
-// drops its remote-tracking ref on the strength of it.
+// TestPushAcceptsNamespacedDestinations is the positive half of Task 8's
+// "namespace re-enable": a push to refs/notes/commits or refs/stash must now
+// succeed end-to-end and be visible to a following ListRefs, closing the old
+// v6.1 narrowing's gap the hard way (a real Push, not just a checkDst call).
+func TestPushAcceptsNamespacedDestinations(t *testing.T) {
+	for _, dst := range []string{"refs/notes/commits", "refs/stash"} {
+		t.Run(dst, func(t *testing.T) {
+			f := transport.NewFake()
+			f.Dirs["/r"] = true
+			_ = Bootstrap(f, "/r")
+			gitDir := newGitRepoForPush(t)
+
+			ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: dst}}
+			res := Push(f, "/r", gitDir, ups, map[string]string{})
+			if len(res) != 1 || !res[0].OK {
+				t.Fatalf("%q must now be accepted, got %+v", dst, res)
+			}
+			refs, err := ListRefs(f, "/r")
+			if err != nil {
+				t.Fatalf("ListRefs: %v", err)
+			}
+			if _, ok := refs[dst]; !ok {
+				t.Errorf("%q must be advertised back after publish, got %v", dst, refs)
+			}
+		})
+	}
+}
+
+// TestPushToRefsHeadsItselfFailsAtPublishNotAtCheckDst pins a real
+// consequence of admitting any advertisable name under refs/: "refs/heads"
+// (no trailing slash — distinct from the malformed "refs/heads/" checked
+// above) is syntactically a valid ref name to both git and advertisableName,
+// so checkDst no longer refuses it up front. It still cannot be PUBLISHED,
+// though — Bootstrap already created refs/heads as a FOLDER, and WriteRef's
+// leaf-named upload to that exact path collides with it (the same D/F guard
+// Task 7 gave the Fake) — so the push still fails, just later, and AFTER a
+// pack upload the old all-or-nothing narrowing would have avoided.
+//
+// ADJUDICATED (Task 9a): Task 9a's batch-preflight D/F check does NOT flip
+// this to a zero-cost preflight refusal, and that is deliberate, not a gap.
+// The preflight is refs-ONLY: it compares this batch's destinations against
+// the caller-supplied `remote` map (the advertised REFS) plus this batch's
+// own valid changes — it has no visibility into raw transport folder state.
+// "refs/heads" here is a plain pre-existing FOLDER from Bootstrap, never a
+// ref (ListRefs never advertises a folder), so it never appears in `remote`
+// and the preflight has nothing to compare against for this fixture (the
+// batch's remote map is empty). The push therefore still reaches phase 3
+// (builds and uploads a real pack — the orphan pinned below) before phase
+// 5's WriteRef hits the actual Dirs-based collision and fails. Pinned
+// deliberately rather than left uncovered: a future checkDst that makes this
+// SUCCEED (writing a ref file where refs/heads/<branch> folders live) would
+// be wrong, and a future preflight that silently starts inspecting folder
+// state would need this test updated on purpose, not by accident.
+func TestPushToRefsHeadsItselfFailsAtPublishNotAtCheckDst(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	if err := checkDst("refs/heads"); err != nil {
+		t.Fatalf(`checkDst("refs/heads") = %v, want nil (git accepts this ref name)`, err)
+	}
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads"}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("must still fail (D/F collision with the refs/heads folder), got %+v", res)
+	}
+	if _, ok := f.Files["/r/refs/heads"]; ok {
+		t.Error("must not be written to the remote")
+	}
+	if packs, idxs := countPackFiles(f, "/r"); packs == 0 || idxs == 0 {
+		t.Errorf("this failure happens AFTER packing, unlike a genuine checkDst "+
+			"rejection — want an orphan pack/idx pair uploaded before the D/F collision "+
+			"was discovered, got pack=%d idx=%d", packs, idxs)
+	}
+}
+
+// TestPushRejectsUnsupportedDeleteDestination covers the delete path against
+// a destination checkDst still refuses (HEAD has no "refs/" prefix at all)
+// — it must be rejected outright, never reported OK: true just because the
+// caller-supplied remote map happens to say the destination does not exist.
+// Before Task 8, this used "refs/stash" as the example destination; that is
+// no longer unsupported (TestPushAcceptsNamespacedDestinations above), so
+// the target moved to one that still is.
 func TestPushRejectsUnsupportedDeleteDestination(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
-	sha := "2222222222222222222222222222222222222222"
-	f.Files["/r/refs/stash"] = []byte(sha + "\n")
+	// Seeded so there is something at "/r/HEAD" a wrongly-permitted delete
+	// could actually trash — an empty Fake would let a Trash call pass
+	// unnoticed (Trash on an absent target is itself Committed, never an
+	// error), which is exactly the silent-success shape this test exists to
+	// catch.
+	f.Files["/r/HEAD"] = []byte("ref: refs/heads/main\n")
 
-	// The remote map is empty on purpose: this is what ListRefs actually
-	// returns for a pseudoref, so !exists is the branch that used to fire.
-	ups := []protocol.RefUpdate{{Src: "", Dst: "refs/stash"}}
+	ups := []protocol.RefUpdate{{Src: "", Dst: "HEAD"}}
 	res := Push(f, "/r", t.TempDir(), ups, map[string]string{})
 
 	if len(res) != 1 || res[0].OK {
-		t.Fatalf("deleting an unsupported destination must be rejected, not reported ok for a ref we cannot see, got %+v", res)
+		t.Fatalf("deleting an unsupported destination must be rejected, not reported ok, got %+v", res)
 	}
-	if _, ok := f.Files["/r/refs/stash"]; !ok {
-		t.Error("a rejected delete must not have trashed anything")
+	if string(f.Files["/r/HEAD"]) != "ref: refs/heads/main\n" {
+		t.Errorf("a rejected delete must not have trashed anything, HEAD now = %q", f.Files["/r/HEAD"])
+	}
+}
+
+// TestCheckDstAdmitsAnyAdvertisableNameUnderRefs pins the namespace
+// re-enable this task is named for directly against checkDst, independent of
+// Push: the old v6.1 narrowing (exactly refs/heads/<name> or
+// refs/tags/<name>, one component) is retired now that ListRefs recurses the
+// whole tree and can actually advertise these names back.
+func TestCheckDstAdmitsAnyAdvertisableNameUnderRefs(t *testing.T) {
+	for _, dst := range []string{
+		"refs/heads/main",
+		"refs/heads/feat/x",
+		"refs/tags/v1/rc",
+		"refs/notes/commits",
+		"refs/stash",
+	} {
+		if err := checkDst(dst); err != nil {
+			t.Errorf("checkDst(%q) = %v, want nil", dst, err)
+		}
+	}
+}
+
+// TestCheckDstStillRejects pins what stays refused after the namespace
+// re-enable: destinations with no "refs/" prefix at all (git's own authority
+// has nothing to check there), and names that fail either git's real
+// check-ref-format or this transport's stageability rules.
+func TestCheckDstStillRejects(t *testing.T) {
+	for _, dst := range []string{
+		"HEAD",
+		"refs/heads/",        // git check-ref-format itself refuses a trailing "/"
+		"refs/heads/.hidden", // leading-dot component
+		"refs/heads/a{b}",    // not stageable (probe C13)
+	} {
+		if err := checkDst(dst); err == nil {
+			t.Errorf("checkDst(%q) = nil, want a refusal", dst)
+		}
+	}
+}
+
+// TestRequiresForce pins the design's conservative other-namespace rule.
+// requiresForce is dead code until Task 9a wires it in (see the "wired in
+// Task 9a" comment on it, push.go) — this test exists now, ahead of any
+// caller, so the behaviour is pinned before it has one, per the brief.
+func TestRequiresForce(t *testing.T) {
+	cases := []struct {
+		dst  string
+		want bool
+	}{
+		{"refs/heads/main", false},
+		{"refs/heads/feat/x", false},
+		{"refs/tags/v1", false},
+		{"refs/notes/commits", true},
+		{"refs/stash", true},
+		{"refs/heads", true}, // no trailing "/" — not actually under refs/heads/
+		{"refs/tags", true},  // same, for refs/tags/
+	}
+	for _, c := range cases {
+		if got := requiresForce(c.dst); got != c.want {
+			t.Errorf("requiresForce(%q) = %v, want %v", c.dst, got, c.want)
+		}
 	}
 }
 
 // TestPushForceSkipsAncestryCheck drives a forced update whose remote-known
 // old sha does not exist locally at all: without Force, this would be
 // rejected as "fetch first" before ever reaching the pack step (see
-// TestPushRejectsNonFastForward above). With Force set, pushOne must skip the
-// ancestry gate entirely and still go through pack upload and ref
+// TestPushRejectsNonFastForward above). With Force set, Push's phase 2 must
+// skip the ancestry gate entirely and still go through pack upload and ref
 // publication — proving Force actually short-circuits the check rather than
 // merely happening not to trip it.
 func TestPushForceSkipsAncestryCheck(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	gitDir := newGitRepoForPush(t)
 	head := headOf(t, gitDir)
@@ -938,6 +1353,7 @@ func (r refusedRefCreateTransport) CreateExclusive(p, local string) (transport.O
 // our sha was never written to the ref path.
 func TestPushReportsFailureWhenRefCreateLosesConcurrentRace(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	gitDir := newGitRepoForPush(t)
 	stub := refusedRefCreateTransport{f}
@@ -958,6 +1374,7 @@ func TestPushReportsFailureWhenRefCreateLosesConcurrentRace(t *testing.T) {
 // RED. Unpatched, Stat sees the corrupt pack and the ref is published.
 func TestPushRefusedCorruptPackIsRejected(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	d := newGitRepoForPush(t)
 	head := headOfPushRepo(t, d)
@@ -980,6 +1397,7 @@ func TestPushRefusedCorruptPackIsRejected(t *testing.T) {
 // RED. Unpatched, Stat sees the corrupt index and the ref is published.
 func TestPushRefusedCorruptIdxIsRejected(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	d := newGitRepoForPush(t)
 	head := headOfPushRepo(t, d)
@@ -1007,6 +1425,7 @@ func TestPushRefusedCorruptIdxIsRejected(t *testing.T) {
 // future change tightens publishIdx, this test is what catches it.
 func TestPushRefusedValidButDifferentIdxIsAccepted(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	d := newGitRepoForPush(t)
 	head := headOfPushRepo(t, d)
@@ -1065,6 +1484,7 @@ func TestPushRefusedValidButDifferentIdxIsAccepted(t *testing.T) {
 // GUARD. A refused pack with no remote index is an orphan this push repairs.
 func TestPushRefusedPackWithNoRemoteIdxRepairsTheOrphan(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	d := newGitRepoForPush(t)
 	head := headOfPushRepo(t, d)
@@ -1079,6 +1499,622 @@ func TestPushRefusedPackWithNoRemoteIdxRepairsTheOrphan(t *testing.T) {
 	}
 	if _, ok := f.Files["/r/packs/"+idxName]; !ok {
 		t.Error("the orphan's index must have been uploaded")
+	}
+}
+
+// ============================================================================
+// Task 9a: five-phase batch engine
+// ============================================================================
+
+// hashObjectBlob writes content as a blob via `git hash-object -w --stdin` in
+// gitDir and returns its sha — a NON-COMMIT object, used to prove that the
+// "other namespaces" force rule runs no commit-shaped machinery (ObjectType,
+// HasObject, IsAncestor) at all.
+func hashObjectBlob(t *testing.T, gitDir, content string) string {
+	t.Helper()
+	cmd := exec.Command("git", "-C", gitDir, "hash-object", "-w", "--stdin")
+	cmd.Stdin = strings.NewReader(content)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("hash-object: %v", err)
+	}
+	sha := strings.TrimSpace(string(out))
+	if len(sha) != 40 {
+		t.Fatalf("hash-object returned %q, want a 40-char sha", sha)
+	}
+	return sha
+}
+
+// orderTraceTransport wraps a Fake and appends one labelled entry per
+// mutating call it observes, in the order they actually happen — proving the
+// five-phase engine's EXECUTION ORDER directly, rather than inferring it from
+// outcomes alone. CreateExclusive under packs/ is "pack:", CreateExclusive or
+// UpdateRevision under refs/ is "ref:", Trash is "trash:".
+type orderTraceTransport struct {
+	*transport.Fake
+	trace *[]string
+}
+
+func (o orderTraceTransport) CreateExclusive(p, local string) (transport.Outcome, error) {
+	switch {
+	case strings.HasPrefix(p, "/r/packs/"):
+		*o.trace = append(*o.trace, "pack:"+p)
+	case strings.Contains(p, "/refs/"):
+		*o.trace = append(*o.trace, "ref:"+p)
+	}
+	return o.Fake.CreateExclusive(p, local)
+}
+
+func (o orderTraceTransport) UpdateRevision(p, local string) (transport.Outcome, error) {
+	if strings.Contains(p, "/refs/") {
+		*o.trace = append(*o.trace, "ref:"+p)
+	}
+	return o.Fake.UpdateRevision(p, local)
+}
+
+func (o orderTraceTransport) Trash(p string) (transport.Outcome, error) {
+	*o.trace = append(*o.trace, "trash:"+p)
+	return o.Fake.Trash(p)
+}
+
+// TestPushRefusesDuplicateDestinationsWholeBatchUntouched covers the round-1
+// Codex finding on the plan: duplicates must be PRE-SCANNED so EVERY holder
+// of a duplicated destination is refused, not a first-seen-wins loop that
+// lets the first one mutate while later ones alone are reported as failed.
+// Two different sources target the same "dup" destination (ambiguous — which
+// src should win?); an unrelated ref in the same batch is untouched by the
+// collision and must still succeed.
+func TestPushRefusesDuplicateDestinationsWholeBatchUntouched(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
+
+	ups := []protocol.RefUpdate{
+		{Src: "refs/heads/main", Dst: "refs/heads/dup"},
+		{Src: head, Dst: "refs/heads/dup"},
+		{Src: "refs/heads/main", Dst: "refs/heads/solo"},
+	}
+	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 3 {
+		t.Fatalf("want 3 results, got %+v", res)
+	}
+	if res[0].OK || res[1].OK {
+		t.Fatalf("both holders of the duplicated destination must be refused, got %+v", res[:2])
+	}
+	for i, r := range res[:2] {
+		if !strings.Contains(r.Err, "duplicate destination") {
+			t.Errorf("result %d must name the duplicate, got %q", i, r.Err)
+		}
+	}
+	if !res[2].OK {
+		t.Fatalf("an unrelated ref in the same batch must still succeed, got %+v", res[2])
+	}
+	if _, ok := f.Files["/r/refs/heads/dup"]; ok {
+		t.Error("a duplicated destination must be left completely untouched")
+	}
+}
+
+// TestPushFinalStateDFPreflightRefusesConflictingCreates covers the
+// final-state D/F preflight (design 2b): two BRAND NEW creates in one batch
+// that conflict with EACH OTHER — a ref cannot be both a leaf and a folder
+// containing other refs — must both be refused, with the failure costing
+// NOTHING: no pack is ever built (asserted via the Fake's own packs/
+// children, not merely the reported outcome).
+func TestPushFinalStateDFPreflightRefusesConflictingCreates(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	ups := []protocol.RefUpdate{
+		{Src: "refs/heads/main", Dst: "refs/heads/feature"},
+		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"},
+	}
+	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 2 {
+		t.Fatalf("want 2 results, got %+v", res)
+	}
+	for i, r := range res {
+		if r.OK {
+			t.Fatalf("both conflicting creates must be refused, got %+v", res)
+		}
+		if !strings.Contains(r.Err, "refs/heads/feature") {
+			t.Errorf("result %d must name the conflicting ref, got %q", i, r.Err)
+		}
+	}
+	refs, err := ListRefs(f, "/r")
+	if err != nil {
+		t.Fatalf("ListRefs: %v", err)
+	}
+	if len(refs) != 0 {
+		t.Errorf("remote listing must be unchanged, got %v", refs)
+	}
+	if packs, idxs := countPackFiles(f, "/r"); packs != 0 || idxs != 0 {
+		t.Errorf("no pack may be built when nothing survives the preflight, got pack=%d idx=%d", packs, idxs)
+	}
+}
+
+// TestPushPreflightDFAgainstExistingRefs covers the preflight's OTHER
+// direction: the conflict need not be batch-internal — a create can conflict
+// with a ref that ALREADY exists on the remote (and is not deleted in this
+// batch). An unrelated ref in the same batch is untouched by the collision.
+func TestPushPreflightDFAgainstExistingRefs(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
+	if _, err := WriteRef(f, "/r", "refs/heads/feature/x", head, false); err != nil {
+		t.Fatal(err)
+	}
+	remote := map[string]string{"refs/heads/feature/x": head}
+
+	ups := []protocol.RefUpdate{
+		{Src: "refs/heads/main", Dst: "refs/heads/feature"},
+		{Src: "refs/heads/main", Dst: "refs/heads/unrelated"},
+	}
+	res := Push(f, "/r", gitDir, ups, remote)
+	if len(res) != 2 {
+		t.Fatalf("want 2 results, got %+v", res)
+	}
+	if res[0].OK {
+		t.Fatalf("a create conflicting with an existing ref must fail at preflight, got %+v", res[0])
+	}
+	if !strings.Contains(res[0].Err, "refs/heads/feature/x") {
+		t.Errorf("must name the conflicting existing ref, got %q", res[0].Err)
+	}
+	if !res[1].OK {
+		t.Fatalf("an unrelated ref in the same batch must still succeed, got %+v", res[1])
+	}
+}
+
+// TestPushFinalStateDFPreflightOrderIndependentOfInputOrder is RED (fix
+// round I1, Important): the final-state preflight is SET ALGEBRA (remote
+// minus every valid delete, plus every valid non-delete) and must not depend
+// on the order ups happens to list entries in. Concretely: remote has
+// refs/heads/feature; the batch UPDATES feature, DELETES feature (same
+// name, update listed FIRST), and CREATES the dependent feature/x. A single
+// pass over ups in input order gets this wrong: it applies the update (a
+// no-op re-add of "feature", already present from remote), then the delete
+// (removes "feature" from finalSet entirely), and nothing re-adds it
+// afterward — so the dependent create sails through the preflight with
+// nothing left to conflict against, costs a pack upload, and only fails
+// LATE at ensureRefParents. Set algebra says "feature" survives regardless
+// of input order (the delete does not "win" merely by being listed after
+// the update — execution order is always phase-4-deletes-then-phase-5-
+// writes, so the update's value is what's actually there afterward), so the
+// dependent create must be refused AT THE CHEAP PREFLIGHT either way. This
+// also exercises fix round M4 along the way: the update and the same-name
+// delete both succeed (phase 5's exists is batch-aware, so the update
+// routes through CreateExclusive against the node phase 4 just trashed,
+// not UpdateRevision).
+func TestPushFinalStateDFPreflightOrderIndependentOfInputOrder(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	sha := headOf(t, gitDir)
+	if _, err := WriteRef(f, "/r", "refs/heads/feature", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	remote := map[string]string{"refs/heads/feature": sha}
+
+	ups := []protocol.RefUpdate{
+		{Src: "refs/heads/main", Dst: "refs/heads/feature", Force: true}, // update, listed FIRST
+		{Src: "", Dst: "refs/heads/feature"},                             // delete, listed SECOND
+		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"},            // dependent create
+	}
+	res := Push(f, "/r", gitDir, ups, remote)
+	if len(res) != 3 {
+		t.Fatalf("want 3 results, got %+v", res)
+	}
+	if !res[0].OK || !res[1].OK {
+		t.Fatalf("the update and the delete must each succeed on their own: %+v", res[:2])
+	}
+	if res[2].OK {
+		t.Fatalf("the dependent create must be refused, got %+v", res[2])
+	}
+	if !strings.Contains(res[2].Err, "refs/heads/feature") {
+		t.Errorf("must name the conflicting ref, got %q", res[2].Err)
+	}
+	// Caught at the CHEAP preflight (its own wording: "conflicts with ...
+	// leaf and a folder"), never the expensive late ensureRefParents path
+	// ("occupies that name") — the whole point of the fix.
+	if !strings.Contains(res[2].Err, "conflicts with") {
+		t.Errorf("must be refused by the preflight, not a late runtime D/F failure, got %q", res[2].Err)
+	}
+	if _, ok := f.Files["/r/refs/heads/feature/x"]; ok {
+		t.Error("the refused create must not have been written")
+	}
+	sha2, err := readRef(f, "/r/refs/heads/feature")
+	if err != nil {
+		t.Fatalf("readRef: %v", err)
+	}
+	if sha2 != sha {
+		// Force:true update resolved "refs/heads/main", which IS `sha` in
+		// this fixture (newGitRepoForPush's only commit) — same value,
+		// different code path (CreateExclusive after the same-batch
+		// delete), so the content assertion is trivially satisfied; the
+		// real pin is the code-path assertion above via M4's routing.
+		t.Errorf("refs/heads/feature = %q, want %q", sha2, sha)
+	}
+}
+
+// TestPushOtherNamespaceRequiresForce covers the design's conservative
+// other-namespace rule end to end: a create needs no force (it is not a
+// move), an unforced update is refused naming the force requirement, and a
+// forced update succeeds. The unforced-update case deliberately uses an OLD
+// tip absent locally and a target that is a non-commit blob — proving that
+// no ancestry/fetch-first machinery runs at all for this namespace (round-2
+// Codex: the generic block would say "fetch first" or error on the object
+// type before ever reaching the force refusal).
+func TestPushOtherNamespaceRequiresForce(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	blobSha := hashObjectBlob(t, gitDir, "notes content")
+	absentOld := "9999999999999999999999999999999999999999"
+
+	t.Run("create without force is ok", func(t *testing.T) {
+		f := transport.NewFake()
+		f.Dirs["/r"] = true
+		_ = Bootstrap(f, "/r")
+		ups := []protocol.RefUpdate{{Src: blobSha, Dst: "refs/notes/commits"}}
+		res := Push(f, "/r", gitDir, ups, map[string]string{})
+		if len(res) != 1 || !res[0].OK {
+			t.Fatalf("a create in another namespace needs no force: %+v", res)
+		}
+	})
+
+	t.Run("unforced update requires force with no ancestry machinery", func(t *testing.T) {
+		f := transport.NewFake()
+		f.Dirs["/r"] = true
+		_ = Bootstrap(f, "/r")
+		ups := []protocol.RefUpdate{{Src: blobSha, Dst: "refs/notes/commits"}}
+		res := Push(f, "/r", gitDir, ups, map[string]string{"refs/notes/commits": absentOld})
+		if len(res) != 1 || res[0].OK {
+			t.Fatalf("an unforced update outside refs/heads/ and refs/tags/ must require force: %+v", res)
+		}
+		if !strings.Contains(res[0].Err, "force") {
+			t.Errorf("must name the force requirement, got %q", res[0].Err)
+		}
+		if strings.Contains(res[0].Err, "fetch first") || strings.Contains(res[0].Err, "ancestry") ||
+			strings.Contains(res[0].Err, "object type") {
+			t.Errorf("no ancestry/fetch-first/object-type machinery may run for this namespace, got %q", res[0].Err)
+		}
+	})
+
+	t.Run("forced update succeeds despite absent old tip and non-commit target", func(t *testing.T) {
+		f := transport.NewFake()
+		f.Dirs["/r"] = true
+		_ = Bootstrap(f, "/r")
+		ups := []protocol.RefUpdate{{Src: blobSha, Dst: "refs/notes/commits", Force: true}}
+		res := Push(f, "/r", gitDir, ups, map[string]string{"refs/notes/commits": absentOld})
+		if len(res) != 1 || !res[0].OK {
+			t.Fatalf("a forced update outside refs/heads/ and refs/tags/ must succeed: %+v", res)
+		}
+	})
+}
+
+// TestPushTagUpdateRequiresForceNoAncestry pins the design table's own row
+// ("Tag update | Requires force, matching git's rule; no ancestry check")
+// directly: an UNFORCED tag update is refused even though it is genuinely
+// fast-forwardable. Shipped pushOne has no tag arm and runs the generic
+// ancestry block on tag updates instead (it would have ACCEPTED this
+// fast-forward) — a pre-existing divergence from the design table that this
+// restructure ALIGNS rather than preserves; flagged in the task report.
+func TestPushTagUpdateRequiresForceNoAncestry(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	old := headOf(t, gitDir)
+	newSha := commitOnPushRepo(t, gitDir, "b.txt", "two") // old IS an ancestor of newSha
+
+	ups := []protocol.RefUpdate{{Src: newSha, Dst: "refs/tags/v1"}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{"refs/tags/v1": old})
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("an unforced tag update must be refused even though it is fast-forwardable, got %+v", res)
+	}
+	if !strings.Contains(res[0].Err, "force") {
+		t.Errorf("must name the force requirement, got %q", res[0].Err)
+	}
+}
+
+// TestPushTagAcceptsNonCommitObjectWithForce is RED (fix round M6): pins the
+// OTHER half of the design table's tag row. "no ancestry check" already has
+// TestPushTagUpdateRequiresForceNoAncestry above; this pins that the tag arm
+// also applies NO OBJECT-TYPE RESTRICTION — real git allows a tag to point
+// at any object (a lightweight tag over a tree or blob is legal), unlike a
+// branch, which the design's own table restricts to commits. Before this
+// test nothing exercised that the tag arm's absence of an object-type check
+// was intentional rather than merely untested. Mirrors
+// TestPushOtherNamespaceRequiresForce's non-commit-target subtest.
+func TestPushTagAcceptsNonCommitObjectWithForce(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	blobSha := hashObjectBlob(t, gitDir, "tag payload")
+	absentOld := "9999999999999999999999999999999999999999"
+
+	ups := []protocol.RefUpdate{{Src: blobSha, Dst: "refs/tags/v1", Force: true}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{"refs/tags/v1": absentOld})
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("a forced tag update must accept a non-commit object with no object-type check: %+v", res)
+	}
+	sha, err := readRef(f, "/r/refs/tags/v1")
+	if err != nil || sha != blobSha {
+		t.Fatalf("tag not published correctly: sha=%q err=%v want=%q", sha, err, blobSha)
+	}
+}
+
+// TestPushDeletionsRunAfterPackConfirmBeforeCreates pins the [Both] round-1
+// ordering rule directly via a call trace, not merely via outcomes: even
+// though the batch lists the CREATE first and the DELETE second (git-order),
+// the engine must upload+confirm the pack, THEN run the delete, THEN write
+// the dependent create's ref — never the reverse.
+func TestPushDeletionsRunAfterPackConfirmBeforeCreates(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	sha := "2222222222222222222222222222222222222222"
+	if _, err := WriteRef(f, "/r", "refs/heads/old", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	remote := map[string]string{"refs/heads/old": sha}
+
+	var trace []string
+	tr := orderTraceTransport{Fake: f, trace: &trace}
+
+	ups := []protocol.RefUpdate{
+		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"}, // create, listed first
+		{Src: "", Dst: "refs/heads/old"},                      // delete, listed second
+	}
+	res := Push(tr, "/r", gitDir, ups, remote)
+	for _, r := range res {
+		if !r.OK {
+			t.Fatalf("both updates must succeed: %+v", res)
+		}
+	}
+
+	packIdx, trashIdx, refIdx := -1, -1, -1
+	for i, e := range trace {
+		switch {
+		case packIdx == -1 && strings.HasPrefix(e, "pack:"):
+			packIdx = i
+		case trashIdx == -1 && strings.HasPrefix(e, "trash:"):
+			trashIdx = i
+		case refIdx == -1 && strings.HasPrefix(e, "ref:"):
+			refIdx = i
+		}
+	}
+	if packIdx == -1 || trashIdx == -1 || refIdx == -1 {
+		t.Fatalf("expected pack, trash, and ref events in the trace, got %v", trace)
+	}
+	if !(packIdx < trashIdx && trashIdx < refIdx) {
+		t.Errorf("want pack < trash < ref (pack confirm, then delete, then create), got trace %v", trace)
+	}
+}
+
+// TestPushPackFailureFailsCreatesButDeletionsProceed is a GUARD, not a RED
+// (round-1 Gemini): today's per-ref pushOne already lets an unrelated
+// deletion proceed past a failed create in the SAME batch. This pins that the
+// behaviour SURVIVES the restructure, with the new all-creates-share-one-
+// pack-failure shape asserted on top — FailNext fires on the very next
+// mutation, which under the new engine is the batch's single pack upload.
+func TestPushPackFailureFailsCreatesButDeletionsProceed(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	sha := "2222222222222222222222222222222222222222"
+	if _, err := WriteRef(f, "/r", "refs/heads/old", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	remote := map[string]string{"refs/heads/old": sha}
+	f.FailNext = "inject"
+
+	ups := []protocol.RefUpdate{
+		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"},
+		{Src: "", Dst: "refs/heads/old"},
+	}
+	res := Push(f, "/r", gitDir, ups, remote)
+	if len(res) != 2 {
+		t.Fatalf("want 2 results, got %+v", res)
+	}
+	if res[0].OK {
+		t.Fatalf("the create must fail when the batch's pack upload is ambiguous, got %+v", res[0])
+	}
+	if !strings.Contains(res[0].Err, "pack") {
+		t.Errorf("must name the pack failure, got %q", res[0].Err)
+	}
+	if !res[1].OK {
+		t.Fatalf("the unrelated deletion must still succeed despite the pack failure, got %+v", res[1])
+	}
+}
+
+// TestPushNonBranchDeleteProceedsUnderUnreadableHEAD is RED (plan round 3,
+// Codex): HEAD protection is BRANCHES-ONLY. HEAD is corrupt/unreadable;
+// deleting refs/tags/v1 must still succeed (HEAD can only ever name a
+// branch), while deleting refs/heads/main in the SAME batch fails closed.
+func TestPushNonBranchDeleteProceedsUnderUnreadableHEAD(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	sha := "2222222222222222222222222222222222222222"
+	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := WriteRef(f, "/r", "refs/tags/v1", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	f.Files["/r/HEAD"] = []byte("this is not a symref\n") // corrupt / unreadable
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/tags/v1"},
+		{Src: "", Dst: "refs/heads/main"},
+	}
+	res := Push(f, "/r", t.TempDir(), ups,
+		map[string]string{"refs/heads/main": sha, "refs/tags/v1": sha})
+
+	if len(res) != 2 {
+		t.Fatalf("want 2 results, got %+v", res)
+	}
+	if !res[0].OK {
+		t.Fatalf("a non-branch delete must succeed despite an unreadable HEAD: %+v", res[0])
+	}
+	if res[1].OK {
+		t.Fatalf("a branch delete must fail closed under an unreadable HEAD: %+v", res[1])
+	}
+	if !strings.Contains(res[1].Err, "HEAD") {
+		t.Errorf("must name the HEAD read failure, got %q", res[1].Err)
+	}
+}
+
+// TestPushDeleteOfHEADBranchRefusedAtPreflight is RED (round-1 Codex): the
+// batch deletes the branch HEAD names AND creates a child underneath it. The
+// delete must be refused in PHASE 2 (the batch's single, non-mutating
+// ReadHEAD) — and, critically, the REFUSED delete must NOT be subtracted from
+// the preflight's final-state set, so the dependent create ALSO fails the D/F
+// preflight — and no pack is ever built. Without the phase-2 HEAD read, this
+// batch would upload a pack and then fail twice downstream instead.
+func TestPushDeleteOfHEADBranchRefusedAtPreflight(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	sha := headOf(t, gitDir)
+	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := WriteHEAD(f, "/r", "refs/heads/main"); err != nil {
+		t.Fatal(err)
+	}
+	remote := map[string]string{"refs/heads/main": sha}
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/main"},
+		{Src: "refs/heads/main", Dst: "refs/heads/main/child"},
+	}
+	res := Push(f, "/r", gitDir, ups, remote)
+	if len(res) != 2 {
+		t.Fatalf("want 2 results, got %+v", res)
+	}
+	if res[0].OK {
+		t.Fatalf("deleting the branch HEAD points at must be refused, got %+v", res[0])
+	}
+	if !strings.Contains(res[0].Err, "HEAD points at") {
+		t.Errorf("must name the HEAD-protection reason, got %q", res[0].Err)
+	}
+	if res[1].OK {
+		t.Fatalf("the dependent create must also fail the D/F preflight, got %+v", res[1])
+	}
+	if !strings.Contains(res[1].Err, "refs/heads/main") {
+		t.Errorf("must name the conflicting ref, got %q", res[1].Err)
+	}
+	if _, ok := f.Files["/r/refs/heads/main"]; !ok {
+		t.Error("the ref file must survive a refused delete")
+	}
+	if packs, idxs := countPackFiles(f, "/r"); packs != 0 || idxs != 0 {
+		t.Errorf("no pack may be built when nothing survives the preflight, got pack=%d idx=%d", packs, idxs)
+	}
+}
+
+// TestPushDeleteThenCreateSameNameOneBatch covers the design's own motivating
+// example for deletions-before-creates ordering: `git push origin :feature
+// feature/x` must succeed in one batch regardless of git's own send order —
+// the delete makes room, and the preflight's final-state set (computed AFTER
+// subtracting the valid delete) contains only feature/x, so there is no
+// conflict left to refuse.
+func TestPushDeleteThenCreateSameNameOneBatch(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	sha := headOf(t, gitDir)
+	if _, err := WriteRef(f, "/r", "refs/heads/feature", sha, false); err != nil {
+		t.Fatal(err)
+	}
+	remote := map[string]string{"refs/heads/feature": sha}
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/feature"},
+		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"},
+	}
+	res := Push(f, "/r", gitDir, ups, remote)
+	for _, r := range res {
+		if !r.OK {
+			t.Fatalf("both the delete and the dependent create must succeed: %+v", res)
+		}
+	}
+	refs, err := ListRefs(f, "/r")
+	if err != nil {
+		t.Fatalf("ListRefs: %v", err)
+	}
+	if _, ok := refs["refs/heads/feature"]; ok {
+		t.Errorf("the deleted ref must be gone, got %v", refs)
+	}
+	if refs["refs/heads/feature/x"] != sha {
+		t.Errorf("the created ref must be present, got %v", refs)
+	}
+}
+
+// TestPushCreatesNestedBranchCreatingParents is the hierarchical-create
+// happy path end to end: creating refs/heads/feature/deep/x on a fresh
+// remote must create the intermediate folders AND the leaf ref file.
+func TestPushCreatesNestedBranchCreatingParents(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature/deep/x"}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("push should succeed: %+v", res)
+	}
+	for _, d := range []string{"/r/refs/heads/feature", "/r/refs/heads/feature/deep"} {
+		if !f.Dirs[d] {
+			t.Errorf("want folder %s to exist, dirs=%v", d, f.Dirs)
+		}
+	}
+	sha, err := readRef(f, "/r/refs/heads/feature/deep/x")
+	if err != nil || sha != head {
+		t.Fatalf("ref not published correctly: sha=%q err=%v want=%q", sha, err, head)
+	}
+}
+
+// TestPushReverseDFRefusedNamingTheBlockingRef exercises ensureRefParents'
+// OWN typed reverse-D/F detection specifically — not the phase-2 preflight.
+// The blocking ref exists on the TRANSPORT but the caller's `remote` snapshot
+// (as if from a stale ListRefs, or a concurrent write the caller has not
+// observed yet) does not know about it, so the conflict is invisible to
+// phase 2 (which only ever consults the caller-supplied remote map) and is
+// only discovered when ensureRefParents' EnsureDir walk actually collides
+// with the existing ref FILE in phase 5.
+func TestPushReverseDFRefusedNamingTheBlockingRef(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	sha := headOf(t, gitDir)
+	if _, err := WriteRef(f, "/r", "refs/heads/feature", sha, false); err != nil {
+		t.Fatal(err)
+	}
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature/x"}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{}) // remote map does NOT know about refs/heads/feature
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("must be refused (D/F collision with an existing ref file), got %+v", res)
+	}
+	if !strings.Contains(res[0].Err, "refs/heads/feature") {
+		t.Errorf("must name the blocking ref, got %q", res[0].Err)
+	}
+	if _, ok := f.Files["/r/refs/heads/feature/x"]; ok {
+		t.Error("the ref must not have been written")
 	}
 }
 
@@ -1234,6 +2270,50 @@ func TestBootstrapFailsClosedOnUnrecognisedMarkerOutcome(t *testing.T) {
 	}
 }
 
+// statErrorTransport wraps a Fake but makes Stat report a transport failure
+// for every path, mimicking a broken or uncertified CLI. transport.Fake's
+// own Stat never errors — a map miss is always confirmed absence (fake.go) —
+// so a small local stub is the only way to drive RequireMarker's err-vs-!ok
+// branches independently against the real transport.Transport interface, the
+// same technique this file already uses above for unknownOutcomeTransport,
+// ambiguousTrashTransport, and lyingWriteTransport.
+type statErrorTransport struct {
+	*transport.Fake
+}
+
+func (s statErrorTransport) Stat(p string) (transport.Node, bool, error) {
+	return transport.Node{}, false, fmt.Errorf("simulated transport failure statting %s", p)
+}
+
+// TestRequireMarkerSurfacesStatFailureDistinctlyFromNoMarker is Task 4's
+// end-to-end check that CLI.Stat's not-found/error split (internal/transport
+// cli.go) actually reaches RequireMarker's two distinct messages up here.
+// marker.go already branches correctly on err vs !ok — the defect this task
+// fixes was entirely inside CLI.Stat folding EVERY nonzero `filesystem info`
+// exit into (_, false, nil), which would have made this test unable to ever
+// observe the transport-failure branch: every Stat failure looked identical
+// to a missing marker, so an operator running against a broken or
+// uncertified CLI saw "it is not a git-remote-proton repo" instead of the
+// real cause. With a transport whose Stat itself errors, RequireMarker must
+// report its "stat ..." wrap (marker.go's err != nil branch), never the
+// "no gpb-remote.json" absence message (the !ok branch) — those are two
+// different failures and must stay distinguishable.
+func TestRequireMarkerSurfacesStatFailureDistinctlyFromNoMarker(t *testing.T) {
+	f := transport.NewFake()
+	stub := statErrorTransport{f}
+
+	err := RequireMarker(stub, "/my-files/r")
+	if err == nil {
+		t.Fatal("want a non-nil error when Stat itself fails")
+	}
+	if !strings.Contains(err.Error(), "stat ") {
+		t.Errorf("a transport failure must surface as RequireMarker's stat-wrap message, got %q", err)
+	}
+	if strings.Contains(err.Error(), "no "+MarkerName) {
+		t.Errorf("a transport failure must not be confused with the absent-marker message, got %q", err)
+	}
+}
+
 // TestAcquireLockFailsClosedOnUnrecognisedOutcome: same exposure on the lock.
 // Falling through reached the read-back verification, which would have
 // reported a held lock had the remote happened to carry our nonce.
@@ -1286,6 +2366,7 @@ func TestDeriveHEAD(t *testing.T) {
 // RED. WriteHEAD/ReadHEAD do not exist.
 func TestWriteAndReadHEAD(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 
 	if _, ok, err := ReadHEAD(f, "/r"); err != nil || ok {
@@ -1310,6 +2391,7 @@ func TestWriteAndReadHEAD(t *testing.T) {
 // and a garbage HEAD must be fatal rather than coerced.
 func TestReadHEADRejectsCorruptContent(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	f.Files["/r/HEAD"] = []byte("1111111111111111111111111111111111111111\n")
 	if _, _, err := ReadHEAD(f, "/r"); err == nil {
@@ -1335,6 +2417,7 @@ func TestReadHEADRejectsCorruptContent(t *testing.T) {
 // path — is identical.
 func TestWriteHEADFailsClosedOnUnrecognisedOutcome(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	tr := unknownOutcomeTransport{Fake: f, forPath: "/r/" + HeadName}
 
@@ -1360,6 +2443,7 @@ func TestWriteHEADFailsClosedOnUnrecognisedOutcome(t *testing.T) {
 // uses CreateExclusive and not UpdateRevision.
 func TestWriteHEADNeverOverwritesExistingHEAD(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	f.Files["/r/HEAD"] = []byte("ref: refs/heads/existing\n")
 
@@ -1380,6 +2464,7 @@ func TestWriteHEADNeverOverwritesExistingHEAD(t *testing.T) {
 // would consume it before WriteHEAD ever runs.
 func TestWriteHEADAmbiguousOutcomeIsReported(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	f.FailNext = "inject"
 
@@ -1395,6 +2480,7 @@ func TestWriteHEADAmbiguousOutcomeIsReported(t *testing.T) {
 // TestWriteRefRefusesNonSha already pins for WriteRef.
 func TestWriteHEADRefusesNonBranchTarget(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 
 	if out, err := WriteHEAD(f, "/r", "refs/tags/v1"); err == nil {
@@ -1411,6 +2497,7 @@ func TestWriteHEADRefusesNonBranchTarget(t *testing.T) {
 // break a HEAD written or touched by a CRLF-writing tool.
 func TestReadHEADAcceptsCRLF(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	f.Files["/r/HEAD"] = []byte("ref: refs/heads/main\r\n")
 
@@ -1430,6 +2517,7 @@ func TestReadHEADAcceptsCRLF(t *testing.T) {
 // 1  UpdateHEAD overwrites an existing HEAD and verifies by read-back.
 func TestUpdateHEADOverwritesExistingAndVerifiesByReadBack(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	f.Files["/r/HEAD"] = []byte("ref: refs/heads/old\n")
 
@@ -1452,6 +2540,7 @@ func TestUpdateHEADOverwritesExistingAndVerifiesByReadBack(t *testing.T) {
 // 2  UpdateHEAD creates HEAD when absent (the headless-remote rescue).
 func TestUpdateHEADCreatesWhenAbsent(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 
 	out, err := UpdateHEAD(f, "/r", "refs/heads/main")
@@ -1470,6 +2559,7 @@ func TestUpdateHEADCreatesWhenAbsent(t *testing.T) {
 // 3  UpdateHEAD refuses a non-branch target (mirrors WriteHEAD's rule).
 func TestUpdateHEADRefusesNonBranchTarget(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 
 	if out, err := UpdateHEAD(f, "/r", "refs/tags/v1"); err == nil {
@@ -1504,6 +2594,7 @@ func (a ambiguousUpdateTransport) UpdateRevision(p, local string) (transport.Out
 //	above.
 func TestUpdateHEADAmbiguousOutcomeOnUpdatePath(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	f.Files["/r/HEAD"] = []byte("ref: refs/heads/old\n")
 	tr := ambiguousUpdateTransport{Fake: f, forPath: "/r/" + HeadName}
@@ -1543,6 +2634,7 @@ func (u unknownOutcomeUpdateTransport) UpdateRevision(p, local string) (transpor
 func TestUpdateHEADFailsClosedOnUnrecognisedOutcome(t *testing.T) {
 	t.Run("create path", func(t *testing.T) {
 		f := transport.NewFake()
+		f.Dirs["/r"] = true
 		_ = Bootstrap(f, "/r")
 		tr := unknownOutcomeTransport{Fake: f, forPath: "/r/" + HeadName}
 
@@ -1563,6 +2655,7 @@ func TestUpdateHEADFailsClosedOnUnrecognisedOutcome(t *testing.T) {
 
 	t.Run("update path", func(t *testing.T) {
 		f := transport.NewFake()
+		f.Dirs["/r"] = true
 		_ = Bootstrap(f, "/r")
 		f.Files["/r/HEAD"] = []byte("ref: refs/heads/old\n")
 		tr := unknownOutcomeUpdateTransport{Fake: f, forPath: "/r/" + HeadName}
@@ -1623,6 +2716,7 @@ func (r refusedHeadCreateTransport) CreateExclusive(p, local string) (transport.
 func TestUpdateHEADRefusedOutcomeIsAnError(t *testing.T) {
 	t.Run("update path", func(t *testing.T) {
 		f := transport.NewFake()
+		f.Dirs["/r"] = true
 		_ = Bootstrap(f, "/r")
 		f.Files["/r/HEAD"] = []byte("ref: refs/heads/main\n")
 
@@ -1641,6 +2735,7 @@ func TestUpdateHEADRefusedOutcomeIsAnError(t *testing.T) {
 
 	t.Run("create path", func(t *testing.T) {
 		f := transport.NewFake()
+		f.Dirs["/r"] = true
 		_ = Bootstrap(f, "/r")
 		tr := refusedHeadCreateTransport{Fake: f, forPath: "/r/" + HeadName}
 
@@ -1679,6 +2774,7 @@ func assertLockReleased(t *testing.T, f *transport.Fake, root string) {
 //	back refs/heads/b; returns "refs/heads/b".
 func TestSetHeadSucceeds(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "1111111111111111111111111111111111111111"
 	if _, err := WriteRef(f, "/r", "refs/heads/a", sha, false); err != nil {
@@ -1750,6 +2846,7 @@ func (c *countingTransport) Trash(p string) (transport.Outcome, error) {
 //	succeeds WITHOUT uploading a new HEAD.
 func TestSetHeadIdempotentMakesNoHeadWrite(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "1111111111111111111111111111111111111111"
 	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
@@ -1796,6 +2893,7 @@ func TestSetHeadIdempotentMakesNoHeadWrite(t *testing.T) {
 //	naming a since-deleted branch would short-circuit straight to success.
 func TestSetHeadRefusesDanglingHead(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "1111111111111111111111111111111111111111"
 	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
@@ -1814,6 +2912,7 @@ func TestSetHeadRefusesDanglingHead(t *testing.T) {
 // 10 Unknown branch refuses, error names existing branches.
 func TestSetHeadRefusesUnknownBranch(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "1111111111111111111111111111111111111111"
 	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
@@ -1835,6 +2934,7 @@ func TestSetHeadRefusesUnknownBranch(t *testing.T) {
 //	first".
 func TestSetHeadRefusesEmptyRepo(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 
 	_, err := SetHead(f, "/r", "main")
@@ -1847,9 +2947,16 @@ func TestSetHeadRefusesEmptyRepo(t *testing.T) {
 	assertLockReleased(t, f, "/r")
 }
 
-// 12 Hierarchical name ("feature/x") refuses naming Stage 5.
-func TestSetHeadRefusesHierarchicalName(t *testing.T) {
+// 12 Hierarchical name ("feature/x") is now a VALID ref name (Task 10 lifts
+//
+//	the blanket Stage 5 refusal — see TestSetHeadAcceptsHierarchicalBranch
+//	below for the happy path) but "feature/x" itself does not exist as a
+//	branch here, so it still refuses — with the ordinary no-such-branch
+//	message, naming the branches that DO exist, never the retired Stage 5
+//	text.
+func TestSetHeadRefusesNonexistentHierarchicalBranch(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "1111111111111111111111111111111111111111"
 	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
@@ -1858,10 +2965,13 @@ func TestSetHeadRefusesHierarchicalName(t *testing.T) {
 
 	_, err := SetHead(f, "/r", "feature/x")
 	if err == nil {
-		t.Fatal("SetHead must refuse a hierarchical branch name")
+		t.Fatal("SetHead must refuse a branch that does not exist, hierarchical or not")
 	}
-	if !strings.Contains(err.Error(), "Stage 5") {
-		t.Errorf("refusal must name Stage 5, got: %v", err)
+	if strings.Contains(err.Error(), "Stage 5") {
+		t.Errorf("refusal must not be the retired Stage-5 blanket message, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "main") {
+		t.Errorf("refusal must name the branches that DO exist, got: %v", err)
 	}
 	assertLockReleased(t, f, "/r")
 }
@@ -1869,6 +2979,7 @@ func TestSetHeadRefusesHierarchicalName(t *testing.T) {
 // 13 Tag target ("refs/tags/v1") refuses: HEAD points at branches only.
 func TestSetHeadRefusesTagTarget(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "1111111111111111111111111111111111111111"
 	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
@@ -1906,6 +3017,7 @@ func TestSetHeadRefusesNoMarker(t *testing.T) {
 //	every refusal path that got far enough to acquire one.
 func TestSetHeadRefusesWhenLockHeld(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	held, err := AcquireLock(f, "/r")
 	if err != nil {
@@ -1931,6 +3043,7 @@ func TestSetHeadRefusesWhenLockHeld(t *testing.T) {
 func TestSetHeadNormalizesShortName(t *testing.T) {
 	build := func() *transport.Fake {
 		f := transport.NewFake()
+		f.Dirs["/r"] = true
 		_ = Bootstrap(f, "/r")
 		sha := "1111111111111111111111111111111111111111"
 		if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
@@ -1963,6 +3076,7 @@ func TestSetHeadNormalizesShortName(t *testing.T) {
 //	repo is headless and SetHead's create path applies.
 func TestSetHeadRefusesCorruptHead(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "1111111111111111111111111111111111111111"
 	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
@@ -1980,9 +3094,208 @@ func TestSetHeadRefusesCorruptHead(t *testing.T) {
 	assertLockReleased(t, f, "/r")
 }
 
+// --- Task 10: SetHead hierarchical names + exact-path verification --------
+//
+// RED before this task: normalizeBranch refused every hierarchical name
+// outright (the retired Stage 5 message above), and SetHead verified
+// existence via a full-tree ListRefs + map lookup rather than an exact-path
+// Stat.
+
+// 18 A hierarchical branch name is accepted end to end: refs/heads/feature/x
+//
+//	exists, SetHead("feature/x") sets HEAD to it and returns the full name.
+func TestSetHeadAcceptsHierarchicalBranch(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	if _, err := WriteRef(f, "/r", "refs/heads/feature/x", sha, false); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := SetHead(f, "/r", "feature/x")
+	if err != nil {
+		t.Fatalf("SetHead: %v", err)
+	}
+	if got != "refs/heads/feature/x" {
+		t.Errorf("SetHead returned %q, want refs/heads/feature/x", got)
+	}
+	branch, ok, err := ReadHEAD(f, "/r")
+	if err != nil || !ok {
+		t.Fatalf("ReadHEAD: %v %v", ok, err)
+	}
+	if branch != "refs/heads/feature/x" {
+		t.Errorf("HEAD = %q, want refs/heads/feature/x", branch)
+	}
+}
+
+// 19 An invalid hierarchical name — a consecutive-slash and a leading-dot
+//
+//	component — refuses with a NAMED reason from advertisableName's
+//	underlying CheckRefName, never the retired blanket Stage-5 message.
+func TestSetHeadRejectsInvalidHierarchicalName(t *testing.T) {
+	cases := []string{"feature//x", "feature/.hidden"}
+	for _, arg := range cases {
+		t.Run(arg, func(t *testing.T) {
+			f := transport.NewFake()
+			f.Dirs["/r"] = true
+			_ = Bootstrap(f, "/r")
+			sha := "1111111111111111111111111111111111111111"
+			if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err := SetHead(f, "/r", arg)
+			if err == nil {
+				t.Fatalf("SetHead must refuse %q", arg)
+			}
+			if strings.Contains(err.Error(), "Stage 5") {
+				t.Errorf("refusal must not be the retired Stage-5 blanket message, got: %v", err)
+			}
+		})
+	}
+}
+
+// setHeadTraceTransport records every path passed to List and to ReadTo, so
+// TestSetHeadVerifyUsesExactPathNotRecursion can assert a successful SetHead
+// never walks the ref tree at all (Stat replaces ListRefs on the happy
+// path) and reads only the target branch's own ref file.
+type setHeadTraceTransport struct {
+	*transport.Fake
+	lists []string
+	reads []string
+}
+
+func (tr *setHeadTraceTransport) List(p string) ([]transport.Node, error) {
+	tr.lists = append(tr.lists, p)
+	return tr.Fake.List(p)
+}
+
+func (tr *setHeadTraceTransport) ReadTo(p, local string) error {
+	tr.reads = append(tr.reads, p)
+	return tr.Fake.ReadTo(p, local)
+}
+
+// 20 GUARD: a successful SetHead verifies the target via an EXACT-PATH Stat
+//
+//	plus readRef, never a full-tree ListRefs walk. A tag and a notes ref sit
+//	alongside two branches so a regression back to the old ListRefs-based
+//	lookup shows up as a List call — none may ever happen on this path, let
+//	alone one naming refs/tags or refs/notes — and the only ref file ever
+//	READ is the target branch itself; refs/heads/other is never touched.
+func TestSetHeadVerifyUsesExactPathNotRecursion(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	for _, ref := range []string{"refs/heads/main", "refs/heads/other", "refs/tags/v1", "refs/notes/commits"} {
+		if _, err := WriteRef(f, "/r", ref, sha, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := WriteHEAD(f, "/r", "refs/heads/other"); err != nil {
+		t.Fatal(err)
+	}
+
+	tr := &setHeadTraceTransport{Fake: f}
+	got, err := SetHead(tr, "/r", "main")
+	if err != nil {
+		t.Fatalf("SetHead: %v", err)
+	}
+	if got != "refs/heads/main" {
+		t.Errorf("SetHead returned %q, want refs/heads/main", got)
+	}
+	for _, p := range tr.lists {
+		t.Errorf("successful SetHead must never call List; got List(%q)", p)
+	}
+	for _, p := range tr.reads {
+		if strings.HasPrefix(p, "/r/refs/") && p != "/r/refs/heads/main" {
+			t.Errorf("successful SetHead must read only the target branch's own ref file, "+
+				"also read %q", p)
+		}
+	}
+}
+
+// 21 GUARD: when the requested branch does not exist, the suggestion list
+//
+//	built on the error path still finds NESTED branches (ListRefs's own
+//	recursion, Task 8), not just direct children of refs/heads.
+func TestSetHeadUnknownBranchListsNestedBranches(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	if _, err := WriteRef(f, "/r", "refs/heads/feature/deep/x", sha, false); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := SetHead(f, "/r", "nope")
+	if err == nil {
+		t.Fatal("SetHead must refuse a branch that does not exist")
+	}
+	if !strings.Contains(err.Error(), "feature/deep/x") {
+		t.Errorf("refusal must name the nested branch that exists, got: %v", err)
+	}
+}
+
+// 22 GUARD (peer-review finding on this task): a branch name that Stat
+//
+//	confirms present but ONLY as a NAMESPACE FOLDER — refs/heads/feature/x
+//	exists, "feature" itself does not, so refs/heads/feature is a folder
+//	node, not a ref file — must refuse with a NAMED reason, and must never
+//	reach readRef's ReadTo-on-a-directory call: that has a misleading
+//	generic "not found" against the Fake and NO verified contract at all
+//	against the live CLI. The IsDir branch must fire strictly BEFORE
+//	readRef, so the folder path itself is never handed to ReadTo — traced
+//	directly via setHeadTraceTransport, the same tracer
+//	TestSetHeadVerifyUsesExactPathNotRecursion uses.
+//
+//	Setup goes through Push (not a direct WriteRef) deliberately: the Fake's
+//	Stat only reports IsDir for a path actually present in f.Dirs, and only
+//	ensureRefParents' EnsureDir walk (Task 9a, exercised end to end via
+//	Push, the same setup TestPushCreatesNestedBranchCreatingParents uses)
+//	populates that — a bare WriteRef("refs/heads/feature/x", ...) never
+//	touches f.Dirs at all, so Stat("refs/heads/feature") would report
+//	absence, not a folder, and this test would not actually exercise the
+//	hazard the fix addresses.
+func TestSetHeadRefusesNamespaceFolderBranch(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature/x"}}
+	if res := Push(f, "/r", gitDir, ups, map[string]string{}); len(res) != 1 || !res[0].OK {
+		t.Fatalf("setup push failed: %+v", res)
+	}
+	if !f.Dirs["/r/refs/heads/feature"] {
+		t.Fatal("setup invariant broken: refs/heads/feature must be a folder in f.Dirs")
+	}
+
+	tr := &setHeadTraceTransport{Fake: f}
+	_, err := SetHead(tr, "/r", "feature")
+	if err == nil {
+		t.Fatal("SetHead must refuse a name that is only a namespace folder, not a branch")
+	}
+	if !strings.Contains(err.Error(), "namespace folder") {
+		t.Errorf("refusal must name the namespace-folder situation, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "feature/x") {
+		t.Errorf("refusal must suggest the real branch living beneath the folder, got: %v", err)
+	}
+	for _, p := range tr.reads {
+		if p == "/r/refs/heads/feature" {
+			t.Errorf("must never ReadTo the folder path itself — the hazard this fix removes; "+
+				"got reads=%v", tr.reads)
+		}
+	}
+	assertLockReleased(t, f, "/r")
+}
+
 // RED. Push does not write HEAD at all today.
 func TestPushWritesHeadOnFirstPush(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	d := newGitRepoForPush(t)
 	head := headOfPushRepo(t, d)
@@ -2000,6 +3313,7 @@ func TestPushWritesHeadOnFirstPush(t *testing.T) {
 // candidate set is every remote branch — not just what this push published.
 func TestPushBackfillsHeadFromAllRemoteBranches(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	d := newGitRepoForPush(t)
 	head := headOfPushRepo(t, d)
@@ -2023,6 +3337,7 @@ func TestPushBackfillsHeadFromAllRemoteBranches(t *testing.T) {
 // GUARD. An existing HEAD is never rewritten.
 func TestPushNeverRewritesAnExistingHead(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	d := newGitRepoForPush(t)
 	head := headOfPushRepo(t, d)
@@ -2040,6 +3355,7 @@ func TestPushNeverRewritesAnExistingHead(t *testing.T) {
 // GUARD. A tag-only push leaves the repo headless — a defined state.
 func TestPushTagOnlyLeavesRepoHeadless(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	d := newGitRepoForPush(t)
 	head := headOfPushRepo(t, d)
@@ -2065,6 +3381,7 @@ func TestPushTagOnlyLeavesRepoHeadless(t *testing.T) {
 // error out of Push.
 func TestPushRefusesToDeleteTheBranchHeadPointsAt(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "2222222222222222222222222222222222222222"
 	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
@@ -2102,6 +3419,7 @@ func TestPushRefusesToDeleteTheBranchHeadPointsAt(t *testing.T) {
 // delete" would pass the test above.
 func TestPushDeletesABranchHeadDoesNotPointAt(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "2222222222222222222222222222222222222222"
 	for _, ref := range []string{"refs/heads/main", "refs/heads/dev"} {
@@ -2131,6 +3449,7 @@ func TestPushDeletesABranchHeadDoesNotPointAt(t *testing.T) {
 // rule above exists to refuse.
 func TestPushDeleteFailsClosedOnAnUnreadableHead(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "2222222222222222222222222222222222222222"
 	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
@@ -2162,6 +3481,7 @@ func TestPushDeleteFailsClosedOnAnUnreadableHead(t *testing.T) {
 // perfectly good branch on it.
 func TestPushDeleteThenRecreateInOneBatchStillDerivesHead(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	d := newGitRepoForPush(t)
 	head := headOfPushRepo(t, d)
@@ -2187,11 +3507,188 @@ func TestPushDeleteThenRecreateInOneBatchStillDerivesHead(t *testing.T) {
 	}
 }
 
+// refWriteMethodTransport wraps a Fake and records which write method —
+// CreateExclusive or UpdateRevision — was actually invoked for ONE chosen
+// remote path. Used to pin fix round M4's batch-aware `exists` flip
+// directly: a Fake's UpdateRevision against an already-absent path silently
+// succeeds as a blind write (see fake.go), so outcomes alone cannot
+// distinguish "took the create path" from "took the update path and got
+// lucky against the Fake's permissive behaviour" — this makes the actual
+// method call observable.
+type refWriteMethodTransport struct {
+	*transport.Fake
+	watch  string
+	method *string
+}
+
+func (r refWriteMethodTransport) CreateExclusive(p, local string) (transport.Outcome, error) {
+	if p == r.watch {
+		*r.method = "create"
+	}
+	return r.Fake.CreateExclusive(p, local)
+}
+
+func (r refWriteMethodTransport) UpdateRevision(p, local string) (transport.Outcome, error) {
+	if p == r.watch {
+		*r.method = "update"
+	}
+	return r.Fake.UpdateRevision(p, local)
+}
+
+// TestPushDeleteThenRecreateInOneBatchOrderIndependent is RED (fix round I1
+// + M4): the sibling test above already pins "delete X, recreate X" with
+// the DELETE listed first; this reverses the order — the update/recreate is
+// listed FIRST, the delete SECOND — to actually exercise the order-
+// independence claim rather than merely assert it in a comment (fix round
+// I1's finding: a naive single in-order pass over ups only gets this shape
+// right when the delete happens to be listed first). It also pins fix round
+// M4 directly: phase 5's `exists` must be BATCH-AWARE, so the update routes
+// through CreateExclusive — the one combination live-verified against the
+// real CLI (C17b, create-after-trash, 30/30) — rather than UpdateRevision
+// against a node phase 4 already trashed, which was never verified live.
+func TestPushDeleteThenRecreateInOneBatchOrderIndependent(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	d := newGitRepoForPush(t)
+	head := headOfPushRepo(t, d)
+	if _, err := WriteRef(f, "/r", "refs/heads/main", head, false); err != nil {
+		t.Fatal(err)
+	}
+	remote := map[string]string{"refs/heads/main": head}
+
+	var method string
+	tr := refWriteMethodTransport{Fake: f, watch: "/r/refs/heads/main", method: &method}
+
+	ups := []protocol.RefUpdate{
+		{Src: head, Dst: "refs/heads/main"}, // update/recreate, listed FIRST
+		{Src: "", Dst: "refs/heads/main"},   // delete, listed SECOND
+	}
+	res := Push(tr, "/r", d, ups, remote)
+	for _, r := range res {
+		if !r.OK {
+			t.Fatalf("both updates must succeed regardless of input order: %+v", res)
+		}
+	}
+	if method != "create" {
+		t.Errorf("phase 5 must route through CreateExclusive after a same-batch delete "+
+			"(fix round M4), got method=%q", method)
+	}
+	sha, err := readRef(f, "/r/refs/heads/main")
+	if err != nil || sha != head {
+		t.Fatalf("ref not published correctly: sha=%q err=%v want=%q", sha, err, head)
+	}
+	if got := string(f.Files["/r/HEAD"]); got != "ref: refs/heads/main\n" {
+		t.Errorf("HEAD = %q, want ref: refs/heads/main — the ensureHEAD candidate-set "+
+			"arithmetic must also be order-independent (fix round I1)", got)
+	}
+}
+
+// trashFailsAndMethodTracked wraps a Fake, forcing Trash to fail (report
+// Ambiguous, nil — the node is left completely untouched, exactly as if the
+// trash never ran) for ONE chosen path, while also recording which write
+// method — CreateExclusive or UpdateRevision — fires for another chosen
+// path. Built specifically to pin fix round 2's correction to M4: a
+// same-batch delete that FAILS in phase 4 must not flip the paired
+// create/update's routing to CreateExclusive, because the node the delete
+// was supposed to remove is still actually there.
+type trashFailsAndMethodTracked struct {
+	*transport.Fake
+	failTrash string
+	watch     string
+	method    *string
+}
+
+func (tr trashFailsAndMethodTracked) Trash(p string) (transport.Outcome, error) {
+	if p == tr.failTrash {
+		return transport.Ambiguous, nil
+	}
+	return tr.Fake.Trash(p)
+}
+
+func (tr trashFailsAndMethodTracked) CreateExclusive(p, local string) (transport.Outcome, error) {
+	if p == tr.watch {
+		*tr.method = "create"
+	}
+	return tr.Fake.CreateExclusive(p, local)
+}
+
+func (tr trashFailsAndMethodTracked) UpdateRevision(p, local string) (transport.Outcome, error) {
+	if p == tr.watch {
+		*tr.method = "update"
+	}
+	return tr.Fake.UpdateRevision(p, local)
+}
+
+// TestPushUpdateRoutesViaUpdateRevisionWhenSameBatchDeleteFails is RED (fix
+// round 2, Important): deletedThisBatch must be built from phase 4's ACTUAL
+// outcome, not phase-2 validity. A batch deletes refs/heads/main (valid at
+// phase 2) AND updates it in the same batch; the transport's Trash is forced
+// to fail for that exact path (Ambiguous, node left untouched — a HEAD
+// written between phases by a non-v2 actor, or a transient transport fault,
+// would produce the same shape). The delete must report its own failure.
+// The update — which is unrelated to why the delete failed, and whose
+// target node is still genuinely occupied — must still succeed, and it must
+// do so via UpdateRevision (the node is there; nothing concurrent
+// happened), NOT CreateExclusive. Before this fix, deletedThisBatch was
+// built from phase-2 validity alone, so the FAILED delete still flipped the
+// update to CreateExclusive, which then hit the still-present node and
+// reported the wrong diagnosis: "ref changed concurrently; refusing to
+// overwrite" — nothing concurrent happened, the batch's own delete simply
+// failed.
+func TestPushUpdateRoutesViaUpdateRevisionWhenSameBatchDeleteFails(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	d := newGitRepoForPush(t)
+	head := headOfPushRepo(t, d)
+	if _, err := WriteRef(f, "/r", "refs/heads/main", head, false); err != nil {
+		t.Fatal(err)
+	}
+	remote := map[string]string{"refs/heads/main": head}
+	newHead := commitOnPushRepo(t, d, "b.txt", "two") // descends from head: a genuine fast-forward
+
+	var method string
+	tr := trashFailsAndMethodTracked{
+		Fake:      f,
+		failTrash: "/r/refs/heads/main",
+		watch:     "/r/refs/heads/main",
+		method:    &method,
+	}
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/main"},      // delete — will FAIL (Trash forced Ambiguous)
+		{Src: newHead, Dst: "refs/heads/main"}, // update — must still succeed via UpdateRevision
+	}
+	res := Push(tr, "/r", d, ups, remote)
+	if len(res) != 2 {
+		t.Fatalf("want 2 results, got %+v", res)
+	}
+	if res[0].OK {
+		t.Fatalf("the delete must report its own failure, got %+v", res[0])
+	}
+	if !strings.Contains(res[0].Err, "delete failed") {
+		t.Errorf("delete failure must name itself, got %q", res[0].Err)
+	}
+	if !res[1].OK {
+		t.Fatalf("the update must still succeed despite the same-batch delete's failure, got %+v", res[1])
+	}
+	if method != "update" {
+		t.Errorf("the update must route via UpdateRevision — the node is still occupied because "+
+			"the batch's own delete failed, nothing concurrent happened — got method=%q", method)
+	}
+	sha, err := readRef(f, "/r/refs/heads/main")
+	if err != nil || sha != newHead {
+		t.Fatalf("ref not published correctly: sha=%q err=%v want=%q", sha, err, newHead)
+	}
+}
+
 // GUARD (ensureHEAD delete arithmetic). Deleting the only branch leaves no
 // candidates at all, and headless is a DEFINED state: no HEAD is written, and
 // nothing fails.
 func TestPushDeleteOfTheOnlyBranchLeavesTheRepoHeadless(t *testing.T) {
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
 	sha := "2222222222222222222222222222222222222222"
 	if _, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil {
@@ -2209,6 +3706,686 @@ func TestPushDeleteOfTheOnlyBranchLeavesTheRepoHeadless(t *testing.T) {
 	if _, ok := f.Files["/r/HEAD"]; ok {
 		t.Errorf("HEAD = %q, want none: deleting the only branch leaves the repo headless, "+
 			"which is a defined state", f.Files["/r/HEAD"])
+	}
+}
+
+// ======================= Task 9b: prune on delete ===========================
+
+// TestDeletePrunesEmptyParentsStopsAtNamespaceRoots is RED: deleting
+// refs/heads/feature/x must trash the ref AND the now-empty feature/ folder
+// it leaves behind, while refs/heads itself — a protected namespace root —
+// survives untouched.
+func TestDeletePrunesEmptyParentsStopsAtNamespaceRoots(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
+
+	// refs/heads/main is seeded ALONGSIDE feature/x so remote HEAD backfills
+	// to main (matching gitDir's own local HEAD, DeriveHEAD's tie-break) —
+	// not to feature/x, which would then make the delete under test refuse
+	// itself as "deleting the branch HEAD points at" before ever reaching
+	// prune. This is a test-setup concern, not the code under test.
+	createUps := []protocol.RefUpdate{
+		{Src: "refs/heads/main", Dst: "refs/heads/main"},
+		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"},
+	}
+	res := Push(f, "/r", gitDir, createUps, map[string]string{})
+	for _, r := range res {
+		if !r.OK {
+			t.Fatalf("setup creates must succeed: %+v", res)
+		}
+	}
+	if !f.Dirs["/r/refs/heads/feature"] {
+		t.Fatalf("setup: want feature/ folder to exist before the delete under test")
+	}
+
+	delUps := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/feature/x"}}
+	remote := map[string]string{"refs/heads/main": head, "refs/heads/feature/x": head}
+	res = Push(f, "/r", gitDir, delUps, remote)
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("delete should succeed: %+v", res)
+	}
+	if _, ok := f.Files["/r/refs/heads/feature/x"]; ok {
+		t.Error("ref file must be gone")
+	}
+	if f.Dirs["/r/refs/heads/feature"] {
+		t.Error("the now-empty feature/ folder must be pruned")
+	}
+	if !f.Dirs["/r/refs/heads"] {
+		t.Error("refs/heads itself must survive pruning (protected namespace root)")
+	}
+}
+
+// TestDeletePruneStopsAtNonEmptyParent is a GUARD, not a RED (review round
+// 4, M8): feature/ has TWO children (x and y), so deleting x must leave
+// feature/ (and y) untouched because y still occupies it. This assertion is
+// satisfied by "pruneEmptyParents correctly stops at a non-empty parent" AND
+// by "pruneEmptyParents does not exist at all" — it passed unmodified
+// against the pre-implementation code (see the task report), so it does NOT
+// by itself detect prune's absence or a bug that skips the emptiness check;
+// it only detects a bug that WRONGLY prunes a non-empty parent, a real and
+// distinct failure mode worth guarding against.
+func TestDeletePruneStopsAtNonEmptyParent(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
+
+	// refs/heads/main is seeded too (same reason as the sibling test above):
+	// without it, DeriveHEAD's alphabetical tie-break among feature/x and
+	// feature/y would still point remote HEAD at feature/x, refusing the
+	// delete under test before it ever reaches prune.
+	createUps := []protocol.RefUpdate{
+		{Src: "refs/heads/main", Dst: "refs/heads/main"},
+		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"},
+		{Src: "refs/heads/main", Dst: "refs/heads/feature/y"},
+	}
+	res := Push(f, "/r", gitDir, createUps, map[string]string{})
+	for _, r := range res {
+		if !r.OK {
+			t.Fatalf("setup creates must succeed: %+v", res)
+		}
+	}
+
+	delUps := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/feature/x"}}
+	remote := map[string]string{
+		"refs/heads/main":      head,
+		"refs/heads/feature/x": head,
+		"refs/heads/feature/y": head,
+	}
+	res = Push(f, "/r", gitDir, delUps, remote)
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("delete should succeed: %+v", res)
+	}
+	if _, ok := f.Files["/r/refs/heads/feature/x"]; ok {
+		t.Error("x must be gone")
+	}
+	if !f.Dirs["/r/refs/heads/feature"] {
+		t.Error("feature/ must survive — its sibling y is still present")
+	}
+	if _, ok := f.Files["/r/refs/heads/feature/y"]; !ok {
+		t.Error("y must be untouched")
+	}
+}
+
+// TestDeletePrunesOnDemandNamespaceRoot is RED: unlike refs/heads and
+// refs/tags, an on-demand namespace root such as refs/notes is itself
+// prunable once its last ref is deleted.
+func TestDeletePrunesOnDemandNamespaceRoot(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
+
+	createUps := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/notes/commits"}}
+	res := Push(f, "/r", gitDir, createUps, map[string]string{})
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("setup create failed: %+v", res)
+	}
+	if !f.Dirs["/r/refs/notes"] {
+		t.Fatalf("setup: want refs/notes to exist")
+	}
+
+	delUps := []protocol.RefUpdate{{Src: "", Dst: "refs/notes/commits"}}
+	res = Push(f, "/r", gitDir, delUps, map[string]string{"refs/notes/commits": head})
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("delete should succeed: %+v", res)
+	}
+	if f.Dirs["/r/refs/notes"] {
+		t.Error("refs/notes is a non-heads/tags namespace root and must be pruned when empty")
+	}
+	if !f.Dirs["/r/refs"] {
+		t.Error("refs/ itself must survive (always protected)")
+	}
+}
+
+// trashFailsForPath forces Trash to report Ambiguous for exactly ONE path,
+// leaving every other Trash call — including the ref delete's own — to the
+// wrapped Fake. Built to isolate pruneEmptyParents' own Trash call from the
+// ref delete's Trash call, which must succeed normally.
+type trashFailsForPath struct {
+	*transport.Fake
+	failPath string
+}
+
+func (tr trashFailsForPath) Trash(p string) (transport.Outcome, error) {
+	if p == tr.failPath {
+		return transport.Ambiguous, nil
+	}
+	return tr.Fake.Trash(p)
+}
+
+// TestPruneFailureIsAdvisoryOnly is a GUARD (review round 4, M8: relabelled
+// honestly — it is not independently RED either): a prune Trash failure is a
+// stderr note, not a delete failure — the ref deletion itself still reports
+// ok (best-effort rule), and the leftover empty folder survives for a later
+// create to self-heal. Like its sibling GUARD above, this assertion is
+// equally satisfied by "pruneEmptyParents does not exist at all" (nothing
+// ever calls the forced-failing Trash, so nothing to report either way) —
+// it passed unmodified against the pre-implementation code. It still
+// detects a real and distinct failure mode: prune swallowing a Trash
+// failure into the delete's own result instead of treating it as advisory.
+func TestPruneFailureIsAdvisoryOnly(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
+
+	// refs/heads/main is seeded too, same reason as the prune tests above:
+	// otherwise remote HEAD backfills to feature/x and the delete under test
+	// refuses itself before ever reaching prune.
+	createUps := []protocol.RefUpdate{
+		{Src: "refs/heads/main", Dst: "refs/heads/main"},
+		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"},
+	}
+	res := Push(f, "/r", gitDir, createUps, map[string]string{})
+	for _, r := range res {
+		if !r.OK {
+			t.Fatalf("setup creates must succeed: %+v", res)
+		}
+	}
+
+	tr := trashFailsForPath{Fake: f, failPath: "/r/refs/heads/feature"}
+	delUps := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/feature/x"}}
+	remote := map[string]string{"refs/heads/main": head, "refs/heads/feature/x": head}
+	res = Push(tr, "/r", gitDir, delUps, remote)
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("the ref delete itself must still report ok even though the prune trash "+
+			"failed: %+v", res)
+	}
+	if _, ok := f.Files["/r/refs/heads/feature/x"]; ok {
+		t.Error("ref file must still be gone")
+	}
+	if !f.Dirs["/r/refs/heads/feature"] {
+		t.Error("the folder must survive when its prune Trash fails — best-effort, not a hard delete")
+	}
+}
+
+// TestDeletePruneNeverFiresFromAlreadyAbsentDeleteArm pins the choice
+// documented at push.go's delete-arm call site (review round 4, M9 —
+// previously unpinned in either direction): pruneEmptyParents is called
+// ONLY after a Committed Trash of the ref file itself, never from the
+// already-absent short-circuit a few lines earlier in the same loop, which
+// trashes nothing and has no empty parent of its OWN making to clean up.
+// refs/heads/feature/z was never created, so this delete hits that
+// short-circuit before t.Trash is ever called. pruneEmptyParents' own first
+// action is always a t.List call on the parent — so zero List calls naming
+// "/r/refs/heads/feature" is the proof it never ran.
+func TestDeletePruneNeverFiresFromAlreadyAbsentDeleteArm(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	var calls []string
+	tr := listCallRecorder{Fake: f, calls: &calls}
+
+	ups := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/feature/z"}}
+	res := Push(tr, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("an already-absent delete must still report ok: %+v", res)
+	}
+	for _, c := range calls {
+		if c == "/r/refs/heads/feature" {
+			t.Errorf("pruneEmptyParents must never fire from the already-absent delete arm, "+
+				"but List was called against its would-be parent, got calls=%v", calls)
+		}
+	}
+}
+
+// ======================= Task 9b: self-heal on create =======================
+
+// TestCreateSelfHealsEmptyFolderCollision is RED: a leftover EMPTY folder at
+// refs/heads/feature (simulating a crashed prune) must not permanently block
+// creating branch "feature" — the create heals the collision (folder
+// trashed, WriteRef retried once) and succeeds.
+func TestCreateSelfHealsEmptyFolderCollision(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
+
+	if err := f.EnsureDir("/r/refs/heads/feature"); err != nil {
+		t.Fatal(err)
+	}
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("self-heal should let the create succeed: %+v", res)
+	}
+	sha, err := readRef(f, "/r/refs/heads/feature")
+	if err != nil || sha != head {
+		t.Fatalf("feature must now be a ref: sha=%q err=%v want=%q", sha, err, head)
+	}
+	if f.Dirs["/r/refs/heads/feature"] {
+		t.Error("feature must be a FILE now, not a leftover folder")
+	}
+}
+
+// TestCreateSelfHealsNestedEmptyResidue is RED (round-2 [Both] catch):
+// leftover feature/ containing ONLY the empty folder feature/x/ (simulating
+// a crash mid-prune after deleting refs/heads/feature/x/y) — nested empties
+// must heal too. The rule is "contains no files ANYWHERE in the subtree",
+// not "the first level is empty": a first-level-only check would see one
+// entry (the dir "x") and wrongly refuse.
+func TestCreateSelfHealsNestedEmptyResidue(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
+
+	if err := f.EnsureDir("/r/refs/heads/feature"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.EnsureDir("/r/refs/heads/feature/x"); err != nil {
+		t.Fatal(err)
+	}
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("self-heal must clear a NESTED empty-folder residue too: %+v", res)
+	}
+	sha, err := readRef(f, "/r/refs/heads/feature")
+	if err != nil || sha != head {
+		t.Fatalf("feature must now be a ref: sha=%q err=%v want=%q", sha, err, head)
+	}
+}
+
+// TestCreateRefusesFolderWithForeignFileUntouched is RED (round-3 Gemini
+// catch): feature/ containing a FOREIGN file (feature/notes.txt, droppable
+// by any non-v2 actor) must refuse the create, name notes.txt AS FOREIGN
+// DATA (never as a ref), and touch NOTHING — the file must survive.
+func TestCreateRefusesFolderWithForeignFileUntouched(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	if err := f.EnsureDir("/r/refs/heads/feature"); err != nil {
+		t.Fatal(err)
+	}
+	const notesContent = "just some notes, not a ref"
+	f.Files["/r/refs/heads/feature/notes.txt"] = []byte(notesContent)
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("must be refused: a foreign file blocks the folder collision, got %+v", res)
+	}
+	if !strings.Contains(res[0].Err, "notes.txt") {
+		t.Errorf("must name notes.txt, got %q", res[0].Err)
+	}
+	if !strings.Contains(res[0].Err, "foreign") {
+		t.Errorf("must name notes.txt as foreign data, not a ref, got %q", res[0].Err)
+	}
+	if strings.Contains(res[0].Err, "conflicting ref") {
+		t.Errorf("must not describe the foreign file as a conflicting ref, got %q", res[0].Err)
+	}
+	got, ok := f.Files["/r/refs/heads/feature/notes.txt"]
+	if !ok || string(got) != notesContent {
+		t.Errorf("the foreign file must survive untouched, got ok=%v content=%q", ok, got)
+	}
+	if !f.Dirs["/r/refs/heads/feature"] {
+		t.Error("the folder must not have been trashed")
+	}
+}
+
+// TestCreateRefusesFolderWithLiveSubRefs is RED: feature/ containing a real
+// sub-ref (refs/heads/feature/x) must refuse the create, naming
+// refs/heads/feature/x as a conflicting ref — and must leave it untouched.
+//
+// The remote map deliberately does NOT know about refs/heads/feature/x (as
+// if from a stale ListRefs, or a concurrent write not yet observed) —
+// mirroring TestPushReverseDFRefusedNamingTheBlockingRef's technique — so
+// phase 2's own finalSet preflight (which only ever consults the
+// caller-supplied remote map) cannot see the conflict and refuse it there;
+// the collision is only discovered when createRefHealingCollision actually
+// enumerates the subtree in phase 5, which is the code path under test.
+func TestCreateRefusesFolderWithLiveSubRefs(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
+
+	seedUps := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature/x"}}
+	if res := Push(f, "/r", gitDir, seedUps, map[string]string{}); len(res) != 1 || !res[0].OK {
+		t.Fatalf("setup create failed: %+v", res)
+	}
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{}) // remote map does NOT know about x
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("must be refused: a live sub-ref blocks the folder collision, got %+v", res)
+	}
+	if !strings.Contains(res[0].Err, "refs/heads/feature/x") {
+		t.Errorf("must name the conflicting sub-ref, got %q", res[0].Err)
+	}
+	if !strings.Contains(res[0].Err, "conflicting ref") {
+		t.Errorf("must describe it as a conflicting ref, got %q", res[0].Err)
+	}
+	sha, err := readRef(f, "/r/refs/heads/feature/x")
+	if err != nil || sha != head {
+		t.Errorf("the live sub-ref must survive untouched: sha=%q err=%v", sha, err)
+	}
+}
+
+// statFailsForPath forces Stat to return a transport error for exactly one
+// path, leaving every other Stat call to the wrapped Fake. Used to exercise
+// self-heal's "diagnostic Stat failed" fail-closed arm without disturbing
+// anything else on the create path (WriteRef's own verification uses
+// readRef/ReadTo, never Stat, so nothing else is affected).
+type statFailsForPath struct {
+	*transport.Fake
+	failPath string
+}
+
+func (s statFailsForPath) Stat(p string) (transport.Node, bool, error) {
+	if p == s.failPath {
+		return transport.Node{}, false, errors.New("simulated stat failure")
+	}
+	return s.Fake.Stat(p)
+}
+
+// TestSelfHealAbortsOnDiagnosticFailure is the GUARD: when self-heal's own
+// diagnostic Stat fails (as opposed to affirmatively confirming a folder or
+// a file), that transport error must be reported and NOTHING healed —
+// self-heal runs only on positive evidence.
+func TestSelfHealAbortsOnDiagnosticFailure(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	if err := f.EnsureDir("/r/refs/heads/feature"); err != nil {
+		t.Fatal(err)
+	}
+	tr := statFailsForPath{Fake: f, failPath: "/r/refs/heads/feature"}
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+	res := Push(tr, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("must fail when the diagnostic Stat errors, got %+v", res)
+	}
+	if !strings.Contains(res[0].Err, "simulated stat failure") {
+		t.Errorf("must surface the diagnostic Stat failure itself, got %q", res[0].Err)
+	}
+	if !f.Dirs["/r/refs/heads/feature"] {
+		t.Error("nothing should have been trashed when the diagnosis itself failed")
+	}
+}
+
+// listCallRecorder records every path passed to List, so a test can assert a
+// specific (invalid) path was never probed — pins subtreeFiles' fail-closed
+// rule: checkComponent runs BEFORE recursion, so an invalid component's own
+// path must never reach List.
+type listCallRecorder struct {
+	*transport.Fake
+	calls *[]string
+}
+
+func (l listCallRecorder) List(p string) ([]transport.Node, error) {
+	*l.calls = append(*l.calls, p)
+	return l.Fake.List(p)
+}
+
+// TestSelfHealFailsClosedOnInvalidComponentInSubtree is RED (plan round 3,
+// Codex): a folder in the collision subtree with an INVALID component name
+// (a{b}, refused by checkComponent — braces glob-expand locally, probe C13)
+// must make the heal FAIL CLOSED: an error is returned, no List call ever
+// names the invalid path (asserted directly via the trace above), and
+// nothing is trashed.
+func TestSelfHealFailsClosedOnInvalidComponentInSubtree(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	if err := f.EnsureDir("/r/refs/heads/feature"); err != nil {
+		t.Fatal(err)
+	}
+	const invalid = "/r/refs/heads/feature/a{b}"
+	f.Dirs[invalid] = true // a foreign folder with an invalid ref component
+
+	var calls []string
+	tr := listCallRecorder{Fake: f, calls: &calls}
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+	res := Push(tr, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("must fail closed on an invalid component in the subtree, got %+v", res)
+	}
+	// Content-check the failure reason, not just OK==false: a bare "ref
+	// changed concurrently" (WriteRef's ordinary concurrent-creator refusal,
+	// which an UNMODIFIED WriteRef would already report for this D/F
+	// collision with no healing logic involved at all) would make this
+	// assertion pass for the wrong reason — the message must actually name
+	// the invalid component, proving subtreeFiles' checkComponent guard is
+	// what fired.
+	if !strings.Contains(res[0].Err, "a{b}") {
+		t.Errorf("must name the invalid component, got %q", res[0].Err)
+	}
+	if strings.Contains(res[0].Err, "concurrently") {
+		t.Errorf("must not be the generic concurrent-creator refusal, got %q", res[0].Err)
+	}
+	for _, c := range calls {
+		if c == invalid {
+			t.Errorf("List must never be called against the invalid path %s, got calls=%v", invalid, calls)
+		}
+	}
+	if !f.Dirs["/r/refs/heads/feature"] || !f.Dirs[invalid] {
+		t.Error("nothing must have been trashed when the heal failed closed")
+	}
+}
+
+// TestSelfHealNamesInvalidNamedFileAsForeignDataNotAnEnumerationFailure is
+// the FILE-side counterpart of TestSelfHealFailsClosedOnInvalidComponentIn-
+// Subtree, added in review round 4 (M6): unlike an invalid FOLDER name — a
+// genuine recursion hazard subtreeFiles must fail closed on — an invalid
+// FILE name is safely nameable without any further remote call (it was
+// already enumerated as part of listing its already-verified parent). It
+// must be treated as an ordinary foreign-data blocker, refusing the create
+// and naming the file, NOT as an "enumerating its subtree...failed"
+// diagnostic (which would wrongly suggest the whole heal aborted rather
+// than correctly refusing on positive evidence).
+func TestSelfHealNamesInvalidNamedFileAsForeignDataNotAnEnumerationFailure(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	if err := f.EnsureDir("/r/refs/heads/feature"); err != nil {
+		t.Fatal(err)
+	}
+	// "{" is refused by checkComponent (probe C13's local glob-expansion
+	// concern) but is a perfectly ordinary filename otherwise — exactly the
+	// shape a non-v2 actor could drop.
+	const badName = "a{b}.txt"
+	f.Files["/r/refs/heads/feature/"+badName] = []byte("not a ref")
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("must be refused: an invalid-named file still blocks the folder collision, got %+v", res)
+	}
+	if !strings.Contains(res[0].Err, badName) {
+		t.Errorf("must name the invalid-named file, got %q", res[0].Err)
+	}
+	if !strings.Contains(res[0].Err, "foreign") {
+		t.Errorf("must classify it as foreign data by name alone, got %q", res[0].Err)
+	}
+	if strings.Contains(res[0].Err, "enumerating") {
+		t.Errorf("must NOT be diagnosed as an enumeration failure — an invalid FILE name is "+
+			"safely nameable without recursion, got %q", res[0].Err)
+	}
+	if _, ok := f.Files["/r/refs/heads/feature/"+badName]; !ok {
+		t.Error("the invalid-named file must survive untouched")
+	}
+}
+
+// TestDescribeBlockersCapsAtMaxAndSummarizesRest is the review round 4,
+// Important 1 fix: describeBlockers must not call readRef (a subprocess
+// plus a temp dir each) or grow its joined message without bound for a
+// FOREIGN-CONTROLLED file list — any non-v2 actor can drop an arbitrary
+// number of files under a collision folder, the same class of untrusted
+// input previewBytes (refs.go, 64 bytes) and bound (cli.go, 200 characters)
+// already cap elsewhere in this codebase. Direct unit test of
+// describeBlockers itself (not routed through Push) so the cap is pinned
+// precisely, independent of how many files a particular Push scenario
+// happens to construct.
+func TestDescribeBlockersCapsAtMaxAndSummarizesRest(t *testing.T) {
+	f := transport.NewFake()
+	var files []string
+	// A large literal, deliberately NOT expressed in terms of
+	// maxDescribedBlockers: a total defined as "maxDescribedBlockers + N"
+	// would make this test self-referential and unable to catch capping
+	// being removed ENTIRELY (as opposed to merely resized) — a fixed,
+	// independent literal is what actually exercises the cap.
+	const total = 37
+	for i := 0; i < total; i++ {
+		p := fmt.Sprintf("/r/refs/heads/feature/foreign-%d.txt", i)
+		f.Files[p] = []byte("not a ref")
+		files = append(files, p)
+	}
+
+	got := describeBlockers(f, "/r", files)
+
+	shown := 0
+	for i := 0; i < total; i++ {
+		if strings.Contains(got, fmt.Sprintf("foreign-%d.txt", i)) {
+			shown++
+		}
+	}
+	// A generous ceiling, well below `total` and independent of
+	// maxDescribedBlockers' exact value: catches capping being removed
+	// entirely (shown would jump to 37) without being coupled to the
+	// constant's current number the way a self-referential total would be.
+	const sanityCeiling = 15
+	if shown == 0 || shown >= sanityCeiling {
+		t.Fatalf("want a small, bounded number of named blockers (capped, not all %d), got %d named in %q",
+			total, shown, got)
+	}
+	if shown > maxDescribedBlockers {
+		t.Errorf("named more blockers (%d) than maxDescribedBlockers (%d)", shown, maxDescribedBlockers)
+	}
+	wantRemaining := total - shown
+	if !strings.Contains(got, fmt.Sprintf("%d more", wantRemaining)) {
+		t.Errorf("want a summary naming %d more, got %q", wantRemaining, got)
+	}
+}
+
+// ================= Task 9b: composed prune-then-heal workflow ===============
+
+// pruneHealOrderTransport records the ORDER of Trash and CreateExclusive
+// calls against ONE watched path. Built specifically to discriminate two
+// otherwise-identical end states in the composed prune-then-heal test below
+// (review round 4, Important 3): "prune's own Trash actually ran in phase 4"
+// vs. "prune never ran, but self-heal covered for its absence in phase 5" —
+// Step 6c's deliberate-regression run (task report) proved these two paths
+// produce the SAME final Fake state and the SAME Push results, so no
+// end-state assertion alone can tell them apart. The call ORDER can: prune
+// fires unconditionally in phase 4, so if it ran, Trash on the watched path
+// precedes any CreateExclusive attempt against it; if prune did not run,
+// phase 5's first move is a CreateExclusive attempt that fails against the
+// still-occupied folder, and only THEN does self-heal's own Trash run —
+// CreateExclusive precedes Trash.
+type pruneHealOrderTransport struct {
+	*transport.Fake
+	watch string
+	calls *[]string
+}
+
+func (p pruneHealOrderTransport) Trash(path string) (transport.Outcome, error) {
+	if path == p.watch {
+		*p.calls = append(*p.calls, "trash")
+	}
+	return p.Fake.Trash(path)
+}
+
+func (p pruneHealOrderTransport) CreateExclusive(path, local string) (transport.Outcome, error) {
+	if path == p.watch {
+		*p.calls = append(*p.calls, "create")
+	}
+	return p.Fake.CreateExclusive(path, local)
+}
+
+// TestPushDeletePrunesThenCreateReusesFolderInOneBatch composes both halves
+// of Task 9b in ONE batch: deleting the only ref under feature/ must prune
+// the now-empty folder in PHASE 4, and creating branch "feature" in the SAME
+// batch's PHASE 5 must then land cleanly. TestDeletePrunesEmptyParentsStops-
+// AtNamespaceRoots and TestCreateSelfHealsEmptyFolderCollision each pin one
+// half of this in isolation; this pins the composition the handoff notes
+// call out explicitly.
+//
+// The end-state assertions below (x gone, feature is now a ref, not a
+// folder) are satisfied EITHER by prune actually running in phase 4 OR by
+// self-heal covering for its absence in phase 5 — Step 6c's deliberate
+// regression proved this directly (task report). pruneHealOrderTransport's
+// call-order trace is the discriminator that actually pins "phase 4 prunes
+// BEFORE phase 5 ever has to heal": it asserts the FIRST call against the
+// watched path is prune's own Trash, not a failed CreateExclusive attempt.
+func TestPushDeletePrunesThenCreateReusesFolderInOneBatch(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
+
+	// refs/heads/main is seeded too (same reason as the isolated prune tests
+	// above): otherwise remote HEAD backfills to feature/x and the delete
+	// under test refuses itself before the composed workflow is ever
+	// exercised.
+	seedUps := []protocol.RefUpdate{
+		{Src: "refs/heads/main", Dst: "refs/heads/main"},
+		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"},
+	}
+	seedRes := Push(f, "/r", gitDir, seedUps, map[string]string{})
+	for _, r := range seedRes {
+		if !r.OK {
+			t.Fatalf("setup creates must succeed: %+v", seedRes)
+		}
+	}
+
+	var calls []string
+	tr := pruneHealOrderTransport{Fake: f, watch: "/r/refs/heads/feature", calls: &calls}
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/feature/x"},
+		{Src: "refs/heads/main", Dst: "refs/heads/feature"},
+	}
+	remote := map[string]string{"refs/heads/main": head, "refs/heads/feature/x": head}
+	res := Push(tr, "/r", gitDir, ups, remote)
+	for _, r := range res {
+		if !r.OK {
+			t.Fatalf("both the delete and the create must succeed in one batch: %+v", res)
+		}
+	}
+	if _, ok := f.Files["/r/refs/heads/feature/x"]; ok {
+		t.Error("x must be gone")
+	}
+	sha, err := readRef(f, "/r/refs/heads/feature")
+	if err != nil || sha != head {
+		t.Fatalf("feature must now be a ref: sha=%q err=%v want=%q", sha, err, head)
+	}
+	if f.Dirs["/r/refs/heads/feature"] {
+		t.Error("feature must be a FILE now, not a leftover folder")
+	}
+	// The discriminator: prune's own Trash must be the FIRST call against
+	// the watched path — proving phase 4 cleared the collision before phase
+	// 5 ever attempted (and would have needed to heal) a create there.
+	if len(calls) == 0 || calls[0] != "trash" {
+		t.Fatalf("want prune's own Trash of refs/heads/feature to run BEFORE any create "+
+			"attempt against it (this is what distinguishes 'phase 4 pruned it' from "+
+			"'self-heal covered for prune never running'), got call order %v", calls)
 	}
 }
 
@@ -2295,10 +4472,14 @@ func assertSamePackDir(t *testing.T, context, want, got string) {
 // marker, refs, and one pack pair under packs/.
 func plantRepoOnFake(t *testing.T, f *transport.Fake, root, gitDir, sha string) {
 	t.Helper()
+	// root's own parent may not be a mount root (every caller here passes
+	// "/r"), so the stricter EnsureDir (Task 7) needs root seeded as
+	// already-existing before Bootstrap can create things under it.
+	f.Dirs[root] = true
 	if err := Bootstrap(f, root); err != nil {
 		t.Fatal(err)
 	}
-	packPath, idxPath, err := gitcmd.WritePack(gitDir, sha, nil, t.TempDir())
+	packPath, idxPath, err := gitcmd.WritePack(gitDir, []string{sha}, nil, t.TempDir())
 	if err != nil || packPath == "" {
 		t.Fatalf("WritePack: %v", err)
 	}
@@ -2427,7 +4608,7 @@ func TestFetchRejectsACorruptPackAndInstallsNothing(t *testing.T) {
 	// remote name, gives Fetch a want whose closure is not yet satisfied
 	// locally.
 	second := commitOnPushRepo(t, src, "b.txt", "two")
-	packPath, idxPath, err := gitcmd.WritePack(src, second, []string{sha}, t.TempDir())
+	packPath, idxPath, err := gitcmd.WritePack(src, []string{second}, []string{sha}, t.TempDir())
 	if err != nil || packPath == "" {
 		t.Fatalf("WritePack: %v", err)
 	}
@@ -2458,9 +4639,9 @@ func TestFetchRejectsACorruptPackAndInstallsNothing(t *testing.T) {
 // RED. Fetch is read-only: no marker means refuse, never initialise.
 func TestFetchRefusesAnUnmarkedRemote(t *testing.T) {
 	f := transport.NewFake()
-	if err := f.EnsureDir("/r"); err != nil {
-		t.Fatal(err)
-	}
+	// "/r"'s parent "/" is not a mount root, so the stricter EnsureDir
+	// (Task 7) needs it seeded as already-existing.
+	f.Dirs["/r"] = true
 	dst := emptyGitRepo(t)
 	if _, err := Fetch(f, "/r", dst, "", []string{"1111111111111111111111111111111111111111"}); err == nil {
 		t.Error("fetch must refuse a folder with no marker, not initialise it")
@@ -2606,6 +4787,10 @@ func TestFetchWithARelativeGitDirInstallsCorrectly(t *testing.T) {
 // ref left at the LAST sha. Returns the stems in history order.
 func plantIncrementalPacks(t *testing.T, f *transport.Fake, root, src string, shas []string) []string {
 	t.Helper()
+	// root's own parent may not be a mount root (every caller here passes
+	// "/r"), so the stricter EnsureDir (Task 7) needs root seeded as
+	// already-existing before Bootstrap can create things under it.
+	f.Dirs[root] = true
 	if err := Bootstrap(f, root); err != nil {
 		t.Fatal(err)
 	}
@@ -2615,7 +4800,7 @@ func plantIncrementalPacks(t *testing.T, f *transport.Fake, root, src string, sh
 		if i > 0 {
 			haves = []string{shas[i-1]}
 		}
-		packPath, idxPath, err := gitcmd.WritePack(src, sha, haves, t.TempDir())
+		packPath, idxPath, err := gitcmd.WritePack(src, []string{sha}, haves, t.TempDir())
 		if err != nil || packPath == "" {
 			t.Fatalf("WritePack(%s): %v", sha, err)
 		}
@@ -2758,7 +4943,7 @@ func TestFetchDownloadsOnlyTheNeededPack(t *testing.T) {
 // because Bootstrap and the first WriteRef must not rerun.
 func plantOneMorePack(t *testing.T, f *transport.Fake, root, src, prev, tip string) []string {
 	t.Helper()
-	packPath, idxPath, err := gitcmd.WritePack(src, tip, []string{prev}, t.TempDir())
+	packPath, idxPath, err := gitcmd.WritePack(src, []string{tip}, []string{prev}, t.TempDir())
 	if err != nil || packPath == "" {
 		t.Fatalf("WritePack: %v", err)
 	}
@@ -2794,6 +4979,7 @@ func TestFetchFrontierDeepensThroughHandBuiltPacks(t *testing.T) {
 	tree := out("rev-parse", sha+"^{tree}")
 	blobList := out("rev-list", "--objects", sha)
 	f := transport.NewFake()
+	f.Dirs["/r"] = true
 	if err := Bootstrap(f, "/r"); err != nil {
 		t.Fatal(err)
 	}
@@ -2992,8 +5178,13 @@ func TestEnsureSidecarDegradesWhenCacheUnusable(t *testing.T) {
 }
 
 // RefreshSidecar must return FRESH bytes even when a stale cached copy and a
-// stale fallback copy both exist (the residue rule applies to sidecars too:
-// ReadTo's overwrite behaviour is unpinned, so stale files are deleted first).
+// stale fallback copy both exist. This is RefreshSidecar's own cache-refresh
+// contract, not the pack-dir residue rule Task 6 deleted: ReadTo's overwrite
+// behaviour onto an existing file is unpinned (C2's identical-content skip),
+// so a refresh has to clear its own stale copies before downloading or it can
+// hand back the bytes it was called to replace. See RefreshSidecar's doc
+// comment (idxcache.go) for why quarantine staging leaves this the only place
+// a stale copy can survive a fetch.
 func TestRefreshSidecarReplacesStaleCopies(t *testing.T) {
 	f := transport.NewFake()
 	stem := "pack-cccccccccccccccccccccccccccccccccccccccc"
@@ -3068,7 +5259,7 @@ func TestListCompletePacksFiltersGrammarAndPairs(t *testing.T) {
 func TestBuildPackMapMapsOidsToStems(t *testing.T) {
 	src := newGitRepoForPush(t)
 	sha := headOfPushRepo(t, src)
-	packPath, idxPath, err := gitcmd.WritePack(src, sha, nil, t.TempDir())
+	packPath, idxPath, err := gitcmd.WritePack(src, []string{sha}, nil, t.TempDir())
 	if err != nil || packPath == "" {
 		t.Fatalf("WritePack: %v", err)
 	}
@@ -3096,7 +5287,7 @@ func TestBuildPackMapMapsOidsToStems(t *testing.T) {
 func TestBuildPackMapHealsACorruptCachedSidecar(t *testing.T) {
 	src := newGitRepoForPush(t)
 	sha := headOfPushRepo(t, src)
-	packPath, idxPath, err := gitcmd.WritePack(src, sha, nil, t.TempDir())
+	packPath, idxPath, err := gitcmd.WritePack(src, []string{sha}, nil, t.TempDir())
 	if err != nil || packPath == "" {
 		t.Fatalf("WritePack: %v", err)
 	}
@@ -3251,8 +5442,9 @@ func TestFetchFatalAfterHealNamesTheOidAndTheRefresh(t *testing.T) {
 
 // residueTransport fails the FIRST download of target, leaving partial bytes
 // at the destination — then, on the retry, REFUSES if those bytes are still
-// there. This pins the residue rule directly: retry correctness must not
-// depend on ReadTo's unpinned overwrite behaviour.
+// there. This pins downloadAndVerifyPack's entry-point removal directly:
+// retry correctness must not depend on ReadTo's unpinned overwrite behaviour
+// onto an existing file.
 type residueTransport struct {
 	*transport.Fake
 	target   string
@@ -3276,17 +5468,27 @@ func (r *residueTransport) ReadTo(p, local string) error {
 	return r.Fake.ReadTo(p, local)
 }
 
-// GUARD, not RED: passed immediately against Task 6's code. Deliberate-
-// regression check: downloadAndVerifyPack removes packPath TWICE — once
-// unconditionally at function entry (before ReadTo), and once again on
-// ReadTo's failure path. Disabling either removal alone left the test green
-// (the other one still cleans up in time for the retry); only disabling BOTH
-// exposed it, failing with "retry found residue at ...; the residue rule is
-// violated" — confirming the assertion is live. Per downloadAndVerifyPack's
-// doc comment (fetch.go), it is the FAILURE-PATH removal that cleans this
-// attempt's own leavings — and in this scenario it had already cleared the
-// residue before the retry began; the entry-point removal is the one that
-// exists for residue from an attempt this process lost track of.
+// GUARD, not RED: passed immediately against Task 6's code. UPDATED for the
+// quarantine refactor: downloadAndVerifyPack no longer removes anything on a
+// failure path (the old residue rule is deleted — see fetch.go); the ONE
+// removal left is the unconditional one at function entry, before ReadTo,
+// and it is now the SOLE thing standing between a healed plan's retry and
+// stale bytes from the attempt this test injects. Without it, the "partial
+// residue" this test's first ReadTo call writes to incomingDir would still
+// be sitting there when the healed round retries the same stem, and
+// residueTransport's second ReadTo call would see it and refuse.
+//
+// Deliberate-regression check: with the entry-point removal disabled
+// (wrapped in `if false {}`), this failed on
+// "Fetch must survive one transient pack-download failure via the heal round
+// (sawStale=true): cannot download pack-....pack: retry found residue at
+// ...\incoming\pack-....pack; the residue rule is violated ... (the sidecar
+// metadata was already refreshed from the remote this run; this indicates
+// genuine remote or transport trouble)" — the err != nil check (repo_test.go,
+// this function's first assertion) fires before the sawStale check is ever
+// reached, because the second failure lands after the one heal round is
+// already spent and Fetch fatals. Confirming the entry-point removal is
+// live and load-bearing. Reverted after confirming.
 func TestFetchRetriesSamePackWithoutResidue(t *testing.T) {
 	src := newGitRepoForPush(t)
 	c1 := headOfPushRepo(t, src)
@@ -3580,6 +5782,122 @@ func TestFetchMidRoundPairRefreshWithTwoPacksCompletes(t *testing.T) {
 	}
 }
 
+// RED (structural + behavioural): downloadAndVerifyPack with a corrupt
+// remote pack must (a) return the checksum error, (b) leave packDir with
+// ZERO entries, and (c) leave the corrupt bytes IN THE INCOMING DIR — the
+// quarantined residue awaiting wholesale teardown. (c) is the discriminator
+// a same-shaped test against unpatched code would lack: unpatched code has
+// no incoming dir at all and scrubs its packDir download on failure, so
+// "packDir empty" alone would prove nothing about quarantine having ever
+// existed.
+//
+// Deliberate-regression check (mutation-verifies (c) specifically): with the
+// old residue rule temporarily ported back onto this failure path
+// (`os.Remove(inPack)` added right before the checksum-mismatch return in
+// fetch.go), this failed on "the corrupt bytes must remain in the incoming
+// dir, awaiting wholesale teardown: open ...\pack-....pack: The system
+// cannot find the file specified" — confirming (c) actually exercises the
+// quarantine-keeps-its-residue behaviour and is not vacuously true. Reverted
+// after confirming.
+func TestDownloadAndVerifyQuarantinesCorruptPackBytes(t *testing.T) {
+	src := newGitRepoForPush(t)
+	sha := headOfPushRepo(t, src)
+	packPath, idxPath, err := gitcmd.WritePack(src, []string{sha}, nil, t.TempDir())
+	if err != nil || packPath == "" {
+		t.Fatalf("WritePack: %v", err)
+	}
+	stem := strings.TrimSuffix(filepath.Base(packPath), ".pack")
+	f := transport.NewFake()
+	for _, p := range []string{packPath, idxPath} {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.Files["/r/packs/"+filepath.Base(p)] = b
+	}
+	// Corrupt the REMOTE pack bytes so the checksum-vs-basename comparison
+	// fails once downloaded — the stem's name is the ORIGINAL content's
+	// checksum, so any bit flip makes the comparison fail deterministically.
+	corrupt := append([]byte{}, f.Files["/r/packs/"+stem+".pack"]...)
+	corrupt[len(corrupt)/2] ^= 0xff
+	f.Files["/r/packs/"+stem+".pack"] = corrupt
+
+	pm, err := buildPackMap(f, "/r", "", t.TempDir(), []string{stem})
+	if err != nil {
+		t.Fatalf("buildPackMap: %v", err)
+	}
+	incomingDir := t.TempDir()
+	packDir := t.TempDir()
+
+	_, err = downloadAndVerifyPack(f, "/r", incomingDir, packDir, stem, pm)
+	if err == nil {
+		t.Fatal("a corrupt remote pack must return an error")
+	}
+	if !errors.Is(err, errCacheSuspect) || !strings.Contains(err.Error(), "recomputes to") {
+		t.Errorf("must return the checksum-mismatch error wrapping errCacheSuspect: %v", err)
+	}
+	entries, rerr := os.ReadDir(packDir)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if len(entries) != 0 {
+		t.Errorf("packDir must have ZERO entries after a corrupt-pack failure, got %d: %v",
+			len(entries), entries)
+	}
+	got, rerr := os.ReadFile(filepath.Join(incomingDir, stem+".pack"))
+	if rerr != nil {
+		t.Fatalf("the corrupt bytes must remain in the incoming dir, awaiting wholesale "+
+			"teardown: %v", rerr)
+	}
+	if !bytes.Equal(got, corrupt) {
+		t.Error("the quarantined pack bytes must be exactly what was downloaded")
+	}
+}
+
+// RED: publishPair renames .pack before .idx — observed via deterministic
+// second-rename failure: a DIRECTORY is pre-created at packDir/<stem>.idx so
+// the idx rename must fail (os.Rename onto an existing directory errors on
+// this platform). Assert: error returned, AND packDir/<stem>.pack IS present
+// (the pack landed first, before the idx rename that failed). With the
+// renames swapped, the idx rename fails FIRST and the .pack never lands —
+// the presence assertion flips, which is exactly the Step-5 deliberate
+// regression this test is designed to catch.
+//
+// Also pins MOVE, not copy: incomingDir/<stem>.pack must be GONE after its
+// successful rename. A copyFile-based publishPair would satisfy every other
+// assertion here (packDir/<stem>.pack present, error returned) while
+// silently leaving the source behind — doubling temp-disk use for every
+// published pack and never actually emptying quarantine on success.
+func TestPublishPairRenamesPackBeforeIdx(t *testing.T) {
+	stem := "pack-" + strings.Repeat("e", 40)
+	incomingDir := t.TempDir()
+	packDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(incomingDir, stem+".pack"), []byte("pack-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(incomingDir, stem+".idx"), []byte("idx-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Force the SECOND rename to fail deterministically: a directory sits
+	// where the .idx destination must land.
+	if err := os.MkdirAll(filepath.Join(packDir, stem+".idx"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	err := publishPair(incomingDir, packDir, stem)
+	if err == nil {
+		t.Fatal("publishPair must fail when the .idx rename cannot land on a directory")
+	}
+	if _, statErr := os.Stat(filepath.Join(packDir, stem+".pack")); statErr != nil {
+		t.Errorf("the .pack must already have landed before the failing .idx rename "+
+			"(pack-before-idx ordering): %v", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(incomingDir, stem+".pack")); !os.IsNotExist(statErr) {
+		t.Errorf("the .pack must be gone from incoming after landing in packDir — "+
+			"publishPair renames (moves), it does not copy: stat err %v", statErr)
+	}
+}
+
 // GUARD, not RED: passed immediately against Task 6's code. A genuinely
 // mismatched REMOTE pair — same-OIDs alt-packing idx planted as the remote's
 // own sidecar, so the map is right but the pair can never verify — is fatal
@@ -3654,5 +5972,269 @@ func TestFetchSucceedsWithUnusableCacheDir(t *testing.T) {
 	}
 	if !gitcmd.HasObject(dst, c1) {
 		t.Error("objects missing")
+	}
+}
+
+// ============================================================================
+// Task 11: GPB_CREATE_PARENTS opt-in parent auto-create (EnsureParents)
+// ============================================================================
+//
+// All of these seed the MOUNT ("/my-files" or "/devices/<id>") explicitly in
+// f.Dirs, even though transport.Fake's EnsureDir has always treated it as
+// present without seeding: EnsureParents Stats the mount PREFIX directly
+// (parents.go), and — per the Task 11 reconciliation of Task 7's Fake-parent-
+// fidelity handoff note, see transport/fake.go's isBuiltinMountParent and
+// Stat doc comments — Fake.Stat now agrees with EnsureDir's own leniency
+// about what counts as a builtin mount. Seeding it explicitly here anyway
+// keeps these tests readable as "the mount exists, everything below it
+// doesn't" without depending on the reader already knowing that fact.
+
+// TestEnsureParentsRefusalIsActionable is RED (Task 11, default create=false):
+// a missing parent must produce an ACTIONABLE refusal — naming the FIRST
+// missing parent and an executable remedy in the CLI's REAL grammar.
+// `proton-drive filesystem create-folder` takes a PARENT plus a NAME, not a
+// path (Surprise R2-1: the raw "Node not found: GitRemotes" reached an
+// operator with no remedy at all).
+func TestEnsureParentsRefusalIsActionable(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/my-files"] = true // the mount; "GitRemotes" deliberately not seeded
+
+	var stderr strings.Builder
+	err := EnsureParents(f, "/my-files/GitRemotes/repo", false, &stderr)
+	if err == nil {
+		t.Fatal("a missing parent with create=false must be refused")
+	}
+	if !strings.Contains(err.Error(), "proton-drive filesystem create-folder /my-files GitRemotes") {
+		t.Errorf("refusal must give the CLI's real grammar (parent + name, not a path), got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "GPB_CREATE_PARENTS=1") {
+		t.Errorf("refusal must name the opt-in env var, got: %v", err)
+	}
+	if f.Dirs["/my-files/GitRemotes"] {
+		t.Error("a refused EnsureParents must not create anything")
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("a refusal writes no loud notes, got stderr %q", stderr.String())
+	}
+}
+
+// TestEnsureParentsCreatesWithLoudNotes is RED (Task 11, create=true): missing
+// parents are created one at a time, each announced on stderr, and the LEAF
+// itself ("repo") is never touched — that is Bootstrap's job, not
+// EnsureParents'.
+func TestEnsureParentsCreatesWithLoudNotes(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/my-files"] = true
+	var stderr strings.Builder
+
+	if err := EnsureParents(f, "/my-files/a/b/repo", true, &stderr); err != nil {
+		t.Fatalf("EnsureParents: %v", err)
+	}
+	if !f.Dirs["/my-files/a"] {
+		t.Error("parent 'a' must be created")
+	}
+	if !f.Dirs["/my-files/a/b"] {
+		t.Error("parent 'b' must be created")
+	}
+	if f.Dirs["/my-files/a/b/repo"] {
+		t.Error("the leaf is Bootstrap's job, not EnsureParents' — it must not be created here")
+	}
+	if _, ok := f.Files["/my-files/a/b/repo"]; ok {
+		t.Error("the leaf must not exist as a file either")
+	}
+	out := stderr.String()
+	if got := strings.Count(out, "\n"); got != 2 {
+		t.Errorf("stderr = %q, want exactly two loud notes (one per created folder), got %d lines", out, got)
+	}
+	// "folder /my-files/a (" rather than a bare "/my-files/a" contains check:
+	// "/my-files/a" is a PREFIX of "/my-files/a/b", so a bare substring check
+	// would pass on the "a/b" line alone and never actually prove the "a"
+	// line exists on its own.
+	if !strings.Contains(out, "folder /my-files/a (GPB_CREATE_PARENTS=1)") {
+		t.Errorf("stderr must announce 'a' created, got %q", out)
+	}
+	if !strings.Contains(out, "folder /my-files/a/b (GPB_CREATE_PARENTS=1)") {
+		t.Errorf("stderr must announce 'b' created, got %q", out)
+	}
+}
+
+// absentMountTransport wraps a Fake but forces Stat to report ONE specific
+// path as confirmed-absent, overriding even transport.Fake's own builtin-
+// mount leniency (fake.go's isBuiltinMountParent, which Task 11 wired into
+// Stat precisely so an ordinary "/devices/<id>" reads as present without
+// seeding). That leniency treats EVERY possible device id as a pre-existing
+// mount — a deliberate convenience so tests don't need to seed the common
+// case — which means a genuinely UNREGISTERED device cannot be modelled with
+// a plain Fake at all: this wrapper is the only way to simulate one.
+type absentMountTransport struct {
+	*transport.Fake
+	absent string
+}
+
+func (a absentMountTransport) Stat(p string) (transport.Node, bool, error) {
+	if p == a.absent {
+		return transport.Node{}, false, nil
+	}
+	return a.Fake.Stat(p)
+}
+
+// TestEnsureParentsNeverCreatesMountRoots is RED (Task 11, round-1 Gemini
+// finding: an earlier draft let a missing MOUNT fall through to the raw CLI
+// error instead of the actionable refusal). Two things pinned together:
+//   - a root that is a direct mount child walks ZERO parents — the mount
+//     itself is Stat-checked, never handed to EnsureDir, even with
+//     create=true;
+//   - an absent device mount is refused in BOTH modes, naming it, and
+//     nothing gets created even though create=true was asked for.
+func TestEnsureParentsNeverCreatesMountRoots(t *testing.T) {
+	t.Run("direct mount child: no parent walk below the mount itself", func(t *testing.T) {
+		f := transport.NewFake()
+		f.Dirs["/my-files"] = true
+		var stderr strings.Builder
+
+		if err := EnsureParents(f, "/my-files/repo", true, &stderr); err != nil {
+			t.Fatalf("EnsureParents: %v", err)
+		}
+		if len(f.Dirs) != 1 { // only the seeded mount itself; nothing else created
+			t.Errorf("nothing besides the seeded mount may exist, got Dirs=%v", f.Dirs)
+		}
+		if stderr.Len() != 0 {
+			t.Errorf("no parent walk happens below a direct mount child; stderr must be empty, got %q", stderr.String())
+		}
+	})
+
+	t.Run("absent device mount refuses in both modes; nothing created", func(t *testing.T) {
+		f := transport.NewFake()
+		tr := absentMountTransport{Fake: f, absent: "/devices/laptop"} // a genuinely missing/unregistered device
+		var stderr strings.Builder
+
+		err := EnsureParents(tr, "/devices/laptop/x/repo", true, &stderr)
+		if err == nil {
+			t.Fatal("an absent device mount must be refused even with create=true")
+		}
+		if !strings.Contains(err.Error(), "/devices/laptop") {
+			t.Errorf("refusal must name the missing mount, got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "GPB_CREATE_PARENTS") {
+			t.Errorf("refusal must state that GPB_CREATE_PARENTS does not apply to mounts, got: %v", err)
+		}
+		if len(f.Dirs) != 0 || len(f.Files) != 0 {
+			t.Errorf("nothing may be created when the mount itself is missing, got Dirs=%v Files=%v", f.Dirs, f.Files)
+		}
+		if stderr.Len() != 0 {
+			t.Errorf("no loud notes when nothing was created, got %q", stderr.String())
+		}
+	})
+}
+
+// TestEnsureParentsRefusesFileOccupyingParentName is RED (Task 11, round-1
+// Codex finding: an earlier draft accepted ANY existing node — including a
+// file — as a usable parent folder). A file occupying a parent's name is
+// refused, naming the path, in BOTH modes: GPB_CREATE_PARENTS cannot resolve
+// a name collision, so the check runs before the create/refuse branch.
+func TestEnsureParentsRefusesFileOccupyingParentName(t *testing.T) {
+	for _, create := range []bool{false, true} {
+		t.Run(fmt.Sprintf("create=%v", create), func(t *testing.T) {
+			f := transport.NewFake()
+			f.Dirs["/my-files"] = true
+			f.Files["/my-files/a"] = []byte("i am a file, not a folder")
+			var stderr strings.Builder
+
+			err := EnsureParents(f, "/my-files/a/repo", create, &stderr)
+			if err == nil {
+				t.Fatal("a file occupying a parent name must be refused")
+			}
+			if !strings.Contains(err.Error(), "/my-files/a") {
+				t.Errorf("refusal must name the offending path, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), "file") {
+				t.Errorf("refusal must say a FILE occupies the name, got: %v", err)
+			}
+			if stderr.Len() != 0 {
+				t.Errorf("a refusal writes no loud notes, got stderr %q", stderr.String())
+			}
+		})
+	}
+}
+
+// failingEnsureDirTransport wraps a Fake but makes EnsureDir fail for exactly
+// one path, letting every other call through unchanged. Used to force
+// EnsureParents into a PARTIAL creation — one folder made, then a later one
+// fails — without EnsureDir itself ever having a genuine reason to fail on an
+// otherwise-valid create. Same technique this file already uses for
+// unknownOutcomeTransport, ambiguousTrashTransport, statErrorTransport, etc.
+type failingEnsureDirTransport struct {
+	*transport.Fake
+	failFor string
+}
+
+func (f failingEnsureDirTransport) EnsureDir(p string) error {
+	if p == f.failFor {
+		return fmt.Errorf("simulated create-folder failure at %s", p)
+	}
+	return f.Fake.EnsureDir(p)
+}
+
+// TestEnsureParentsPartialCreationIsKeptAndReported is a GUARD, not a RED:
+// the design spec states plainly that partial creation is KEPT, never rolled
+// back — rollback would be exactly the unsafe folder-removal race push.go's
+// prune logic bounds so carefully, for zero benefit. Creation succeeds at
+// "a" and then fails at "b": "a" must remain, and stderr must show what WAS
+// created before the failure, not merely a bare error.
+func TestEnsureParentsPartialCreationIsKeptAndReported(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/my-files"] = true
+	tr := failingEnsureDirTransport{Fake: f, failFor: "/my-files/a/b"}
+	var stderr strings.Builder
+
+	err := EnsureParents(tr, "/my-files/a/b/repo", true, &stderr)
+	if err == nil {
+		t.Fatal("a failed create at 'b' must be reported as an error")
+	}
+	if !strings.Contains(err.Error(), "/my-files/a/b") {
+		t.Errorf("the error must name the folder that actually failed, got: %v", err)
+	}
+	if !f.Dirs["/my-files/a"] {
+		t.Error("no rollback: 'a', created before the failure, must remain")
+	}
+	if f.Dirs["/my-files/a/b"] {
+		t.Error("'b' was never actually created; it must not appear as if it were")
+	}
+	out := stderr.String()
+	// Same "/my-files/a" is a PREFIX of "/my-files/a/b" caveat as
+	// TestEnsureParentsCreatesWithLoudNotes above.
+	if !strings.Contains(out, "folder /my-files/a (GPB_CREATE_PARENTS=1)") {
+		t.Errorf("stderr must report what WAS created before the failure, got %q", out)
+	}
+	if strings.Contains(out, "folder /my-files/a/b (GPB_CREATE_PARENTS=1)") {
+		t.Errorf("stderr must not claim 'b' was created when it failed, got %q", out)
+	}
+}
+
+// TestSetHeadNeverCreatesParents is a GUARD pinning the OTHER half of Task
+// 11's wiring rule: EnsureParents is called ONLY from cmd's "list for-push"
+// arm, never from SetHead/runSetHead (design spec, component 3/6 — a repo
+// cannot exist below a missing parent, so honouring the var here could only
+// manufacture folder trees and then fail on the marker anyway). SetHead
+// simply never references EnsureParents at all (sethead.go), so this is a
+// regression guard: a set-head against a root whose PARENTS are ALSO
+// missing (not merely an unmarked existing folder, the case
+// TestSetHeadRefusesNoMarker already covers) must still fail with exactly
+// RequireMarker's refusal, and must create NOTHING — not even a partial
+// parent chain — proving no parent-creation side effect ever occurs on this
+// path regardless of GPB_CREATE_PARENTS.
+func TestSetHeadNeverCreatesParents(t *testing.T) {
+	f := transport.NewFake() // nothing seeded at all: mount, parents, and marker all absent
+
+	_, err := SetHead(f, "/my-files/GitRemotes/repo", "main")
+	if err == nil {
+		t.Fatal("SetHead against a missing tree must refuse")
+	}
+	if !strings.Contains(err.Error(), MarkerName) {
+		t.Errorf("refusal must be RequireMarker's own reason, not a parent-creation message, got: %v", err)
+	}
+	if len(f.Dirs) != 0 || len(f.Files) != 0 {
+		t.Errorf("a set-head against a missing tree must create NOTHING — no parent chain, "+
+			"no lock, no marker — got Dirs=%v Files=%v", f.Dirs, f.Files)
 	}
 }

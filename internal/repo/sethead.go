@@ -38,23 +38,61 @@ func SetHead(t transport.Transport, root, branchArg string) (string, error) {
 		}
 	}()
 
-	refs, err := ListRefs(t, root)
+	// Existence check via an EXACT-PATH Stat, not a full-tree ListRefs walk:
+	// the target branch's own ref path is Stat'd directly, and Stat absence
+	// is trustworthy post-Task 4 (an affirmative "does not exist", never a
+	// folded-in transport failure — see transport.Transport.Stat's own doc
+	// comment). ListRefs is reserved for the ERROR path only, to build the
+	// "branches that exist" suggestion list (now recursive, so nested
+	// branches are suggested too) — a successful set never walks the tree.
+	// This still runs BEFORE the idempotence short-circuit below, for the
+	// same round-3 peer-review reason as before: a HEAD already naming a
+	// since-deleted branch must refuse, not short-circuit to success.
+	node, ok, err := t.Stat(root + "/" + branch)
 	if err != nil {
 		return "", err
 	}
-	if _, ok := refs[branch]; !ok {
-		var branches []string
-		for name := range refs {
-			if strings.HasPrefix(name, "refs/heads/") {
-				branches = append(branches, strings.TrimPrefix(name, "refs/heads/"))
-			}
+	// A hierarchical name that resolves to a FOLDER (some deeper branch
+	// lives beneath it — e.g. requesting "feature" when only
+	// refs/heads/feature/x exists, a state hierarchical push routinely
+	// creates) must be refused HERE, before readRef ever sees it. Stat
+	// affirmatively confirms presence, so falling through to readRef would
+	// call t.ReadTo on a DIRECTORY — against the Fake that just reads as a
+	// misleading generic "not found", and against the live CLI it has NO
+	// verified contract at all (`filesystem download` on a directory is
+	// unprobed; peer-review finding on this task). The branch check must
+	// come first.
+	if ok && node.IsDir {
+		branches, lerr := existingBranchNames(t, root)
+		if lerr != nil {
+			return "", lerr
+		}
+		if len(branches) == 0 {
+			return "", fmt.Errorf("cannot set HEAD to %q: %s is a namespace folder containing "+
+				"other branches, not a branch itself", branchArg, branch)
+		}
+		return "", fmt.Errorf("cannot set HEAD to %q: %s is a namespace folder containing "+
+			"other branches, not a branch itself; branches that exist: %s",
+			branchArg, branch, strings.Join(branches, ", "))
+	}
+	if !ok {
+		branches, lerr := existingBranchNames(t, root)
+		if lerr != nil {
+			return "", lerr
 		}
 		if len(branches) == 0 {
 			return "", fmt.Errorf("cannot set HEAD to %q: no branches exist; push a branch first", branchArg)
 		}
-		sort.Strings(branches)
 		return "", fmt.Errorf("cannot set HEAD to %q: no such branch; branches that exist: %s",
 			branchArg, strings.Join(branches, ", "))
+	}
+	// Confirmed present as a FILE by the ok/IsDir checks above; readRef
+	// verifies it is actually a well-formed ref file (exact
+	// 40-hex-plus-newline grammar). A present-but-corrupt ref is FATAL
+	// here, never coerced into "does not exist" — the same fail-closed rule
+	// readRef always applies to content it reaches.
+	if _, err := readRef(t, root+"/"+branch); err != nil {
+		return "", err
 	}
 
 	// Idempotence short-circuit — AFTER the existence check above. A ReadHEAD
@@ -77,10 +115,37 @@ func SetHead(t transport.Transport, root, branchArg string) (string, error) {
 	return branch, nil
 }
 
-// normalizeBranch turns the user's argument into a full refs/heads/ name,
-// refusing everything Stage 4 does not support. The hierarchical refusal
-// comes FIRST so it gets its own named reason (Stage 5), not the generic
-// staging-path one.
+// existingBranchNames returns every refs/heads/* branch's leaf name (the
+// refs/heads/ prefix stripped), sorted — the "branches that exist"
+// suggestion list shared by SetHead's error-path arms (target absent;
+// target present but only as a namespace folder, not a branch itself).
+// Built from ListRefs, which walks the WHOLE ref tree (Task 8), so nested
+// branches are included — e.g. a request for the folder "feature" itself
+// suggests "feature/x" if that is the real branch living beneath it. Only
+// ever called on an error path: SetHead's happy path never calls this.
+func existingBranchNames(t transport.Transport, root string) ([]string, error) {
+	refs, err := ListRefs(t, root)
+	if err != nil {
+		return nil, err
+	}
+	var branches []string
+	for name := range refs {
+		if strings.HasPrefix(name, "refs/heads/") {
+			branches = append(branches, strings.TrimPrefix(name, "refs/heads/"))
+		}
+	}
+	sort.Strings(branches)
+	return branches, nil
+}
+
+// normalizeBranch turns the user's argument into a full refs/heads/ name.
+// Hierarchical names ("feature/x") are accepted (Task 10 lifts Stage 4's
+// blanket refusal): once the refs/heads/ prefix is settled, the full name is
+// validated by advertisableName — the same git-validity-plus-stageability
+// check ListRefs and Push apply to every other ref this helper advertises or
+// writes, covering both full git validity (CheckRefName) and per-component
+// stageability (checkComponent/checkStageableLeaf). Backslash is rejected as
+// part of CheckRefName's forbidden-character set, not a bespoke check here.
 func normalizeBranch(arg string) (string, error) {
 	b := arg
 	if !strings.HasPrefix(b, "refs/") {
@@ -89,11 +154,7 @@ func normalizeBranch(arg string) (string, error) {
 	if !strings.HasPrefix(b, "refs/heads/") {
 		return "", fmt.Errorf("refusing to point HEAD at %q: HEAD points at branches only", arg)
 	}
-	leaf := strings.TrimPrefix(b, "refs/heads/")
-	if strings.ContainsAny(leaf, `/\`) {
-		return "", fmt.Errorf("hierarchical ref names are not supported yet (Stage 5): %q", arg)
-	}
-	if err := checkStageableLeaf(leaf); err != nil {
+	if err := advertisableName(b); err != nil {
 		return "", err
 	}
 	return b, nil

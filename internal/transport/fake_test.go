@@ -3,6 +3,7 @@ package transport
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -190,6 +191,11 @@ func TestFakeReadToIntoMissingDirectoryErrors(t *testing.T) {
 
 func TestFakeEnsureDirAndList(t *testing.T) {
 	f := NewFake()
+	// "/refs" is not a mount root (only "/my-files" and "/devices" are), so
+	// the stricter EnsureDir (Task 7) needs it seeded as already-existing —
+	// this test is about List's behaviour, not about parent validation, so
+	// seeding rather than weakening the Fake keeps that scope intact.
+	f.Dirs["/refs"] = true
 	if err := f.EnsureDir("/refs/heads"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -264,6 +270,10 @@ func TestFakeRejectsMismatchedLocalBasename(t *testing.T) {
 // was validating a Bootstrap more permissive than the one that ships.
 func TestFakeListIncludesEmptyEnsuredDirs(t *testing.T) {
 	f := NewFake()
+	// "/my-files/r" is not itself a mount root (only "/my-files" is), so the
+	// stricter EnsureDir (Task 7) needs it seeded as already-existing, mirroring
+	// how a real Bootstrap would have created it first.
+	f.Dirs["/my-files/r"] = true
 	if err := f.EnsureDir("/my-files/r/refs"); err != nil {
 		t.Fatalf("EnsureDir: %v", err)
 	}
@@ -290,5 +300,249 @@ func TestFakeListIncludesEmptyEnsuredDirs(t *testing.T) {
 	}
 	if len(nodes) != 2 || nodes[0].Name != "packs" || nodes[1].Name != "refs" {
 		t.Fatalf("want exactly [packs refs] with no duplicate, got %+v", nodes)
+	}
+}
+
+// TestFakeTrashOnFolderRemovesWholeSubtree: RED (Task 7). The old Trash only
+// ever looked at f.Files[p] itself — a folder path was never a key in Files,
+// so trashing a non-empty folder silently did nothing to what's beneath it,
+// even though the real CLI's `filesystem trash` removes the whole subtree.
+// Files under the prefix and nested Dirs entries must all be gone, and a
+// sibling outside the trashed prefix must survive untouched (also covers the
+// brief's "Stat on dir unchanged" case).
+func TestFakeTrashOnFolderRemovesWholeSubtree(t *testing.T) {
+	f := NewFake()
+	f.Dirs["/my-files/r"] = true
+	for _, d := range []string{"/my-files/r/refs", "/my-files/r/refs/heads", "/my-files/r/packs"} {
+		if err := f.EnsureDir(d); err != nil {
+			t.Fatalf("EnsureDir %s: %v", d, err)
+		}
+	}
+	if _, err := f.CreateExclusive("/my-files/r/refs/heads/main", writeTemp(t, "main", "sha")); err != nil {
+		t.Fatalf("seed create: %v", err)
+	}
+	if _, err := f.CreateExclusive("/my-files/r/packs/pack-x.pack", writeTemp(t, "pack-x.pack", "bytes")); err != nil {
+		t.Fatalf("seed create: %v", err)
+	}
+
+	out, err := f.Trash("/my-files/r/refs")
+	if err != nil {
+		t.Fatalf("Trash: %v", err)
+	}
+	if out != Committed {
+		t.Fatalf("Trash of a non-empty folder: want Committed, got %s", out)
+	}
+
+	if _, ok := f.Files["/my-files/r/refs/heads/main"]; ok {
+		t.Error("a file under the trashed prefix must be gone")
+	}
+	if f.Dirs["/my-files/r/refs/heads"] {
+		t.Error("a nested dir under the trashed prefix must be gone")
+	}
+	if f.Dirs["/my-files/r/refs"] {
+		t.Error("the trashed folder itself must be gone")
+	}
+
+	// Sibling untouched: proves the subtree removal is prefix-scoped, and
+	// pins Stat's behaviour on a surviving dir as unchanged.
+	if !f.Dirs["/my-files/r/packs"] {
+		t.Error("a sibling folder outside the trashed prefix must survive")
+	}
+	if _, ok := f.Files["/my-files/r/packs/pack-x.pack"]; !ok {
+		t.Error("a file under a sibling folder must survive")
+	}
+	node, ok, statErr := f.Stat("/my-files/r/packs")
+	if statErr != nil || !ok || !node.IsDir {
+		t.Errorf("Stat on the surviving sibling dir: node=%+v ok=%v err=%v, want an unchanged dir", node, ok, statErr)
+	}
+}
+
+// TestFakeTrashOfEmptyFolderIsCommitted: RED (Task 7). An empty folder — one
+// created by EnsureDir with nothing under it — must also be removable by
+// Trash. Before this fix Trash never looked at f.Dirs at all, so trashing an
+// empty folder silently left it in f.Dirs forever.
+func TestFakeTrashOfEmptyFolderIsCommitted(t *testing.T) {
+	f := NewFake()
+	f.Dirs["/my-files/r"] = true
+	if err := f.EnsureDir("/my-files/r/emptydir"); err != nil {
+		t.Fatalf("EnsureDir: %v", err)
+	}
+
+	out, err := f.Trash("/my-files/r/emptydir")
+	if err != nil {
+		t.Fatalf("Trash: %v", err)
+	}
+	if out != Committed {
+		t.Fatalf("Trash of an empty folder: want Committed, got %s", out)
+	}
+	if f.Dirs["/my-files/r/emptydir"] {
+		t.Error("the trashed empty folder must be gone from f.Dirs")
+	}
+	if _, ok, _ := f.Stat("/my-files/r/emptydir"); ok {
+		t.Error("Stat must confirm the trashed folder is gone")
+	}
+}
+
+// TestFakeCreateExclusiveOntoFolderIsRefused and
+// TestFakeUpdateRevisionOntoFolderIsRefused: RED (Task 7). A name already
+// taken by a FOLDER must refuse a file write the same way a name taken by a
+// file does — the D/F collision Task 9b heals, and the live contract row
+// (contract_test.go) pins the real CLI's shape for the upload-onto-folder
+// case. Before this fix, CreateExclusive/UpdateRevision only ever checked
+// f.Files[p], so writing a file over an existing folder name silently
+// succeeded and left the folder's own f.Dirs entry orphaned underneath it.
+func TestFakeCreateExclusiveOntoFolderIsRefused(t *testing.T) {
+	f := NewFake()
+	f.Dirs["/my-files/r"] = true
+	if err := f.EnsureDir("/my-files/r/taken"); err != nil {
+		t.Fatalf("EnsureDir: %v", err)
+	}
+
+	out, err := f.CreateExclusive("/my-files/r/taken", writeTemp(t, "taken", "x"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out != Refused {
+		t.Fatalf("CreateExclusive onto a folder name: want Refused, got %s", out)
+	}
+	if !f.Dirs["/my-files/r/taken"] {
+		t.Error("the folder must survive a refused create")
+	}
+	if _, ok := f.Files["/my-files/r/taken"]; ok {
+		t.Error("nothing must be written for a refused create onto a folder name")
+	}
+}
+
+func TestFakeUpdateRevisionOntoFolderIsRefused(t *testing.T) {
+	f := NewFake()
+	f.Dirs["/my-files/r"] = true
+	if err := f.EnsureDir("/my-files/r/taken"); err != nil {
+		t.Fatalf("EnsureDir: %v", err)
+	}
+
+	out, err := f.UpdateRevision("/my-files/r/taken", writeTemp(t, "taken", "x"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out != Refused {
+		t.Fatalf("UpdateRevision onto a folder name: want Refused, got %s", out)
+	}
+	if !f.Dirs["/my-files/r/taken"] {
+		t.Error("the folder must survive a refused update")
+	}
+}
+
+// TestFakeEnsureDirOntoFileErrors: RED (Task 7). Before this fix EnsureDir
+// was a bare `f.Dirs[p] = true`, so calling it on a path that is already a
+// FILE silently turned the file into a directory in f.Dirs while leaving the
+// stale f.Files entry behind — a D/F collision the Fake manufactured rather
+// than caught. The exact wording is free (reverse-D/F detection is typed via
+// Stat elsewhere; Fake and CLI messages need not match) but the error must
+// name the file.
+func TestFakeEnsureDirOntoFileErrors(t *testing.T) {
+	f := NewFake()
+	f.Dirs["/my-files/r"] = true
+	if _, err := f.CreateExclusive("/my-files/r/leaf", writeTemp(t, "leaf", "x")); err != nil {
+		t.Fatalf("seed create: %v", err)
+	}
+
+	err := f.EnsureDir("/my-files/r/leaf")
+	if err == nil {
+		t.Fatal("EnsureDir onto an existing file must error")
+	}
+	if !strings.Contains(err.Error(), "/my-files/r/leaf") {
+		t.Errorf("error must name the file, got: %v", err)
+	}
+	if f.Dirs["/my-files/r/leaf"] {
+		t.Error("a refused EnsureDir must not turn the file into a directory")
+	}
+}
+
+// TestFakeEnsureDirMissingParentErrors and
+// TestFakeEnsureDirBuiltinMountParentsNeedNoSeeding: RED (Task 7). Before
+// this fix EnsureDir never looked at its parent at all, so a caller bug that
+// tried to create a deeply nested path with no ancestor ever created would
+// silently succeed — the Fake was more permissive than the live CLI, which
+// genuinely refuses `create-folder` under a parent that does not exist
+// ("Node not found: <parent leaf>", cli.go's notFoundSignature shape).
+func TestFakeEnsureDirMissingParentErrors(t *testing.T) {
+	f := NewFake()
+	err := f.EnsureDir("/my-files/never-seeded/child")
+	if err == nil {
+		t.Fatal("EnsureDir under a missing parent must error")
+	}
+	if !strings.Contains(err.Error(), "Node not found: never-seeded") {
+		t.Errorf("error must embed the live not-found shape naming the parent leaf, got: %v", err)
+	}
+	if f.Dirs["/my-files/never-seeded/child"] {
+		t.Error("a refused EnsureDir must not create the child")
+	}
+}
+
+// TestFakeEnsureDirParentImpliedByAFile (Task 7 fix round, cheap minor):
+// parentExists' "implied by Files" branch (fake.go) was dead relative to the
+// suite — every prior test either seeds f.Dirs directly or relies on a
+// builtin mount parent. A file placed directly in f.Files (bypassing
+// EnsureDir/CreateExclusive entirely, the way plantRepoOnFake-style test
+// helpers plant pack files) still proves its own parent folder exists, so
+// EnsureDir under that folder must succeed without the folder ever having
+// been separately created or seeded.
+func TestFakeEnsureDirParentImpliedByAFile(t *testing.T) {
+	f := NewFake()
+	f.Files["/my-files/r/implied/leaf.txt"] = []byte("x")
+	if err := f.EnsureDir("/my-files/r/implied/newdir"); err != nil {
+		t.Errorf("EnsureDir under a parent implied by an existing file must not need separate seeding: %v", err)
+	}
+}
+
+// TestFakeEnsureDirBuiltinMountParentsNeedNoSeeding pins the deliberate
+// exception: the two Proton Drive top-level namespaces, and exactly one path
+// component beneath /devices (a device root, "/devices/<id>"), need no prior
+// seeding — EnsureDir may create directly under them, mirroring the real
+// mount points the CLI itself cannot create. Anything deeper under /devices
+// does need seeding, same as everywhere else. Each case uses a FRESH Fake so
+// a pass can only be explained by the builtin allowance itself, never by an
+// earlier call in the same test having already seeded the parent.
+//
+// Task 11 (internal/repo/parents.go, EnsureParents) TIGHTENED this from an
+// earlier version that also allowed a second component ("/devices/<id>/
+// <folder>") for free — see isBuiltinMountParent's doc for the full
+// reconciliation rationale against EnsureParents' protectedDepth, which has
+// only ever protected this same one-component depth. The former depth-2 case
+// is now folded into TestFakeEnsureDirMissingParentErrors' sibling assertion
+// below instead of asserting success.
+func TestFakeEnsureDirBuiltinMountParentsNeedNoSeeding(t *testing.T) {
+	if err := NewFake().EnsureDir("/my-files/newrepo"); err != nil {
+		t.Errorf("EnsureDir under /my-files must not need seeding: %v", err)
+	}
+	if err := NewFake().EnsureDir("/devices/newrepo"); err != nil {
+		t.Errorf("EnsureDir directly under /devices must not need seeding: %v", err)
+	}
+	if err := NewFake().EnsureDir("/devices/dev1/onefolder"); err != nil {
+		t.Errorf("EnsureDir at depth 1 under /devices (a device root) must not need seeding: %v", err)
+	}
+	if err := NewFake().EnsureDir("/devices/dev2/onefolder/twolevel"); err == nil {
+		t.Error("EnsureDir at depth 2 under /devices is now beyond the builtin allowance (Task 11 tightening) and must still require an existing parent")
+	}
+	if err := NewFake().EnsureDir("/devices/dev3/onefolder/twolevel/threelevel"); err == nil {
+		t.Error("EnsureDir at depth 3 under /devices is beyond the builtin allowance and must still require an existing parent")
+	}
+}
+
+// TestFakeStatSeesBuiltinMountsWithoutSeeding is Task 11's companion to the
+// EnsureDir test above: EnsureParents (internal/repo/parents.go) Stats the
+// mount prefix DIRECTLY, as its first move, so Stat must agree with
+// EnsureDir's own parentExists about what counts as a builtin mount needing
+// no seeding — otherwise every existing test that roots a push under an
+// un-seeded "/my-files/..." would newly fail EnsureParents' mount check.
+func TestFakeStatSeesBuiltinMountsWithoutSeeding(t *testing.T) {
+	f := NewFake()
+	for _, p := range []string{"/my-files", "/devices", "/devices/dev1"} {
+		if _, ok, err := f.Stat(p); err != nil || !ok {
+			t.Errorf("Stat(%q) = ok=%v err=%v, want ok=true err=nil: a builtin mount must Stat as present without seeding", p, ok, err)
+		}
+	}
+	if _, ok, _ := f.Stat("/devices/dev1/onefolder"); ok {
+		t.Error("Stat(\"/devices/dev1/onefolder\") = present, want absent: a folder BENEATH a device root is ordinary content, not part of the mount")
 	}
 }

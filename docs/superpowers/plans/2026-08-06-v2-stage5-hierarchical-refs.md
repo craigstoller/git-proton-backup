@@ -91,7 +91,7 @@ git commit -m "docs: release procedure (CHANGELOG flip step) and standing gate-b
 - Consumes: current `install.ps1` params (`-Force`, `-SkipPathUpdate`, `-HelperExe`, `-EffectivePath`).
 - Produces: new parameter `-EnvironmentKey` (object with `GetValue($name, $default, $options)`, `GetValueKind($name)`, `SetValue($name, $value, $kind)`, `Close()`); `$null` default opens the real `HKCU\Environment`. Tests never touch the real registry (isolation rule — this is the entire point of the task).
 
-- [ ] **Step 1: Write the failing Pester tests** in `tests/InstallHelper.Tests.ps1`. **Containment first (round-1 Codex blocker): the script must be run as a COPY under TestDrive, never from the repo root** — beside the repo the `GitProtonBackup` payload directory exists, so the module block would write into the REAL Documents modules dir; a TestDrive copy has no payload and takes the skip branch. Additionally set `$env:LOCALAPPDATA` to a TestDrive dir in `BeforeAll` (restore the saved value in `AfterAll`) so the helper `Copy-Item` lands in TestDrive, not the real `%LOCALAPPDATA%\Programs\git-proton-backup`. (The runbook's warning that env overrides do not contain REGISTRY writes is exactly why the registry goes through the mock, not the env.) Guards: `AfterAll` asserts the real user PATH (read via `[Microsoft.Win32.Registry]` with `DoNotExpandEnvironmentNames`), the real `%LOCALAPPDATA%\Programs\git-proton-backup` fingerprint, and the real Documents module dir are all byte-unchanged. Build a mock key as a `PSCustomObject` with `Add-Member -MemberType ScriptMethod` for the four methods, backed by a hashtable `@{ Path = '%USERPROFILE%\bin'; Kind = 'ExpandString' }` plus a `$script:setCalls` recorder. Cases (each asserts on the recorder):
+- [ ] **Step 1: Write the failing Pester tests** in `tests/InstallHelper.Tests.ps1`. **Containment first (round-1 Codex blocker): the script must be run as a COPY under TestDrive, never from the repo root** — beside the repo the `GitProtonBackup` payload directory exists, so the module block would write into the REAL Documents modules dir; a TestDrive copy has no payload and takes the skip branch. Additionally set `$env:LOCALAPPDATA` to a TestDrive dir in `BeforeAll` (restore the saved value in `AfterAll`) so the helper `Copy-Item` lands in TestDrive, not the real `%LOCALAPPDATA%\Programs\git-proton-backup`. (The runbook's warning that env overrides do not contain REGISTRY writes is exactly why the registry goes through the mock, not the env.) Guards: `AfterAll` asserts the real user PATH (read via `[Microsoft.Win32.Registry]` with `DoNotExpandEnvironmentNames`), the real `%LOCALAPPDATA%\Programs\git-proton-backup` fingerprint, and the real Documents module dir are all byte-unchanged. Build a mock key as a `PSCustomObject` with `Add-Member -MemberType ScriptMethod` for the four methods, backed by a hashtable `@{ Path = '%USERPROFILE%\bin'; Kind = 'ExpandString' }` plus a recorder. **SUPERSEDED (Task 2 execution, 2026-08-07): the original sketch said a `$script:setCalls` recorder — that does not work: `$script:` inside an `Add-Member` ScriptMethod resolves against the script executing at invocation time (install.ps1's own scope when called via `&`), not the test file's; verified interactively. Use `.GetNewClosure()`-captured state exposed as object properties (`$mock.SetCalls`/`$mock.CloseCalls`) instead.** Cases (each asserts on the recorder):
   - RED `preserves REG_EXPAND_SZ kind on append` — existing `ExpandString` value; expect one `SetValue` call with kind `ExpandString` and value `<old>;<helperDir>`.
   - RED `preserves REG_SZ kind` — same with `String` kind.
   - RED `no-op when helperDir already present` (including a `%VAR%`-spelled entry that expands to helperDir) — expect zero `SetValue` calls.
@@ -282,6 +282,11 @@ func longPathHint(paths ...string) string {
 				"260-character MAX_PATH; if this failure is about path length, set "+
 				"`git config core.longpaths true` or use a shorter destination)", len(p))
 		}
+		// SUPERSEDED (Task 5 execution, 2026-08-07): the sample text above lacks
+		// the word "may" that this task's own Step 1 RED spec requires the hint to
+		// contain — an internal plan inconsistency confirmed in review. Shipped
+		// wording: "...this may be why the write failed — try `git config
+		// core.longpaths true`..." (possible-cause framing, both remedies kept).
 	}
 	return ""
 }
@@ -826,7 +831,7 @@ func Push(t transport.Transport, root, gitDir string, ups []protocol.RefUpdate, 
 ```
 `ensureRefParents`: split `ref` on `/`, walk `root+"/refs"`, `root+"/refs/heads"`, … `EnsureDir` each prefix above the leaf (the first two exist from init; `EnsureDir` is Stat-then-create so that's one Stat each — acceptable; do NOT special-case them away, partial init is a real state). **Reverse-D/F detection is TYPED, never error-text matching** (round-2 Codex: the Fake and CLI would need byte-identical phrases forever): on any `EnsureDir` failure, `Stat` the failing prefix; `(file, true)` → the named refusal `creating %s requires folder %s, but a ref file occupies that name (directory/file conflict; delete it first)`; anything else → the original `EnsureDir` error stands. Works identically over Fake and CLI regardless of their message wording.
 
-- [ ] **Step 5: Run the full suite** — expect fallout in every existing push test that asserted per-ref pack behaviour; adapt assertions to batch-level (the multi-ref same-commit reconciliation-cost tests from Stage 3b: one pack now uploads ONCE — those tests' premise is obsolete; update them to assert the new single-upload behaviour and note it in the task report as a deliberate design-doc-aligned change).
+- [ ] **Step 5: Run the full suite** — expect fallout in every existing push test that asserted per-ref pack behaviour; adapt assertions to batch-level. **SUPERSEDED (Task 9a execution, 2026-08-07): the "multi-ref same-commit reconciliation-cost tests from Stage 3b" named here DO NOT EXIST — exhaustive grep found no test asserting pack count across a multi-ref push; the plan named a fallout category with no referent. Actual fallout was zero existing-test semantic changes (only mechanical WritePack `sha`→`[]string{sha}` call-site updates).**
 
 - [ ] **Step 6: Deliberate regressions:** (a) reorder phase 4 before phase 3 → `TestPushDeletionsRunAfterPackConfirmBeforeCreates` fails; (b) drop the duplicate-dst check → its test fails. Revert both.
 
@@ -1188,64 +1193,6 @@ git commit -m "chore(release): v0.4.0 CHANGELOG flip; Stage 5 live gate brief"
 ```
 
 ---
-
-## Revisions
-
-*Scaffolding for the review loop; delete before execution dispatch.*
-
-**Round 1 (Codex + Gemini, 2026-08-06) — applied:** authoritative `git check-ref-format` wired
-into `checkDst` ahead of the in-process check ([Both] — the spec's push-boundary rule had no
-implementing call); `CLI.EnsureDir`'s initial Stat branches on node type (Codex blocker: a file
-read as a usable folder); Task 6's tests rewritten against the extracted `publishPair` seam with
-discriminating observations (Codex blocker: the drafts passed against unpatched code — residue
-rule also leaves packDir clean; end-state pair-completeness cannot see rename order), and the
-two-pack pair-refresh claim corrected — the Stage 4 polish wave already added
-`TestFetchMidRoundPairRefreshWithTwoPacksCompletes`, whose own comments document that
-restart-vs-resume cannot be empirically discriminated under the downloaded-map design ([Both];
-residual recorded for the v6.5 edit instead of a non-discriminating test); Task 2 contained
-(Codex blocker: script now runs as a TestDrive copy with `$env:LOCALAPPDATA` redirected, real
-install/module/registry fingerprints guarded); duplicate-dst pre-scan refuses every holder
-(Codex: first-seen-wins left the first duplicate mutable); HEAD-branch deletes refused in phase
-2 via one non-mutating ReadHEAD so the D/F preflight's final set is computed correctly and no
-pack is wasted (Codex); `EnsureParents` Stats the mount first — absent mount is the actionable
-refusal in both modes, never creatable — and checks `IsDir` on every existing parent (Codex +
-Gemini); `readRef` grammar tightened to exact 40-hex+LF with boundary fixtures (Codex: TrimRight
-accepted no-LF/CRLF/double-LF); `CheckRefName` gains git's at-least-one-slash rule plus
-one-level fixtures (Codex); `longPathHint` includes `gitDir`, notes the UTF-8-byte caveat, and
-gains a failure-path wiring test (Codex); Task 3's stdout assertion reframed as writer-plumbing
-(Codex: it tested the stub's text); Task 4 preserves `c.run`'s error in the `%w` chain (Gemini)
-and its Files/commit lists gain `repo_test.go` (Codex); `TestPushPackFailureFailsCreatesButDeletionsProceed`
-relabelled GUARD (Gemini: per-ref pushOne already behaves so). **Spec touched once, disclosed:**
-component 8's "`Trash` non-idempotence on folders" corrected to the wrapper contract
-(absent → Committed) — the phrase named the raw binary and contradicted `transport.go`'s
-Stat-first rule the Fake models (Codex).
-
-**Round 2 (Codex at high effort after an xhigh timeout; Gemini) — Gemini reported NO new
-blocker/major findings and validated each round-1 fix; Codex found one blocker + three majors,
-all verified and applied:** `CheckRefFormat` drops the `--` separator — verified live,
-`check-ref-format -- refs/heads/main` exits 129 (usage) while the bare form exits 0/1 — with an
-unexpected-exit test and a no-dash-injection note (blocker); the recursive walk validates every
-COMPONENT before recursing, so an invalid folder name skips its whole subtree with a note and
-braces never reach a `List` argument (the unverified remote-glob hazard), pinned by a
-no-List-beneath-invalid-folder trace test; phase-2 validation branches by namespace BEFORE any
-ancestry machinery — branches keep commit-type+ancestry, tag updates require force with no
-ancestry (aligning a pre-existing shipped divergence from the design table, flagged for the
-task report), other namespaces force-only — with non-commit/absent-old-tip fixtures proving no
-ancestry ran; reverse-D/F detection and the EnsureDir contradiction diagnostic stop keying on
-error text — parent-walk failures re-`Stat` (typed), and the contradiction path re-observes via
-raw `filesystem info` so both observations can be quoted verbatim (the `Stat` wrapper
-deliberately discards not-found output).
-
-**Round 3 (Codex + Gemini, 2026-08-06, final round) — Gemini: no new blocker/major findings,
-explicitly. Codex: three majors, all applied:** `subtreeFiles` applies `checkComponent` before
-recursing and an invalid component fails the heal CLOSED — no List of an unverifiable path, no
-trash over an incomplete enumeration — with a trace test; the phase-2 HEAD guard is gated on
-`isBranch` so an unreadable HEAD never blocks tag/notes deletions (narrows shipped pushOne's
-every-delete gating to the spec's branches-only protection; flagged as an alignment for the
-task report); the stale "keys on this text" sentence in Task 9b contradicted round 2's typed
-reverse-D/F detection and is corrected, with an arbitrary-wording test pinning that
-classification is typed. The loop ends at the three-round cap with every tracked finding
-applied or rejected-with-reason and none deferred.
 
 ## Self-Review Notes (run before handing the plan to review)
 

@@ -132,6 +132,15 @@ func parseNodeJSON(b []byte) (Node, error) {
 	return n, nil
 }
 
+// notFoundSignature is the certified CLI's confirmed-absence text for
+// `filesystem info`, pinned live at the Stage 4 gate (docs/research/gates/
+// stage3b-gate.md, stage4-gate.md: "Node not found: <leaf>"). It is a
+// hypothesis constant, not a guarantee: Stat's not-found/error split below
+// depends entirely on this string staying accurate for the certified build,
+// which is exactly what contract_test.go's live row pins against reality at
+// the gate.
+const notFoundSignature = "Node not found"
+
 func (c *CLI) Stat(p string) (Node, bool, error) {
 	out, code, err := c.run("filesystem", "info", p, "--json")
 	if code == -1 {
@@ -145,7 +154,22 @@ func (c *CLI) Stat(p string) (Node, bool, error) {
 		return Node{}, false, fmt.Errorf("proton CLI did not start: %w", err)
 	}
 	if code != 0 {
-		return Node{}, false, nil // absence is not an error
+		// Absence is (_, false, nil) ONLY on the certified CLI's own
+		// not-found signature. Every other nonzero exit is a transport
+		// failure and must return an error — this is the Stage 4 gate 2b
+		// masquerade fix: the old blanket "any nonzero exit is absence" read
+		// a BROKEN CLI (e.g. under GPB_UNCERTIFIED_CLI=1) as "not a
+		// git-remote-proton repo" instead of surfacing the real failure.
+		if strings.Contains(out, notFoundSignature) {
+			return Node{}, false, nil // the certified CLI's confirmed-absence signature
+		}
+		// Preserve the underlying error per the transport convention List and
+		// EnsureDir already follow: dropping c.run's err here would break the
+		// %w chain a caller might inspect.
+		if err != nil {
+			return Node{}, false, fmt.Errorf("info %s failed: %s: %w", p, strings.TrimSpace(bound(out, 200)), err)
+		}
+		return Node{}, false, fmt.Errorf("info %s failed: %s", p, strings.TrimSpace(bound(out, 200)))
 	}
 	n, err := parseNodeJSON([]byte(out))
 	if err != nil {
@@ -214,14 +238,41 @@ func (c *CLI) ReadTo(p, localDir string) error {
 	return nil
 }
 
+// alreadyExistsSignature is a HYPOTHESIS about the certified CLI's
+// create-folder-on-an-existing-folder wording, keyed on the same C17
+// observation as EnsureDir's contradiction re-observation below: seen ONCE
+// live, never reproduced under deliberate provocation (C17b:
+// docs/research/probes/c17b-provocation-log.md). The helper-role tests in
+// cli_test.go pin the CODE PATH this constant drives; only a live contract
+// row (contract_test.go) can pin the constant's actual VALUE against the
+// certified CLI's real wording — this is generic robustness against a
+// hypothesised check-then-create race, never claimable as a validated live
+// fix on the strength of the hermetic tests alone.
+const alreadyExistsSignature = "already exists"
+
 // EnsureDir is Stat-then-create: create-folder exits 1 on an existing folder
 // (Stage 1 C5). Swallowing that error generically would also hide real
 // permission and path failures, so the existence check is explicit.
+//
+// The initial Stat branches on node TYPE (Task 9b, round-1 Codex BLOCKER
+// fix): before this fix, EnsureDir returned nil for ANY existing node
+// without ever reading Node.IsDir, so a ref FILE already at p read as a
+// usable folder and the reverse-D/F failure surfaced later, elsewhere, with
+// a wrong diagnostic. repo.ensureRefParents' own reverse-D/F detection
+// depends on this being TYPED via a fresh Stat call on failure, never on
+// error-text matching (its own doc comment says so) — silently returning nil
+// here for a file would defeat that by never producing a failure to detect
+// in the first place. ok && n.IsDir -> nil (already a usable folder);
+// ok && !n.IsDir -> refuse, naming the conflict (exact wording is free: nothing
+// in this codebase parses this string); absent -> fall through to create.
 func (c *CLI) EnsureDir(p string) error {
-	if _, ok, err := c.Stat(p); err != nil {
+	if n, ok, err := c.Stat(p); err != nil {
 		return err
 	} else if ok {
-		return nil
+		if n.IsDir {
+			return nil
+		}
+		return fmt.Errorf("cannot use %s as a folder: a file occupies that name", p)
 	}
 	i := strings.LastIndex(p, "/")
 	if i <= 0 {
@@ -229,13 +280,80 @@ func (c *CLI) EnsureDir(p string) error {
 	}
 	parent, name := p[:i], p[i+1:]
 	out, code, err := c.run("filesystem", "create-folder", parent, name)
-	if code != 0 {
-		if err != nil {
-			return fmt.Errorf("create-folder %s in %s failed: %s: %w", name, parent, strings.TrimSpace(out), err)
-		}
-		return fmt.Errorf("create-folder %s in %s failed: %s", name, parent, strings.TrimSpace(out))
+	if code == 0 {
+		return nil
 	}
-	return nil
+	trimmed := strings.TrimSpace(out)
+	if strings.Contains(trimmed, alreadyExistsSignature) {
+		// The C17 contradiction: the Stat above JUST reported p absent, yet
+		// create-folder now claims it already exists. Re-observe once before
+		// trusting either observation — see reobserveEnsureDirContradiction.
+		return c.reobserveEnsureDirContradiction(p, trimmed)
+	}
+	if err != nil {
+		return fmt.Errorf("create-folder %s in %s failed: %s: %w", name, parent, trimmed, err)
+	}
+	return fmt.Errorf("create-folder %s in %s failed: %s", name, parent, trimmed)
+}
+
+// reobserveEnsureDirContradiction is the C17 contradiction's second half
+// (Task 9b, design §2d): it re-observes p via a RAW
+// c.run("filesystem","info",p,"--json") call — deliberately NOT the Stat
+// wrapper. Stat (above) deliberately discards the CLI's raw output on the
+// not-found path, keeping only (_, false, nil); the whole point here is to
+// quote BOTH the create-folder output and this info output VERBATIM if the
+// contradiction cannot be resolved, and the Stat wrapper cannot supply that
+// second verbatim observation.
+//
+// createOut is create-folder's own trimmed output, already captured by the
+// caller; it is quoted here, never re-derived.
+//
+// Classification, in order: code == -1 (mirrors Stat's own code==-1 guard,
+// above) -> the CLI executable itself never started for THIS re-observation
+// call, a distinct transport failure, never folded into "not found" or
+// "undetermined" (review round 4, M5 — the original version discarded the
+// exit code entirely and would have misdiagnosed this as one of those two);
+// code == 0 AND the raw output parses as a folder node -> resolved, proceed
+// as if the folder was there all along (nil); code == 0 AND parses as a
+// file node -> the reverse-D/F refusal, named, not a silent proceed; the
+// JSON parse is gated on code == 0 throughout — a nonzero exit is never fed
+// to parseNodeJSON, matching Stat's own contract that a successful parse
+// only ever happens on a confirmed-successful call; carries
+// notFoundSignature -> the C17 signature itself, GENERIC ROBUSTNESS ONLY
+// (see alreadyExistsSignature's doc comment: observed once live, never
+// reproduced under provocation — C17b's ruling stands, this can never be
+// claimed as a validated live fix) — error quoting both raw observations
+// verbatim so a genuine recurrence stays diagnosable; anything else -> error
+// quoting both as undetermined.
+func (c *CLI) reobserveEnsureDirContradiction(p, createOut string) error {
+	infoOut, infoCode, infoErr := c.run("filesystem", "info", p, "--json")
+	if infoCode == -1 {
+		return fmt.Errorf("contradiction creating folder %s could not be re-observed: the "+
+			"Proton CLI did not start for the follow-up info call: %v (original create-folder "+
+			"output: %q)", p, infoErr, bound(createOut, 200))
+	}
+	if infoCode == 0 {
+		if n, perr := parseNodeJSON([]byte(infoOut)); perr == nil {
+			if n.IsDir {
+				return nil // resolved: a folder genuinely is there now
+			}
+			return fmt.Errorf("cannot use %s as a folder: a file occupies that name "+
+				"(create-folder reported %q; a follow-up info call confirms a file)",
+				p, bound(createOut, 200))
+		}
+	}
+	trimmedInfo := strings.TrimSpace(infoOut)
+	if strings.Contains(trimmedInfo, notFoundSignature) {
+		return fmt.Errorf("contradiction creating folder %s: create-folder reported %q, but a "+
+			"follow-up info call reports not-found: %q — this may be a benign check-then-create "+
+			"race on the CLI's own side, or something removed the node between the two calls; "+
+			"refusing to guess which (generic robustness against a hypothesised race, not a "+
+			"validated live fix — see docs/research/probes/c17b-provocation-log.md)",
+			p, bound(createOut, 200), bound(trimmedInfo, 200))
+	}
+	return fmt.Errorf("contradiction creating folder %s could not be resolved: create-folder "+
+		"reported %q; a follow-up info call reported %q (undetermined)",
+		p, bound(createOut, 200), bound(trimmedInfo, 200))
 }
 
 // transferSummary mirrors an `upload --json` response. Fields are pointers,

@@ -49,7 +49,13 @@ type Transport interface {
 	// (Stage 1 C5), so a bare create would error on every run after the first.
 	EnsureDir(path string) error
 	List(path string) ([]Node, error)
-	Stat(path string) (Node, bool, error) // absence is (_, false, nil), never an error
+	// Stat: absence is (_, false, nil) ONLY when the underlying transport
+	// affirmatively confirms the path does not exist (for *CLI, that is
+	// specifically the certified CLI's own not-found signature — see
+	// cli.go's notFoundSignature). Any other failure is a transport error,
+	// never absence: folding every failure into (_, false, nil) let a broken
+	// CLI masquerade as "not a git-remote-proton repo" (Stage 4 gate 2b).
+	Stat(path string) (Node, bool, error)
 	// ReadTo downloads the node at path into the existing local directory
 	// localPath, landing as a file named after path's own remote basename.
 	// localPath is a directory, never a destination file path.

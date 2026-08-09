@@ -28,6 +28,23 @@ var version = "dev"
 // what the documented variable is.
 const uncertifiedCLIEnv = "GPB_UNCERTIFIED_CLI"
 
+// createParentsEnv is Task 11's opt-in for repo.EnsureParents: unset (the
+// default), a missing parent above a push's repo root is an actionable
+// refusal; "1" lets the helper create missing parents itself, one at a time,
+// with a loud stderr line per folder. Read fresh from the environment on
+// EVERY invocation, same convention as uncertifiedCLIEnv — never cached.
+//
+// Read ONLY at the "list for-push" arm in loop, below, immediately before
+// repo.Bootstrap. Never at a read path (a fetch or plain "list" must never
+// bring anything into existence, parents included) and never by runSetHead:
+// a repo cannot exist below a missing parent, so honouring this var there
+// could only manufacture folder trees and then fail on the marker check
+// anyway (repo.SetHead's RequireMarker call, which runs first and refuses
+// regardless — see internal/repo/parents.go's doc comment and
+// repo_test.go's TestSetHeadNeverCreatesParents, which pins that SetHead
+// never references EnsureParents at all).
+const createParentsEnv = "GPB_CREATE_PARENTS"
+
 // main only chooses the process exit code. All cleanup lives in run's defers:
 // calling os.Exit directly from deep inside the command loop would skip every
 // deferred func (Go does not run defers on os.Exit), which is exactly the lock
@@ -35,6 +52,14 @@ const uncertifiedCLIEnv = "GPB_UNCERTIFIED_CLI"
 func main() {
 	os.Exit(run())
 }
+
+// runSetHeadFn exists ONLY as a test seam pinning the dispatchUtility→
+// runSetHead wiring (argv routing, argument order, exit-code propagation,
+// writer plumbing) for hermetic tests that cannot reach the real
+// runSetHead (it constructs a live *transport.CLI). Nothing else may
+// reassign it — production always calls through the real runSetHead via
+// this variable's initializer.
+var runSetHeadFn = runSetHead
 
 // dispatchUtility handles the CLOSED set of direct-invocation modes. Only
 // exact matches dispatch: a prefix match would misroute a remote whose
@@ -57,7 +82,7 @@ func dispatchUtility(args []string, stdout, stderr io.Writer) (bool, int) {
 			fmt.Fprintln(stderr, "usage: git-remote-proton --set-head <proton::address> <branch>")
 			return true, 1
 		}
-		return true, runSetHead(args[2], args[3], stdout, stderr)
+		return true, runSetHeadFn(args[2], args[3], stdout, stderr)
 	}
 	return false, 0
 }
@@ -365,6 +390,17 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 			out.Flush()
 
 		case line == "list for-push":
+			// EnsureParents runs BEFORE Bootstrap, and ONLY here — see
+			// createParentsEnv's doc above for why this is the one and only
+			// call site. Its stderr argument is the real os.Stderr, not the
+			// buffered `out` this loop writes protocol lines to: created-
+			// folder notes are advisory operator output, the same channel
+			// warn() already uses, never part of the git-remote-helper
+			// protocol stream itself.
+			if err := repo.EnsureParents(t, root, os.Getenv(createParentsEnv) == "1", os.Stderr); err != nil {
+				warn(err)
+				return 1
+			}
 			if err := repo.Bootstrap(t, root); err != nil {
 				warn(err)
 				return 1

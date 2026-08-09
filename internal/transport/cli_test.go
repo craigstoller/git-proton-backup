@@ -46,6 +46,23 @@ const (
 	roleWrongVersion   = "version-wrong"
 	roleNonzeroVersion = "version-nonzero"
 	roleNoToken        = "version-no-token"
+
+	// The two Stat classification stand-ins, below runStatRole (Task 4). Like
+	// the version roles, each ignores its args and just reports a fixed
+	// `filesystem info` failure shape on stderr with exit 1 — the roleNonzero-
+	// Version convention above, mirrored here because both are CLI FAILURES.
+	roleStatNotFound   = "stat-not-found"
+	roleStatOtherError = "stat-other-error"
+
+	// The four EnsureDir contradiction stand-ins, below runEnsureDirRole
+	// (Task 9b). Unlike every role above, EnsureDir's contradiction path
+	// makes MULTIPLE c.run calls within a single method call (info, then
+	// create-folder, then a raw re-observing info), so these roles are
+	// SCRIPTED SEQUENCES, not single fixed responses — see ensureDirScript.
+	roleEnsureDirFile             = "ensuredir-file"
+	roleEnsureDirContraFolder     = "ensuredir-contra-folder"
+	roleEnsureDirContraFile       = "ensuredir-contra-file"
+	roleEnsureDirContraUnresolved = "ensuredir-contra-unresolved"
 )
 
 // helperVersionLine is what the stand-in prints, shaped like the real CLI's
@@ -56,6 +73,13 @@ const helperVersionLine = "Proton Drive CLI " + CertifiedCLI
 // process behind forever. The grandchild normally exits within milliseconds of
 // the release file appearing; nothing asserts against this value.
 const lingerCap = 30 * time.Second
+
+// stepCounterEnv names a file used ONLY by the EnsureDir contradiction roles
+// (Task 9b): each of their c.run calls spawns a FRESH subprocess (re-exec'd
+// from this same test binary), so "which call is this" cannot be read from
+// in-process state the way the single-shot roles above get away with. The
+// file survives across those subprocesses — see nextStep.
+const stepCounterEnv = "GPB_TEST_STEP_COUNTER_FILE"
 
 var (
 	helperDir     string // private temp dir holding the grandchild's binary
@@ -71,6 +95,10 @@ func TestMain(m *testing.M) {
 		runLingerRole()
 	case roleCertified, roleWrongVersion, roleNonzeroVersion, roleNoToken:
 		runVersionRole(os.Getenv(helperEnv))
+	case roleStatNotFound, roleStatOtherError:
+		runStatRole(os.Getenv(helperEnv))
+	case roleEnsureDirFile, roleEnsureDirContraFolder, roleEnsureDirContraFile, roleEnsureDirContraUnresolved:
+		runEnsureDirRole(os.Getenv(helperEnv))
 	}
 	if err := setupHelper(); err != nil {
 		fmt.Fprintln(os.Stderr, "helper setup:", err)
@@ -136,6 +164,101 @@ func runVersionRole(role string) {
 		fmt.Println("unexpected output with no cli-drive@ token")
 	}
 	os.Exit(0)
+}
+
+// runStatRole is the stand-in proton-drive for the Task 4 Stat classification
+// tests. Like runVersionRole it never spawns a grandchild. run() always calls
+// Stat with "filesystem info ... --json", so there is nothing to branch on in
+// the args; the role alone selects which failure shape comes back. Both
+// failure messages land on stderr, matching runVersionRole's
+// roleNonzeroVersion convention for a CLI failure — and it does not actually
+// matter which stream: run()'s cmd.CombinedOutput() (cli.go:51) merges
+// stdout and stderr into one string before Stat ever sees it, so a role that
+// wrote to stdout instead would exercise the identical code path. It never
+// returns.
+func runStatRole(role string) {
+	switch role {
+	case roleStatNotFound:
+		// The exact shape the Stage 4 gate captured live (docs/research/gates/
+		// stage3b-gate.md, stage4-gate.md): "Node not found: <leaf>".
+		fmt.Fprintln(os.Stderr, "Node not found: gpb-remote.json")
+	case roleStatOtherError:
+		fmt.Fprintln(os.Stderr, "something exploded: quota exceeded")
+	}
+	os.Exit(1)
+}
+
+// ensureDirStep is one scripted response: raw combined output plus exit code.
+type ensureDirStep struct {
+	out  string
+	code int
+}
+
+// ensureDirScript returns role's full scripted response sequence, indexed by
+// call position (0-based) — see runEnsureDirRole and nextStep. The response
+// shapes mirror the genuine ones runStatRole/runVersionRole already use:
+// a `filesystem info --json` success prints a parseable node payload and
+// exits 0; a failure (not-found, already-exists) prints the CLI's failure
+// text and exits nonzero.
+func ensureDirScript(role string) []ensureDirStep {
+	const (
+		fileNode      = `{"uid":"u1","name":{"value":"leaf"},"type":"file"}`
+		folderNode    = `{"uid":"u1","name":{"value":"leaf"},"type":"folder"}`
+		notFoundOut   = "Node not found: leaf"
+		alreadyExists = "create-folder failed: leaf: already exists"
+	)
+	switch role {
+	case roleEnsureDirFile:
+		// ONE call: the initial Stat (info) reports a FILE. EnsureDir must
+		// refuse without ever reaching create-folder — a second c.run call
+		// here would run off the end of the script (see the overrun guard in
+		// runEnsureDirRole), which is itself a useful failure signal.
+		return []ensureDirStep{{fileNode, 0}}
+	case roleEnsureDirContraFolder:
+		return []ensureDirStep{{notFoundOut, 1}, {alreadyExists, 1}, {folderNode, 0}}
+	case roleEnsureDirContraFile:
+		return []ensureDirStep{{notFoundOut, 1}, {alreadyExists, 1}, {fileNode, 0}}
+	case roleEnsureDirContraUnresolved:
+		return []ensureDirStep{{notFoundOut, 1}, {alreadyExists, 1}, {notFoundOut, 1}}
+	}
+	return nil
+}
+
+// runEnsureDirRole is the stand-in proton-drive for the Task 9b EnsureDir
+// contradiction tests. It never spawns a grandchild, and it never branches
+// on the args it was given — run() always calls filesystem info/create-
+// folder in EnsureDir's own fixed order, so the SCRIPT POSITION alone
+// (nextStep) is what selects the response; deliberately not keyed off the
+// actual args, because the point of the script is to pin what EnsureDir does
+// with a given sequence of raw outputs, not to re-implement the real CLI. It
+// never returns.
+func runEnsureDirRole(role string) {
+	script := ensureDirScript(role)
+	n := nextStep()
+	if n >= len(script) {
+		fmt.Fprintf(os.Stderr, "ensureDir stand-in role %s invoked more times (call #%d) than "+
+			"scripted (%d) — EnsureDir made an unexpected extra c.run call\n", role, n+1, len(script))
+		os.Exit(1)
+		return
+	}
+	step := script[n]
+	fmt.Print(step.out)
+	os.Exit(step.code)
+}
+
+// nextStep reads-and-increments the step counter file named by
+// stepCounterEnv, treating a missing or empty file as step 0. Each of the
+// EnsureDir contradiction tests below uses its OWN private counter file
+// (t.TempDir()), so there is exactly one writer per file and no locking is
+// needed.
+func nextStep() int {
+	path := os.Getenv(stepCounterEnv)
+	n := 0
+	if b, err := os.ReadFile(path); err == nil {
+		fmt.Sscanf(string(b), "%d", &n)
+	}
+	os.WriteFile(path, []byte(fmt.Sprintf("%d", n+1)), 0o600)
+	return n
 }
 
 // setupHelper copies the test binary into a private temp directory. The
@@ -324,6 +447,49 @@ func TestCLIStatStartFailureIsNotConfirmedAbsence(t *testing.T) {
 	}
 	if ok {
 		t.Fatalf("want ok=false alongside the error, got ok=true")
+	}
+}
+
+// TestCLIStatNonNotFoundFailureIsAnErrorNotAbsence is the Stage 4 gate 2b
+// masquerade regression: a CLI that ran and reported a NON-not-found failure
+// must surface as an error, never as confirmed absence. Before this fix, any
+// nonzero `filesystem info` exit was folded into (_, false, nil), so a
+// broken CLI under GPB_UNCERTIFIED_CLI=1 read as "not a git-remote-proton
+// repo" instead of as the transport failure it actually was.
+func TestCLIStatNonNotFoundFailureIsAnErrorNotAbsence(t *testing.T) {
+	t.Setenv(helperEnv, roleStatOtherError)
+	c := &CLI{Exe: os.Args[0]}
+
+	_, ok, err := c.Stat("/whatever")
+
+	if err == nil {
+		t.Fatalf("want a non-nil error for a non-not-found failure, got ok=%v err=nil", ok)
+	}
+	if !strings.Contains(err.Error(), "quota exceeded") {
+		t.Errorf("error must name the underlying failure, got %q", err)
+	}
+	if ok {
+		t.Errorf("want ok=false alongside the error, got ok=true")
+	}
+}
+
+// TestCLIStatNotFoundSignatureIsConfirmedAbsence is the GUARD: the genuine
+// not-found signature — the exact shape the Stage 4 gate captured live —
+// stays confirmed absence.
+func TestCLIStatNotFoundSignatureIsConfirmedAbsence(t *testing.T) {
+	t.Setenv(helperEnv, roleStatNotFound)
+	c := &CLI{Exe: os.Args[0]}
+
+	n, ok, err := c.Stat("/whatever")
+
+	if err != nil {
+		t.Fatalf("want a nil error for the not-found signature, got %v", err)
+	}
+	if ok {
+		t.Errorf("want ok=false for the not-found signature, got true")
+	}
+	if n != (Node{}) {
+		t.Errorf("want a zero Node alongside confirmed absence, got %+v", n)
 	}
 }
 
@@ -897,5 +1063,99 @@ func TestDirOf(t *testing.T) {
 				t.Errorf("dirOf(%q) = %q, want %q", c.p, got, c.want)
 			}
 		})
+	}
+}
+
+// ensureDirRoleCLI sets this test's helper role and its own private step
+// counter file, then hands back a *CLI pointed at this same test binary,
+// re-exec'd as the stand-in proton-drive via runEnsureDirRole above — the
+// same os/exec helper-process technique every other role in this file uses.
+func ensureDirRoleCLI(t *testing.T, role string) *CLI {
+	t.Helper()
+	t.Setenv(helperEnv, role)
+	t.Setenv(stepCounterEnv, filepath.Join(t.TempDir(), "step"))
+	return &CLI{Exe: os.Args[0]}
+}
+
+// TestEnsureDirRefusesAFileAtThePath is the round-1 Codex BLOCKER: today's
+// EnsureDir returns nil for ANY existing node without ever reading
+// Node.IsDir (cli.go:221-225), so a ref FILE at the path reads as a usable
+// folder and the reverse-D/F failure surfaces later with a wrong diagnostic.
+// The stand-in role answers the initial info call with a FILE node.
+//
+// The script has exactly ONE scripted response, but that alone is NOT what
+// proves EnsureDir didn't wrongly proceed to create-folder (review round 4,
+// M4): a wrongly-proceeding EnsureDir still calls c.run a second time, gets
+// the role's overrun-guard failure, and STILL returns a non-nil error —
+// so a bare err!=nil assertion passes either way. The content check below
+// (the path itself, only ever named by the FIRST-call diagnosis) is what
+// actually discriminates "refused correctly, from the Stat alone" from
+// "proceeded, then failed for an unrelated overrun reason".
+func TestEnsureDirRefusesAFileAtThePath(t *testing.T) {
+	c := ensureDirRoleCLI(t, roleEnsureDirFile)
+	const path = "/r/refs/heads/main"
+	err := c.EnsureDir(path)
+	if err == nil {
+		t.Fatal("EnsureDir onto a FILE must error, never return nil")
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Errorf("error must name the path, got %q", err.Error())
+	}
+}
+
+// TestEnsureDirContradictionResolvedByReStatFolder drives the FULL
+// contradiction sequence (Task 9b, cli.go's alreadyExistsSignature): the
+// initial Stat reports absent, create-folder fails with the already-exists
+// signature (the C17 shape), and the re-observation finds a FOLDER —
+// EnsureDir must succeed, having resolved the contradiction rather than
+// trusting the create-folder failure at face value.
+func TestEnsureDirContradictionResolvedByReStatFolder(t *testing.T) {
+	c := ensureDirRoleCLI(t, roleEnsureDirContraFolder)
+	if err := c.EnsureDir("/r/refs/heads/feature"); err != nil {
+		t.Fatalf("a re-observed folder must resolve the contradiction: %v", err)
+	}
+}
+
+// TestEnsureDirContradictionFileIsNamedConflict is the same sequence, but
+// the re-observation finds a FILE: EnsureDir must refuse, naming the
+// directory/file conflict rather than the raw (and now misleading)
+// create-folder failure text.
+func TestEnsureDirContradictionFileIsNamedConflict(t *testing.T) {
+	c := ensureDirRoleCLI(t, roleEnsureDirContraFile)
+	err := c.EnsureDir("/r/refs/heads/feature")
+	if err == nil {
+		t.Fatal("a re-observed FILE must refuse, naming the directory/file conflict")
+	}
+	// Content-check, not just "any error": an UNMODIFIED EnsureDir also
+	// errors here (it just wraps create-folder's raw failure and gives up),
+	// which would make a bare err!=nil assertion pass for the wrong reason.
+	// The re-observation's own diagnosis must actually have run — its error
+	// does not wrap c.run's raw exec error (unlike the old bare create-folder
+	// wrap, which always ends in "exit status N").
+	if strings.Contains(err.Error(), "exit status") {
+		t.Errorf("must be the re-observation's OWN file-occupies diagnosis, not the raw "+
+			"create-folder wrap, got %q", err.Error())
+	}
+}
+
+// TestEnsureDirContradictionUnresolvedQuotesBoth is the C17 signature: the
+// re-observation STILL reports not-found after create-folder claimed
+// already-exists. This is diagnosable, generic robustness ONLY — C17b's own
+// ruling (docs/research/probes/c17b-provocation-log.md) is that the
+// underlying race was observed once, live, and never reproduced under
+// deliberate provocation, so this path must never be claimed as a validated
+// live fix, only as generic defence against a hypothesised check-then-create
+// race. The error must quote BOTH raw observations verbatim so a genuine
+// recurrence stays diagnosable.
+func TestEnsureDirContradictionUnresolvedQuotesBoth(t *testing.T) {
+	c := ensureDirRoleCLI(t, roleEnsureDirContraUnresolved)
+	err := c.EnsureDir("/r/refs/heads/feature")
+	if err == nil {
+		t.Fatal("an unresolved contradiction must error")
+	}
+	for _, want := range []string{alreadyExistsSignature, notFoundSignature} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error must quote both raw observations verbatim, missing %q in %q", want, err.Error())
+		}
 	}
 }

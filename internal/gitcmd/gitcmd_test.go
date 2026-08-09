@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -149,7 +150,7 @@ func TestWritePack(t *testing.T) {
 
 	t.Run("real pack", func(t *testing.T) {
 		outDir := t.TempDir()
-		packPath, idxPath, err := WritePack(d, head, nil, outDir)
+		packPath, idxPath, err := WritePack(d, []string{head}, nil, outDir)
 		if err != nil {
 			t.Fatalf("WritePack: %v", err)
 		}
@@ -167,7 +168,7 @@ func TestWritePack(t *testing.T) {
 	t.Run("nothing to send", func(t *testing.T) {
 		outDir := t.TempDir()
 		// want == the only have: rev-list --objects head ^head is empty.
-		packPath, idxPath, err := WritePack(d, head, []string{head}, outDir)
+		packPath, idxPath, err := WritePack(d, []string{head}, []string{head}, outDir)
 		if err != nil {
 			t.Fatalf("WritePack: %v", err)
 		}
@@ -175,6 +176,76 @@ func TestWritePack(t *testing.T) {
 			t.Fatalf("want empty paths when there is nothing to send, got pack=%q idx=%q", packPath, idxPath)
 		}
 	})
+}
+
+// RED (Task 9a, step 1). WritePack's wants parameter is plural because the
+// batch push engine packs a WHOLE batch's creates/updates in one pack, not
+// one pack per ref (design's normative "Object transfer per batch" text,
+// which Stage 2's per-ref packing quietly diverged from). Two branches with
+// DISJOINT commits (neither is an ancestor of the other, both built on the
+// same base commit from newRepo) prove the pack is genuinely the union of
+// both closures, not just one want silently winning.
+func TestWritePackMultipleWantsOnePack(t *testing.T) {
+	d := newRepo(t)
+	run := func(args ...string) {
+		if err := exec.Command("git", append([]string{"-C", d}, args...)...).Run(); err != nil {
+			t.Fatalf("git %v: %v", args, err)
+		}
+	}
+	run("checkout", "-qb", "branchA")
+	if err := os.WriteFile(filepath.Join(d, "a2.txt"), []byte("A"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", ".")
+	run("commit", "-qm", "onA")
+	branchA := headOf(t, d)
+
+	run("checkout", "-qb", "branchB", "main")
+	if err := os.WriteFile(filepath.Join(d, "b2.txt"), []byte("B"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", ".")
+	run("commit", "-qm", "onB")
+	branchB := headOf(t, d)
+
+	outDir := t.TempDir()
+	packPath, idxPath, err := WritePack(d, []string{branchA, branchB}, nil, outDir)
+	if err != nil {
+		t.Fatalf("WritePack: %v", err)
+	}
+	if packPath == "" || idxPath == "" {
+		t.Fatalf("want non-empty paths, got pack=%q idx=%q", packPath, idxPath)
+	}
+	if got := countPacks(t, outDir); got != 1 {
+		t.Errorf("want exactly 1 pack for a multi-want batch, got %d", got)
+	}
+	out, err := exec.Command("git", "verify-pack", "-v", idxPath).Output()
+	if err != nil {
+		t.Fatalf("verify-pack: %v", err)
+	}
+	got := string(out)
+	if !strings.Contains(got, branchA) {
+		t.Errorf("pack must contain branchA's closure (%s), verify-pack output:\n%s", branchA, got)
+	}
+	if !strings.Contains(got, branchB) {
+		t.Errorf("pack must contain branchB's closure (%s), verify-pack output:\n%s", branchB, got)
+	}
+}
+
+// GUARD (Task 9a, step 1). Empty wants means nothing to send, the same
+// legitimate non-error outcome as the "nothing new" case in TestWritePack
+// above — pinned here as its own case because it is now reached BEFORE any
+// git subprocess runs at all, not merely as an empty rev-list result.
+func TestWritePackNoWantsIsNoPack(t *testing.T) {
+	d := newRepo(t)
+	outDir := t.TempDir()
+	packPath, idxPath, err := WritePack(d, nil, nil, outDir)
+	if err != nil {
+		t.Fatalf("WritePack: %v", err)
+	}
+	if packPath != "" || idxPath != "" {
+		t.Fatalf("empty wants must yield no pack, got pack=%q idx=%q", packPath, idxPath)
+	}
 }
 
 // chdirForTest changes the process's working directory to dir for the
@@ -228,7 +299,7 @@ func TestWritePackResolvesARelativeOutDirAgainstTheProcessCwd(t *testing.T) {
 		t.Fatalf("mkdir out: %v", err)
 	}
 
-	packPath, idxPath, err := WritePack(d, head, nil, "out") // RELATIVE, and not under gitDir
+	packPath, idxPath, err := WritePack(d, []string{head}, nil, "out") // RELATIVE, and not under gitDir
 	if err != nil {
 		t.Fatalf("WritePack with a relative outDir: %v", err)
 	}
@@ -301,7 +372,7 @@ func TestWritePackIgnoresAHostilePackSizeLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := t.TempDir()
-	packPath, _, err := WritePack(d, head, nil, out)
+	packPath, _, err := WritePack(d, []string{head}, nil, out)
 	if err != nil {
 		t.Fatalf("WritePack must survive a configured packSizeLimit: %v", err)
 	}
@@ -321,7 +392,7 @@ func TestWritePackPinsIndexVersion2(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := t.TempDir()
-	_, idxPath, err := WritePack(d, head, nil, out)
+	_, idxPath, err := WritePack(d, []string{head}, nil, out)
 	if err != nil {
 		t.Fatalf("WritePack: %v", err)
 	}
@@ -412,12 +483,12 @@ func TestConnectivityOKDetectsAnIncompleteClosure(t *testing.T) {
 	src, first, second := twoCommitRepo(t)
 
 	// A pack of only the SECOND commit: its parent is deliberately absent.
-	partial, _, err := WritePack(src, second, []string{first}, t.TempDir())
+	partial, _, err := WritePack(src, []string{second}, []string{first}, t.TempDir())
 	if err != nil || partial == "" {
 		t.Fatalf("WritePack partial: %v", err)
 	}
 	// A pack of the whole history.
-	full, _, err := WritePack(src, second, nil, t.TempDir())
+	full, _, err := WritePack(src, []string{second}, nil, t.TempDir())
 	if err != nil || full == "" {
 		t.Fatalf("WritePack full: %v", err)
 	}
@@ -436,7 +507,7 @@ func TestConnectivityOKDetectsAnIncompleteClosure(t *testing.T) {
 // incremental fetch reconsolidating history the repo already has.
 func TestRevListNewObjectsExcludesWhatTheRepoAlreadyHas(t *testing.T) {
 	src, _, second := twoCommitRepo(t)
-	full, _, err := WritePack(src, second, nil, t.TempDir())
+	full, _, err := WritePack(src, []string{second}, nil, t.TempDir())
 	if err != nil || full == "" {
 		t.Fatalf("WritePack: %v", err)
 	}
@@ -511,6 +582,48 @@ func TestSymbolicRef(t *testing.T) {
 	}
 }
 
+// RED. CheckRefFormat does not exist yet. A syntactically valid ref name
+// (per `git check-ref-format`) must report (true, nil) — exit 0.
+func TestCheckRefFormatValid(t *testing.T) {
+	ok, err := CheckRefFormat("refs/heads/main")
+	if err != nil {
+		t.Fatalf("CheckRefFormat: %v", err)
+	}
+	if !ok {
+		t.Error("want ok=true for a valid ref name")
+	}
+}
+
+// RED. Exit 1 from `git check-ref-format` is the CONFIRMED negative answer —
+// (false, nil), not an error. "main" has no "/", which git's default rules
+// refuse (verified live: exit 1, same as the CheckRefName parity fixtures).
+func TestCheckRefFormatInvalid(t *testing.T) {
+	ok, err := CheckRefFormat("main")
+	if err != nil {
+		t.Fatalf("CheckRefFormat: %v", err)
+	}
+	if ok {
+		t.Error("want ok=false for an invalid ref name")
+	}
+}
+
+// RED. Any exit other than 0 or 1 is a tooling failure, not a confirmed
+// verdict, and must surface as (false, err). "--" is the caller-contract-
+// forbidden case the round-2 Codex blocker turned up: every real caller
+// passes a name already required to start with "refs/", so a leading "-"
+// can never occur in production, but passing "--" here directly proves the
+// wrapper does not silently fold git's usage-error exit (129, verified live)
+// into a confirmed "not a valid ref name" answer.
+func TestCheckRefFormatUnexpectedExitIsError(t *testing.T) {
+	ok, err := CheckRefFormat("--")
+	if err == nil {
+		t.Fatalf("want a non-nil error for an unexpected exit code, got ok=%v err=nil", ok)
+	}
+	if ok {
+		t.Fatal("want ok=false alongside the error, got true")
+	}
+}
+
 // RED (fix round 1, I1). PackObjectsFromList does not exist yet — it is the
 // extraction of WritePack's own exec site so repo.consolidateAndInstall gets
 // the same WaitDelay / ErrWaitDelay / multi-pack-rejection guards WritePack
@@ -545,7 +658,7 @@ func TestPackObjectsFromListBuildsFromGitDirAlone(t *testing.T) {
 // exactly the path that had no guards before this fix round.
 func TestPackObjectsFromListSplicesInAnAlternate(t *testing.T) {
 	src, _, second := twoCommitRepo(t)
-	full, _, err := WritePack(src, second, nil, t.TempDir())
+	full, _, err := WritePack(src, []string{second}, nil, t.TempDir())
 	if err != nil || full == "" {
 		t.Fatalf("WritePack: %v", err)
 	}
@@ -573,7 +686,7 @@ func TestIndexPackVerifyAcceptsGoodPairRejectsCorrupt(t *testing.T) {
 	d := newRepo(t)
 	head := headOf(t, d)
 	out := t.TempDir()
-	packPath, idxPath, err := WritePack(d, head, nil, out)
+	packPath, idxPath, err := WritePack(d, []string{head}, nil, out)
 	if err != nil || packPath == "" {
 		t.Fatalf("WritePack: %v", err)
 	}
@@ -628,7 +741,7 @@ func makeIdxFixture(t *testing.T, indexVersion string) (idxPath string, oids map
 	sha := run("rev-parse", "HEAD")
 
 	out := t.TempDir()
-	packPath, gotIdx, err := WritePack(d, sha, nil, out)
+	packPath, gotIdx, err := WritePack(d, []string{sha}, nil, out)
 	if err != nil || packPath == "" {
 		t.Fatalf("WritePack: %v", err)
 	}
@@ -856,5 +969,91 @@ func TestParseMissingOIDs(t *testing.T) {
 	}
 	if _, err := parseMissingOIDs("?nothex\n"); err == nil {
 		t.Error("a malformed ?-line must be a hard error")
+	}
+}
+
+// RED. longPathHint does not exist yet. It must fire for a path AT the
+// 240-char threshold, phrased as a POSSIBLE cause (never asserting path
+// length IS the problem — a possible-cause hint that claimed certainty would
+// be wrong every time the failure is actually unrelated), and name the
+// `core.longpaths` remedy so a user can act on it without decoding the raw
+// git error themselves.
+//
+// Gated on GOOS: the helper itself only fires on Windows (Windows' MAX_PATH
+// is not a thing on other platforms), but this suite's own platform IS
+// Windows (see the task's binding environment), so the gate skips nothing
+// here — it exists so this test does not regress into a false failure if the
+// suite is ever run cross-platform.
+func TestLongPathHintFiresNear240(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("longPathHint is a Windows-only diagnostic")
+	}
+	p := strings.Repeat("a", 240)
+	got := longPathHint(p)
+	if got == "" {
+		t.Fatal("want a non-empty hint for a 240-char path on Windows")
+	}
+	if !strings.Contains(got, "may") {
+		t.Errorf("hint must be phrased as a POSSIBLE cause (want it to contain \"may\"): %q", got)
+	}
+	if !strings.Contains(got, "core.longpaths") {
+		t.Errorf("hint must name the core.longpaths remedy: %q", got)
+	}
+}
+
+// RED. Every path under the threshold must stay silent — a hint on an
+// ordinary-length failure would misdirect a user chasing an unrelated bug.
+func TestLongPathHintSilentOnShortPaths(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("longPathHint is a Windows-only diagnostic")
+	}
+	if got := longPathHint("short", strings.Repeat("b", 239)); got != "" {
+		t.Errorf("want \"\" when every path is under the 240-char threshold, got %q", got)
+	}
+	if got := longPathHint(); got != "" {
+		t.Errorf("want \"\" for no paths at all, got %q", got)
+	}
+}
+
+// RED then GUARD: proves the hint is actually WIRED into a real failure
+// return, not just a standalone helper nothing calls. gitDir need not exist
+// on disk to be long — `git -C <gitDir>` fails immediately either way, which
+// is exactly the failure PackObjectsFromList's own error return must carry
+// the hint on.
+func TestPackObjectsFailureCarriesLongPathHint(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("longPathHint is a Windows-only diagnostic")
+	}
+	gitDir := `C:\` + strings.Repeat("nonexistent-dir\\", 20) // well over 240 chars, never created
+	_, err := PackObjectsFromList(gitDir, "", "", filepath.Join(t.TempDir(), "pack"))
+	if err == nil {
+		t.Fatal("want an error for a gitDir that does not exist")
+	}
+	if !strings.Contains(err.Error(), "core.longpaths") {
+		t.Errorf("want the MAX_PATH hint appended to the error, got %v", err)
+	}
+}
+
+// RED then GUARD: pins the OTHER wired branch — WritePack's own rev-list
+// failure, not PackObjectsFromList's. rev-list runs as `git -C gitDir ...`
+// exactly like every other exec site in this package, so a deep gitDir can
+// make rev-list itself the spawn that hits MAX_PATH, before pack-objects is
+// ever reached. A nonexistent gitDir makes `git -C gitDir rev-list ...` fail
+// immediately — the same "need not exist to be long" technique as the
+// PackObjectsFromList wiring test above, aimed at the earlier failure point.
+func TestWritePackRevListFailureCarriesLongPathHint(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("longPathHint is a Windows-only diagnostic")
+	}
+	gitDir := `C:\` + strings.Repeat("nonexistent-dir\\", 20) // well over 240 chars, never created
+	_, _, err := WritePack(gitDir, []string{"HEAD"}, nil, t.TempDir())
+	if err == nil {
+		t.Fatal("want an error for a gitDir that does not exist")
+	}
+	if !strings.Contains(err.Error(), "rev-list") {
+		t.Fatalf("expected this to fail at rev-list (before pack-objects is ever reached), got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "core.longpaths") {
+		t.Errorf("want the MAX_PATH hint appended to the error, got %v", err)
 	}
 }

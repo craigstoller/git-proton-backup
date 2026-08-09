@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -151,6 +152,36 @@ func IsAncestor(gitDir, old, new string) (bool, error) {
 	}
 }
 
+// CheckRefFormat runs `git check-ref-format <name>` — the ground truth
+// repo.CheckRefName's in-process rule set is checked against by
+// TestCheckRefNameParityWithGit (internal/repo/refname_test.go).
+//
+// Deliberately NO "--" separator: verified live 2026-08-06,
+// `check-ref-format -- refs/heads/main` exits 129 (a usage error) while the
+// bare form exits 0/1 correctly (round-2 Codex blocker). This carries no
+// argument-injection exposure: every caller here passes a name already
+// required to start with "refs/", so a leading "-" can never occur.
+//
+// Contract, mirroring IsAncestor's exit-code interpretation above: exit 0 is
+// the confirmed positive (true, nil); exit 1 is the confirmed negative
+// (false, nil); any other exit — 129 included — is a tooling failure, not a
+// confirmed verdict, and is surfaced as (false, err) rather than silently
+// read as "not a valid ref name".
+func CheckRefFormat(name string) (bool, error) {
+	out, code, err := git(".", "check-ref-format", name)
+	switch code {
+	case 0:
+		return true, nil
+	case 1:
+		return false, nil
+	default:
+		if err != nil {
+			return false, fmt.Errorf("check-ref-format %s: %s: %w", name, out, err)
+		}
+		return false, fmt.Errorf("check-ref-format %s: %s (exit %d)", name, out, code)
+	}
+}
+
 // RevParse runs `git rev-parse <args...>` and returns the trimmed output,
 // the raw exit code, and any start/run error, the same three-value shape
 // git() itself returns: callers (Task 10's resolve(), repo.consolidateAndInstall)
@@ -170,20 +201,55 @@ func RevParse(gitDir string, args ...string) (string, int, error) {
 	return out, code, err
 }
 
-// WritePack builds a NON-THIN pack containing the objects reachable from
-// want but not from any of haves, and writes it into outDir. --no-thin is
+// longPathHint returns a one-line POSSIBLE-cause note when any involved path
+// approaches Windows' legacy 260-character MAX_PATH (threshold 240,
+// deliberately conservative: the limit counts a terminator and directory
+// operations fail below it). len() counts UTF-8 bytes, not the UTF-16 path
+// units Windows itself counts against MAX_PATH — an undercount for any
+// non-ASCII path segment, and acceptable for exactly that reason: it only
+// makes the already-conservative 240 threshold MORE conservative, never
+// less, so the byte/unit mismatch cannot cause a genuinely long path to go
+// unflagged. Path-length arithmetic only — git's own messages are localised,
+// so matching against stderr text is a non-starter. Checkout-phase failures
+// happen after this helper has already exited (git itself, not this
+// package, does the checkout) and are documented in README instead; no
+// helper hint is reachable there.
+func longPathHint(paths ...string) string {
+	if runtime.GOOS != "windows" {
+		return ""
+	}
+	for _, p := range paths {
+		if len(p) >= 240 {
+			return fmt.Sprintf(" (note: a path involved is %d characters, near Windows' "+
+				"260-character MAX_PATH; this may be why the write failed — try `git config "+
+				"core.longpaths true` or a shorter destination)", len(p))
+		}
+	}
+	return ""
+}
+
+// WritePack builds a NON-THIN pack containing the objects reachable from any
+// of wants but not from any of haves, and writes it into outDir. --no-thin is
 // deliberate: a thin pack would depend on delta bases the remote may not
 // hold, and the remote here is Proton Drive, not another git repo that can
 // fill in bases on the fly.
+//
+// wants is plural (Task 9a): the batch push engine packs the WHOLE batch's
+// creates/updates in one pack against one set of pre-batch haves, matching
+// the design doc's normative "Object transfer per batch" text rather than
+// Stage 2's per-ref packing. An empty wants means there is nothing to send
+// at all — WritePack returns ("", "", nil) immediately, without even
+// resolving outDir or spawning rev-list, the same legitimate non-error
+// outcome as the "nothing new to send" case below.
 //
 // Ordering guarantee: pack, then idx, then confirm both exist, then (by the
 // caller) the ref. WritePack itself only does the first three steps — it
 // must not report success, or hand back a path, it has not confirmed. A ref
 // pointing at a missing index would not be fetch-discoverable.
 //
-// When rev-list finds nothing to send (want is already covered by haves),
-// WritePack returns ("", "", nil): a legitimate, distinct outcome, not an
-// error.
+// When rev-list finds nothing to send (every want is already covered by
+// haves), WritePack returns ("", "", nil): a legitimate, distinct outcome,
+// not an error.
 //
 // outDir is resolved to an ABSOLUTE path first, and the returned paths are
 // absolute as a result. This is the untreated twin of the path-doubling bug
@@ -198,7 +264,11 @@ func RevParse(gitDir string, args ...string) (string, int, error) {
 // anyway because PackObjectsFromList is now a SHARED exec site with two
 // callers holding different path disciplines, and "latent" is a property of
 // today's callers, not of the function.
-func WritePack(gitDir, want string, haves []string, outDir string) (string, string, error) {
+func WritePack(gitDir string, wants []string, haves []string, outDir string) (string, string, error) {
+	if len(wants) == 0 {
+		return "", "", nil // nothing to send; not an error
+	}
+
 	absOut, err := filepath.Abs(outDir)
 	if err != nil {
 		return "", "", fmt.Errorf("cannot resolve pack output directory %q to an absolute "+
@@ -209,16 +279,23 @@ func WritePack(gitDir, want string, haves []string, outDir string) (string, stri
 	// path instead of the one the caller actually passed.
 	outDir = absOut
 
-	revArgs := []string{"rev-list", "--objects", want}
+	revArgs := []string{"rev-list", "--objects"}
+	revArgs = append(revArgs, wants...)
 	for _, h := range haves {
 		revArgs = append(revArgs, "^"+h)
 	}
 	objs, code, err := git(gitDir, revArgs...)
 	if code != 0 {
+		// rev-list runs as `git -C gitDir ...`, the same exec shape every other
+		// call in this package uses, so a deep gitDir with a short outDir can
+		// make THIS spawn the one that hits MAX_PATH — not just the later
+		// pack-write steps below. outDir is included too (already absolutised
+		// above); no emitted pack path exists yet at this point, so it is
+		// omitted from the tuple rather than passed empty.
 		if err != nil {
-			return "", "", fmt.Errorf("rev-list failed: %s: %w", objs, err)
+			return "", "", fmt.Errorf("rev-list failed: %s: %w%s", objs, err, longPathHint(gitDir, outDir))
 		}
-		return "", "", fmt.Errorf("rev-list failed: %s", objs)
+		return "", "", fmt.Errorf("rev-list failed: %s%s", objs, longPathHint(gitDir, outDir))
 	}
 	// The one caller of git() where truncated output would be silently WRONG
 	// rather than merely noisy: this list IS the pack's contents, so a short
@@ -250,10 +327,12 @@ func WritePack(gitDir, want string, haves []string, outDir string) (string, stri
 	// a pack or index that was never actually written, which would not be
 	// fetch-discoverable.
 	if _, err := os.Stat(packPath); err != nil {
-		return "", "", fmt.Errorf("pack-objects reported %s but the pack file is missing: %w", packPath, err)
+		return "", "", fmt.Errorf("pack-objects reported %s but the pack file is missing: %w%s",
+			packPath, err, longPathHint(gitDir, outDir, packPath))
 	}
 	if _, err := os.Stat(idxPath); err != nil {
-		return "", "", fmt.Errorf("pack-objects reported %s but the idx file is missing: %w", idxPath, err)
+		return "", "", fmt.Errorf("pack-objects reported %s but the idx file is missing: %w%s",
+			idxPath, err, longPathHint(gitDir, outDir, idxPath))
 	}
 	return packPath, idxPath, nil
 }
@@ -334,7 +413,8 @@ func PackObjectsFromList(gitDir, altObjects, objs, outStem string) (string, erro
 				"pipe open after %s, so the pack name it printed cannot be trusted to be "+
 				"complete; refusing to guess which pack it wrote", waitDelay)
 		}
-		return "", fmt.Errorf("pack-objects: %s: %w", strings.TrimSpace(stderr.String()), err)
+		return "", fmt.Errorf("pack-objects: %s: %w%s", strings.TrimSpace(stderr.String()), err,
+			longPathHint(gitDir, outStem))
 	}
 	name := strings.TrimSpace(stdout.String())
 

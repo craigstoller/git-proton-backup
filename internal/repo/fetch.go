@@ -67,7 +67,14 @@ func Fetch(t transport.Transport, root, gitDir, cacheDir string, wants []string)
 	altObjects := filepath.Join(tmp, "objects")
 	packDir := filepath.Join(altObjects, "pack")
 	fallbackDir := filepath.Join(tmp, "idx")
-	for _, d := range []string{packDir, fallbackDir} {
+	// incomingDir is the per-fetch quarantine: downloads land and verify here,
+	// never in packDir directly. It is a SIBLING of altObjects under the one
+	// per-fetch tmp root, so it is on the same filesystem by construction —
+	// publication (downloadAndVerifyPack's publishPair) is a plain os.Rename,
+	// never a cross-volume copy of a repository-sized pack. See design doc
+	// Component 4 ("Quarantine fetch staging").
+	incomingDir := filepath.Join(tmp, "incoming")
+	for _, d := range []string{packDir, fallbackDir, incomingDir} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return "", err
 		}
@@ -145,7 +152,7 @@ func Fetch(t transport.Transport, root, gitDir, cacheDir string, wants []string)
 			continue
 		}
 		for _, stem := range toGet {
-			refreshed, err := downloadAndVerifyPack(t, root, packDir, stem, pm)
+			refreshed, err := downloadAndVerifyPack(t, root, incomingDir, packDir, stem, pm)
 			if err != nil {
 				if !errors.Is(err, errCacheSuspect) {
 					return "", err // pair-corrupt fatal, or a non-heal-able failure
@@ -195,77 +202,107 @@ func stemSet(stems []string) map[string]bool {
 // downloadAndVerifyPack downloads one pack, checksums it against its own
 // basename (the .pack ALONE — the .idx borrows the pack's name, so that
 // comparison could never pass), lays the sidecar beside it (git discovers
-// packs in an alternate only via the .idx), and runs pair verification.
+// packs in an alternate only via the .idx), and runs pair verification — all
+// of it in incomingDir, the per-fetch quarantine. Only a fully verified pair
+// is published into packDir (see publishPair); nothing unverified ever exists
+// there. See design doc Component 4 ("Quarantine fetch staging").
 //
 // refreshed reports that the sidecar was re-downloaded and the map rebuilt —
 // the caller must restart its round planning.
-//
-// RESIDUE RULE (spec, round 3): every failure path deletes what it wrote
-// before returning. ReadTo's behaviour onto an existing file is deliberately
-// unpinned (C2's identical-content skip makes reuse of stale bytes a real
-// hazard), and a healed plan may legitimately re-select this same pack, so
-// retry correctness must never depend on overwrite semantics. The remove
-// BEFORE downloading covers residue from an attempt this process lost track
-// of; the removes on each failure path cover this attempt's own leavings.
-func downloadAndVerifyPack(t transport.Transport, root, packDir, stem string, pm *packMap) (bool, error) {
+func downloadAndVerifyPack(t transport.Transport, root, incomingDir, packDir, stem string, pm *packMap) (bool, error) {
 	packName := stem + ".pack"
-	packPath := filepath.Join(packDir, packName)
-	if err := os.Remove(packPath); err != nil && !os.IsNotExist(err) {
+	inPack := filepath.Join(incomingDir, packName)
+	// A healed plan may re-select this stem; ReadTo onto an existing file is
+	// deliberately unpinned, so clear THIS QUARANTINE's own copy first. This
+	// is not the old residue rule: it never touches packDir, and it is the
+	// only cleanup downloadAndVerifyPack does — every failure below just
+	// returns, leaving its bytes in incomingDir for wholesale teardown.
+	if err := os.Remove(inPack); err != nil && !os.IsNotExist(err) {
 		return false, err
 	}
-	if err := t.ReadTo(root+"/packs/"+packName, packDir); err != nil {
-		_ = os.Remove(packPath)
+	if err := t.ReadTo(root+"/packs/"+packName, incomingDir); err != nil {
 		return false, fmt.Errorf("cannot download %s: %v — a truthful map might never have "+
 			"selected this pack: %w", packName, err, errCacheSuspect)
 	}
-	got, err := packContentChecksum(packPath)
+	got, err := packContentChecksum(inPack)
 	if err != nil {
-		_ = os.Remove(packPath)
 		return false, fmt.Errorf("cannot checksum downloaded pack %s: %v: %w",
 			packName, err, errCacheSuspect)
 	}
 	if want := packNameChecksum(packName); got != want {
-		_ = os.Remove(packPath)
 		return false, fmt.Errorf("downloaded pack %s recomputes to %s; the name is the "+
 			"content checksum, so this file is not what its name claims: %w",
 			packName, got, errCacheSuspect)
 	}
-	idxPath := filepath.Join(packDir, stem+".idx")
-	if err := copyFile(pm.sidecars[stem], idxPath); err != nil {
+	inIdx := filepath.Join(incomingDir, stem+".idx")
+	if err := copyFile(pm.sidecars[stem], inIdx); err != nil {
 		// The SOURCE here may be a cache path, and an unreadable cached
 		// sidecar is cache-read trouble — heal-able, not fatal (spec: any
 		// cache I/O failure degrades). Wrapping unconditionally is safe: a
 		// genuine temp-dir failure wastes one heal round and then fatals.
-		_ = os.Remove(idxPath)
-		_ = os.Remove(packPath)
 		return false, fmt.Errorf("cannot lay sidecar beside %s: %v: %w",
 			packName, err, errCacheSuspect)
 	}
-	if err := gitcmd.IndexPackVerify(packPath); err == nil {
-		return false, nil
+	refreshed := false
+	if err := gitcmd.IndexPackVerify(inPack); err != nil {
+		// Pair failed. The pack proved it matches its NAME, not that it is
+		// well formed — so the cached sidecar is the CHEAPER suspect, not the
+		// proven one. One fresh sidecar, map rebuilt, one re-verify.
+		fresh, rerr := RefreshSidecar(t, root, pm.cacheDir, pm.fallbackDir, stem)
+		if rerr != nil {
+			return false, rerr
+		}
+		pm.sidecars[stem] = fresh
+		if err := pm.rebuildFromSidecars(); err != nil {
+			return false, err
+		}
+		if err := os.Remove(inIdx); err != nil && !os.IsNotExist(err) {
+			return false, err
+		}
+		if err := copyFile(fresh, inIdx); err != nil {
+			return false, err
+		}
+		if err := gitcmd.IndexPackVerify(inPack); err != nil {
+			return false, fmt.Errorf("pack pair %s.{pack,idx} fails verification even with a "+
+				"freshly downloaded index; the pair is corrupt, member undetermined: %w", stem, err)
+		}
+		refreshed = true
 	}
-	// Pair failed. The pack proved it matches its NAME, not that it is well
-	// formed — so the cached sidecar is the CHEAPER suspect, not the proven
-	// one. One fresh sidecar, map rebuilt, one re-verify.
-	fresh, rerr := RefreshSidecar(t, root, pm.cacheDir, pm.fallbackDir, stem)
-	if rerr != nil {
-		return false, rerr
+	// PUBLISH: only a fully verified pair leaves quarantine.
+	if err := publishPair(incomingDir, packDir, stem); err != nil {
+		return refreshed, err
 	}
-	pm.sidecars[stem] = fresh
-	if err := pm.rebuildFromSidecars(); err != nil {
-		return false, err
+	return refreshed, nil
+}
+
+// publishPair moves a VERIFIED pair from quarantine into the alternate's pack
+// dir: .pack first, then .idx. The .idx rename is the pair's commit point —
+// git discovers packs only via their index, so a pack whose idx has not
+// landed is invisible to the traversal — which is what makes the two renames
+// an atomic publication from the reader's side. Go's os.Rename replaces an
+// existing destination file on Windows — the same fact idxcache.go's
+// installIntoCache already relies on, and which the mid-round pair-refresh
+// exercises via RefreshSidecar's cache write — but publishPair itself does
+// not depend on it: greedyCover never re-selects an already-downloaded stem,
+// and packDir starts empty every fetch (a fresh os.MkdirTemp), so this
+// function's destination is never occupied. Overwrite is not relied on here,
+// and is not a hazard either.
+//
+// inPack was just held open by gitcmd.IndexPackVerify's `index-pack
+// --verify`; on its ErrWaitDelay path a grandchild may still hold a handle
+// on it, which can turn this rename into a Windows sharing-violation error —
+// left fatal-and-loud on purpose (publishPair's error is never wrapped in
+// errCacheSuspect, so Fetch spends none of its one heal round on it): a held
+// file handle is local trouble a re-download cannot fix.
+//
+// Extracted so the ordering is unit-testable (TestPublishPairRenamesPackBeforeIdx).
+func publishPair(incomingDir, packDir, stem string) error {
+	if err := os.Rename(filepath.Join(incomingDir, stem+".pack"),
+		filepath.Join(packDir, stem+".pack")); err != nil {
+		return err
 	}
-	if err := os.Remove(idxPath); err != nil && !os.IsNotExist(err) {
-		return false, err
-	}
-	if err := copyFile(fresh, idxPath); err != nil {
-		return false, err
-	}
-	if err := gitcmd.IndexPackVerify(packPath); err != nil {
-		return false, fmt.Errorf("pack pair %s.{pack,idx} fails verification even with a "+
-			"freshly downloaded index; the pair is corrupt, member undetermined: %w", stem, err)
-	}
-	return true, nil
+	return os.Rename(filepath.Join(incomingDir, stem+".idx"),
+		filepath.Join(packDir, stem+".idx"))
 }
 
 // copyFile copies src to dst. out is closed EXACTLY ONCE on each path, with

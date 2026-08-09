@@ -82,10 +82,18 @@ func EnsureSidecar(t transport.Transport, root, cacheDir, fallbackDir, stem stri
 }
 
 // RefreshSidecar unconditionally re-downloads stem's .idx, deleting any
-// stale fallback copy first (ReadTo's behaviour onto an existing file is
-// unpinned — C2's identical-content skip — so the residue rule applies to
-// sidecars exactly as it does to packs) and replacing the cached copy when
-// possible. The returned path is the guaranteed-fresh fallback copy.
+// stale fallback copy first and replacing the cached copy when possible. The
+// returned path is the guaranteed-fresh fallback copy.
+//
+// The delete-first step is NOT the old pack-dir residue rule (deleted in Task
+// 6, when quarantine staging replaced it): it is this function's own
+// precondition. ReadTo's behaviour onto an EXISTING file is unpinned — C2's
+// identical-content skip means a download can be a silent no-op — so a
+// refresh that did not clear its own stale copy first could return the very
+// bytes it exists to replace. Under quarantine staging the sidecar cache is
+// the only place a stale copy can survive a fetch, which is exactly why the
+// clearing has to happen here rather than being inherited from a general
+// download-residue rule that no longer exists.
 func RefreshSidecar(t transport.Transport, root, cacheDir, fallbackDir, stem string) (string, error) {
 	name := stem + ".idx"
 	if err := os.Remove(filepath.Join(fallbackDir, name)); err != nil && !os.IsNotExist(err) {
