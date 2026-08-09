@@ -51,8 +51,13 @@ modified or deleted by the helper.
 
 **The scan result is structured, not a bare map.** `ListRefs` (the advertisement walk) returns
 three things, distinctly typed: the advertised ref map (exactly as today); the **skipped
-occupancy set** — every well-named path that was skipped, with a classified reason (consumed by
-component 2's preflight and delete handling, and by HEAD advertisement below); and errors.
+occupancy set** — **every** skipped path, with a classified reason: content-skipped files
+(this component), name-skipped files, and name-skipped **folders** (whose subtrees the Stage 5
+walk deliberately never enters — the folder itself is the recorded occupancy); and errors.
+(Round-2 Codex: recording only content-skips would let a create over a folder holding an
+invalid-named child sail through preflight and reproduce the late-failure defect for that
+class.) The set is consumed by component 2's preflight and delete handling, and by HEAD
+advertisement below.
 Only a **grammar/classification failure is skippable**; every transport or read failure remains
 fatal, and the two must be distinguished by **type** (a sentinel/typed error from the ref-read
 path), never by message text — a natural implementation that caught all read errors would turn
@@ -60,16 +65,30 @@ network failures into false absence, which is exactly the misrepresentation the 
 below exist to prevent. A GUARD test pins it: a transport `ReadTo` failure during the walk
 stays fatal while a grammar failure beside it skips.
 
-**Classification is size-gated — no unbounded downloads.** A valid ref file is exactly 41
-bytes. The walk classifies from the listing's size metadata *before* any download:
+**Classification is size-gated — downloads are bounded by a candidate band.** A valid ref
+file is exactly 41 bytes, and the noncanonical damaged-ref shapes worth diagnosing sit within
+a few bytes of it (no-LF = 40, CRLF = 42, double-LF = 42, BOM-prefixed = up to 44). The walk
+classifies from the listing's size metadata *before* any download:
 
-- size known and ≠ 41 → **skipped without downloading**; the note reports the size, never
-  contents (bounds work, and keeps foreign file contents out of logs).
-- size known and = 41 → downloaded and grammar-checked (40 lowercase hex + `\n`). On failure,
-  skipped with a note carrying the 41-byte preview, control bytes hex-escaped.
+- size known and **outside the 40–44 byte candidate band** → **skipped without downloading**;
+  the note reports the size, never contents (bounds work, and keeps foreign file contents out
+  of logs).
+- size known and **within the band** → downloaded and grammar-checked (40 lowercase hex +
+  `\n`, exactly 41 bytes, is the only advertisable form). On failure, skipped with a note
+  carrying the escaped preview (≤44 bytes, control bytes hex-escaped) — and the noncanonical
+  classification below. (Round-2 [Both] blocker: the round-1 gate downloaded only exactly-41-
+  byte files, which made the damaged-pointer note below physically impossible for the 40- and
+  42-byte shapes it exists for; the band restores it while keeping every download ≤44 bytes.)
 - size unavailable → **skipped without downloading**, note says so. (Fail-safe: never download
   what cannot be bounded. The certified CLI reports sizes for files; this arm is belt-and-
   braces, and the note makes its firing visible if the assumption ever breaks.)
+
+**The gate is a best-effort metadata bound, and says so.** The size is observed at listing
+time; an occupant replaced between that observation and the read can in principle be larger
+(round-2 Codex). The certified CLI offers no byte-capped partial download, so this residual is
+**accepted and stated** rather than engineered away: the race requires a non-v2 actor writing
+mid-operation, the same single-writer posture every check-then-act site in this design already
+documents (design §2c), and the blast radius is one oversized transfer, not corruption.
 
 **Notes are classified, and a damaged-ref pointer is never destroyed silently.** The note
 grammar extends the existing `skipNote` mechanism — `git-remote-proton: skipping
@@ -132,7 +151,9 @@ invocation that then executes the push batch, so the batch engine receives both.
   as a valid ref, keep the existing concurrent-creator message (it is true). Otherwise:
   `a file occupies <ref> and its contents are not a ref (<reason>); delete it first (...)`.
   The message asserts only what is observed **now** — it does not claim the file "was skipped
-  at advertisement" (round-1 Codex: that history is not this code path's observation).
+  at advertisement" (round-1 Codex: that history is not this code path's observation). The
+  size gate here is the same best-effort metadata bound as component 1's, with the same
+  stated residual.
 - **The write boundary stays fail-closed in every arm.** Nothing is overwritten, nothing is
   auto-deleted; heal remains folders-only exactly as shipped. If a diagnostic read fails, the
   original refusal stands with the read failure noted — the same only-act-on-positive-evidence
@@ -203,10 +224,14 @@ One revision entry, edits in place per house style:
 
 - Content-skip: junk beside good refs → map contains the good refs only, note asserted on
   captured stderr (mutation-verified); nested junk skips without disturbing siblings; the
-  size-gate arms (≠41 skipped WITHOUT a ReadTo — pinned by trace assertion; =41 downloaded and
-  parsed; the noncanonical-40-hex note quotes the hex); the Stage 5 exact-grammar boundary
-  fixtures (no-LF, CRLF, double-LF) flip from fatal-pinning to skip-pinning with fixtures
-  preserved.
+  size-gate arms (outside the 40–44 band skipped WITHOUT a ReadTo — pinned by trace assertion;
+  in-band downloaded and parsed; the noncanonical-40-hex note quotes the hex — reachable
+  because 40- and 42-byte shapes are in-band); the Stage 5 exact-grammar boundary fixtures
+  (no-LF, CRLF, double-LF) flip from fatal-pinning to skip-pinning with fixtures preserved,
+  each asserting its classified note.
+- Occupancy completeness: a create over a folder whose only content is a name-skipped child
+  (file or folder) is refused at preflight with NO pack built — the name-skip occupancy case
+  (round-2 Codex).
 - Typed-split GUARD: a transport `ReadTo` failure during the walk stays fatal (named folder,
   no partial advertisement) while a grammar failure beside it skips.
 - Degraded states: HEAD naming a skipped ref (HEAD not advertised, note, others intact);
@@ -306,3 +331,16 @@ brainstorm-adjudicated availability decision; the scenario — including exit-0-
 same-sha idempotent create reconciliation ([Codex] — changes Stage 2 concurrent-creator
 semantics for an unobserved case; deferred); a verify/health command ([Codex] — real gap,
 wrong stage; recorded as a Stage 7 candidate in Out of scope).
+
+**Round 2 (Codex + Gemini, 2026-08-09) — applied:** the round-1 size gate was DEFECTIVE and
+both engines caught it as a blocker — "download only exactly 41 bytes" made the damaged-
+pointer note physically impossible for the 40-byte (no-LF) and 42-byte (CRLF/double-LF)
+shapes it exists for; replaced with a 40–44-byte candidate band (every download still ≤44
+bytes; wrong-terminator hex recovery restored; component-5 fixtures now assert their
+classified notes) ([Both] blocker). The occupancy set widened from content-skips to ALL
+skipped paths — name-skipped files and name-skipped folders included (folder itself recorded;
+its subtree is never entered) — closing the late-failure reproduction for invalid-named
+foreign data, with a preflight test ([Codex] major). The size gate is now explicitly a
+best-effort metadata bound with the replace-between-observe-and-read race accepted and
+stated (no byte-capped download exists in the certified CLI; same single-writer posture as
+design §2c), in both components 1 and 2 ([Codex] major, honesty option adopted).
