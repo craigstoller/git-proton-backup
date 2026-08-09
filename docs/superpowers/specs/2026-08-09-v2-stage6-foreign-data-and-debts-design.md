@@ -142,14 +142,16 @@ remote-only objects; the note preserves it at zero behavioural cost.)
   the fetch-direction contract. Name-skips do not trigger this (the principled line in the
   scope section); their notes still print.
 
-**Degraded states are defined, not implied (push-direction survey; the strict fetch survey
-fails before these states can matter):**
-- **HEAD names a content-skipped ref** → the HEAD symref is not advertised either, with its
-  own note (advertising a symref to a ref git cannot see would be incoherent). Everything
-  else advertises.
-- **Every ref skipped** → an empty push advertisement with one note per file (`git push`
-  then behaves as pushing to an empty remote — creates proceed; component 2 refuses the
-  occupied names).
+**Degraded states are defined, not implied.** For CONTENT-skips the strict fetch survey
+fails before these states can matter, so they are push-survey states; for NAME-skips they
+are reachable in BOTH directions (name-skips never fail a survey — round-5 Gemini):
+- **HEAD names a skipped ref (either class)** → the HEAD symref is not advertised either,
+  with its own note (advertising a symref to a ref git cannot see would be incoherent).
+  Everything else advertises — in the fetch direction too, when the skip is a name-skip.
+- **Every ref skipped** → an empty advertisement with one note per file. Push direction:
+  `git push` behaves as pushing to an empty remote (creates proceed; component 2 refuses the
+  occupied names). Fetch direction (all skips being NAME-skips — any content-skip fails it
+  instead): clone behaves as cloning an empty repo, loudly noted.
 - **Git-porcelain deletion lock-out is a documented consequence:** because a skipped name is
   not advertised, `git push --delete` of it is refused by *git itself* client-side ("remote
   ref does not exist") and never reaches the helper. The operator's remedy is the CLI/web UI,
@@ -259,7 +261,10 @@ One revision entry, edits in place per house style:
 - **README:** foreign-data paragraph — files under `refs/` **whose contents are not valid
   refs** (the helper cannot distinguish dropped junk from a damaged ref, and says so) never
   stop backups (skipped loudly on push) but DO stop fetch/clone/`ls-remote` with an error
-  naming every such file, so a restore is never silently incomplete; mirror-fetch jobs will
+  naming every such file, so a restore is never silently incomplete — **this fetch-blocking
+  class is exactly valid-ref-named files with unparseable contents; invalid-NAMED files stay
+  note-only in both directions** (they can never be refs, so their absence is never loss;
+  round-5 Codex caught the unqualified wording) — mirror-fetch jobs will
   alarm on them, which is intended; pushing onto one names it and gives the remedy; git
   itself cannot delete such a name (the lock-out), so the remedy is the CLI/web UI (Proton
   trash keeps deletions restorable). `GPB_CONTRACT_LIVE_ROOT` is NOT documented in README
@@ -293,8 +298,11 @@ One revision entry, edits in place per house style:
   direction) FAILS with the enumerated error naming the junk path, its classified reason,
   and the remedy (mutation-verified: with the strict check removed, the fetch survey
   wrongly succeeds).
-- Degraded states (push survey): HEAD naming a content-skipped ref (HEAD not advertised,
-  note, others intact); all-refs-skipped (empty push advertisement).
+- Degraded states: HEAD naming a content-skipped ref (push survey: HEAD not advertised,
+  note, others intact); HEAD naming a NAME-skipped ref (BOTH directions: HEAD not
+  advertised, note, others intact — the fetch survey does not fail on name-skips);
+  all-refs-skipped (push: empty advertisement; fetch with only name-skips: clone-of-empty,
+  loudly noted).
 - The restore shape: a protocol-loop clone with junk present FAILS with the enumerated
   error (complete-or-loudly-incomplete pinned); after the junk fixture is removed, the same
   clone succeeds with all refs. A clone with only NAME-skipped junk present succeeds with
@@ -318,11 +326,13 @@ One revision entry, edits in place per house style:
    unrelated ref succeeds** (tolerant direction, classified notes observed verbatim, the
    oversized one classified by size with no download — observed via the absence of a
    transfer); **`git ls-remote` FAILS** with the enumerated error naming both junk paths
-   (strict direction, observed verbatim); delete both junk files via the CLI (verify-before-
-   trash); `git ls-remote` and a clone now succeed with all real refs.
-2. Push onto the junk name: the preflight refusal observed verbatim, and the row-set listing
-   proves no pack was uploaded by that refused batch (BLOCK on mismatch, the Stage 5
-   signature-pin discipline).
+   (strict direction, observed verbatim). **The junk files stay in place for step 2** (round-5
+   Codex: an earlier draft deleted them here, leaving step 2's push nothing to collide with).
+2. Push onto the junk name: the occupancy preflight refusal observed verbatim, and the
+   row-set listing proves no pack was uploaded by that refused batch (BLOCK on mismatch, the
+   Stage 5 signature-pin discipline). THEN delete both junk files via the CLI
+   (verify-before-trash); `git ls-remote` and a clone now succeed with all real refs
+   (complete-restore recovery observed live).
 3. Contract table live via `GPB_CONTRACT_LIVE_ROOT` pointed inside the brief's confinement —
    including the new F1 row.
 4. Hierarchical smoke: nested branch push/fetch round-trip (no regression).
@@ -435,6 +445,16 @@ the round-1 structured scan makes per-operation policy a small protocol-layer sw
 (reasons + damaged-ref hex + remedy in the blocking error); name-skips stay non-fatal in both
 directions (they can never be refs — no silent-loss class); no fetch tolerance env var
 (YAGNI, recorded in Out of scope). Components 1, 4, 5, the scope rationale, and the decisions
-log were revised accordingly; the HEAD/all-skipped degraded states are now push-survey-only
-(the strict fetch survey fails before they matter). These edits are Craig-adjudicated and
-post-date the three engine rounds; the plan-review rounds re-cover them.
+log were revised accordingly. These edits are Craig-adjudicated and post-date the three
+engine rounds.
+
+**Round 5 (Codex + Gemini, 2026-08-09, verification of round 4) — applied:** gate steps 1–2
+reordered — round 4's edit deleted the junk files before the push-onto-junk step needed them
+to collide with ([Codex] blocker); the README's fetch-blocking class qualified to
+valid-ref-named files with unparseable contents, name-skips documented note-only in both
+directions ([Codex] major); the degraded states corrected — for NAME-skips they are
+reachable in BOTH directions since name-skips never fail a survey (HEAD→name-skipped and
+all-name-skipped defined and tested for the fetch direction too) ([Gemini] major). Both
+engines otherwise explicitly reported no further blocker/major findings. These round-5 fixes
+are propagation corrections applied at the loop's end without a further engine round; the
+plan-review rounds re-cover the spec.
