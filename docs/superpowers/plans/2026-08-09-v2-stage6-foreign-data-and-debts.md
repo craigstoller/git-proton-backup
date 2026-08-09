@@ -21,6 +21,7 @@
 - **The foreign-data rule:** the helper NEVER modifies or deletes a foreign file or folder, on any path, in any task.
 - **gofmt on CRLF:** `gofmt -l` false-positives on CRLF-rewritten working-tree files; never "fix" line endings.
 - **Sha collisions in fixtures:** pin `GIT_COMMITTER_DATE`/`GIT_AUTHOR_DATE` when a fixture needs distinct histories with repeated content.
+- **The `git commit` blocks below omit the co-author trailer for brevity; every actual commit MUST append it** (round-1 Codex: the literal commands contradicted the trailer constraint).
 
 ## File Structure
 
@@ -101,7 +102,8 @@ func OccupancyMessage(root string, s SkippedRef) string
 
 - `func ScanRefs(t transport.Transport, root string) (*RefScan, error)` — replaces `ListRefs` (hard rename; no compat wrapper — every caller updates in this task).
 - `var errMalformedRef = errors.New(...)` (unexported sentinel, refs.go): `readRef` wraps ONLY the grammar-failure arm with it (`%w`); transport/read failures stay unwrapped. Callers classify with `errors.Is`.
-- Band constants (refs.go): `refBandMin = 40`, `refBandMax = 44` (spec: no-LF=40, exact=41, CRLF/double-LF=42, BOM-prefixed up to 44).
+- Band constants (refs.go): `refBandMin = 40`, `refBandMax = 42` (no-LF=40, exact=41, CRLF/double-LF=42). **Round-1 correction, DISCLOSED SPEC EDIT:** the spec said 40–44 with a BOM-prefixed rationale, but classifying BOM-prefixed content as "malformed terminator" misstates the corruption (round-1 Codex) — BOM shapes are generic junk with a preview, so the band shrinks to the three shapes the noncanonical message is true for. The spec's band paragraph is edited in the same commit with a revision note; flagged to Craig rather than silently chosen.
+- `func classifyRefContent(raw []byte) (reason string, hex string)` (refs.go) — the ONE classifier both the scan (Task 1) and the heal arm (Task 4) use: 40-hex + wrong terminator (no-LF/CRLF/double-LF, nothing else) → the damaged-ref reason + hex; anything else → `not a ref: <preview>` with the preview capped at 42 bytes independently of `previewBytes`' 64 (a size-lying race must not widen the log bound; round-1 Codex).
 
 - [ ] **Step 1: Write the failing tests** (repo_test.go). Stub `ScanRefs`/types first so REDs are behavioural:
 ```go
@@ -156,6 +158,11 @@ func TestOccupancyMessageKindAware(t *testing.T)
 // (0 < 40) and needs no special arm; use -1 as the cannot-know sentinel in
 // the wrapper. The CLI never reports negative sizes; document in the arm.)
 func TestScanRefsUnknownSizeSkipsWithoutDownload(t *testing.T)
+
+// RED (upper bound — round-1 Codex: without it an implementation checking
+// only size<40 passes everything): a 100-byte junk file skips WITHOUT any
+// ReadTo (trace-asserted), Reason cites the size.
+func TestScanRefsOversizedSkipsWithoutDownload(t *testing.T)
 ```
 - [ ] **Step 2: Run, expect FAIL** for the right reasons: `go test ./internal/repo/ -run TestScanRefs -count=1` (stubs return empty scan → assertions fire; record which).
 - [ ] **Step 3: Implement.** refscan.go: the types + `ContentSkips` + `OccupancyMessage` exactly as the Interfaces block. refs.go: rename, then inside the walk replace the fatal `readRef` arm:
@@ -192,18 +199,15 @@ func readRefClassified(t transport.Transport, root, full string, size int64, sca
 		return "", err // transport failure stays fatal (typed split)
 	}
 	raw := malformedRaw(err) // the raw bytes readRef captured; see Step 3 note
-	s := SkippedRef{Path: full, Kind: SkipContent, Reason: fmt.Sprintf("not a ref: %s", previewEscaped(raw))}
-	if hex := noncanonicalHex(raw); hex != "" {
-		s.Hex = hex
-		s.Reason = fmt.Sprintf("damaged ref? contents are 40-hex with a malformed terminator: %s", hex)
-	}
+	reason, hex := classifyRefContent(raw)
+	s := SkippedRef{Path: full, Kind: SkipContent, Reason: reason, Hex: hex}
 	scan.Skipped = append(scan.Skipped, s)
 	skipNote(os.Stderr, root, full, errors.New(s.Reason))
 	return "", nil
 }
 ```
-Supporting pieces (hypotheses — adapt mechanically): `readRef`'s grammar arm becomes `return "", &malformedRefError{p: p, raw: raw}` where the error type wraps `errMalformedRef` via `Is` and exposes the raw bytes (`malformedRaw(err)` unwraps it; `errors.As` under the hood); `noncanonicalHex(raw []byte) string` returns the hex when `shaRe.Match` succeeds on a 40-hex prefix or BOM-stripped prefix and the remainder is only `\r`/`\n` bytes, else ""; `previewEscaped` = `previewBytes` + hex-escape of control bytes (`%q` on the preview string is acceptable — it escapes control bytes; say so in the comment). Name-skip arms: the two existing `skipNote` sites additionally append `SkippedRef{Kind: SkipInvalidName / SkipInvalidNameFolder, Reason: err.Error()}`. Callers: main.go three sites + sethead.go read `scan.Refs` (behaviour-neutral in THIS task — policy lands in Task 2); every repo_test.go `ListRefs(` call updates mechanically.
-- [ ] **Step 4: Run the full suite** (`go test ./... -count=1`); fix mechanical fallout (existing tests asserting fatal-on-content now flip — ONLY the retitled test's assertions change semantically; list every other edited test in the report with one-line reasoning).
+Supporting pieces (hypotheses — adapt mechanically): `readRef`'s grammar arm becomes `return "", &malformedRefError{p: p, raw: raw}` where the error type wraps `errMalformedRef` via `Is` and exposes the raw bytes (`malformedRaw(err)` unwraps it; `errors.As` under the hood); `classifyRefContent` (shared with Task 4, see Interfaces): 40-hex prefix (`shaRe.Match(raw[:40])` when `len(raw) >= 40`) with a remainder of only `\r`/`\n` bytes → `("damaged ref? contents are 40-hex with a malformed terminator: <hex>", hex)`; anything else → `("not a ref: <escaped preview capped at 42 bytes>", "")` — `%q` for the escaping (it escapes control bytes; say so in the comment). NO BOM handling (round-1 correction, see Interfaces). Name-skip arms: the two existing `skipNote` sites additionally append `SkippedRef{Kind: SkipInvalidName / SkipInvalidNameFolder, Reason: err.Error()}`. Callers: main.go three sites + sethead.go read `scan.Refs` (behaviour-neutral in THIS task — policy lands in Task 2); every repo_test.go `ListRefs(` call updates mechanically.
+- [ ] **Step 4: Run the full suite** (`go test ./... -count=1`); fix mechanical fallout. TWO existing tests change SEMANTICS (retire/convert both explicitly, list any further finds): the retitled exact-grammar test (Step 1), and **`TestWriteAndListRefs`' fatal-content assertion at repo_test.go:415** — its `"not-a-sha\n"` fixture (10 bytes) is now an out-of-band skip, not an error (round-1 Codex: the draft claimed only one test flips). Convert it to assert the skip + intact siblings.
 - [ ] **Step 5: Deliberate regressions:** (a) make readRefClassified treat transport errors as skips → the typed-split GUARD fails; (b) drop the band check (always download) → the no-download trace test fails; (c) drop the Hex recovery → noncanonical test fails. Record which assertion fired; revert each.
 - [ ] **Step 6: Commit.**
 ```bash
@@ -235,17 +239,33 @@ func TestLoop_ListIsStrictOnContentSkipsListForPushTolerant(t *testing.T)
 // RED: enumerated error includes recovered Hex when present (CRLF fixture).
 func TestLoop_ListStrictErrorCarriesDamagedRefHex(t *testing.T)
 
-// RED: name-skipped junk only (file ".hidden" under refs/heads) -> "list"
-// SUCCEEDS with notes (the principled line, fetch direction).
+// GUARD (round-1 Gemini: this passes against unpatched code — Stage 5's list
+// arm already tolerates name-skips; it pins that Task 2's strict check does
+// not overreach): name-skipped junk only (file ".hidden" under refs/heads) ->
+// "list" SUCCEEDS with notes (the principled line, fetch direction).
 func TestLoop_ListTolerantOnNameSkips(t *testing.T)
 
-// RED: HEAD names a content-skipped ref -> "list for-push" advertises others,
-// no HEAD line... NOTE: list for-push never emits a HEAD line (main.go:392-423)
-// — HEAD suppression is the "list" arm's logic, and strict "list" fails first
-// on content-skips. So the HEAD-note case is NAME-skips on "list": HEAD ->
-// refs/heads/.hidden (manufactured HEAD content naming a name-skipped ref):
-// symref line absent (existing logic), NEW: a note names why.
+// RED ([Both] round-1 blocker — the draft dismissed this spec state): the
+// PUSH survey's HEAD note. "list for-push" with HEAD naming a content-skipped
+// ref: refs advertised (others intact), and a stderr note names HEAD's target
+// and why it is skipped. Implementation must GATE the ReadHEAD on a nonempty
+// scan.Skipped — Stage 5's fix round deliberately removed an unconditional
+// per-push HEAD read (cost); the degraded state can only exist when something
+// was skipped, so the happy path stays read-free.
+func TestLoop_ListForPushHeadNamingContentSkippedRefNoted(t *testing.T)
+
+// RED: the fetch-survey HEAD case is NAME-skips only (strict "list" fails
+// first on content-skips): HEAD -> refs/heads/.hidden: symref line absent
+// (existing logic), NEW: a note names why.
 func TestLoop_ListHeadNamingNameSkippedRefNotedNotAdvertised(t *testing.T)
+
+// RED (restore shape, hermetic — round-1 Codex: the spec's clone sequence
+// needs a loop-level pin, not only the live gate): two-phase loop drive —
+// phase 1: "list" with content junk present fails with the enumerated error;
+// phase 2: remove the junk from the Fake, fresh loop: "list" then a fetch
+// command sequence succeeds and materialises the refs. Name-junk variant
+// stays nonfatal throughout (covered by the GUARD above).
+func TestLoop_RestoreShapeBlockedThenRecovers(t *testing.T)
 
 // RED: all-name-skipped repo -> "list" succeeds with empty advertisement +
 // notes (clone-of-empty shape); all-content-skipped -> "list" fails with all
@@ -269,7 +289,7 @@ if cs := scan.ContentSkips(); len(cs) > 0 {
 	return 1
 }
 ```
-The HEAD block gains, beside the existing suppressed-symref path: if `hasHead` and the branch is in `scan.Skipped` (any kind), `fmt.Fprintf(os.Stderr, "git-remote-proton: HEAD names %s, which was skipped (%s); advertising no default branch\n", branch, reason)`. `"list for-push"` arm: no policy change (scan.Refs advertised; notes already emitted by the walk).
+The `"list"` HEAD block gains, beside the existing suppressed-symref path: if `hasHead` and the branch is in `scan.Skipped` (any kind), `fmt.Fprintf(os.Stderr, "git-remote-proton: HEAD names %s, which was skipped (%s); advertising no default branch\n", branch, reason)`. The `"list for-push"` arm gains the push-survey HEAD note ([Both] round-1 blocker): AFTER advertising, `if len(scan.Skipped) > 0` (the cost gate — no remote read on clean repos), `ReadHEAD` and, when its branch is in the skipped set, emit the same stderr note shape. No symref/protocol output changes in that arm.
 - [ ] **Step 4: Full suite; deliberate regression:** remove the strict check → the per-operation RED fails on its "list must fail" half. Revert. Commit.
 ```bash
 git add cmd/git-remote-proton
@@ -310,6 +330,14 @@ func TestPushDeleteOfSkippedNameRefusedUntouched(t *testing.T)
 func TestPushOccupancyRefusalIsPerRef(t *testing.T)
 // GUARD: nil/empty skipped slice -> exact Stage 5 behaviour (no new refusals).
 func TestPushNilSkippedIsStage5Behaviour(t *testing.T)
+
+// RED (wiring — round-1 Codex: every test above manufactures the slice, so
+// main.go passing nil would stay green): loop-level — Fake holds a real junk
+// file at refs/heads/blocked; drive "list for-push" + a push batch creating
+// refs/heads/blocked/x through loop(); assert the occupancy refusal in the
+// protocol error line AND no pack uploaded (Fake /packs unchanged) AND the
+// junk file byte-identical.
+func TestLoop_PushCollidesWithScannedOccupancy(t *testing.T)  // main_test.go
 ```
 - [ ] **Step 2: Run, expect FAIL** (`go test ./internal/repo/ -run "TestPushCreateOfSkipped|TestPushCreateBeneath|TestPushCreateAbove|TestPushSkippedFolder|TestPushDeleteOfSkipped|TestPushOccupancy|TestPushNilSkipped" -count=1`).
 - [ ] **Step 3: Implement.** Build once in phase 2, before the finalSet loop:
@@ -319,7 +347,7 @@ for _, s := range skipped {
 	occupied[s.Path] = s
 }
 ```
-In the per-update validation loop (with `checkDst` already passed): for a DELETE, `if s, ok := occupied[u.Dst]; ok { failed(i, OccupancyMessage(root, s)); continue }`. For a CREATE/UPDATE, three checks in order — exact name, ancestor (walk `parentOf(u.Dst)` upward against `occupied`), descendant (linear scan: `strings.HasPrefix(s.Path, u.Dst+"/")`) — first hit refuses with `OccupancyMessage(root, s)`. All refusals happen before `newShas`/`valid[i]` assignment, so the pack (phase 3) never includes them (the existing no-pack-on-preflight-refusal structure carries this for free — assert it anyway). main.go:476: `scan, err := repo.ScanRefs(t, root)` → `repo.Push(t, root, gitDir, ups, scan.Refs, scan.Skipped)`.
+In the per-update validation loop (with `checkDst` already passed — **deliberate ordering, say so in a comment**: occupancy applies to checkDst-VALID dsts; an invalid dst gets checkDst's own refusal, which is correct because the helper could never create or delete such a name regardless of what occupies it — round-1 Codex proposed the reverse order; rejected with this reason, and note the beneath-an-invalid-name case still lands via the DESCENDANT check whose occupancy Path carries the invalid component while the dst itself is valid): for a DELETE, `if s, ok := occupied[u.Dst]; ok { failed(i, OccupancyMessage(root, s)); continue }`. For a CREATE/UPDATE, three checks in order — exact name, ancestor (walk `parentOf(u.Dst)` upward against `occupied`), descendant (linear scan: `strings.HasPrefix(s.Path, u.Dst+"/")`) — first hit refuses with `OccupancyMessage(root, s)`. All refusals happen before `newShas`/`valid[i]` assignment, so the pack (phase 3) never includes them (the existing no-pack-on-preflight-refusal structure carries this for free — assert it anyway). main.go:476: `scan, err := repo.ScanRefs(t, root)` → `repo.Push(t, root, gitDir, ups, scan.Refs, scan.Skipped)`.
 - [ ] **Step 4: Full suite** (every existing `Push(` test call gains `, nil` — mechanical; list any test whose SEMANTICS needed change, expected: none). **Deliberate regression:** drop the descendant check → the above-case test fails; drop the delete check → delete test reports a false ok. Revert; commit.
 ```bash
 git add internal/repo cmd/git-remote-proton
@@ -344,10 +372,16 @@ git commit -m "feat(push): occupancy-aware preflight and delete refusals - pre-p
 // a 12B junk file at the dst) -> create refused; message says a file occupies
 // the name, contents not a ref, size-classified WITHOUT download (trace: no
 // ReadTo of the occupant), remedy present. NOT "ref changed concurrently".
+func TestHealArmDiagnosesUnderBandOccupantWithoutDownload(t *testing.T)
+// RED (upper bound — round-1 Codex): 100B occupant, same no-download assertions.
 func TestHealArmDiagnosesOversizedOccupantWithoutDownload(t *testing.T)
 // RED: in-band junk occupant (41B non-hex) -> downloaded, diagnosed with
 // escaped preview.
 func TestHealArmDiagnosesInBandJunkOccupant(t *testing.T)
+// RED ([Gemini] round 1: the draft lost hex recovery in the race arm): a 42B
+// CRLF occupant -> diagnosed via classifyRefContent, message carries the
+// damaged-ref reason WITH the recovered hex.
+func TestHealArmRecoversNoncanonicalHex(t *testing.T)
 // GUARD: occupant IS a valid ref (41B, real sha) -> existing concurrent-
 // creator message, byte-unchanged (assert exact current text).
 func TestHealArmValidRefOccupantKeepsConcurrentCreatorMessage(t *testing.T)
@@ -356,7 +390,7 @@ func TestHealArmValidRefOccupantKeepsConcurrentCreatorMessage(t *testing.T)
 func TestHealArmDiagnosticFailureFallsBackToOriginal(t *testing.T)
 ```
 - [ ] **Step 2: Run, expect FAIL.**
-- [ ] **Step 3: Implement** in the file arm (currently `return out, err // not a folder collision`): when `ok && !n.IsDir`, size-gate `n.Size` against the band; out-of-band → refusal citing size; in-band → `readRef`; `errors.Is(err, errMalformedRef)` → refusal with escaped preview + remedy; valid sha → the existing concurrent-creator return untouched; read failure → original result + `(diagnosis unavailable: <err>)` suffix. Message body: `a file occupies <ref> and its contents are not a ref (<reason>); delete it first (proton-drive filesystem trash <root>/<ref>, or the web UI)` — present-tense observation only (spec: never claim "was skipped at advertisement").
+- [ ] **Step 3: Implement** in the file arm (currently `return out, err // not a folder collision`): when `ok && !n.IsDir`, size-gate `n.Size` against the band; out-of-band → refusal citing size; in-band → `readRef`; `errors.Is(err, errMalformedRef)` → refusal built from `classifyRefContent` (so noncanonical hex recovery carries into the race arm — round-1 Gemini); valid sha → the existing concurrent-creator return untouched; NEW read-path failure → original result + `(diagnosis unavailable: <err>)` suffix. **The pre-existing Stat-ERROR arm (push.go:671-674) already conforms** to "original + failure noted" — its `"create of %s did not commit and its diagnosis failed: %v (original: %v)"` text stays byte-unchanged and the diagnostic-failure GUARD asserts BOTH arms (round-1 Codex asked for both paths to be explicit). Message body: `a file occupies <ref> and its contents are not a ref (<reason>); delete it first (proton-drive filesystem trash <root>/<ref>, or the web UI)` — present-tense observation only (spec: never claim "was skipped at advertisement").
 - [ ] **Step 4: Full suite; deliberate regression:** force the arm to always return the original → both RED tests fail with the old concurrent-creator text (record). Revert; commit.
 ```bash
 git add internal/repo
@@ -393,12 +427,12 @@ git commit -m "test(transport): F1 directory-download contract row + Fake ReadTo
 - Modify: `docs/research/gates/brief-checklist.md`
 
 **Interfaces:**
-- Produces: `func contractLiveRoot(t *testing.T) string` — env override with validation; the brief-checklist lines Task 9 cites.
+- Produces: `func validateContractLiveRoot(v string) error` — PURE validation, directly testable (round-1 Codex: a t.Fatalf-only surface cannot have rejection subtests — an expected Fatalf still fails the suite); `func contractLiveRoot(t *testing.T) string` — env read + `validateContractLiveRoot` + `t.Fatalf` on error; the brief-checklist lines Task 9 cites.
 
-- [ ] **Step 1: Failing hermetic tests** (subtests of a new `TestContractLiveRootValidation`; validation must run WITHOUT `GPB_LIVE_ACCOUNT` — it is pure string logic; use `t.Setenv`):
-reject `/my-files` (root itself), `/my-files/GitBackups/x` + the other three untouchable prefixes, `/other/x` (outside), `/my-files/x/../../etc` and `/my-files/x/../GitBackups` (dot segments — reject ANY `.`/`..` segment on the RAW string), `relative/path`; accept the default and `/my-files/_cas-probe/other`. Each rejection names the offending value.
-- [ ] **Step 2: Run, expect FAIL** (helper undefined).
-- [ ] **Step 3: Implement:** `contractLiveRoot` reads `GPB_CONTRACT_LIVE_ROOT` (default `liveRoot` const), splits on `/`, validates segment-wise (absolute; first segment `my-files`; ≥2 segments; no empty/`.`/`..` segments; second segment not in the untouchables list `{"GitBackups","Sensitive Project Sources","Project Repo Bundles","ChatGPT Export Text Backup"}` — **verify the exact four names against the runbook/stage5-gate.md before hardcoding; they are account facts, not inventions**), `t.Fatalf` on violation. `TestContractCLI` uses it in place of `liveRoot`. Brief-checklist gains two lines: (1) the contract table's root must be stated in the brief and included in its confinement list (`GPB_CONTRACT_LIVE_ROOT` if non-default); (2) gate runners run pushes with a long tool timeout or in background — a harness timeout mid-push orphans the remote lock (Stage 5 S1).
+- [ ] **Step 1: Failing hermetic tests** — table subtests of a new `TestValidateContractLiveRoot` calling the PURE `validateContractLiveRoot` directly (no env, no Fatalf):
+reject `/my-files` (root itself), `/my-files/GitBackups/x` + the other three untouchable prefixes, `/other/x` (outside), `/my-files/x/../../etc` and `/my-files/x/../GitBackups` (dot segments — reject ANY `.`/`..` segment on the RAW string), `relative/path`, `/my-files//x` (empty segment); accept the default and `/my-files/_cas-probe/other`. Each rejection's error names the offending value.
+- [ ] **Step 2: Run, expect FAIL** (function undefined).
+- [ ] **Step 3: Implement:** `validateContractLiveRoot(v)`: require the `/my-files/` prefix, then `parts := strings.Split(strings.TrimPrefix(v, "/"), "/")` (**TrimPrefix first — round-1 Gemini: splitting the raw absolute path yields an empty first element that a no-empty-segments rule would reject for every valid path**); require `len(parts) >= 2`, `parts[0] == "my-files"`, no empty/`.`/`..` segment anywhere, and `parts[1]` not in the untouchables list `{"GitBackups","Sensitive Project Sources","Project Repo Bundles","ChatGPT Export Text Backup"}` — **verify the exact four names against the runbook/stage5-gate.md before hardcoding; they are account facts, not inventions**. `contractLiveRoot(t)` reads `GPB_CONTRACT_LIVE_ROOT` (default `liveRoot` const), calls the validator, `t.Fatalf` on error. `TestContractCLI` uses it in place of `liveRoot`. Brief-checklist gains two lines: (1) the contract table's root must be stated in the brief and included in its confinement list (`GPB_CONTRACT_LIVE_ROOT` if non-default); (2) gate runners run pushes with a long tool timeout or in background — a harness timeout mid-push orphans the remote lock (Stage 5 S1).
 - [ ] **Step 4: Full suite (validation subtests run hermetically; `TestContractCLI` still skips loudly); commit.**
 ```bash
 git add internal/transport docs/research/gates/brief-checklist.md
@@ -473,3 +507,27 @@ git commit -m "chore(release): v0.5.0 CHANGELOG flip; Stage 6 live gate brief"
 ## Revisions
 
 *Scaffolding for the review loop; delete before execution dispatch.*
+
+**Round 1 (Codex + Gemini, 2026-08-09) — applied:** Task 2 gains the push-survey HEAD note the
+draft had dismissed — `list for-push` reads HEAD when (and only when) the scan skipped
+anything (cost-gated per Stage 5's M1 lesson) and notes a skipped HEAD target ([Both]
+blocker); Task 6 splits a pure `validateContractLiveRoot(string) error` out of the
+Fatalf-wrapping helper so rejection subtests can exist, and the split logic TrimPrefixes the
+leading slash before segment checks ([Codex] blocker + [Gemini] split-yields-empty-first-
+element); the band shrinks to 40–42 with BOM shapes declassified to generic junk — a
+DISCLOSED SPEC EDIT in the same commit ([Codex] moderate); a shared `classifyRefContent`
+feeds both the scan and the heal race arm so hex recovery survives into race refusals
+([Gemini]); upper-bound (100-byte) no-download fixtures added to both scan and heal tests
+([Codex]: size<40-only would have passed everything); `TestWriteAndListRefs`' fatal-content
+assertion named for conversion alongside the retitled test ([Codex]); loop-level
+`ScanRefs→Push` wiring test added ([Codex]: manufactured slices left main.go's nil
+pass green); hermetic two-phase restore-shape loop test added ([Codex]);
+`TestLoop_ListTolerantOnNameSkips` relabelled GUARD ([Gemini]: passes against unpatched
+code); heal-arm Stat-error conformance made explicit (both diagnostic-failure paths asserted)
+([Codex]); trailer-brevity note added to Global Constraints ([Codex]). **Rejected with
+reason:** reordering occupancy checks BEFORE `checkDst` ([Codex] blocker as filed) — an
+invalid dst gets `checkDst`'s own refusal, which is correct (the helper could never create or
+delete that name regardless of occupancy), and the beneath-an-invalid-name case lands via the
+descendant check whose occupancy Path carries the invalid component while the dst stays
+valid; the plan now states this ordering rationale in Task 3 Step 3 and the kind-aware test
+manufactures a legal scan state.

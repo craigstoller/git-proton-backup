@@ -85,15 +85,20 @@ stays fatal while a grammar failure beside it skips.
 
 **Classification is size-gated — downloads are bounded by a candidate band.** A valid ref
 file is exactly 41 bytes, and the noncanonical damaged-ref shapes worth diagnosing sit within
-a few bytes of it (no-LF = 40, CRLF = 42, double-LF = 42, BOM-prefixed = up to 44). The walk
-classifies from the listing's size metadata *before* any download:
+a byte of it (no-LF = 40, CRLF = 42, double-LF = 42). **Plan-review disclosed edit
+(2026-08-09): the band is 40–42, not the earlier 40–44** — the extra width existed for
+BOM-prefixed content, but calling a BOM-corrupted file "40-hex with a malformed terminator"
+misstates the corruption (the terminator may be fine; the prefix is the damage), so BOM
+shapes are out-of-band generic junk classified by size, and the noncanonical message stays
+true for exactly the three shapes it names. The walk classifies from the listing's size
+metadata *before* any download:
 
-- size known and **outside the 40–44 byte candidate band** → **skipped without downloading**;
+- size known and **outside the 40–42 byte candidate band** → **skipped without downloading**;
   the note reports the size, never contents (bounds work, and keeps foreign file contents out
   of logs).
 - size known and **within the band** → downloaded and grammar-checked (40 lowercase hex +
   `\n`, exactly 41 bytes, is the only advertisable form). On failure, skipped with a note
-  carrying the escaped preview (≤44 bytes, control bytes hex-escaped) — and the noncanonical
+  carrying the escaped preview (≤42 bytes, control bytes hex-escaped) — and the noncanonical
   classification below. (Round-2 [Both] blocker: the round-1 gate downloaded only exactly-41-
   byte files, which made the damaged-pointer note below physically impossible for the 40- and
   42-byte shapes it exists for; the band restores it while keeping every download ≤44 bytes.)
@@ -110,7 +115,7 @@ documents (design §2c), and the blast radius is one oversized transfer, not cor
 
 **Notes are classified, and a damaged-ref pointer is never destroyed silently.** The note
 grammar extends the existing `skipNote` mechanism — `git-remote-proton: skipping
-<root>/<path>: <reason>` — with distinct reasons: `not a ref: size <N> outside the 40-44
+<root>/<path>: <reason>` — with distinct reasons: `not a ref: size <N> outside the 40-42
 candidate band`; `not a ref: <escaped preview>`; and, when an in-band candidate contains
 exactly 40 hex characters with a wrong terminator (no-LF at 40 bytes, CRLF/double-LF at 42 —
 the noncanonical class), the note **quotes the hex**:
@@ -188,7 +193,7 @@ invocation that then executes the push batch, so the batch engine receives both.
   never-touch rule; deleting a "branch" must not delete an unknown foreign file or folder).
 - **Create-heal wrapper (race window, secondary):** the existing arm where the post-refusal
   `Stat` shows a **file** gains the diagnosis for occupants that appeared *after* the
-  advertisement: size-gate first (the SAME 40–44-byte candidate band as component 1 — an
+  advertisement: size-gate first (the SAME 40–42-byte candidate band as component 1 — an
   out-of-band occupant is classified by size without downloading; round 3 corrected a stale
   exact-41 phrasing here), then read only in-band candidates. If the occupant parses
   as a valid ref, keep the existing concurrent-creator message (it is true). Otherwise:
@@ -280,7 +285,7 @@ One revision entry, edits in place per house style:
 
 - Content-skip: junk beside good refs → map contains the good refs only, note asserted on
   captured stderr (mutation-verified); nested junk skips without disturbing siblings; the
-  size-gate arms (outside the 40–44 band skipped WITHOUT a ReadTo — pinned by trace assertion;
+  size-gate arms (outside the 40–42 band skipped WITHOUT a ReadTo — pinned by trace assertion;
   in-band downloaded and parsed; the noncanonical-40-hex note quotes the hex — reachable
   because 40- and 42-byte shapes are in-band); the Stage 5 exact-grammar boundary fixtures
   (no-LF, CRLF, double-LF) flip from fatal-pinning to skip-pinning with fixtures preserved,
