@@ -16,20 +16,35 @@ escalated, plus every small contract/infra debt in the Stage 5 ledger. Compactio
 and deliberately parked for its own stage (it is a full design of its own; Stage 5 showed 14
 tasks is the comfortable upper bound and this stage must stay well under it).
 
-The motivating decision, argued through failure scenarios in-session: **this is a backup tool,
-so the local repo is the source of truth**. Writes flowing (backups happening) is the product's
-purpose; a trivially-produced foreign file that silently stops unattended backups is a worse
-data-protection failure than a loudly-skipped, never-yet-observed corrupt ref. Availability wins
-at the *survey* boundary; strictness is kept at every *write* and *directly-addressed* boundary.
-The residual this accepts — a disaster-recovery clone can succeed while lacking a skipped
-branch, signalled only on stderr — was examined explicitly (including the exit-0-reads-as-
-full-success objection) and accepted, because the retired fatal rule's remedy produced the same
-clone content anyway; its sole advantage was forced awareness, which components 1–2 partially
-recover (classified notes preserving recoverable OIDs; refusal-with-remedy on the next push).
+The motivating decision, argued through failure scenarios in-session and **revised once on
+re-examination (Craig-directed, after both round-1 engines independently argued for it):
+policy is PER-OPERATION**, because the two directions are different trades with different
+people present. **This is a backup tool, so the local repo is the source of truth.**
 
-1. **Content-skip at the read boundary** — a well-named ref file whose contents are unparseable
-   is skipped with a loud, classified note, never fatal (closes the v6.5 OPEN question in the
-   availability direction).
+- **The push direction is the unattended path** — cron backups, nobody reading exit codes. A
+  trivially-produced foreign file that silently stops backups is the worst failure this
+  product can have. The push-side survey is therefore **tolerant**: unparseable contents skip
+  with a classified note, and the occupancy machinery (component 2) refuses collisions
+  actionably.
+- **The fetch direction is the attended path** — a restore or mirror is exactly when a human
+  (or a mirror job that *should* alarm) is present and trusting exit codes. A clone that
+  succeeds while silently lacking a branch is a false-success restore. The fetch-side survey
+  is therefore **strict**: content-skips make `list` (fetch/clone/`ls-remote`) **fail with an
+  error enumerating every skipped path, its classified reason, and the remedy** — which also
+  puts a damaged ref's recoverable hex in the blocking error a human must read, not a
+  scrollable note.
+- **The principled line:** only *valid-named, unparseable-content* files trigger fetch-side
+  strictness — they are the class that could be a damaged real ref, so only they can
+  represent silent loss. *Name*-invalid files can never be refs git could hold; their skip
+  stays non-fatal in both directions (the Stage 5 rule, unchanged).
+- The wedge this re-accepts is bounded and attended: a junk file blocks restores/mirrors
+  until deleted (the error names it and the remedy; Proton trash makes deletion recoverable);
+  cron mirror-fetchers get loud failures, which for a mirror is correct and documented.
+
+1. **Content classification at the read boundary** — a well-named ref file whose contents are
+   unparseable is classified and skipped from advertisement with a loud note; **tolerant on
+   the push-direction survey, fatal-with-enumeration on the fetch-direction survey** (closes
+   the v6.5 OPEN question with a per-operation rule).
 2. **Occupancy-aware push** — skipped names participate in the batch preflight and delete arm,
    so collisions refuse *before* pack work with an actionable message; the create-heal wrapper
    keeps a race-window diagnosis.
@@ -42,12 +57,15 @@ recover (classified notes preserving recoverable OIDs; refusal-with-remedy on th
 
 ---
 
-## Component 1 — Content-skip at the advertisement boundary
+## Component 1 — Content classification at the advertisement boundary
 
 Stage 5's read boundary has two outcomes per discovered file: invalid *name* → skip-with-note;
-well-named but unparseable *contents* → fatal for the whole advertisement. Stage 6 merges them
-into **one foreign-data rule**: nothing foreign can stop the world, and nothing foreign is ever
-modified or deleted by the helper.
+well-named but unparseable *contents* → fatal for the whole advertisement. Stage 6 replaces
+the content rule with **one classification mechanism and two policies**: the scan classifies
+foreign data once; the push-direction survey (`list for-push`) tolerates it (skip + note +
+occupancy); the fetch-direction survey (`list`, serving fetch/clone/`ls-remote`) fails on it
+with full enumeration. In both directions, nothing foreign is ever modified or deleted by the
+helper.
 
 **The scan result is structured, not a bare map.** `ListRefs` (the advertisement walk) returns
 three things, distinctly typed: the advertised ref map (exactly as today); the **skipped
@@ -108,19 +126,30 @@ remote-only objects; the note preserves it at zero behavioural cost.)
    typed split above is what enforces it.
 2. **`--set-head` to a corrupt target.** The user named that branch; the exact-path read errors
    with the bounded preview rather than pretending absence. (Unchanged from Stage 5; restated
-   because the boundary rule differs on purpose: advertisement is a survey and degrades
-   per-ref; a direct address is a demand and stays strict.)
+   because the boundary rule differs on purpose: the push-direction survey degrades per-ref,
+   the fetch-direction survey fails whole-with-enumeration, and a direct address is a demand
+   that stays strict.)
 3. **`WriteRef`'s read-back verification.** v2 verifying bytes it just wrote; tolerance there
    would mask real write corruption.
 
-**Degraded states are defined, not implied:**
-- **HEAD names a skipped ref** → the HEAD symref is not advertised either, with its own note
-  (advertising a symref to a ref git cannot see would be incoherent). Everything else
-  advertises.
-- **Every ref skipped** → an empty advertisement with one note per file; clone behaves as a
-  clone of an empty repo. Valid, loud, and tested.
-- **Fetch/clone:** a skipped ref is absent from the advertisement; git fetches what is
-  advertised. The disaster-recovery residual is stated and accepted in the scope section above.
+**The two policies over the one scan:**
+- **`list for-push` (tolerant):** content-skips are absent from the advertisement, each with
+  its note; pushes proceed; component 2's occupancy machinery owns collisions.
+- **`list` — fetch/clone/`ls-remote` (strict):** a nonempty content-skip set fails the
+  command with one error enumerating every content-skipped path, its classified reason
+  (including the damaged-ref hex where recovered), and the remedy (delete the file —
+  CLI grammar or web UI; Proton trash keeps it restorable). Complete-or-loudly-incomplete is
+  the fetch-direction contract. Name-skips do not trigger this (the principled line in the
+  scope section); their notes still print.
+
+**Degraded states are defined, not implied (push-direction survey; the strict fetch survey
+fails before these states can matter):**
+- **HEAD names a content-skipped ref** → the HEAD symref is not advertised either, with its
+  own note (advertising a symref to a ref git cannot see would be incoherent). Everything
+  else advertises.
+- **Every ref skipped** → an empty push advertisement with one note per file (`git push`
+  then behaves as pushing to an empty remote — creates proceed; component 2 refuses the
+  occupied names).
 - **Git-porcelain deletion lock-out is a documented consequence:** because a skipped name is
   not advertised, `git push --delete` of it is refused by *git itself* client-side ("remote
   ref does not exist") and never reaches the helper. The operator's remedy is the CLI/web UI,
@@ -215,20 +244,27 @@ One revision entry, edits in place per house style:
 
 - **Error table:** the Stage 5 "malformed discovered *contents*" rows change verdict — at the
   advertisement boundary: skipped with a classified note, never advertised, never modified or
-  deleted; on direct address (`--set-head` target, read-back): fatal exactly as before. New
-  rows: create/delete refused by skipped occupancy (pre-pack, with remedy); the git-porcelain
-  deletion lock-out and its remedy; the HEAD-names-a-skipped-ref degradation.
-- **The v6.5 OPEN question is closed** with the adjudicated rationale (backup tool; survey vs
-  direct-address boundary split; the disaster-recovery residual stated and accepted),
-  replacing the open-question paragraph with the decision and a pointer to this spec.
+  deleted; on direct address (`--set-head` target, read-back): fatal exactly as before. The
+  content rows are **per-operation**: push-survey tolerant (skip + note), fetch-survey fatal
+  with enumeration. New rows: create/delete refused by skipped occupancy (pre-pack, with
+  kind-aware remedy); the git-porcelain deletion lock-out and its remedy; the
+  HEAD-names-a-skipped-ref push-advertisement degradation; the fetch-direction enumerated
+  failure.
+- **The v6.5 OPEN question is closed** with the adjudicated rationale (backup tool;
+  per-operation policy — unattended push direction tolerant, attended fetch direction
+  strict-with-enumeration; direct-address boundaries strict as before), replacing the
+  open-question paragraph with the decision and a pointer to this spec.
 - **F1 recorded** as a verified contract fact beside the ReadTo/C16 material, with the
   directory-download row cited.
 - **README:** foreign-data paragraph — files under `refs/` **whose contents are not valid
-  refs** (the helper cannot distinguish dropped junk from a damaged ref, and says so) are
-  skipped loudly and never modified or deleted; pushing onto one names it and gives the
-  remedy; git itself cannot delete such a name (the lock-out), so the remedy is the CLI/web
-  UI. `GPB_CONTRACT_LIVE_ROOT` is NOT documented in README (test-infrastructure var); it lives
-  in the contract test's own comment and the brief checklist.
+  refs** (the helper cannot distinguish dropped junk from a damaged ref, and says so) never
+  stop backups (skipped loudly on push) but DO stop fetch/clone/`ls-remote` with an error
+  naming every such file, so a restore is never silently incomplete; mirror-fetch jobs will
+  alarm on them, which is intended; pushing onto one names it and gives the remedy; git
+  itself cannot delete such a name (the lock-out), so the remedy is the CLI/web UI (Proton
+  trash keeps deletions restorable). `GPB_CONTRACT_LIVE_ROOT` is NOT documented in README
+  (test-infrastructure var); it lives in the contract test's own comment and the brief
+  checklist.
 - **CHANGELOG:** `Unreleased` entries as components land; the version flip is release-prep
   work per `docs/releasing.md`.
 
@@ -252,10 +288,17 @@ One revision entry, edits in place per house style:
   `/my-files/x/../<untouchable>` — both refused (round-3 Codex).
 - Typed-split GUARD: a transport `ReadTo` failure during the walk stays fatal (named folder,
   no partial advertisement) while a grammar failure beside it skips.
-- Degraded states: HEAD naming a skipped ref (HEAD not advertised, note, others intact);
-  all-refs-skipped (empty advertisement, clone-of-empty behaviour).
-- The disaster-recovery-clone shape: a protocol-loop clone with junk present succeeds; all
-  other refs materialize; the note appears on stderr.
+- Per-operation policy: the SAME junk fixture through both survey directions — `list
+  for-push` advertises the good refs and skips the junk with its note; `list` (fetch
+  direction) FAILS with the enumerated error naming the junk path, its classified reason,
+  and the remedy (mutation-verified: with the strict check removed, the fetch survey
+  wrongly succeeds).
+- Degraded states (push survey): HEAD naming a content-skipped ref (HEAD not advertised,
+  note, others intact); all-refs-skipped (empty push advertisement).
+- The restore shape: a protocol-loop clone with junk present FAILS with the enumerated
+  error (complete-or-loudly-incomplete pinned); after the junk fixture is removed, the same
+  clone succeeds with all refs. A clone with only NAME-skipped junk present succeeds with
+  notes (the principled line pinned in both directions).
 - Occupancy-aware push: create of / beneath / above a skipped name refused at preflight with
   NO pack built (trace-asserted, both D/F directions); delete of a skipped name refused, file
   untouched; the heal-wrapper race arm (occupant appearing post-advertisement): parseable →
@@ -271,10 +314,12 @@ One revision entry, edits in place per house style:
 **Live gate (one, small — roughly a third of Stage 5's):**
 
 1. Manufacture a junk file in the gate repo at a valid ref name (CLI upload of a non-ref file
-   — the web-UI-equivalent action), plus one oversized junk file: `git ls-remote` succeeds and
-   omits both (classified notes observed verbatim, the oversized one skipped by size with no
-   download — observed via the absence of a transfer); clone succeeds with all real refs; push
-   of an unrelated ref succeeds.
+   — the web-UI-equivalent action), plus one oversized junk file. Then, in order: **push of an
+   unrelated ref succeeds** (tolerant direction, classified notes observed verbatim, the
+   oversized one classified by size with no download — observed via the absence of a
+   transfer); **`git ls-remote` FAILS** with the enumerated error naming both junk paths
+   (strict direction, observed verbatim); delete both junk files via the CLI (verify-before-
+   trash); `git ls-remote` and a clone now succeed with all real refs.
 2. Push onto the junk name: the preflight refusal observed verbatim, and the row-set listing
    proves no pack was uploaded by that refused batch (BLOCK on mismatch, the Stage 5
    signature-pin discipline).
@@ -295,8 +340,9 @@ Compaction (deliberately parked for its own stage — the `RevListNewObjects` me
 parked with it), PowerShell Gallery publishing, non-Windows support, multi-writer,
 shallow/partial clone, SHA-256 repos. Also out, from this stage's review rounds: any
 auto-deletion or quarantine-move of foreign files (the foreign-data rule is observe-and-report,
-never modify or delete); per-operation strictness (strict clone / tolerant push) — the survey
-boundary gets one rule, adjudicated in brainstorm; a repository health/verify utility command
+never modify or delete); a fetch-side tolerance env var (`GPB_TOLERATE_FOREIGN`-style escape
+hatch for deliberate partial restores — YAGNI while delete-the-file remains available and
+trash-recoverable; the door is noted, not built); a repository health/verify utility command
 (the classified notes are this stage's integrity signal; a `--verify` mode that walks and
 reports skipped occupancies is recorded as a Stage 7 candidate for the unattended-monitoring
 gap round-1 Codex named); same-sha idempotent-create reconciliation (component 2).
@@ -317,8 +363,9 @@ gap round-1 Codex named); same-sha idempotent-create reconciliation (component 2
 | Decision | Choice | Rejected alternatives |
 |---|---|---|
 | Stage 6 anchor | Design debts (fatal-content decision + Stage 5 ledger) | Compaction now; usage-driven feature; minimal cleanup |
-| Fatal-content rule | Skip-with-note at advertisement + occupancy-aware push | Keep fatal with better UX; namespace-dependent middle ground |
-| Strictness boundary | Survey degrades per-ref; direct address and writes stay strict | Uniform skip everywhere; uniform fatal everywhere; per-operation strictness (strict clone) |
+| Fatal-content rule | Per-operation: push survey tolerant (skip + occupancy-aware push); fetch survey strict with enumeration | Uniform skip (initial choice, reversed on re-examination); keep fatal with better UX; namespace-dependent middle ground |
+| Strictness boundary | Push survey degrades per-ref; fetch survey complete-or-fail; direct address and writes stay strict | Uniform skip everywhere; uniform fatal everywhere |
+| Fetch tolerance escape hatch | Not built (delete-the-file is available and trash-recoverable) | GPB_TOLERATE_FOREIGN env var now |
 | Scope shape | Full debt ledger rides along, one small gate, v0.5.0 | Decision-only minimal; debts + compaction start |
 | Foreign-file handling | Observe and report only, never modify or delete | Auto-trash; quarantine-move |
 
@@ -375,3 +422,19 @@ contents are not a ref" message was false for name-skips and its trash remedy da
 folders ([Codex] major). `GPB_CONTRACT_LIVE_ROOT` validation is segment-wise and rejects
 `.`/`..` segments, with hermetic traversal cases ([Codex] major). No other new blocker/major
 findings in round 3; Gemini explicitly reported none beyond the stale-phrasing items.
+
+**Round 4 (Craig-directed reversal, 2026-08-09):** on Craig's review of the round-1 rejection
+list, the per-operation-strictness proposal ([Both], round 1) was RE-EXAMINED on merits — the
+original rejection reasoned circularly ("re-litigates an adjudicated decision" whose
+adjudication had followed the author's own recommendation). The re-argument: the push and
+fetch directions are different trades with different people present (unattended cron backups
+vs attended restores/alarming mirrors), so uniformity forced one answer onto two questions;
+the round-1 structured scan makes per-operation policy a small protocol-layer switch.
+**Adopted:** push survey tolerant (unchanged from rounds 1–3); fetch survey
+(`list`/fetch/clone/`ls-remote`) fails on a nonempty content-skip set with full enumeration
+(reasons + damaged-ref hex + remedy in the blocking error); name-skips stay non-fatal in both
+directions (they can never be refs — no silent-loss class); no fetch tolerance env var
+(YAGNI, recorded in Out of scope). Components 1, 4, 5, the scope rationale, and the decisions
+log were revised accordingly; the HEAD/all-skipped degraded states are now push-survey-only
+(the strict fetch survey fails before they matter). These edits are Craig-adjudicated and
+post-date the three engine rounds; the plan-review rounds re-cover them.
