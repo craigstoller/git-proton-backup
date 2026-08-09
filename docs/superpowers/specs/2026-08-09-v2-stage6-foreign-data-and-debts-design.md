@@ -92,9 +92,10 @@ documents (design §2c), and the blast radius is one oversized transfer, not cor
 
 **Notes are classified, and a damaged-ref pointer is never destroyed silently.** The note
 grammar extends the existing `skipNote` mechanism — `git-remote-proton: skipping
-<root>/<path>: <reason>` — with distinct reasons: `not a ref: size <N> != 41`; `not a ref:
-<escaped preview>`; and, when a 41-byte candidate contains exactly 40 hex characters with a
-wrong terminator (CRLF, no-LF — the noncanonical class), the note **quotes the hex**:
+<root>/<path>: <reason>` — with distinct reasons: `not a ref: size <N> outside the 40-44
+candidate band`; `not a ref: <escaped preview>`; and, when an in-band candidate contains
+exactly 40 hex characters with a wrong terminator (no-LF at 40 bytes, CRLF/double-LF at 42 —
+the noncanonical class), the note **quotes the hex**:
 `damaged ref? contents are 40-hex with a malformed terminator: <sha>` — so a recoverable
 object pointer survives in the operator's log even though the file is skipped. (Round-1 Codex:
 deleting such a file under the old fatal rule's remedy could destroy the only pointer to
@@ -136,18 +137,29 @@ invocation that then executes the push batch, so the batch engine receives both.
   the advertised ref set, and **additionally treats every skipped occupancy as an occupied
   name**: a create of a skipped name itself, a create beneath one (`refs/heads/foo/bar` under
   skipped file `foo`), and a create above one (`refs/heads/foo` over skipped file `foo/bar` in
-  a folder) are all **refused in phase 2, before any pack is built**, with the occupant named:
-  `a file occupies <path> and its contents are not a ref (<classified reason from the scan>);
-  delete it first (proton-drive filesystem trash <path>, or the web UI)`. This closes the
-  round-1 [Both] finding that skipped names silently vanished from the preflight and pushed
-  the failure past pack upload into infrastructure errors with the wrong wording.
+  a folder) are all **refused in phase 2, before any pack is built**, with the occupant named
+  by a **kind-aware message built from the scan's classified reason** (round-3 Codex: a
+  one-size message called every occupancy "a file whose contents are not a ref", which is
+  false for name-skipped entries — never content-examined — and dangerous for folders, whose
+  trash remedy could induce deleting a foreign subtree):
+  - content-skipped file → `a file occupies <path> and its contents are not a ref (<reason>);
+    delete it first (proton-drive filesystem trash <path>, or the web UI)`;
+  - name-skipped file → `a file with an invalid ref name occupies <path> (contents never
+    examined); delete or rename it first (…)`;
+  - name-skipped folder → `a folder with an invalid name occupies <path>; its contents were
+    never examined — inspect it before removing anything (…)` — the remedy directs
+    inspection, never blind deletion.
+  This closes the round-1 [Both] finding that skipped names silently vanished from the
+  preflight and pushed the failure past pack upload into infrastructure errors with the wrong
+  wording.
 - **Delete arm:** a delete whose dst is a skipped occupancy is **refused** with the same
-  message — never reported as an already-absent success, and never trashed (the never-touch
-  rule; deleting a "branch" must not delete an unknown foreign file).
+  kind-aware message — never reported as an already-absent success, and never trashed (the
+  never-touch rule; deleting a "branch" must not delete an unknown foreign file or folder).
 - **Create-heal wrapper (race window, secondary):** the existing arm where the post-refusal
   `Stat` shows a **file** gains the diagnosis for occupants that appeared *after* the
-  advertisement: size-gate first (same rule as component 1 — a non-41-byte occupant is
-  classified without downloading), then read only 41-byte candidates. If the occupant parses
+  advertisement: size-gate first (the SAME 40–44-byte candidate band as component 1 — an
+  out-of-band occupant is classified by size without downloading; round 3 corrected a stale
+  exact-41 phrasing here), then read only in-band candidates. If the occupant parses
   as a valid ref, keep the existing concurrent-creator message (it is true). Otherwise:
   `a file occupies <ref> and its contents are not a ref (<reason>); delete it first (...)`.
   The message asserts only what is observed **now** — it does not claim the file "was skipped
@@ -175,10 +187,13 @@ invocation that then executes the push batch, so the batch engine receives both.
   divergence and cites the row (no end-to-end shim test may rely on directory download).
 - **`TestContractCLI`'s live root becomes configurable — with in-code validation.** New env
   var `GPB_CONTRACT_LIVE_ROOT`, read by the contract table only, default unchanged
-  (`/my-files/_cas-probe/contract`). The table **validates before writing**: the value must be
-  an absolute path strictly below `/my-files/`, must not be `/my-files` itself, and must not
-  begin with any of the four untouchable top-level folders — otherwise the run refuses with
-  the offending value named (fail-closed beats a checklist; round-1 Codex). The standing brief
+  (`/my-files/_cas-probe/contract`). The table **validates before writing**, segment-wise on
+  the raw value: the value must be an absolute path strictly below `/my-files/`, must not be
+  `/my-files` itself, must not begin with any of the four untouchable top-level folders, and
+  **must contain no `.` or `..` segments** (round-3 Codex: a prefix check alone admits
+  `/my-files/x/../../outside`-style traversal if the CLI resolves dot segments) — otherwise
+  the run refuses with the offending value named (fail-closed beats a checklist; round-1
+  Codex). The standing brief
   checklist gains one line: state the table's root and include it in the confinement list.
 - **The install.ps1 mock pins the `DoNotExpandEnvironmentNames` flag — as a spy, not a
   Windows-registry model.** The mock records the `$options` argument of every `GetValue` call;
@@ -231,7 +246,10 @@ One revision entry, edits in place per house style:
   each asserting its classified note.
 - Occupancy completeness: a create over a folder whose only content is a name-skipped child
   (file or folder) is refused at preflight with NO pack built — the name-skip occupancy case
-  (round-2 Codex).
+  (round-2 Codex); the refusal messages are kind-aware (round-3 Codex): a name-skipped FOLDER
+  occupancy is never described as a file, and its message directs inspection, not deletion.
+- Live-root traversal: hermetic validation cases include `/my-files/x/../../outside` and
+  `/my-files/x/../<untouchable>` — both refused (round-3 Codex).
 - Typed-split GUARD: a transport `ReadTo` failure during the walk stays fatal (named folder,
   no partial advertisement) while a grammar failure beside it skips.
 - Degraded states: HEAD naming a skipped ref (HEAD not advertised, note, others intact);
@@ -344,3 +362,16 @@ foreign data, with a preflight test ([Codex] major). The size gate is now explic
 best-effort metadata bound with the replace-between-observe-and-read race accepted and
 stated (no byte-capped download exists in the certified CLI; same single-writer posture as
 design §2c), in both components 1 and 2 ([Codex] major, honesty option adopted).
+
+**Round 3 (Codex + Gemini, 2026-08-09, final round — cap reached; these fixes are applied but
+NOT re-verified by a further engine round; Craig's spec review and the plan's own review
+rounds are the net):** round 2's band fix was incompletely propagated and both engines caught
+the stale exact-41 phrasings — component 1's note grammar (`!= 41` → outside-the-band) and
+noncanonical clause ("41-byte candidate" → in-band candidate at 40/42 bytes), and component
+2's create-heal wrapper (now the same 40–44 band) ([Both]). The occupancy refusal messages
+became kind-aware — content-skipped file / name-skipped file (contents never examined) /
+name-skipped folder (inspect, never blind deletion) — because a one-size "a file whose
+contents are not a ref" message was false for name-skips and its trash remedy dangerous for
+folders ([Codex] major). `GPB_CONTRACT_LIVE_ROOT` validation is segment-wise and rejects
+`.`/`..` segments, with hermetic traversal cases ([Codex] major). No other new blocker/major
+findings in round 3; Gemini explicitly reported none beyond the stale-phrasing items.
