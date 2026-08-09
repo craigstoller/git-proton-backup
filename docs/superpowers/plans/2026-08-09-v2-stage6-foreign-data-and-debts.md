@@ -259,6 +259,14 @@ func TestLoop_ListForPushHeadNamingContentSkippedRefNoted(t *testing.T)
 // (existing logic), NEW: a note names why.
 func TestLoop_ListHeadNamingNameSkippedRefNotedNotAdvertised(t *testing.T)
 
+// GUARD (round-2 Codex: undefined failure semantics would let a natural
+// fatal-error implementation reintroduce the backup-stopping wedge): the
+// push-survey HEAD diagnostic is ADVISORY — a failing ReadHEAD (corrupt HEAD
+// bytes in the Fake + a skipped file to arm the cost gate) produces a stderr
+// note ("HEAD unreadable during skip diagnostics: ...") and list for-push
+// COMPLETES normally (advertisement intact, exit flow unchanged).
+func TestLoop_ListForPushHeadDiagnosticFailureIsAdvisory(t *testing.T)
+
 // RED (restore shape, hermetic — round-1 Codex: the spec's clone sequence
 // needs a loop-level pin, not only the live gate): two-phase loop drive —
 // phase 1: "list" with content junk present fails with the enumerated error;
@@ -289,7 +297,7 @@ if cs := scan.ContentSkips(); len(cs) > 0 {
 	return 1
 }
 ```
-The `"list"` HEAD block gains, beside the existing suppressed-symref path: if `hasHead` and the branch is in `scan.Skipped` (any kind), `fmt.Fprintf(os.Stderr, "git-remote-proton: HEAD names %s, which was skipped (%s); advertising no default branch\n", branch, reason)`. The `"list for-push"` arm gains the push-survey HEAD note ([Both] round-1 blocker): AFTER advertising, `if len(scan.Skipped) > 0` (the cost gate — no remote read on clean repos), `ReadHEAD` and, when its branch is in the skipped set, emit the same stderr note shape. No symref/protocol output changes in that arm.
+The `"list"` HEAD block gains, beside the existing suppressed-symref path: if `hasHead` and the branch is in `scan.Skipped` (any kind), `fmt.Fprintf(os.Stderr, "git-remote-proton: HEAD names %s, which was skipped (%s); advertising no default branch\n", branch, reason)`. The `"list for-push"` arm gains the push-survey HEAD note ([Both] round-1 blocker): AFTER advertising, `if len(scan.Skipped) > 0` (the cost gate — no remote read on clean repos), `ReadHEAD` and, when its branch is in the skipped set, emit the same stderr note shape. **The diagnostic is ADVISORY (round-2 Codex): a ReadHEAD error here is a stderr note (`HEAD unreadable during skip diagnostics: <err>`) and the arm continues — it must never fail a push advertisement, which would reintroduce exactly the wedge the tolerant policy removes.** No symref/protocol output changes in that arm.
 - [ ] **Step 4: Full suite; deliberate regression:** remove the strict check → the per-operation RED fails on its "list must fail" half. Revert. Commit.
 ```bash
 git add cmd/git-remote-proton
@@ -338,6 +346,13 @@ func TestPushNilSkippedIsStage5Behaviour(t *testing.T)
 // protocol error line AND no pack uploaded (Fake /packs unchanged) AND the
 // junk file byte-identical.
 func TestLoop_PushCollidesWithScannedOccupancy(t *testing.T)  // main_test.go
+
+// RED (round-2 Codex: with only the content-junk wiring case, passing
+// scan.ContentSkips() instead of scan.Skipped would stay green and silently
+// drop name-skip protection): same loop-level shape but the occupancy is a
+// scanned INVALID-NAMED file (refs/heads/blocked/.hidden), dst
+// refs/heads/blocked — pre-pack kind-aware refusal, file survives.
+func TestLoop_PushCollidesWithScannedNameSkipOccupancy(t *testing.T)  // main_test.go
 ```
 - [ ] **Step 2: Run, expect FAIL** (`go test ./internal/repo/ -run "TestPushCreateOfSkipped|TestPushCreateBeneath|TestPushCreateAbove|TestPushSkippedFolder|TestPushDeleteOfSkipped|TestPushOccupancy|TestPushNilSkipped" -count=1`).
 - [ ] **Step 3: Implement.** Build once in phase 2, before the finalSet loop:
@@ -409,9 +424,9 @@ git commit -m "feat(push): heal-arm race diagnosis - size-gated occupant classif
 - Consumes: Stage 5 gate F1 observation (stage5-gate.md): `filesystem download` of a directory exits 0 and recursively downloads the subtree.
 - Produces: `Fake.ReadTo(dirPath, dest)` recursively materialises `dest/<leaf>/...`; the live row `download of a directory recursively materialises the subtree`.
 
-- [ ] **Step 1: Failing Fake test:** seed `Dirs["/r/d"]`, `Files["/r/d/a"]="A"`, `Dirs["/r/d/sub"]`, `Files["/r/d/sub/b"]="B"`; `ReadTo("/r/d", dest)` → nil, `dest/d/a` == "A", `dest/d/sub/b` == "B" (the F1 fixture shape, pinned).
+- [ ] **Step 1: Failing Fake tests:** (a) seed `Dirs["/r/d"]`, `Files["/r/d/a"]="A"`, `Dirs["/r/d/sub"]`, `Files["/r/d/sub/b"]="B"`; `ReadTo("/r/d", dest)` → nil, `dest/d/a` == "A", `dest/d/sub/b` == "B" (the F1 fixture shape, pinned). (b) GUARD (round-2 Codex): `ReadTo("/r/d", missingDest)` → ERROR and creates nothing — the C16 wrapper contract (destination must exist; the CLI wrapper stats before spawning) applies to directory downloads exactly as to files; the directory branch must run AFTER the existing dest validation, never `MkdirAll` an absent dest into existence.
 - [ ] **Step 2: Run, expect FAIL** (Fake.ReadTo today misses on `Files[p]` for a dir path — verify the actual failure mode and record it).
-- [ ] **Step 3: Implement** in Fake.ReadTo: if `f.Dirs[p]`, walk `Files`/`Dirs` under `p+"/"`, `os.MkdirAll` + write each under `filepath.Join(dest, path.Base(p), rel)`; return nil. Add the live contract row per the existing row pattern: fake half asserts the layout above; live half creates the same tree under the (Task 6) validated root, downloads, asserts layout, records verbatim output. Update `runDownload`'s doc comment in testcli.go: directory targets misreport as notFound; the REAL contract is recursive success — cite the new row; shim stays file-oriented and no shim test may rely on directory download.
+- [ ] **Step 3: Implement** in Fake.ReadTo: keep the existing dest-exists validation FIRST (C16 — round-2 Codex: a directory branch that MkdirAlls beneath an unvalidated dest would make the Fake accept a missing destination the CLI rejects); then, if `f.Dirs[p]`, walk `Files`/`Dirs` under `p+"/"`, `os.MkdirAll` + write each under `filepath.Join(dest, path.Base(p), rel)`; return nil. Add the live contract row per the existing row pattern: fake half asserts the layout above; live half creates the same tree under the (Task 6) validated root, downloads, asserts layout, records verbatim output. Update `runDownload`'s doc comment in testcli.go: directory targets misreport as notFound; the REAL contract is recursive success — cite the new row; shim stays file-oriented and no shim test may rely on directory download.
 - [ ] **Step 4: Full suite; commit.**
 ```bash
 git add internal/transport internal/testcli
@@ -531,3 +546,13 @@ delete that name regardless of occupancy), and the beneath-an-invalid-name case 
 descendant check whose occupancy Path carries the invalid component while the dst stays
 valid; the plan now states this ordering rationale in Task 3 Step 3 and the kind-aware test
 manufactures a legal scan state.
+
+**Round 2 (Codex + Gemini, 2026-08-09) — Gemini: no new blocker/major findings, explicitly
+("the plan is ready for execution"). Codex: three majors, all applied:** Task 5's directory
+branch runs AFTER the existing dest-exists validation with a missing-dest GUARD (the C16
+wrapper contract applies to directory downloads; MkdirAll under an unvalidated dest would
+make the Fake accept what the CLI rejects); Task 2's push-survey HEAD diagnostic is
+explicitly ADVISORY with a failing-ReadHEAD GUARD (undefined semantics would let a natural
+fatal implementation reintroduce the backup-stopping wedge); Task 3 gains a loop-level
+NAME-skip occupancy wiring case (content-junk-only wiring would stay green if main.go passed
+ContentSkips() instead of Skipped).
