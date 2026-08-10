@@ -332,9 +332,10 @@ returns just the `SkipContent` subset — the set the fetch-direction survey ins
 
 **The scan/error split is typed, never by message text.** Only a grammar/classification failure
 is skippable; every transport or read failure stays fatal, and `readRefClassified` distinguishes
-the two with `errors.Is(err, errMalformedRef)` — a sentinel `*malformedRefError` wraps, and that a
-`ReadTo`/`ReadDir`/`ReadFile` failure never satisfies. A GUARD test pins it: a transport failure
-during the walk stays fatal while a grammar failure beside it skips.
+the two with `errors.Is(err, errMalformedRef)` — a sentinel `errMalformedRef` that only
+`*malformedRefError` wraps, and that a `ReadTo`/`ReadDir`/`ReadFile` failure never satisfies. A
+GUARD test pins it: a transport failure during the walk stays fatal while a grammar failure beside
+it skips.
 
 **Classification is size-gated — a candidate's SIZE, from the listing metadata, gates whether it
 is downloaded at all.** `refBandMin`/`refBandMax` (`internal/repo/refs.go`) bound the candidate

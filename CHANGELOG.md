@@ -2,16 +2,22 @@
 
 ## Unreleased
 
-- **git-remote-proton: fetch/clone/`ls-remote` now fail loudly on unparseable ref-file contents,
-  instead of silently succeeding without them.** This is a user-visible behaviour change on the
-  fetch direction — read it before upgrading if you run unattended mirror-fetch jobs. A ref file
-  under `refs/` that is well-named but whose contents don't parse as a ref (a stray web-UI upload,
-  a damaged file, foreign junk) is now classified at read time, and on `list`/`clone`/`ls-remote`
-  it fails the whole command with one error enumerating every such file, its reason, and the
-  remedy — a clone that quietly lacked a branch was a false-success restore, and this closes that.
-  **`push` is unaffected**, and gets safer, not stricter: the
-  push-direction survey (`list for-push`) skips the same file with a loud note and proceeds, so an
-  unattended cron backup never stops on a junk file it didn't create. Files with **invalid names**
+- **git-remote-proton: `push` no longer fails outright because of a junk file under `refs/`.**
+  This is the headline behaviour change, and it is **breaking-ish in one specific way — read it
+  before upgrading if you rely on push failing as your junk-file alarm.** Previously, a ref file
+  that was well-named but whose contents didn't parse as a ref (a stray web-UI upload, a damaged
+  file, foreign junk) was **uniformly fatal**: both `list` and `list for-push` walked the same ref
+  tree, and a single such file aborted the whole advertisement — so an unattended cron `push`
+  stopped dead on a file it never created, with no way to skip past it but deleting the file by
+  hand. `push` now **tolerates** it: the file is skipped with a loud, classified note, the push
+  proceeds, and pushing (or deleting) onto that exact name is still refused, actionably, by the new
+  occupancy machinery below. **The trade:** a junk file that used to stop backups loudly no longer
+  stops them — anyone who was relying on that fatal failure as a "something's wrong" signal loses
+  it and should watch the new skip notes instead. `fetch`/`clone`/`ls-remote` **still fail by
+  design** on the same class of file — that direction was never silently succeeding, it already
+  failed loudly before this change — but the failure is now more useful: one error enumerating
+  every content-skipped path, its classified reason, and the remedy, instead of the previous single
+  generic error naming just the first file the walk happened to reach. Files with **invalid names**
   (never valid refs to begin with) stay note-only in both directions, unchanged. See the README's
   new foreign-data paragraph and `docs/v2-remote-helper-design.md`'s "Foreign data at the read
   boundary" section (v6.6) for the full rule and remedy.
