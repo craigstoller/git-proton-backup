@@ -114,9 +114,15 @@ SUCCESSFUL download — `gpb: downloaded <remote path> (<n> bytes)\n` — to the
 (`internal/transport/trace.go:38-48`; its own doc comment calls the `"gpb: downloaded "` prefix
 NORMATIVE). Every `readRef` call goes through `t.ReadTo`, so this line fires on every in-band
 candidate `ScanRefs` actually downloads — including a junk file, before its grammar check fails.
-Seeing `gpb: downloaded ...` lines interleaved with the strings below is expected, not an
-anomaly; outline step 1 below asserts the specific positive/negative pair this stage's size gate
-predicts.
+**`Traced.ReadTo` is the ONE handle wrapping every download this helper makes, not only ref
+reads** — fetch and clone route pack/index downloads through the same transport, so expect
+`gpb: downloaded .../packs/pack-*.pack` and matching `.idx` lines during outline step 2's clone
+and outline step 4's fetches too; these are ordinary, unrelated to the junk fixtures, and not
+something to cross-check against anything in this brief. Seeing `gpb: downloaded ...` lines
+interleaved with the strings below is expected, not an anomaly; outline step 1 below asserts the
+specific positive/negative pair this stage's size gate predicts, scoped by the exact junk
+filenames — `gate-junk-a`/`gate-junk-b` — never by count or by conflating them with a
+pack/idx line that happens to appear nearby.
 
 1. **The strict-fetch enumerated error** (`cmd/git-remote-proton/main.go`, the `case line ==
    "list":` arm, ~line 372). Surfaced by `git ls-remote`, `git fetch`, or `git clone` against
@@ -446,6 +452,20 @@ outline-step-1 gate repo (main checked out) and the outline-step-2 clone.
 
 Per spec component 5's live-gate outline item 5, and checklist items 1/3/7 inline.
 
+- **First, check the Preconditions-step-4 baseline: did `/my-files/GitRemotes` already have a
+  row there BEFORE this gate ran?** Do this before any of the listing/trash steps below, since it
+  determines whether they apply at all. The expected case (per Preconditions step 5) is NO —
+  this gate creates it fresh, and everything below (subtree verification, trashing both children,
+  then trashing `GitRemotes` itself) applies as written. **If the baseline already shows a
+  `GitRemotes` row, this gate did NOT create it, and the folder itself is NOT this gate's to
+  trash** — trash only its two children (the subtree-verification and both-children-trash steps
+  below still apply unchanged), then STOP: skip the "verify and trash `/my-files/GitRemotes`
+  itself" step entirely. In that branch, `/my-files/GitRemotes` reappears in the post-run
+  comparison with the SAME `uid`/`name`/`type`/`creationTime` as the baseline, but its
+  `modificationTime` MAY legitimately differ — this gate wrote children into it and then removed
+  them, and Proton is free to bump a folder's own modification time for that. A differing
+  `modificationTime` on `/my-files/GitRemotes` alone, in this branch only, is NOT a BLOCK; every
+  other field (and every other row, including the four untouchables) still must match exactly.
 - **Verify-before-trash with full subtree enumeration** (checklist item 3): `filesystem list`
   the full subtree of `/my-files/GitRemotes/stage6-gate` (refs/heads holding `main` and
   `push-ok` as FILES, plus a `feature` FOLDER containing `x` — outline step 4's nested branch is
@@ -458,17 +478,10 @@ Per spec component 5's live-gate outline item 5, and checklist items 1/3/7 inlin
   `trashTime` field, wait briefly and re-list before concluding it is non-empty — only a
   persistent non-empty listing after a re-list means it is not actually empty (and is itself a
   BLOCK, since it would mean a subfolder `t.Cleanup` was supposed to trash did not commit).
-- **First, check the Preconditions-step-4 baseline: did `/my-files/GitRemotes` already have a
-  row there BEFORE this gate ran?** The expected case (per Preconditions step 5) is NO — this
-  gate creates it fresh. **If the baseline already shows a `GitRemotes` row, this gate did NOT
-  create it, and the folder itself is NOT this gate's to trash** — trash only its two children
-  below and stop there; `/my-files/GitRemotes` itself must then reappear unchanged in the
-  post-run comparison, and the "Confirm the listing is empty" step below does not apply. This
-  brief expects the fresh-creation case; the paragraph below assumes it.
-- **Trash both roots, THEN verify and trash `/my-files/GitRemotes` itself** (fresh-creation case
-  only) — the demo repo and the contract root are `GitRemotes`' only two children (both
-  gate-created; Preconditions step 5 authorizes this symmetrically with authorizing
-  `GitRemotes`' own creation, same close every prior gate took:
+- **Trash both children, THEN — fresh-creation case only — verify and trash
+  `/my-files/GitRemotes` itself too** — the demo repo and the contract root are `GitRemotes`'
+  only two children (both gate-created; Preconditions step 5 authorizes this symmetrically with
+  authorizing `GitRemotes`' own creation, same close every prior gate took:
   `docs/research/gates/stage3b-gate.md:268-270`, `stage4-gate.md:743-749`,
   `stage5-gate.md:508-514`):
   ```
@@ -499,8 +512,18 @@ Per spec component 5's live-gate outline item 5, and checklist items 1/3/7 inlin
   `/my-files/GitRemotes` itself), only TWO if the baseline check above found `GitRemotes`
   pre-existing (the demo repo subtree and the contract base folder only).
 - **Post-run `/my-files` listing** must be row-set-identical to the pre-run listing from
-  Preconditions step 4 (no `trashTime` on any of the four untouchable rows; same uids, same
-  creation/modification times).
+  Preconditions step 4: no `trashTime` on any row, same uids, same creation/modification times —
+  **except** `/my-files/GitRemotes`'s own `modificationTime` in the pre-existing-`GitRemotes`
+  branch above (first bullet), where a differing `modificationTime` on that ONE row alone is not
+  a BLOCK, exactly as that bullet already states; every other row and every other field is held
+  to the strict identity rule. **This listing is taken immediately after the cleanup trash(es)
+  above (`/my-files/GitRemotes` itself in the fresh-creation case; its two children only in the
+  pre-existing case), so the same transient post-trash listing lag applies here** — if a
+  just-trashed node still appears in this listing carrying a `trashTime` field, that is the same
+  lag `docs/research/gates/stage5-gate.md:534-538` recorded live under its own "Post-run
+  `/my-files` listing" heading (the first post-trash listing there still showed the just-trashed
+  `GitRemotes` row). Wait briefly and re-list; only a listing that STILL shows a non-trashed or
+  mismatched row after a re-list is a BLOCK.
 
 ---
 
