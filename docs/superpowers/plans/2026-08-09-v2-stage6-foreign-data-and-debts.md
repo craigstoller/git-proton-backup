@@ -486,7 +486,22 @@ git commit -m "test: registry-mock options spy (DoNotExpandEnvironmentNames pinn
 
 - [ ] **Step 1: v6.6 edits, one revision entry** per spec component 4: per-operation content rows (push-survey skip+note vs fetch-survey enumerated failure — quote the Task 2 error shape); the v6.5 OPEN question replaced with the adjudicated per-operation rationale + spec pointer; occupancy refusal rows (kind-aware, pre-pack) + delete refusal + git-porcelain lock-out row; heal-arm race diagnosis row; HEAD/all-skipped degraded states (per-direction as specced); F1 recorded beside ReadTo/C16 with the row cited; size-gate band + best-effort residual documented.
 - [ ] **Step 2: README** foreign-data paragraph exactly as specced (component 4 wording: fetch-blocking class is valid-ref-named files with unparseable contents; invalid-named note-only both directions; mirror-alarm intended; lock-out + CLI/web-UI remedy; trash restorable).
-- [ ] **Step 3: CHANGELOG Unreleased entries:** per-operation foreign-data policy (user-visible behaviour change: fetch/clone/ls-remote now fail loudly on unparseable ref files instead of silently succeeding without them — BREAKING-ish, flag prominently; push unaffected); occupancy refusals with actionable messages; damaged-ref hex recovery in errors/notes; F1 contract fact. Do NOT flip the version (Task 9).
+- [ ] **Step 3: CHANGELOG Unreleased entries:**
+
+  > **SUPERSEDED (2026-08-09, Task 8 review round 1).** The parenthetical this step shipped with —
+  > "fetch/clone/ls-remote now fail loudly on unparseable ref files instead of silently succeeding
+  > without them — BREAKING-ish; push unaffected" — described the change relative to the spec's
+  > ABANDONED round-1–3 uniform-skip draft, not relative to the shipped v0.4.0 baseline. At v0.4.0,
+  > malformed ref-file contents were uniformly FATAL: both `list` arms called the same walk whose
+  > content failure aborted the whole advertisement, so junk blocked `push` too, and fetch never
+  > "silently succeeded" (it failed with one generic error). The accurate entry, which governs:
+  > **push is the direction that changes** (was fatally blocked by any junk under refs/, now
+  > tolerant with classified notes + occupancy refusals — the unattended-backup fix); **fetch stays
+  > failing by design**, upgraded from one generic error to full enumeration + remedy. Flag
+  > prominently that a junk file that used to stop backups loudly no longer stops them (the only
+  > honest "breaking-ish" angle: anyone relying on push failure as a junk alarm loses that signal).
+
+  Corrected content: per-operation foreign-data policy as described in the banner above; occupancy refusals with actionable messages; damaged-ref hex recovery in errors/notes; F1 contract fact. Do NOT flip the version (Task 9).
 - [ ] **Step 4: Commit.**
 ```bash
 git add docs/v2-remote-helper-design.md README.md CHANGELOG.md
