@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 — 2026-08-09
 
 - **git-remote-proton: `push` no longer fails outright because of a junk file under `refs/`.**
   This is the headline behaviour change, and it is **breaking-ish in one specific way — read it
