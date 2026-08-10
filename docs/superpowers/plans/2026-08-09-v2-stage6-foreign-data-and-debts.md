@@ -297,7 +297,7 @@ if cs := scan.ContentSkips(); len(cs) > 0 {
 	return 1
 }
 ```
-The `"list"` HEAD block gains, beside the existing suppressed-symref path: if `hasHead` and the branch is in `scan.Skipped` (any kind), `fmt.Fprintf(os.Stderr, "git-remote-proton: HEAD names %s, which was skipped (%s); advertising no default branch\n", branch, reason)`. The `"list for-push"` arm gains the push-survey HEAD note ([Both] round-1 blocker): AFTER advertising, `if len(scan.Skipped) > 0` (the cost gate — no remote read on clean repos), `ReadHEAD` and, when its branch is in the skipped set, emit the same stderr note shape. **The diagnostic is ADVISORY (round-2 Codex): a ReadHEAD error here is a stderr note (`HEAD unreadable during skip diagnostics: <err>`) and the arm continues — it must never fail a push advertisement, which would reintroduce exactly the wedge the tolerant policy removes.** No symref/protocol output changes in that arm.
+The `"list"` HEAD block gains, beside the existing suppressed-symref path: if `hasHead` and the branch **matches** the skipped set, `fmt.Fprintf(os.Stderr, "git-remote-proton: HEAD names %s, which was skipped (%s); advertising no default branch\n", branch, reason)`. **Matching is a helper `scanSkipMatch(scan, branch) (SkippedRef, bool)` on RefScan (round-3 Codex): exact Path match for any kind, OR `strings.HasPrefix(branch, s.Path+"/")` for `SkipInvalidNameFolder` — the scan records only the skipped folder, never its unentered subtree, so HEAD → `refs/heads/.hidden/topic` matches `.hidden`'s entry by prefix.** Both arms use the same helper; both directions get a descendant-case test (Fake HEAD content naming a branch inside a name-skipped folder → note fires, symref absent). The `"list for-push"` arm gains the push-survey HEAD note ([Both] round-1 blocker): AFTER advertising, `if len(scan.Skipped) > 0` (the cost gate — no remote read on clean repos), `ReadHEAD` and, when its branch is in the skipped set, emit the same stderr note shape. **The diagnostic is ADVISORY (round-2 Codex): a ReadHEAD error here is a stderr note (`HEAD unreadable during skip diagnostics: <err>`) and the arm continues — it must never fail a push advertisement, which would reintroduce exactly the wedge the tolerant policy removes.** No symref/protocol output changes in that arm.
 - [ ] **Step 4: Full suite; deliberate regression:** remove the strict check → the per-operation RED fails on its "list must fail" half. Revert. Commit.
 ```bash
 git add cmd/git-remote-proton
@@ -556,3 +556,11 @@ explicitly ADVISORY with a failing-ReadHEAD GUARD (undefined semantics would let
 fatal implementation reintroduce the backup-stopping wedge); Task 3 gains a loop-level
 NAME-skip occupancy wiring case (content-junk-only wiring would stay green if main.go passed
 ContentSkips() instead of Skipped).
+
+**Round 3 (Codex + Gemini, 2026-08-09, final round) — Gemini: no new blocker/major findings,
+explicitly ("sound and ready for execution"). Codex: one major, applied:** HEAD matching
+against the skipped set is exact-Path OR descendant-of-`SkipInvalidNameFolder` prefix (via a
+shared `scanSkipMatch` helper, both arms, descendant tests both directions) — the scan
+records only the skipped folder, never its unentered subtree, so HEAD naming a branch INSIDE
+a name-skipped folder previously suppressed the symref with no note. The loop ends at the
+three-round cap with every tracked finding applied or rejected-with-reason and none deferred.
