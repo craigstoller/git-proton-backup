@@ -1668,3 +1668,29 @@ Only after it PASSes is the v0.5.0 release final.
 `create-folder` line needs its two-argument form restored. No product defect was found by either
 run.
 
+
+---
+
+# Publication digest closure — CLOSURE PASS (2026-08-10T08:53:28-07:00, controller-run, read-only)
+
+Craig published the release via the GitHub UI (`publishedAt: 2026-08-10T15:51:40Z`). Closure per
+the brief's Release-integration third bullet, three-way against the staged digests at section R2:
+
+1. **Recorded-vs-published:** every published asset re-downloaded into a NEW empty directory
+   (`C:\gpb6\closure1`) via `gh release download v0.5.0`; SHA-256 of all three EQUAL the R2
+   staged baseline (exe `e633eaf5158a61ef18b79a12fe733dbc03d649f57e4b9fdb4336ff847c65892d`,
+   sidecar `4248c88f5bd4728970aec1f9bd003a1f7089a3ee33706b3635af3b6050f7e9e6`, install.ps1
+   `8987ab2b73e66a79b5a33c4652d92ca10d2a2aae3fe4a2e1174b3519858575e0`). Sizes 3982336 / 87 /
+   8805, unchanged.
+2. **Staging-dir-rehash-vs-recorded:** `C:\gpb6\draft-stage` re-hashed; all three EQUAL the R2
+   digests (staging bytes undisturbed since the gate run).
+3. **Byte-for-byte:** staged vs published, all three files `SequenceEqual = True`.
+
+Asset identity carried through publication without re-upload, same as Stages 4-5: ids
+`RA_kwDOTfWuiM4eTPy5`/`...y7`/`...y6` with `createdAt: 2026-08-10T05:57:37Z` (the draft
+build time, hours before publication) — GitHub re-homed the draft's assets.
+
+**The provisional verdict is now final: STAGE 6 LIVE GATE — PASS. v0.5.0 is published and
+final.** Outstanding cosmetic item from R2-D1 was already fixed in the brief (two-argument
+`create-folder`) before this closure ran.
+
