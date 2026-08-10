@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,8 +12,127 @@ import (
 // runner exercises only the Fake and can never touch a real account.
 const liveEnv = "GPB_LIVE_ACCOUNT"
 
-// liveRoot is the only remote path the live half may write to.
+// liveRoot is the default remote path the live half writes to.
+// GPB_CONTRACT_LIVE_ROOT (see contractLiveRoot) may override it — the
+// Stage 5 gate hit a real incident (S2, docs/research/gates/stage5-gate.md)
+// where a gate's authorised confinement did not include this hardcoded
+// value, so the table refused to run under the gate's own root. An
+// override still goes through validateContractLiveRoot, fail-closed.
 const liveRoot = "/my-files/_cas-probe/contract"
+
+// contractLiveRootEnv overrides liveRoot for one test run. Read fresh on
+// every call (see contractLiveRoot) — never cached in package state.
+const contractLiveRootEnv = "GPB_CONTRACT_LIVE_ROOT"
+
+// untouchableTopLevelFolders are the four pre-existing top-level folders in
+// the live Proton account that no gate or contract run may ever write to or
+// trash. These are account facts, not inventions — verified verbatim
+// against docs/research/gates/stage5-gate.md:669-670 ("Untouchable folders
+// read-only. `GitBackups`, `Sensitive Project Sources`, `Project Repo
+// Bundles`, `ChatGPT Export Text Backup` appeared only as rows in
+// `filesystem list /my-files` output.") and cross-checked against the same
+// four names in docs/research/gates/stage4-gate.md:271-272,830-831 and
+// docs/research/gates/stage5-gate-brief.md:60,487.
+var untouchableTopLevelFolders = map[string]bool{
+	"GitBackups":                 true,
+	"Sensitive Project Sources":  true,
+	"Project Repo Bundles":       true,
+	"ChatGPT Export Text Backup": true,
+}
+
+// validateContractLiveRoot is the PURE, fail-closed gate on the contract
+// table's live root, directly unit-testable with no environment and no
+// live account (TestValidateContractLiveRoot below). It requires:
+//   - an absolute path strictly below /my-files/ — so /my-files itself is
+//     refused, and any path outside /my-files is refused;
+//   - no empty, ".", or ".." segment ANYWHERE, checked on the raw split of
+//     v (not a cleaned path): a prefix check alone would still admit
+//     /my-files/x/../../outside-style traversal if the CLI resolves dot
+//     segments (round-3 Codex, spec Component 3);
+//   - the first path segment under /my-files/ is not one of the four
+//     untouchable top-level folders above.
+//
+// Every rejection's error names the offending value v.
+func validateContractLiveRoot(v string) error {
+	if !strings.HasPrefix(v, "/my-files/") {
+		return fmt.Errorf("GPB_CONTRACT_LIVE_ROOT must be an absolute path strictly below /my-files/, got %q", v)
+	}
+	// TrimPrefix first, THEN split — round-1 Gemini (plan review): splitting
+	// the raw absolute path (leading "/") yields an empty first element that
+	// a no-empty-segments rule would then reject for every valid path.
+	parts := strings.Split(strings.TrimPrefix(v, "/"), "/")
+	if len(parts) < 2 || parts[0] != "my-files" {
+		return fmt.Errorf("GPB_CONTRACT_LIVE_ROOT must be an absolute path strictly below /my-files/, got %q", v)
+	}
+	for _, p := range parts {
+		if p == "" || p == "." || p == ".." {
+			return fmt.Errorf("GPB_CONTRACT_LIVE_ROOT must not contain an empty, \".\", or \"..\" path segment, got %q", v)
+		}
+	}
+	if untouchableTopLevelFolders[parts[1]] {
+		return fmt.Errorf("GPB_CONTRACT_LIVE_ROOT must not be inside the untouchable folder %q, got %q", parts[1], v)
+	}
+	return nil
+}
+
+// contractLiveRoot resolves the live root TestContractCLI must use: the
+// env override if set, else liveRoot — always passed through
+// validateContractLiveRoot before any live call is made. An invalid value
+// fails the live run loudly (t.Fatalf) rather than silently falling back to
+// the default or proceeding unvalidated.
+func contractLiveRoot(t *testing.T) string {
+	t.Helper()
+	v := os.Getenv(contractLiveRootEnv)
+	if v == "" {
+		v = liveRoot
+	}
+	if err := validateContractLiveRoot(v); err != nil {
+		t.Fatalf("%s: %v", contractLiveRootEnv, err)
+	}
+	return v
+}
+
+// TestValidateContractLiveRoot exercises the PURE validator directly — no
+// env, no live call, no t.Fatalf-only surface (round-1 Codex: a
+// t.Fatalf-only surface cannot have rejection subtests, since an expected
+// Fatalf would still fail the suite).
+func TestValidateContractLiveRoot(t *testing.T) {
+	reject := []struct{ name, v string }{
+		{"root itself", "/my-files"},
+		{"GitBackups prefix", "/my-files/GitBackups/x"},
+		{"Sensitive Project Sources prefix", "/my-files/Sensitive Project Sources/x"},
+		{"Project Repo Bundles prefix", "/my-files/Project Repo Bundles/x"},
+		{"ChatGPT Export Text Backup prefix", "/my-files/ChatGPT Export Text Backup/x"},
+		{"outside /my-files", "/other/x"},
+		{"dot-dot segments climbing out", "/my-files/x/../../etc"},
+		{"dot-dot segment reaching an untouchable", "/my-files/x/../GitBackups"},
+		{"relative path", "relative/path"},
+		{"empty segment (doubled slash)", "/my-files//x"},
+	}
+	for _, c := range reject {
+		t.Run(c.name, func(t *testing.T) {
+			err := validateContractLiveRoot(c.v)
+			if err == nil {
+				t.Fatalf("validateContractLiveRoot(%q): want a rejection, got nil", c.v)
+			}
+			if !strings.Contains(err.Error(), c.v) {
+				t.Errorf("validateContractLiveRoot(%q): error must name the offending value, got %q", c.v, err.Error())
+			}
+		})
+	}
+
+	accept := []struct{ name, v string }{
+		{"the default liveRoot", liveRoot},
+		{"a sibling under the cas-probe root", "/my-files/_cas-probe/other"},
+	}
+	for _, c := range accept {
+		t.Run(c.name, func(t *testing.T) {
+			if err := validateContractLiveRoot(c.v); err != nil {
+				t.Errorf("validateContractLiveRoot(%q): want acceptance, got %v", c.v, err)
+			}
+		})
+	}
+}
 
 // contractCase is one scenario, expressed against the interface alone.
 type contractCase struct {
@@ -480,6 +600,10 @@ func TestContractCLI(t *testing.T) {
 			"Set %s=1 to run it. It writes only under %s and trashes that root afterwards.",
 			liveEnv, liveRoot)
 	}
+	// Validated fail-closed BEFORE any live call — including before the
+	// Version() probe below — so an invalid GPB_CONTRACT_LIVE_ROOT never
+	// reaches the account at all.
+	base := contractLiveRoot(t)
 	runContract(t, func(t *testing.T) (Transport, string) {
 		c := NewCLI("")
 		v, err := c.Version()
@@ -490,9 +614,9 @@ func TestContractCLI(t *testing.T) {
 			t.Fatalf("live half refuses an uncertified CLI: got %q, certified is %s", v, CertifiedCLI)
 		}
 		// A per-test root so cases cannot see each other's nodes.
-		root := liveRoot + "/" + strings.ReplaceAll(t.Name(), "/", "_")
-		if err := c.EnsureDir(liveRoot); err != nil {
-			t.Fatalf("EnsureDir %s: %v", liveRoot, err)
+		root := base + "/" + strings.ReplaceAll(t.Name(), "/", "_")
+		if err := c.EnsureDir(base); err != nil {
+			t.Fatalf("EnsureDir %s: %v", base, err)
 		}
 		if err := c.EnsureDir(root); err != nil {
 			t.Fatalf("EnsureDir %s: %v", root, err)
