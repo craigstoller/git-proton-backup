@@ -21,7 +21,12 @@ bootstrap push mid-flight and orphaned the repo lock, which then had to be diagn
 by hand — see `docs/research/gates/stage5-gate.md`'s S1). This is stated once, here, and applies
 to every push step below without repeating it. The one `go test` invocation in this brief
 (outline step 3) has historically run 5–10+ minutes live (17 contract cases; the Stage 3b
-9-case table took 270s) and gets the same long-timeout-or-background treatment.
+9-case table took 270s) and gets the same long-timeout-or-background treatment — **and (run-1
+amendment, 2026-08-10, adjudicated): `go test`'s OWN default 10-minute deadline must be raised
+explicitly with `-timeout 40m`; a harness-side timeout does not cover it. Run 1 of this gate
+BLOCKED at exactly this — the live table panicked at `test timed out after 10m0s` with all 17
+subtests started and none failed: a command-validity defect in this brief's original text, not
+a product defect.**
 
 Release integration follows `docs/releasing.md` step 5: **this gate runs against the v0.5.0
 DRAFT's bytes** (downloaded from the draft, digests staged before any account write), never
@@ -214,11 +219,17 @@ Per spec component 5's live-gate outline item 1.
    cd stage6-gate
    git commit --allow-empty -m "gate: stage6 initial commit"
    git remote add proton-v2 "proton::/my-files/GitRemotes/stage6-gate"
+   proton-drive filesystem create-folder /my-files/GitRemotes
    git push -u proton-v2 main
    ```
    (`-b main` is explicit, not `init.defaultBranch` — every later command in this brief names
-   `main` literally.) This creates `/my-files/GitRemotes` if absent (write-confinement
-   authorization above), the repo marker, and `refs/heads/main`.
+   `main` literally.) **Run-1 amendment (2026-08-10, adjudicated):** the original text claimed
+   the bootstrap push itself "creates `/my-files/GitRemotes` if absent" — wrong: the helper
+   refuses missing parents unless `GPB_CREATE_PARENTS=1` is set, which this brief never sets.
+   The explicit `create-folder` above (authorized by Preconditions step 5) is the correct
+   bootstrap when the folder is absent; run 1's runner performed exactly this as an
+   adjudicated-accepted in-spirit deviation. The push then creates the repo marker and
+   `refs/heads/main`.
 1. **Manufacture two junk files** at valid ref names under `refs/heads` — CLI upload of a
    non-ref file, the web-UI-equivalent action. One lands IN the 40–42-byte candidate band (gets
    downloaded and grammar-checked); one is oversized (classified by size alone, never
@@ -403,7 +414,7 @@ the same anchoring Stage 3b/4/5's briefs assumed for their own `go test ./intern
 ```
 $env:GPB_LIVE_ACCOUNT = "1"
 $env:GPB_CONTRACT_LIVE_ROOT = "/my-files/GitRemotes/stage6-gate-contract"
-go test ./internal/transport/ -run TestContractCLI -count=1 -v
+go test ./internal/transport/ -run TestContractCLI -count=1 -timeout 40m -v
 Remove-Item Env:GPB_LIVE_ACCOUNT
 Remove-Item Env:GPB_CONTRACT_LIVE_ROOT
 ```
