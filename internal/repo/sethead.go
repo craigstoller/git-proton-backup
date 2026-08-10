@@ -119,17 +119,17 @@ func SetHead(t transport.Transport, root, branchArg string) (string, error) {
 // refs/heads/ prefix stripped), sorted — the "branches that exist"
 // suggestion list shared by SetHead's error-path arms (target absent;
 // target present but only as a namespace folder, not a branch itself).
-// Built from ListRefs, which walks the WHOLE ref tree (Task 8), so nested
+// Built from ScanRefs, which walks the WHOLE ref tree (Task 8), so nested
 // branches are included — e.g. a request for the folder "feature" itself
 // suggests "feature/x" if that is the real branch living beneath it. Only
 // ever called on an error path: SetHead's happy path never calls this.
 func existingBranchNames(t transport.Transport, root string) ([]string, error) {
-	refs, err := ListRefs(t, root)
+	scan, err := ScanRefs(t, root)
 	if err != nil {
 		return nil, err
 	}
 	var branches []string
-	for name := range refs {
+	for name := range scan.Refs {
 		if strings.HasPrefix(name, "refs/heads/") {
 			branches = append(branches, strings.TrimPrefix(name, "refs/heads/"))
 		}

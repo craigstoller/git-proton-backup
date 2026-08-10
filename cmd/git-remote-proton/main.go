@@ -354,11 +354,12 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 				warn(err)
 				return 1
 			}
-			refs, err := repo.ListRefs(t, root)
+			scan, err := repo.ScanRefs(t, root)
 			if err != nil {
 				warn(err)
 				return 1
 			}
+			refs := scan.Refs // Task 2 wires scan.Skipped into fetch-direction strictness
 			for name, sha := range refs {
 				fmt.Fprintf(out, "%s %s\n", sha, name)
 			}
@@ -411,11 +412,12 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 				return 1
 			}
 			lock = l
-			refs, err := repo.ListRefs(t, root)
+			scan, err := repo.ScanRefs(t, root)
 			if err != nil {
 				warn(err)
 				return 1
 			}
+			refs := scan.Refs // Task 2 wires scan.Skipped into the push-side occupancy preflight
 			for name, sha := range refs {
 				fmt.Fprintf(out, "%s %s\n", sha, name)
 			}
@@ -473,11 +475,12 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 				out.Flush()
 				continue
 			}
-			remote, err := repo.ListRefs(t, root)
+			scan, err := repo.ScanRefs(t, root)
 			if err != nil {
 				warn(err)
 				return 1
 			}
+			remote := scan.Refs // Task 2 wires scan.Skipped into the push-side occupancy preflight
 			for _, r := range repo.Push(t, root, gitDir, ups, remote) {
 				if r.OK {
 					fmt.Fprintf(out, "ok %s\n", r.Ref)

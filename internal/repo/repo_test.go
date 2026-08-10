@@ -403,22 +403,51 @@ func TestWriteAndListRefs(t *testing.T) {
 	if out, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil || out != transport.Committed {
 		t.Fatalf("create ref: %v %v", out, err)
 	}
-	refs, err := ListRefs(f, "/r")
+	scan, err := ScanRefs(f, "/r")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if refs["refs/heads/main"] != sha {
-		t.Errorf("got %q", refs["refs/heads/main"])
+	if scan.Refs["refs/heads/main"] != sha {
+		t.Errorf("got %q", scan.Refs["refs/heads/main"])
 	}
 }
 
-func TestListRefsRejectsCorruptRefFile(t *testing.T) {
+// TestScanRefsOutOfBandCorruptFileNowSkipsWithIntactSiblings — SEMANTIC
+// CONVERSION from the retired TestListRefsRejectsCorruptRefFile (Stage 5's
+// "malformed content is fatal" premise). "not-a-sha\n" is 10 bytes, well
+// outside the 40-42 candidate band, so under Stage 6's size-gated
+// classification it is now an out-of-band SKIP, never a fatal error
+// (round-1 Codex: the draft plan claimed only the exact-grammar test below
+// flips — this one does too). A good sibling is asserted intact, per the
+// brief's Step 4 instruction to convert this test to "the skip + intact
+// siblings".
+func TestScanRefsOutOfBandCorruptFileNowSkipsWithIntactSiblings(t *testing.T) {
 	f := transport.NewFake()
 	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
-	f.Files["/r/refs/heads/bad"] = []byte("not-a-sha\n")
-	if _, err := ListRefs(f, "/r"); err == nil {
-		t.Error("a malformed ref file must be fatal, never coerced")
+	sha := "1111111111111111111111111111111111111111"
+	f.Files["/r/refs/heads/main"] = []byte(sha + "\n")
+	f.Files["/r/refs/heads/bad"] = []byte("not-a-sha\n") // 10 bytes, out-of-band
+
+	scan, err := ScanRefs(f, "/r")
+	if err != nil {
+		t.Fatalf("an out-of-band candidate must never be fatal: %v", err)
+	}
+	if scan.Refs["refs/heads/main"] != sha {
+		t.Errorf("the intact sibling must still be advertised, got %v", scan.Refs)
+	}
+	if _, ok := scan.Refs["refs/heads/bad"]; ok {
+		t.Errorf("the junk file must not be advertised, got %v", scan.Refs)
+	}
+	if len(scan.Skipped) != 1 {
+		t.Fatalf("want exactly one skip, got %+v", scan.Skipped)
+	}
+	sk := scan.Skipped[0]
+	if sk.Path != "refs/heads/bad" || sk.Kind != SkipContent {
+		t.Errorf("want SkippedRef{Path: refs/heads/bad, Kind: SkipContent}, got %+v", sk)
+	}
+	if !strings.Contains(sk.Reason, "size 10") {
+		t.Errorf("reason must cite the size, got %q", sk.Reason)
 	}
 }
 
@@ -442,10 +471,11 @@ func TestListRefsRecursesAllNamespaces(t *testing.T) {
 		f.Files["/r/"+name] = []byte(sha + "\n")
 	}
 
-	refs, err := ListRefs(f, "/r")
+	scan, err := ScanRefs(f, "/r")
 	if err != nil {
-		t.Fatalf("ListRefs: %v", err)
+		t.Fatalf("ScanRefs: %v", err)
 	}
+	refs := scan.Refs
 	for _, name := range seed {
 		if refs[name] != sha {
 			t.Errorf("refs[%q] = %q, want %q (full map: %v)", name, refs[name], sha, refs)
@@ -475,13 +505,14 @@ func TestListRefsSkipsInvalidNamesWithNoteNeverFatal(t *testing.T) {
 	// specifically; the folder-skip path is the next test.
 	f.Files["/r/refs/heads/a{b}"] = []byte(sha + "\n")
 
-	var refs map[string]string
+	var scan *RefScan
 	var err error
-	stderr := captureStderr(t, func() { refs, err = ListRefs(f, "/r") })
+	stderr := captureStderr(t, func() { scan, err = ScanRefs(f, "/r") })
 
 	if err != nil {
 		t.Fatalf("a foreign junk name must never be fatal: %v", err)
 	}
+	refs := scan.Refs
 	if refs["refs/heads/main"] != sha {
 		t.Errorf("the well-named sibling must still be advertised, got %v", refs)
 	}
@@ -537,13 +568,14 @@ func TestListRefsNeverListsBeneathAnInvalidFolderName(t *testing.T) {
 	f.Files["/r/refs/heads/a{b}/y"] = []byte(sha + "\n")
 
 	tr := &tracedListTransport{Fake: f}
-	var refs map[string]string
+	var scan *RefScan
 	var err error
-	stderr := captureStderr(t, func() { refs, err = ListRefs(tr, "/r") })
+	stderr := captureStderr(t, func() { scan, err = ScanRefs(tr, "/r") })
 
 	if err != nil {
 		t.Fatalf("an invalid folder name must never be fatal: %v", err)
 	}
+	refs := scan.Refs
 	if refs["refs/heads/main"] != sha {
 		t.Errorf("the valid sibling must still be advertised, got %v", refs)
 	}
@@ -586,14 +618,17 @@ func TestSkipNoteText(t *testing.T) {
 	}
 }
 
-// TestListRefsMalformedContentStillFatal pins the readRef tightening: the
-// OLD TrimRight(sha, "\r\n") tolerated a bare sha with no trailing newline, a
-// CRLF terminator, and (because TrimRight strips a whole trailing run of
-// \r/\n bytes) even a double-LF terminator — none of those are bytes v2
-// itself ever writes (WriteRef always writes sha+"\n"), so all three are
-// foreign or damaged data and must be fatal under the spec's exact grammar:
-// 40 lowercase hex plus a single trailing newline, nothing else.
-func TestListRefsMalformedContentStillFatal(t *testing.T) {
+// TestScanRefsMalformedContentSkipsWithHex — RETITLED from
+// TestListRefsMalformedContentStillFatal (SEMANTIC CONVERSION #1 of the
+// brief's Step 4: "the retitled exact-grammar test"). The OLD test pinned
+// the Stage 5 premise that malformed content is fatal; Stage 6 retires that
+// premise for exactly these three shapes, because all three sit inside the
+// 40-42 candidate band (no-LF=40, CRLF=42, double-LF=42) — they are now
+// in-band SKIPS with the recoverable 40-hex carried forward in Hex, never
+// fatal errors. Fixture bytes preserved byte-for-byte from the retired test
+// per the brief ("reuse the exact fixture bytes... the old test name must
+// not survive, its premise is retired by the spec").
+func TestScanRefsMalformedContentSkipsWithHex(t *testing.T) {
 	sha := "1111111111111111111111111111111111111111"
 	cases := []struct {
 		name    string
@@ -609,10 +644,387 @@ func TestListRefsMalformedContentStillFatal(t *testing.T) {
 			f.Dirs["/r"] = true
 			_ = Bootstrap(f, "/r")
 			f.Files["/r/refs/heads/bad"] = c.content
-			if _, err := ListRefs(f, "/r"); err == nil {
-				t.Errorf("%s must be fatal under the exact grammar, got no error", c.name)
+
+			scan, err := ScanRefs(f, "/r")
+			if err != nil {
+				t.Fatalf("%s must skip under the size-gated band, never be fatal: %v", c.name, err)
+			}
+			if _, ok := scan.Refs["refs/heads/bad"]; ok {
+				t.Errorf("%s must not be advertised, got %v", c.name, scan.Refs)
+			}
+			if len(scan.Skipped) != 1 {
+				t.Fatalf("%s: want exactly one skip, got %+v", c.name, scan.Skipped)
+			}
+			sk := scan.Skipped[0]
+			if sk.Kind != SkipContent {
+				t.Errorf("%s: want Kind=SkipContent, got %v", c.name, sk.Kind)
+			}
+			if !strings.Contains(sk.Reason, "malformed terminator") {
+				t.Errorf("%s: reason must say malformed terminator, got %q", c.name, sk.Reason)
+			}
+			if sk.Hex != sha {
+				t.Errorf("%s: want recovered Hex %q, got %q", c.name, sha, sk.Hex)
 			}
 		})
+	}
+}
+
+// RED: junk beside good refs — Refs has the good refs only; Skipped carries
+// the junk with Kind=SkipContent and its classified Reason; note emitted.
+func TestScanRefsClassifiesContentJunkBesideGoodRefs(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	f.Files["/r/refs/heads/main"] = []byte(sha + "\n")
+	f.Files["/r/refs/heads/junk"] = []byte("hello world\n") // 12 bytes, out-of-band
+
+	var scan *RefScan
+	var err error
+	stderr := captureStderr(t, func() { scan, err = ScanRefs(f, "/r") })
+	if err != nil {
+		t.Fatalf("content junk must never be fatal: %v", err)
+	}
+	if len(scan.Refs) != 1 || scan.Refs["refs/heads/main"] != sha {
+		t.Errorf("want exactly the good ref advertised, got %v", scan.Refs)
+	}
+	if len(scan.Skipped) != 1 {
+		t.Fatalf("want exactly one skip, got %+v", scan.Skipped)
+	}
+	sk := scan.Skipped[0]
+	if sk.Path != "refs/heads/junk" || sk.Kind != SkipContent {
+		t.Errorf("want SkippedRef{Path: refs/heads/junk, Kind: SkipContent}, got %+v", sk)
+	}
+	if !strings.Contains(sk.Reason, "size 12") {
+		t.Errorf("reason must cite the size, got %q", sk.Reason)
+	}
+	if !strings.Contains(stderr, "refs/heads/junk") {
+		t.Errorf("skipping the junk file must emit a note naming it, got stderr %q", stderr)
+	}
+}
+
+// RED (size gate, trace-asserted): an out-of-band file is skipped WITHOUT any
+// ReadTo — the traced transport records no download of its path.
+func TestScanRefsOutOfBandSkipsWithoutDownload(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	f.Files["/r/refs/heads/main"] = []byte(sha + "\n")
+	f.Files["/r/refs/heads/junk"] = []byte("hello world\n") // 12 bytes, out-of-band
+
+	var trace strings.Builder
+	tr := transport.NewTraced(f, &trace)
+	scan, err := ScanRefs(tr, "/r")
+	if err != nil {
+		t.Fatalf("ScanRefs: %v", err)
+	}
+	if scan.Refs["refs/heads/main"] != sha {
+		t.Fatalf("the in-band control must be read, got %v", scan.Refs)
+	}
+	if strings.Contains(trace.String(), "refs/heads/junk") {
+		t.Errorf("an out-of-band file must never be downloaded, trace: %q", trace.String())
+	}
+	if !strings.Contains(trace.String(), "refs/heads/main") {
+		t.Errorf("the in-band control must be downloaded, trace: %q", trace.String())
+	}
+}
+
+// RED: in-band non-ref (41B of junk, e.g. "x" repeated 40 + "\n") downloads,
+// fails grammar, skips with escaped preview in Reason.
+func TestScanRefsInBandJunkSkipsWithPreview(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	junk := strings.Repeat("x", 40) + "\n" // 41 bytes, in-band, not hex
+	f.Files["/r/refs/heads/junk"] = []byte(junk)
+
+	var trace strings.Builder
+	tr := transport.NewTraced(f, &trace)
+	scan, err := ScanRefs(tr, "/r")
+	if err != nil {
+		t.Fatalf("ScanRefs: %v", err)
+	}
+	if len(scan.Refs) != 0 {
+		t.Errorf("junk must not be advertised, got %v", scan.Refs)
+	}
+	if !strings.Contains(trace.String(), "refs/heads/junk") {
+		t.Errorf("an in-band candidate must be downloaded, trace: %q", trace.String())
+	}
+	if len(scan.Skipped) != 1 {
+		t.Fatalf("want exactly one skip, got %+v", scan.Skipped)
+	}
+	sk := scan.Skipped[0]
+	if sk.Kind != SkipContent {
+		t.Errorf("want Kind=SkipContent, got %v", sk.Kind)
+	}
+	if !strings.Contains(sk.Reason, "not a ref") {
+		t.Errorf("reason must say not a ref, got %q", sk.Reason)
+	}
+	wantPreview := fmt.Sprintf("%q", junk) // classifyRefContent's escaping
+	if !strings.Contains(sk.Reason, wantPreview) {
+		t.Errorf("reason must carry the escaped preview %s, got %q", wantPreview, sk.Reason)
+	}
+	if sk.Hex != "" {
+		t.Errorf("non-hex junk must not recover a Hex, got %q", sk.Hex)
+	}
+}
+
+// RED (noncanonical): 40B no-LF and 42B CRLF fixtures — both downloaded
+// (in-band), both skipped, Reason says malformed terminator, Hex carries the
+// 40-hex.
+func TestScanRefsNoncanonicalHexRecovered(t *testing.T) {
+	sha := "2222222222222222222222222222222222222222"
+	cases := []struct {
+		name    string
+		content []byte
+	}{
+		{"no-LF (40B)", []byte(sha)},
+		{"CRLF (42B)", []byte(sha + "\r\n")},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := transport.NewFake()
+			f.Dirs["/r"] = true
+			_ = Bootstrap(f, "/r")
+			f.Files["/r/refs/heads/bad"] = c.content
+
+			var trace strings.Builder
+			tr := transport.NewTraced(f, &trace)
+			scan, err := ScanRefs(tr, "/r")
+			if err != nil {
+				t.Fatalf("%s: ScanRefs: %v", c.name, err)
+			}
+			if !strings.Contains(trace.String(), "refs/heads/bad") {
+				t.Errorf("%s: must be downloaded (in-band), trace: %q", c.name, trace.String())
+			}
+			if len(scan.Skipped) != 1 {
+				t.Fatalf("%s: want exactly one skip, got %+v", c.name, scan.Skipped)
+			}
+			sk := scan.Skipped[0]
+			if !strings.Contains(sk.Reason, "malformed terminator") {
+				t.Errorf("%s: reason must say malformed terminator, got %q", c.name, sk.Reason)
+			}
+			if sk.Hex != sha {
+				t.Errorf("%s: want recovered hex %q, got %q", c.name, sha, sk.Hex)
+			}
+		})
+	}
+}
+
+// RED: 42B non-hex junk (in-band, wrong content) -> SkipContent, no Hex.
+func TestScanRefsInBandNonHexHasNoHex(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	f.Files["/r/refs/heads/bad"] = []byte(strings.Repeat("y", 42)) // 42 bytes, in-band, not hex at all
+
+	scan, err := ScanRefs(f, "/r")
+	if err != nil {
+		t.Fatalf("ScanRefs: %v", err)
+	}
+	if len(scan.Skipped) != 1 {
+		t.Fatalf("want exactly one skip, got %+v", scan.Skipped)
+	}
+	sk := scan.Skipped[0]
+	if sk.Kind != SkipContent {
+		t.Errorf("want Kind=SkipContent, got %v", sk.Kind)
+	}
+	if sk.Hex != "" {
+		t.Errorf("non-hex junk must not recover a Hex, got %q", sk.Hex)
+	}
+}
+
+// failingReadToTransport wraps a Fake and fails ReadTo for exactly one
+// path, simulating a transport/network failure distinct from a grammar
+// failure — the fixture TestScanRefsTransportFailureStaysFatalWhileGrammarSkips
+// needs to prove the typed split does not conflate the two.
+type failingReadToTransport struct {
+	*transport.Fake
+	failPath string
+}
+
+func (tr *failingReadToTransport) ReadTo(p, local string) error {
+	if p == tr.failPath {
+		return fmt.Errorf("simulated transport failure reading %s", p)
+	}
+	return tr.Fake.ReadTo(p, local)
+}
+
+// GUARD (typed split — deliberate regression required): a transport ReadTo
+// failure during the walk stays FATAL (error names the path; no partial map);
+// the grammar failure beside it skips. "aaa-junk" sorts before "zzz-fails"
+// (Fake.List sorts by name), so the walk processes the grammar-failing file
+// first (an internal skip) before reaching the ReadTo failure and aborting —
+// proving the typed split, not merely absence of any download at all.
+func TestScanRefsTransportFailureStaysFatalWhileGrammarSkips(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	junk := strings.Repeat("x", 40) + "\n" // 41 bytes, in-band, grammar failure
+	f.Files["/r/refs/heads/aaa-junk"] = []byte(junk)
+	sha := "1111111111111111111111111111111111111111"
+	f.Files["/r/refs/heads/zzz-fails"] = []byte(sha + "\n") // 41 bytes, in-band, ReadTo fails
+
+	tr := &failingReadToTransport{Fake: f, failPath: "/r/refs/heads/zzz-fails"}
+	scan, err := ScanRefs(tr, "/r")
+	if err == nil {
+		t.Fatal("a transport ReadTo failure must be fatal, not a skip")
+	}
+	if !strings.Contains(err.Error(), "refs/heads/zzz-fails") {
+		t.Errorf("the fatal error must name the failing path, got: %v", err)
+	}
+	if scan != nil {
+		t.Errorf("a fatal error must not return a partial scan, got %+v", scan)
+	}
+}
+
+// RED: name-skips now recorded — invalid-named file -> SkipInvalidName;
+// invalid-named folder -> SkipInvalidNameFolder (and STILL no List beneath
+// it — extends TestListRefsNeverListsBeneathAnInvalidFolderName's trace
+// assertion above, does not weaken it).
+func TestScanRefsRecordsNameSkipsAsOccupancies(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	f.Files["/r/refs/heads/main"] = []byte(sha + "\n")
+	f.Files["/r/refs/heads/a{b}"] = []byte(sha + "\n")      // invalid-named FILE
+	f.Files["/r/refs/heads/.hidden/x"] = []byte(sha + "\n") // invalid-named FOLDER
+
+	tr := &tracedListTransport{Fake: f}
+	scan, err := ScanRefs(tr, "/r")
+	if err != nil {
+		t.Fatalf("name-skips must never be fatal: %v", err)
+	}
+	if scan.Refs["refs/heads/main"] != sha {
+		t.Errorf("the valid sibling must still be advertised, got %v", scan.Refs)
+	}
+
+	var fileSkip, folderSkip *SkippedRef
+	for i := range scan.Skipped {
+		switch scan.Skipped[i].Path {
+		case "refs/heads/a{b}":
+			fileSkip = &scan.Skipped[i]
+		case "refs/heads/.hidden":
+			folderSkip = &scan.Skipped[i]
+		}
+	}
+	if fileSkip == nil || fileSkip.Kind != SkipInvalidName {
+		t.Errorf("want refs/heads/a{b} recorded as SkipInvalidName, got %+v (all: %+v)", fileSkip, scan.Skipped)
+	}
+	if folderSkip == nil || folderSkip.Kind != SkipInvalidNameFolder {
+		t.Errorf("want refs/heads/.hidden recorded as SkipInvalidNameFolder, got %+v (all: %+v)", folderSkip, scan.Skipped)
+	}
+	for _, p := range tr.listed {
+		if strings.Contains(p, ".hidden") {
+			t.Errorf("List() must never be called beneath the invalid folder, but got %q (all calls: %v)", p, tr.listed)
+		}
+	}
+}
+
+// RED: OccupancyMessage renders all three kinds; folder text contains
+// "inspect" and never the word "file"; SkipInvalidName says "contents never
+// examined"; SkipContent contains the CLI trash grammar with the full path.
+func TestOccupancyMessageKindAware(t *testing.T) {
+	root := "/r"
+	p := "refs/heads/junk"
+
+	content := OccupancyMessage(root, SkippedRef{
+		Path: p, Kind: SkipContent,
+		Reason: "not a ref: size 12 outside the 40-42 candidate band",
+	})
+	if !strings.Contains(content, "proton-drive filesystem trash "+root+"/"+p) {
+		t.Errorf("SkipContent message must contain the CLI trash grammar with the full path, got %q", content)
+	}
+
+	name := OccupancyMessage(root, SkippedRef{Path: p, Kind: SkipInvalidName})
+	if !strings.Contains(name, "contents never examined") {
+		t.Errorf("SkipInvalidName message must say contents never examined, got %q", name)
+	}
+
+	folder := OccupancyMessage(root, SkippedRef{Path: "refs/heads/.hidden", Kind: SkipInvalidNameFolder})
+	if !strings.Contains(folder, "inspect") {
+		t.Errorf("SkipInvalidNameFolder message must say inspect, got %q", folder)
+	}
+	if strings.Contains(folder, "file") {
+		t.Errorf("SkipInvalidNameFolder message must never say the word file, got %q", folder)
+	}
+}
+
+// sizeOverrideTransport wraps a Fake's List, overriding the Size reported
+// for one specific leaf name to -1 (the cannot-know sentinel this package
+// uses for "size unavailable" — the certified CLI itself never reports a
+// negative size for a real file; this wrapper simulates the belt-and-braces
+// arm readRefClassified carries for a transport that cannot supply one).
+type sizeOverrideTransport struct {
+	*transport.Fake
+	leaf string
+}
+
+func (tr *sizeOverrideTransport) List(p string) ([]transport.Node, error) {
+	nodes, err := tr.Fake.List(p)
+	if err != nil {
+		return nil, err
+	}
+	for i := range nodes {
+		if nodes[i].Name == tr.leaf {
+			nodes[i].Size = -1
+		}
+	}
+	return nodes, nil
+}
+
+// GUARD: size-unknown arm — a wrapper transport that zeroes Size... NOTE:
+// Fake reports real sizes, so build a listWrapper that sets Size=-1 for one
+// file; assert skip-without-download with "size unknown" in Reason.
+func TestScanRefsUnknownSizeSkipsWithoutDownload(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	f.Files["/r/refs/heads/main"] = []byte(sha + "\n")
+
+	var trace strings.Builder
+	tr := transport.NewTraced(&sizeOverrideTransport{Fake: f, leaf: "main"}, &trace)
+	scan, err := ScanRefs(tr, "/r")
+	if err != nil {
+		t.Fatalf("ScanRefs: %v", err)
+	}
+	if len(scan.Refs) != 0 {
+		t.Errorf("a size-unknown candidate must not be advertised, got %v", scan.Refs)
+	}
+	if strings.Contains(trace.String(), "refs/heads/main") {
+		t.Errorf("a size-unknown candidate must never be downloaded, trace: %q", trace.String())
+	}
+	if len(scan.Skipped) != 1 || !strings.Contains(scan.Skipped[0].Reason, "size unknown") {
+		t.Errorf("want one skip with 'size unknown' in the reason, got %+v", scan.Skipped)
+	}
+}
+
+// RED (upper bound — round-1 Codex: without it an implementation checking
+// only size<40 passes everything): a 100-byte junk file skips WITHOUT any
+// ReadTo (trace-asserted), Reason cites the size.
+func TestScanRefsOversizedSkipsWithoutDownload(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	f.Files["/r/refs/heads/huge"] = []byte(strings.Repeat("z", 100))
+
+	var trace strings.Builder
+	tr := transport.NewTraced(f, &trace)
+	scan, err := ScanRefs(tr, "/r")
+	if err != nil {
+		t.Fatalf("ScanRefs: %v", err)
+	}
+	if len(scan.Refs) != 0 {
+		t.Errorf("an oversized candidate must not be advertised, got %v", scan.Refs)
+	}
+	if strings.Contains(trace.String(), "refs/heads/huge") {
+		t.Errorf("an oversized candidate must never be downloaded, trace: %q", trace.String())
+	}
+	if len(scan.Skipped) != 1 || !strings.Contains(scan.Skipped[0].Reason, "size 100") {
+		t.Errorf("want one skip citing the size, got %+v", scan.Skipped)
 	}
 }
 
@@ -625,12 +1037,12 @@ func TestListRefsIgnoresEmptyFolders(t *testing.T) {
 	if err := f.EnsureDir("/r/refs/heads/empty"); err != nil {
 		t.Fatalf("EnsureDir: %v", err)
 	}
-	refs, err := ListRefs(f, "/r")
+	scan, err := ScanRefs(f, "/r")
 	if err != nil {
-		t.Fatalf("ListRefs: %v", err)
+		t.Fatalf("ScanRefs: %v", err)
 	}
-	if len(refs) != 0 {
-		t.Errorf("an empty tree must advertise nothing, got %v", refs)
+	if len(scan.Refs) != 0 {
+		t.Errorf("an empty tree must advertise nothing, got %v", scan.Refs)
 	}
 }
 
@@ -1071,12 +1483,12 @@ func TestPushAcceptsHierarchicalDestinationNowThatListRefsRecurses(t *testing.T)
 	if packs, idxs := countPackFiles(f, "/r"); packs == 0 || idxs == 0 {
 		t.Errorf("a successful push must still upload a pack/idx pair, got pack=%d idx=%d", packs, idxs)
 	}
-	refs, err := ListRefs(f, "/r")
+	scan, err := ScanRefs(f, "/r")
 	if err != nil {
-		t.Fatalf("ListRefs: %v", err)
+		t.Fatalf("ScanRefs: %v", err)
 	}
-	if refs["refs/heads/feat/x"] != head {
-		t.Errorf("the ref just published must be advertised back, got %v", refs)
+	if scan.Refs["refs/heads/feat/x"] != head {
+		t.Errorf("the ref just published must be advertised back, got %v", scan.Refs)
 	}
 }
 
@@ -1135,10 +1547,11 @@ func TestPushAcceptsNamespacedDestinations(t *testing.T) {
 			if len(res) != 1 || !res[0].OK {
 				t.Fatalf("%q must now be accepted, got %+v", dst, res)
 			}
-			refs, err := ListRefs(f, "/r")
+			scan, err := ScanRefs(f, "/r")
 			if err != nil {
-				t.Fatalf("ListRefs: %v", err)
+				t.Fatalf("ScanRefs: %v", err)
 			}
+			refs := scan.Refs
 			if _, ok := refs[dst]; !ok {
 				t.Errorf("%q must be advertised back after publish, got %v", dst, refs)
 			}
@@ -1624,12 +2037,12 @@ func TestPushFinalStateDFPreflightRefusesConflictingCreates(t *testing.T) {
 			t.Errorf("result %d must name the conflicting ref, got %q", i, r.Err)
 		}
 	}
-	refs, err := ListRefs(f, "/r")
+	scan, err := ScanRefs(f, "/r")
 	if err != nil {
-		t.Fatalf("ListRefs: %v", err)
+		t.Fatalf("ScanRefs: %v", err)
 	}
-	if len(refs) != 0 {
-		t.Errorf("remote listing must be unchanged, got %v", refs)
+	if len(scan.Refs) != 0 {
+		t.Errorf("remote listing must be unchanged, got %v", scan.Refs)
 	}
 	if packs, idxs := countPackFiles(f, "/r"); packs != 0 || idxs != 0 {
 		t.Errorf("no pack may be built when nothing survives the preflight, got pack=%d idx=%d", packs, idxs)
@@ -2049,10 +2462,11 @@ func TestPushDeleteThenCreateSameNameOneBatch(t *testing.T) {
 			t.Fatalf("both the delete and the dependent create must succeed: %+v", res)
 		}
 	}
-	refs, err := ListRefs(f, "/r")
+	scan, err := ScanRefs(f, "/r")
 	if err != nil {
-		t.Fatalf("ListRefs: %v", err)
+		t.Fatalf("ScanRefs: %v", err)
 	}
+	refs := scan.Refs
 	if _, ok := refs["refs/heads/feature"]; ok {
 		t.Errorf("the deleted ref must be gone, got %v", refs)
 	}

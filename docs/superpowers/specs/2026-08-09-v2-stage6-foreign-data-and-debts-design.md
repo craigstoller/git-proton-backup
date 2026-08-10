@@ -101,7 +101,12 @@ metadata *before* any download:
   carrying the escaped preview (≤42 bytes, control bytes hex-escaped) — and the noncanonical
   classification below. (Round-2 [Both] blocker: the round-1 gate downloaded only exactly-41-
   byte files, which made the damaged-pointer note below physically impossible for the 40- and
-  42-byte shapes it exists for; the band restores it while keeping every download ≤44 bytes.)
+  42-byte shapes it exists for; the band restores it while keeping every download ≤42 bytes.
+  **Task 1 revision note (2026-08-09):** this line still read "≤44 bytes" after the disclosed
+  band edit above landed — a leftover from the pre-edit 40–44 band, not a second band value.
+  Corrected here for the same reason as the disclosed edit: BOM-corrupted content is not
+  "malformed terminator" damage, so the band — and every bound derived from it, including this
+  one — is 40–42, not 40–44.)
 - size unavailable → **skipped without downloading**, note says so. (Fail-safe: never download
   what cannot be bounded. The certified CLI reports sizes for files; this arm is belt-and-
   braces, and the note makes its firing visible if the assumption ever breaks.)
