@@ -102,6 +102,21 @@ git push proton-v2 main
 hierarchical branch and tag names (`refs/heads/feature/x`), `refs/notes/*`, `refs/replace/*`, and
 any other valid namespace are all advertised, fetchable, and pushable.
 
+**Foreign files under `refs/` — dropped by another tool, a stray web-UI upload, or an accident —
+are handled per operation, never silently.** A file whose contents are not valid refs (the helper
+cannot tell a dropped junk file from a damaged ref, and says so) never stops backups: it's skipped
+loudly on push, with a note naming the file and why. But it DOES stop `fetch`/`clone`/`ls-remote`
+with an error naming every such file, so a restore is never silently incomplete — a clone that
+quietly lacked a branch would be a false-success restore. This fetch-blocking class is exactly
+**valid-ref-named files with unparseable contents**; files with **invalid names** stay note-only
+in both directions, since a name git itself would reject can never be a ref, so its absence is
+never loss. If you run a scheduled mirror-fetch job, it will alarm on a content-blocking file —
+that's intended. Pushing onto one of these files (creating or updating a ref at that name) is
+refused with the file named and a remedy. Git itself cannot delete such a name — `git push
+--delete` on it fails client-side with "remote ref does not exist," since the helper never
+advertised the name to begin with — so the remedy is always the CLI or the Proton Drive web UI
+(`proton-drive filesystem trash <path>`); Proton trash keeps the deletion restorable.
+
 Cloning a deeply nested repo on Windows can hit the legacy `MAX_PATH` limit — see
 [Windows path length](#windows-path-length) below if a clone, fetch, or push fails with a
 "Filename too long" style error.

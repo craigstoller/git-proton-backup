@@ -1,6 +1,6 @@
 # git-remote-proton — v2 design
 
-**Status:** design v6.5, revised 2026-08-06 during Stage 5 implementation. v5 was settled after four rounds of Codex + Gemini peer review; v6, v6.1, v6.2 and v6.3 each change exactly one mechanism, and each only because implementation proved the original unimplementable, unenforceable, or worse than what shipped. v6.4 documented Stage 4's shipped additions — the CLI version allowlist and the `--set-head` operation. v6.5 is the largest revision since v5: it re-enables full hierarchical refs and the other-namespace rule v6.1 had narrowed away, replaces the fetch residue rule with quarantine staging, and folds in the gate-sourced UX items (opt-in parent auto-create, MAX_PATH diagnostics, marker-absent-vs-read-failure). See the revision history.
+**Status:** design v6.6, revised 2026-08-09 during Stage 6 implementation. v5 was settled after four rounds of Codex + Gemini peer review; v6, v6.1, v6.2 and v6.3 each change exactly one mechanism, and each only because implementation proved the original unimplementable, unenforceable, or worse than what shipped. v6.4 documented Stage 4's shipped additions — the CLI version allowlist and the `--set-head` operation. v6.5 was the largest revision since v5: it re-enabled full hierarchical refs and the other-namespace rule v6.1 had narrowed away, replaced the fetch residue rule with quarantine staging, folded in the gate-sourced UX items, and left one item open — a git-valid-named foreign file with unparseable contents still failed every read against the repo, in both directions, until deleted. v6.6 closes that open question: the fatal-content rule is now **per-operation** — tolerant (skip + note) on the push-direction survey, fatal-with-enumeration on the fetch-direction survey — adds occupancy-aware push refusals (kind-aware, pre-pack) for names the read boundary skipped, adds the create-heal race-window diagnosis for an occupant that appears after advertisement, and pins F1 (directory download) as a verified contract fact. See the revision history.
 **Relates to:** [issue #3](https://github.com/craigstoller/git-proton-backup/issues/3).
 **Depends on:** [`docs/research/remote-helper-prior-art.md`](research/remote-helper-prior-art.md) — read first; assumed, not repeated.
 **Pinned to:** Proton Drive CLI **`cli-drive@0.7.0`** (SDK `js@0.20.0`) — Stage 1 was certified
@@ -249,15 +249,18 @@ what `List()` does with such a path remotely). A node that fails validation — 
 hold names v2 itself would never create (a foreign tool, a stray web-UI upload), and one such name
 must not deny the advertisement to every other ref in the repo. v2 itself can never create a
 skipped name (rule 2a refuses it at push), so a skip always marks foreign data. This is a
-different failure from malformed **content** of a well-named ref file, which stays fatal — but
-"already-advertised" would be the wrong word for it, and the asymmetry it leaves is a recorded
-open question rather than a settled outcome. `readRef` runs on each candidate discovered file
-*during this same walk* (`internal/repo/refs.go:84-87`), so the fatal fires **before**
-advertisement, on a file that may never have been a ref at all; Stage 5 both **widened its reach**
-(any git-valid, stageable-named file anywhere under `refs/`, not just the direct children of
-`refs/heads` and `refs/tags`) and **tightened its grammar** (exactly 40 lowercase hex plus one
-`\n`; the code's old `TrimRight` slack is gone). See the error table for both, and the v6.5
-revision entry for the open question this leaves for the owner.
+different failure from malformed **content** of a well-named ref file — Stage 5 made that
+uniformly fatal; **Stage 6 replaces the uniform rule with per-operation classification**, closing
+the v6.5 open question rather than leaving it recorded. `readRef` runs on each candidate
+discovered file *during this same walk* (`internal/repo/refs.go:84-87`), so a content failure is
+observed **before** advertisement, on a file that may never have been a ref at all; Stage 5 both
+**widened its reach** (any git-valid, stageable-named file anywhere under `refs/`, not just the
+direct children of `refs/heads` and `refs/tags`) and **tightened its grammar** (exactly 40
+lowercase hex plus one `\n`; the code's old `TrimRight` slack is gone) — both unchanged by Stage
+6. What Stage 6 changes is what happens **after** that observation: see "Foreign data at the read
+boundary (Stage 6)," below, for the classification mechanism and the per-operation policy, the
+error table for both content and name skips, and the v6.6 revision entry for what closed the
+open question and why.
 
 **Prune on delete, self-heal on create (rule 2c).** These are a deliberate pair; shipping one
 without the other reintroduces the exact wedge they exist to prevent.
@@ -309,6 +312,106 @@ robustness against a hypothesised race, never claimed as a live-validated fix.
 it runs during batch validation, before anything is packed, and is described with the rest of the
 batch execution order under Push, below.
 
+### Foreign data at the read boundary (Stage 6)
+
+**One classification mechanism, two policies.** `ScanRefs` (`internal/repo/refs.go`) replaces the
+old `ListRefs` walk and returns a `*RefScan` (`internal/repo/refscan.go`), not a bare map: the
+advertised ref map exactly as before, plus a `Skipped []SkippedRef` set recording **every** path
+the walk declined to advertise, classified by `SkipKind` —
+
+- `SkipInvalidName` / `SkipInvalidNameFolder` — a name that fails `checkComponent` /
+  `advertisableName` (rule 2a, unchanged from Stage 5); contents are never examined, and a
+  skipped folder's whole subtree is never entered.
+- `SkipContent` — a well-named file whose contents do not parse as a ref (new this stage; this is
+  the class Stage 5 made uniformly fatal).
+
+Recording both kinds in one set, not just content-skips, is deliberate: occupancy-aware push
+(below) must refuse a create over a folder holding only a name-skipped child, and that needs the
+name-skip visible in the same structured result the content-skip is. `RefScan.ContentSkips()`
+returns just the `SkipContent` subset — the set the fetch-direction survey inspects.
+
+**The scan/error split is typed, never by message text.** Only a grammar/classification failure
+is skippable; every transport or read failure stays fatal, and `readRefClassified` distinguishes
+the two with `errors.Is(err, errMalformedRef)` — a sentinel `*malformedRefError` wraps, and that a
+`ReadTo`/`ReadDir`/`ReadFile` failure never satisfies. A GUARD test pins it: a transport failure
+during the walk stays fatal while a grammar failure beside it skips.
+
+**Classification is size-gated — a candidate's SIZE, from the listing metadata, gates whether it
+is downloaded at all.** `refBandMin`/`refBandMax` (`internal/repo/refs.go`) bound the candidate
+band at **40–42 bytes**: a valid ref file is exactly 41 bytes (40 lowercase hex + `\n`), and the
+three noncanonical damaged-ref shapes `classifyRefContent` recognises sit within a byte of that
+(no-LF = 40, CRLF = 42, double-LF = 42).
+
+- **Outside the band, or size unavailable** → skipped **without downloading**; the note reports
+  the size (or that it is unknown), never contents.
+- **Inside the band** → downloaded and grammar-checked (`readRef`'s exact-grammar rule, unchanged
+  since Stage 5). A grammar failure is classified (`classifyRefContent`) from the bytes already in
+  hand — no second download.
+
+**The gate is a best-effort metadata bound, stated as such, not engineered away.** The size is
+observed at listing time; an occupant replaced between that observation and the read can in
+principle be larger. The certified CLI offers no byte-capped partial download, so this residual is
+accepted rather than closed: the race requires a non-v2 actor writing mid-operation — the same
+single-writer posture every check-then-act site in this design already carries — and the blast
+radius is one oversized transfer, never corruption.
+
+**Notes are classified, and a damaged-ref pointer is never destroyed silently.** `skipNote`
+(`internal/repo/refs.go`) writes `git-remote-proton: skipping <root>/<path>: <reason>` for every
+skip, both kinds, in both directions. The content-skip reasons: `not a ref: size <N> outside the
+40-42 candidate band`; `not a ref: size unknown; refusing to download unbounded content`; `not a
+ref: <escaped preview>` (`%q`-escaped, capped at 42 bytes); and, for an in-band candidate that is
+exactly 40 hex characters followed only by `\r`/`\n` bytes (the no-LF/CRLF/double-LF noncanonical
+class) — `damaged ref? contents are 40-hex with a malformed terminator: <sha>` — so a recoverable
+object pointer survives in the operator's log even though the file is skipped.
+
+**The two policies over the one scan** (`cmd/git-remote-proton/main.go`):
+
+- **`list for-push` (tolerant).** Content-skips are absent from the advertisement, each with its
+  note; `scan.Skipped` is handed to `repo.Push`, whose occupancy machinery (below) owns
+  collisions. A push-survey HEAD diagnostic runs **after** the advertisement (never changing what
+  was just advertised) and only when `len(scan.Skipped) > 0` — a clean repo's push survey stays as
+  read-free as before this stage.
+- **`list` — fetch/clone/`ls-remote` (strict).** A nonempty `ContentSkips()` fails the whole
+  command with one error enumerating every content-skipped path, its classified reason, and the
+  remedy. The exact shape, quoted from `main.go`'s `"list"` arm:
+
+  ```
+  cannot serve a fetch: %d file(s) under refs/ are not valid refs and a restore would silently lack them:
+    <root>/<path>: <reason>
+    ...
+  delete these files first (proton-drive filesystem trash <path>, or the web UI; Proton trash keeps them restorable), then retry
+  ```
+
+  Name-skips never trigger this — only a valid-ref-**named**, unparseable-**content** file could
+  be a damaged real ref, so only that class can represent silent loss (the principled line the
+  v6.5 open question left unsettled). A name-skipped file or folder can never be a ref git could
+  hold, so its absence is never silent loss, and its note still prints in both directions.
+
+**Degraded states, both directions.** For CONTENT-skips the strict fetch survey fails before
+these can matter, so they are push-survey states; for NAME-skips they are reachable in **both**
+directions (name-skips never fail a survey):
+
+- **HEAD names a skipped ref (either class)** — `scanSkipMatch` matches HEAD's branch against
+  `scan.Skipped` (exact path, or a `SkipInvalidNameFolder` ancestor for a nested branch under a
+  skipped folder); the HEAD symref line is withheld, with its own note —
+  `git-remote-proton: HEAD names <branch>, which was skipped (<reason>); advertising no default
+  branch` (`headSkipNote`, shared verbatim by both survey arms). Every other ref still advertises.
+- **Every ref skipped** — an empty advertisement, one note per file. Push direction: `git push`
+  behaves as pushing to an empty remote (creates proceed; occupancy still refuses the occupied
+  names). Fetch direction (only reachable when every skip is a NAME-skip — any content-skip fails
+  `list` outright instead): clone behaves as cloning an empty repo, loudly noted.
+- **Git-porcelain deletion lock-out, a documented consequence, not a mechanism of its own.**
+  Because a skipped name is never advertised, `git push --delete` of it is refused by **git
+  itself**, client-side (`"remote ref does not exist"`), and never reaches the helper at all. The
+  operator's remedy is the CLI or the web UI, named by the occupancy messages below (Proton trash
+  keeps a deletion restorable). If a delete of a skipped name does reach the helper — a non-git
+  caller — the delete arm refuses it by occupancy (below).
+
+**What stays fatal, unaffected by this section (the design's existing carve-outs):** a transport
+or read failure during the walk; `--set-head` reading its exact target directly (`SetHead` calls
+`readRef` unconditionally — a corrupt named target is still fatal, never skipped); and `WriteRef`'s
+own read-back verification of what it just wrote.
+
 ## Architecture
 
 ```
@@ -350,6 +453,25 @@ type Transport interface {
 | `Trash` | `trash --json` | **`{uid, ok}` — NOT a transfer summary** | needs its own parser; the upload parser would silently read nulls |
 | `EnsureDir` | `create-folder parent name` | text | **fails on an existing folder** |
 | `List` | `list path --json` | JSON array | empty folder → exit 0, zero elements. Distinguishable from failure |
+| `ReadTo` | `filesystem download path localDir` | raw bytes to file(s) | destination not auto-created (probe **C16**); a directory source recurses (probe **F1**, Stage 6) — both below |
+
+**`ReadTo`'s two live-verified facts, recorded here rather than left in code comments only.**
+Probe **C16** (Stage 3a gate) found `filesystem download` given a missing destination directory
+silently **creates** it and succeeds — the wrapper contract does not inherit this: every `ReadTo`
+implementation (`*CLI.ReadTo`, `Fake.ReadTo`) `Stat`s `localDir` first and refuses if it is
+absent, because every caller already creates its own temp dir with `os.MkdirTemp`, so a missing
+destination signals a caller bug the wrapper should surface, never paper over. **Finding F1**
+(Stage 5 gate, precisely pinned as a contract row in Stage 6) established the second: `filesystem
+download` on a **directory** source exits 0 and recursively downloads the whole subtree. The
+contract-table row "download of a directory recursively materialises the subtree (F1)"
+(`internal/transport/contract_test.go`) pins the precise shape — one folder containing one file
+and one subfolder with a file, both landing under `<dest>/<leaf>/…`, relative layout preserved —
+and `Fake.ReadTo` is taught the identical behaviour so the fake and CLI halves of every test agree.
+**This is what makes `--set-head`'s Stat-IsDir-first guard (see `--set-head` grammar, below)
+permanently regression-safe**, rather than resting on an unprobed assumption as it did through
+Stage 5. **The row certifies the transport layer only**: the `testcli` shim's `runDownload` stays
+file-oriented, and its own doc comment states that divergence and cites the F1 row — no
+end-to-end shim test may rely on directory download.
 
 **`Trash` on a missing target FAILS with exit 1** — this document previously declared it idempotent and `Committed`, which is wrong. Since the desired end state is still "not there", the helper must `Stat` first, or treat this specific absent-target error as success. It cannot simply call `Trash` and trust the exit code, which is what concurrent branch deletion and lock cleanup would otherwise do.
 
@@ -731,6 +853,68 @@ Any failure of the checks above is fatal for that ref and reported as a corrupt 
 
 **Shallow and promisor repositories are refused**, and — because a fresh `git clone --depth` is not yet shallow when the helper starts — the helper must poison on the full set - `depth`, `deepen-since`, `deepen-not`, `deepen-relative`, `update-shallow`, `filter`, `from-promisor`, `no-dependents`, `refetch`. A startup check alone is insufficient.
 
+### Occupancy-aware push, and the occupant diagnosis (Stage 6)
+
+**The same helper invocation that produces the advertisement also executes the batch that follows
+it**, so the batch engine (`repo.Push`) receives `scan.Skipped` directly from the `list for-push`
+call's own `ScanRefs` — no re-derivation, no risk of the two disagreeing.
+
+**Preflight (pre-pack, primary).** Phase 2's whole-batch validation (above) additionally treats
+every skipped occupancy as an occupied name: a create of a skipped name itself, a create beneath
+one (`refs/heads/foo/bar` under skipped file `foo`), and a create above one (`refs/heads/foo` over
+skipped file `foo/bar`) are all **refused before any pack is built**, three checks in order —
+exact name, ancestor, descendant — first hit wins. The refusal is rendered by
+`OccupancyMessage` (`internal/repo/refscan.go`), **kind-aware** because a one-size message is
+actively wrong for two of the three kinds — quoted verbatim, `<path>` and `<full>` being the
+relative and root-qualified remote paths:
+
+- content-skipped file: `a file occupies <path> and its contents are not a ref (<reason>); delete
+  it first (proton-drive filesystem trash <full>, or the web UI)`
+- name-skipped file: `a file with an invalid ref name occupies <path> (contents never examined);
+  delete or rename it first (proton-drive filesystem trash <full>, or the web UI)`
+- name-skipped folder: `a folder with an invalid name occupies <path>; its contents were never
+  examined - inspect it before removing anything (the web UI, or a CLI listing of <full>, will
+  show what's inside before you decide)` — the remedy directs inspection, never blind deletion,
+  because trashing an uninspected foreign folder could destroy data this design promises never to
+  touch.
+
+This closes the defect a one-size "a file whose contents are not a ref" message would have left:
+false for a name-skipped entry (never content-examined) and dangerous for a folder occupant.
+
+**Delete arm.** A delete whose destination is a skipped occupancy is **refused** with the same
+kind-aware `OccupancyMessage` — never reported as an already-absent success, and never trashed
+(the never-touch rule: deleting a "branch" must not delete an unknown foreign file or folder).
+Occupancy is checked before the already-absent shortcut, so a skipped foreign path — never a key
+in the advertised ref map — cannot fall through that shortcut and report `ok` without ever
+touching what was actually asked to be deleted.
+
+**Create-heal wrapper (race window, secondary).** `createRefHealingCollision`
+(`internal/repo/push.go`) already handled the case where a post-refusal `Stat` shows a **folder**
+(self-heal, Stage 5, unchanged). Stage 6 adds the diagnosis for the case where it shows a **file**
+— an occupant that appeared *after* the advertisement, so `scan.Skipped` never named it and the
+preflight above never saw it:
+
+1. **Size-gate first**, from the `Stat` already in hand — no extra round trip — using the *same*
+   40–42-byte candidate band the read boundary gates on. An out-of-band occupant is classified by
+   size alone and never downloaded.
+2. Only an in-band candidate is read and classified with `classifyRefContent` — the *same*
+   classifier the read boundary uses, so this arm's wording can never drift from `ScanRefs`' own
+   skip reasons or the preflight's `OccupancyMessage` text.
+3. **If the occupant parses as a valid ref**, the existing concurrent-creator convention stands
+   unchanged — it is true, and this diagnosis invents nothing where the ordinary explanation
+   already fits.
+4. **Otherwise**, the refusal is rendered as an `OccupancyMessage`-shaped `content-skipped file`
+   message — asserting only what is observed **now**, never that the file "was skipped at
+   advertisement" (that history is not this code path's observation).
+5. **A diagnostic read failure (genuine transport/read error, distinguished by type from a
+   grammar failure) leaves the original refusal standing**, with the diagnosis failure noted
+   alongside it — the same only-act-on-positive-evidence posture as the folder heal above and every
+   other write-boundary arm in this design. Nothing is overwritten or auto-deleted in any branch.
+
+**Not adopted, recorded:** reconciling a create whose occupant parses to the *same* sha as an
+idempotent success. It would change the Stage 2 concurrent-creator semantics for a case with no
+observed occurrence; deferred with the compaction-era backlog rather than built speculatively.
+
 ## Fetch
 
 The helper owns the closure. Git's `fetch` capability is defined as transferring "objects **reachable from**" the named ones, and under `check-connectivity` "**the helper** must output `connectivity-ok`". Git does not iteratively request missing objects.
@@ -870,9 +1054,13 @@ happy path); if the target exists as a **folder** — requesting `feature` when 
 refused **before** any read of ref content is attempted, naming the target as a namespace folder
 and, when any branches exist, listing them as suggestions (`existingBranchNames`, built from the
 now-recursive `ListRefs`, so nested branches are suggested too). This ordering exists because
-falling through to a content read on a directory has no verified contract on the live CLI (`filesystem
-download` against a folder is unprobed) and reads misleadingly as a generic "not found" against
-the fake transport — the branch/folder distinction has to be resolved by the `Stat` first. The
+falling through to a content read on a directory reads misleadingly as a generic "not found"
+against the fake transport, and — as of Stage 6 — is now **known**, not merely unverified, to
+behave differently against the live CLI: F1 (see "Transport contract," above) pins `filesystem
+download` on a directory as exit 0 with a full recursive download of the subtree, which `readRef`
+is never prepared to interpret as ref content. The branch/folder distinction still has to be
+resolved by the `Stat` first — F1 makes that guard permanently regression-safe rather than
+resting on an unprobed assumption, but does not remove the need for it. The
 remaining leaf must pass the same `checkStageableLeaf` rules the push path enforces — no braces,
 no Windows reserved device names, not empty/`.`/`..`. Matching against remote branches is exact
 byte comparison, no case folding. `--set-head` does **not** honour `GPB_CREATE_PARENTS` (see
@@ -950,10 +1138,14 @@ named the problem with no way out.
 | Ref-file create blocked by an existing folder whose subtree holds any file (a conflicting ref, or foreign data) | Refused, naming each blocking entry as what it is — a conflicting ref, or foreign data — never trashed |
 | Folder create (a hierarchical ref's parent) blocked by an existing ref **file** at that name (reverse D/F) | Fatal refusal with a named reason mirroring git's own local directory/file conflict rule, unless the batch's own delete clears the blocker first |
 | A batch create would collide, directory/file-wise, with the **final** ref set the batch produces (e.g. `feature` and `feature/x` both created in one batch) | Refused at batch validation, before anything is packed — the final-state D/F preflight (rule 2b); costs nothing on failure |
-| Malformed **contents** of a ref file `readRef` reaches (corrupt sha, wrong grammar) | **Fatal, never coerced — CURRENT behaviour.** Not "already-advertised": `readRef` runs on each candidate discovered file *during* the advertisement walk (`internal/repo/refs.go:84-87`), so the fatal fires **before** advertisement and the file may never have been a ref. **Reach widened in Stage 5** — see the next row |
-| Reach of that fatal, widened by the recursive walk (Stage 5) | Pre-Stage-5, only the direct file *children* of `refs/heads` and `refs/tags` could trip it (subdirectories were skipped outright). Now **any** git-valid, stageable-named file anywhere under `refs/` — `refs/notes/README.md`, `refs/heads/team/desktop.ini` — whose contents are not a sha makes `list`, `list for-push`, and `fetch` all fail, for every caller, until a human **deletes the offending file** (Proton web UI, or `proton-drive filesystem trash <path>`); the error names that exact remote path, so the remedy is always identifiable from the message. Recorded, not defended: see "the tension the skip rule leaves" in the v6.5 revision entry — an open question for the owner, not a promised change |
-| Ref-file **grammar** tightened (Stage 5; code aligned to spec, tightening observable behaviour) | `readRef` now requires **exactly** 40 lowercase hex plus one `\n` (41 bytes) and nothing else. This document always specified that grammar; the **code** previously `TrimRight`-ed `"\r\n"` before matching, so a bare sha with no trailing newline, a CRLF terminator, and a double-LF terminator were silently tolerated. All three are **newly fatal**. Only a foreign or damaged file can be affected — `WriteRef` has always written exactly `sha+"\n"` |
-| Malformed discovered ref **name** under `refs/` (fails full git-check-ref-format validity or per-component stageability) | **Shipped Stage 5, superseding the earlier merged row:** skipped with a loud stderr note naming the exact remote path at the **read** boundary (advertisement), never fatal — v2 itself can never create a skipped name, so a skip always marks foreign data. **Refused** with a named reason at the **push** boundary, before anything is packed |
+| Malformed **contents** of a ref file discovered during the advertisement walk (well-named, corrupt sha or wrong grammar) | **Per-operation, Stage 6 — supersedes the earlier uniform-fatal row.** Classified and skipped from the advertisement with a note (see "Foreign data at the read boundary," above); never modified or deleted either way. `list for-push` (push survey): **tolerant** — skip + note; occupancy-aware push (below) still refuses a create/delete landing on the skipped path. `list` — fetch/clone/`ls-remote` (fetch survey): **fatal** — the whole command fails with one error enumerating every content-skipped path, its classified reason, and the remedy. Direct address (`--set-head` target, read-back) stays **fatal exactly as before Stage 6** — unaffected by this row, since a direct address is a demand, not a survey |
+| Reach of that classification, widened by the recursive walk (Stage 5, unchanged by Stage 6) | Pre-Stage-5, only the direct file *children* of `refs/heads` and `refs/tags` could trip it (subdirectories were skipped outright). Now **any** git-valid, stageable-named file anywhere under `refs/` — `refs/notes/README.md`, `refs/heads/team/desktop.ini` — with non-sha contents is classified. What changed in Stage 6 is the consequence (the row above), not the reach: the v6.5 open question about this asymmetry is **closed** — see the v6.6 revision entry |
+| Ref-file **grammar** tightened (Stage 5; code aligned to spec, tightening observable behaviour) | `readRef` now requires **exactly** 40 lowercase hex plus one `\n` (41 bytes) and nothing else. This document always specified that grammar; the **code** previously `TrimRight`-ed `"\r\n"` before matching, so a bare sha with no trailing newline, a CRLF terminator, and a double-LF terminator were silently tolerated. All three are **newly fatal** (Stage 5) — and, as of Stage 6, classified rather than uniformly fatal, per the per-operation row above; the three noncanonical shapes are exactly what `classifyRefContent`'s damaged-ref note recovers the hex for. Only a foreign or damaged file can be affected — `WriteRef` has always written exactly `sha+"\n"` |
+| Malformed discovered ref **name** under `refs/` (fails full git-check-ref-format validity or per-component stageability) | **Shipped Stage 5, superseding the earlier merged row:** skipped with a loud stderr note naming the exact remote path at the **read** boundary (advertisement), never fatal, in **both** directions (`list` and `list for-push` alike — a name-skip never fails a survey) — v2 itself can never create a skipped name, so a skip always marks foreign data. **Refused** with a named reason at the **push** boundary (rule 2a, `checkDst`) when v2 itself is asked to create such a name, before anything is packed |
+| A create/update/delete lands on, above, or beneath a path the read boundary skipped (either class) — occupancy-aware push (Stage 6) | **Refused at phase 2, before any pack is built** (create/update) or before the delete is attempted, with a kind-aware message naming the occupant and its remedy — see "Occupancy-aware push, and the occupant diagnosis," above, for the three exact message texts. Never trashed, never coerced into an already-absent success |
+| `git push --delete` of a name the read boundary skipped, sent through git's own porcelain (Stage 6) | Refused by **git itself**, client-side (`"remote ref does not exist"`), before the request ever reaches this helper — the name was never advertised, so git believes it does not exist. The remedy is the CLI or web UI, named by the occupancy messages above; Proton trash keeps the deletion restorable. A non-git caller that reaches the helper directly hits the occupancy delete-arm refusal instead (the row above) |
+| HEAD names a ref the read boundary skipped, either class (Stage 6) | The HEAD symref line is withheld from the advertisement, with its own note: `git-remote-proton: HEAD names <branch>, which was skipped (<reason>); advertising no default branch`. Every other ref still advertises. For a CONTENT-skip this is a push-survey-only state (the fetch survey already failed before HEAD is read); for a NAME-skip it is reachable in both directions |
+| Every ref under `refs/` skipped (Stage 6) | Empty advertisement, one note per file. Push direction: `git push` behaves as pushing to an empty remote — creates proceed, occupancy-aware push refuses any name colliding with a skipped occupancy. Fetch direction (reachable only when every skip is a NAME-skip; a single content-skip fails `list` outright first): clone behaves as cloning an empty repo, loudly noted |
 | Corrupt or mismatched `.pack`/`.idx` | **Two checks, each run as early as it can be and always before the data it validates is trusted; either failure is fatal.** (1) **Checksum against basename**, immediately on downloading a `.pack` — it needs nothing else, and it is the only check proving the file is the one the name claims. (2) **`git index-pack --verify` on the pair**, as soon as both members are local — it is the only check proving the pack is well-formed and agrees with its index, and it necessarily cannot run on a member that arrives alone. Note fetch downloads `.idx` sidecars first, before their packs: that is permitted, because the lone index is used only to *plan* which packs to fetch, never as a source of truth about objects. **No object from a pack may be trusted until both checks have passed for that pack.** "Before install" would be the wrong gate — fetch never installs the downloaded packs, it consolidates them into a new one |
 | Pack present, `.idx` missing | Incomplete pair — the ref is not published. **Not necessarily an error to be reported and left:** a push that finds its own pack already there with no index completes the pair, repairing the orphan (see Push). Reported only when this push is not the one that can repair it |
 | `.idx` present with no pack | Incomplete pair, and the unrepairable direction — an index cannot be validated without its pack, and v2 never overwrites an immutable name. Ref not published. **`listCompletePacks` silently excludes it from the pack set with no per-file stderr note** (unlike the pack-only case, which gets its own "may be in flight" note) — see "listCompletePacks's stderr notes cover packish-looking skips only" under Fetch; the failure still surfaces in aggregate, as an incomplete closure, if this is the only pack that could satisfy a want |
@@ -1016,6 +1208,95 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
 
 ## Revision history
 
+**v6.6, 2026-08-09 — Stage 6 ships: per-operation foreign-data policy (closing the v6.5 open question), occupancy-aware push, the heal-arm race diagnosis, and F1's directory-download contract pin. Documents shipped behaviour, verified against the merged code.**
+
+- **The v6.5 open question is closed, not left recorded.** A git-valid-**named** ref file with
+  unparseable **contents** used to be uniformly fatal — for `list`, `list for-push`, and `fetch`
+  alike — which made a single junk file dropped by any non-v2 actor (a stray web-UI upload, a
+  `Thumbs.db`-style accident) capable of stopping every future read against the repo, including
+  unattended cron backups, until a human found and deleted it. **The rule is now per-operation**,
+  argued through failure scenarios and revised once on re-examination (both round-1 review engines
+  independently argued for it, and Craig directed the reversal): this is a backup tool, so the
+  local repo is the source of truth, and the two directions are different trades with different
+  people present. The **push** direction is the unattended path — cron backups, nobody reading
+  exit codes — so a foreign file must never silently stop it: the push-side survey (`list
+  for-push`) is **tolerant**, skipping the file with a classified note and leaving occupancy
+  enforcement to component 2. The **fetch** direction is the attended path — a restore or a mirror
+  job that *should* alarm — so a clone that succeeds while silently lacking a branch is a
+  false-success restore: the fetch-side survey (`list`, serving fetch/clone/`ls-remote`) is
+  **strict**, failing the whole command with one error enumerating every content-skipped path, its
+  classified reason, and the remedy. Direct-address boundaries (`--set-head`'s target read,
+  `WriteRef`'s own read-back) stay strict exactly as before — a direct address, or verifying bytes
+  v2 itself just wrote, is a demand, not a survey, and tolerance there would mask real corruption.
+  New "Foreign data at the read boundary (Stage 6)" section states the full mechanism; the error
+  table's "malformed contents" rows are rewritten to match, and the affected Storage-layout
+  paragraph (rule 2a, "Hierarchical refs") no longer calls the old rule "unchanged."
+- **The classification mechanism is new, not just the policy split.** `ScanRefs`
+  (`internal/repo/refs.go`) replaces `ListRefs` and returns a structured `*RefScan`
+  (`internal/repo/refscan.go`): the advertised ref map, plus **every** skipped path classified by
+  `SkipKind` (`SkipInvalidName`, `SkipInvalidNameFolder`, `SkipContent`) — recording name-skips
+  alongside content-skips, not just the new kind, because occupancy-aware push (below) needs a
+  name-skipped child visible in the same structured result a content-skip is. The
+  skippable/fatal split is **typed** (`errors.Is(err, errMalformedRef)`), never by message text, so
+  a transport failure mid-walk can never be silently misread as "this file is not a ref" — a GUARD
+  test pins exactly that distinction.
+- **Classification is size-gated, and the gate is stated as a best-effort bound, not hidden as an
+  absolute one.** A candidate's size — from the listing metadata, before any download — must fall
+  in the 40–42-byte band (a valid ref is 41 bytes; the three noncanonical damaged-ref shapes this
+  document already named sit within a byte of it) or it is skipped **without ever being
+  downloaded**. This bounds both what gets read (foreign file contents never enter logs when
+  out-of-band) and what gets downloaded (never more than 42 bytes for an in-band candidate). The
+  bound is metadata observed at listing time, not a guarantee about the byte actually read
+  moments later; that residual race is accepted and stated, not engineered away, because the
+  certified CLI offers no byte-capped partial download and the blast radius is one oversized
+  transfer under an already-accepted single-writer threat model, never corruption.
+- **A damaged ref's recoverable hex now survives in the log even when the file is skipped.** The
+  three noncanonical shapes (no trailing newline, CRLF terminator, doubled newline) previously hit
+  the uniform-fatal rule with a generic message. `classifyRefContent` now recognises exactly this
+  shape — 40 hex characters followed only by `\r`/`\n` bytes — and quotes the hex in the skip note
+  (`damaged ref? contents are 40-hex with a malformed terminator: <sha>`), so a file a human might
+  otherwise delete without a second look still leaves its object pointer recoverable.
+- **Occupancy-aware push closes the round-1 finding that a skipped name silently vanished from
+  push validation and reappeared as an infrastructure error deep in pack upload, worded wrong.**
+  The batch preflight (phase 2) now treats every skipped path — exact name, ancestor, or
+  descendant — as occupied, refusing the colliding create/update **before any pack is built**,
+  with a message built from the scan's own classified reason: a one-size "contents are not a ref"
+  message would have been false for a name-skipped entry (never content-examined) and dangerous
+  for a name-skipped folder (inviting deletion of an uninspected foreign subtree). The delete arm
+  gets the identical refusal — never an already-absent success, never trashed. New "Occupancy-aware
+  push, and the occupant diagnosis (Stage 6)" section states the three exact message texts and the
+  delete-arm rule; new error-table rows state the preflight/delete refusal and the git-porcelain
+  deletion lock-out this creates (a skipped name is never advertised, so `git push --delete` of it
+  is refused by git itself, client-side, before the request ever reaches this helper).
+- **The create-heal wrapper's race window gets a diagnosis it never had.** `createRefHealingCollision`
+  already self-healed a folder collision (Stage 5, unchanged); Stage 6 adds the file-occupant case
+  — an occupant that appeared *after* the advertisement, so the preflight above never saw it and
+  never refused it up front. The diagnosis size-gates first from the `Stat` already in hand (the
+  *same* 40–42 band, never a second download for an out-of-band occupant), then classifies an
+  in-band candidate with the *same* `classifyRefContent` the read boundary uses, so this arm's
+  wording can never drift from the scan's own reasons. A valid-ref occupant keeps the existing
+  concurrent-creator message unchanged — it is already correct and this diagnosis invents nothing
+  where the ordinary explanation fits; an unparseable occupant gets the occupancy-style message; a
+  diagnostic read failure leaves the original refusal standing, noted, never inventing a diagnosis
+  from a failure mode it has no positive evidence for.
+- **F1 (directory download) is now a precisely-pinned contract row, not just a gate finding.** The
+  Stage 5 gate observed live that `filesystem download` on a directory exits 0 and recursively
+  downloads; the new contract-table row (`internal/transport/contract_test.go`) pins the exact
+  shape (nested folder-plus-file fixture, relative layout preserved under `<dest>/<leaf>/…`), and
+  `Fake.ReadTo` is taught the identical behaviour so the fake and CLI halves agree. This is what
+  makes `--set-head`'s Stat-IsDir-first guard **permanently regression-safe** rather than resting
+  on an unprobed assumption — the guard's own code comment (`internal/repo/sethead.go`) is updated
+  to cite the row instead of calling the behaviour unverified, and this document's "`--set-head`
+  grammar" section and "Transport contract" section are updated the same way. The `testcli` shim's
+  `runDownload` deliberately does not model directory download; its own doc comment states the
+  divergence and cites the F1 row, and no end-to-end shim test may rely on it.
+- **`GPB_CONTRACT_LIVE_ROOT` is a test-infrastructure variable, deliberately not documented here or
+  in the README.** It lets `TestContractCLI`'s live half point at a different confined root than
+  the hardcoded default, validated segment-wise (absolute, strictly below `/my-files/`, no `.`/`..`
+  segment, not one of the four untouchable top-level folders) before any live call runs. It lives
+  in the contract test's own comment and the gate brief checklist, not in user-facing docs — it
+  governs how this repository's own tests are run, not how `git-remote-proton` behaves.
+
 **v6.5, 2026-08-06 — Stage 5 ships: hierarchical refs, quarantine fetch staging, and the gate-sourced UX items. Documents shipped behaviour, verified against the merged code.**
 
 - **Hierarchical refs are fully re-enabled**, not just heads/tags. `ListRefs` recurses the whole
@@ -1056,15 +1337,20 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
     `"\r\n"` first, so bare-sha, CRLF, and double-LF variants were tolerated and are newly fatal.
     A **code-to-design alignment that tightens observable behaviour**, not a design change —
     recorded the same way as the per-ref-packing and tag-force alignments below.
-- **The tension the skip rule leaves is an OPEN question for the owner, deliberately unresolved
-  here.** The skip rule above closes the bricking failure for git-**invalid** names. It does not
-  close it for a git-**valid**-named foreign file with non-ref contents: that file is still read by
-  `readRef` and still fails every read against the repo until a human deletes it. This asymmetry
-  was escalated to the owner during Task 8's execution as a spec-level tension and left unchanged
-  by instruction; it is recorded here rather than defended or quietly resolved. A possible future
-  resolution — skip-with-note for a discovered file that is absent from the *caller's* remote ref
-  map, rather than fatal — may be considered in a later stage. Nothing here promises it; the fatal
-  above is current behaviour.
+- **CLOSED in v6.6 — the tension the skip rule leaves was an OPEN question for the owner,
+  deliberately unresolved here.** The skip rule above closed the bricking failure for
+  git-**invalid** names. It did not close it for a git-**valid**-named foreign file with non-ref
+  contents: that file was still read by `readRef` and still failed every read against the repo
+  until a human deleted it. This asymmetry was escalated to the owner during Task 8's execution as
+  a spec-level tension and left unchanged by instruction at the time, recorded here rather than
+  defended or quietly resolved. **Stage 6 resolves it**, per the Stage 6 spec's brainstormed
+  decision (this is a backup tool; the two directions are different trades with different people
+  present): the fatal-content rule is now **per-operation** — tolerant (skip + note) on the
+  unattended push-direction survey, fatal-with-enumeration on the attended fetch-direction survey
+  — rather than the "skip-with-note for a file absent from the caller's remote ref map" resolution
+  this entry once speculated about. See the v6.6 revision entry, above, and the Stage 6 spec
+  (`docs/superpowers/specs/2026-08-09-v2-stage6-foreign-data-and-debts-design.md`) for the full
+  rationale and the rejected alternatives.
 - **Component validation is uniform across the whole ref path, not leaf-only** (rule 2a):
   `checkComponent` applies `checkStageableLeaf`'s rules to every path component, folders
   included, before `ListRefs` ever recurses into one — never handing an unvalidated name to a
