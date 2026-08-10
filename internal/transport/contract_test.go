@@ -171,13 +171,12 @@ var contractCases = []contractCase{
 	// comment names the live CLI's directory-download behaviour, not this
 	// row, and is out of this task's file list, so it is left as is; this row
 	// is what now actually pins the shape. Fake.ReadTo had no directory
-	// behaviour at all before this row: a
-	// directory path missed on f.Files and was misreported as an absent
-	// file. Fixture is the pinned F1 shape: one folder containing one file
-	// and one subfolder with a file — both must land, relative layout
-	// preserved under <dest>/<leaf>/.... Live half records the verbatim
-	// output of the raw download call; both halves then assert the same
-	// resulting layout.
+	// behaviour at all before this row: a directory path missed on f.Files
+	// and was misreported as an absent file. Fixture is the pinned F1 shape:
+	// one folder containing one file and one subfolder with a file — both
+	// must land, relative layout preserved under <dest>/<leaf>/.... Live half
+	// records the verbatim output of the raw download call; both halves then
+	// assert the same resulting layout.
 	{"download of a directory recursively materialises the subtree (F1)", func(t *testing.T, tr Transport, root string, stage func(string, string) string) {
 		d := root + "/d"
 		if err := tr.EnsureDir(d); err != nil {
