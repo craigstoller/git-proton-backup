@@ -4885,6 +4885,288 @@ func TestSelfHealNamesInvalidNamedFileAsForeignDataNotAnEnumerationFailure(t *te
 	}
 }
 
+// ===================== Task 4: create-heal race-window diagnosis ==========
+//
+// The occupancy preflight (component 2, Task 3) refuses a create/update/
+// delete landing on a path ScanRefs already SAW and skipped — but it can
+// only act on what the CALLER'S skipped slice already contains. An occupant
+// that appears AFTER that scan ran (a genuinely concurrent write — some
+// other actor, or a stray upload, landing between the advertisement and
+// this push's own create attempt) is invisible to that preflight: the
+// caller passes an empty (or scan-stale) skipped slice, exactly as every
+// test below does, mirroring TestCreateRefusesFolderWithLiveSubRefs' own
+// technique for the folder-collision arm. createRefHealingCollision's
+// post-refusal Stat is the ONLY place this race is ever actually observed,
+// so diagnosing it has to live there.
+//
+// All six tests route through the whole Push() entry point rather than
+// calling createRefHealingCollision directly — the same convention every
+// other self-heal test above already uses — so the assertions also pin
+// how the diagnosis surfaces in a real Result.Err.
+
+// TestHealArmDiagnosesUnderBandOccupantWithoutDownload is RED: a 12-byte
+// junk file occupies the destination — below refBandMin (40), so it is
+// classified BY SIZE ALONE, with no download at all (the traced transport
+// proves no ReadTo of the occupant's own path). The refusal must name the
+// occupant as a file whose contents are not a ref, offer the delete-first
+// remedy, and must NOT say "concurrently" — that generic WriteRef-only text
+// is what this diagnosis replaces for a race the preflight could not see.
+func TestHealArmDiagnosesUnderBandOccupantWithoutDownload(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	const junk = "hello world\n" // 12 bytes, out-of-band (below refBandMin)
+	f.Files["/r/refs/heads/feature"] = []byte(junk)
+
+	var trace strings.Builder
+	tr := transport.NewTraced(f, &trace)
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+	res := Push(tr, "/r", gitDir, ups, map[string]string{}, nil)
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("must be refused: a file occupies the destination, got %+v", res)
+	}
+	if !strings.Contains(res[0].Err, "refs/heads/feature") {
+		t.Errorf("must name the occupied ref, got %q", res[0].Err)
+	}
+	if !strings.Contains(res[0].Err, "not a ref") {
+		t.Errorf("must say the contents are not a ref, got %q", res[0].Err)
+	}
+	if !strings.Contains(res[0].Err, "delete it first") {
+		t.Errorf("must offer the delete-first remedy, got %q", res[0].Err)
+	}
+	if strings.Contains(res[0].Err, "concurrently") {
+		t.Errorf("must not be the generic concurrent-creator refusal, got %q", res[0].Err)
+	}
+	if strings.Contains(trace.String(), "refs/heads/feature") {
+		t.Errorf("an out-of-band occupant must never be downloaded, trace: %q", trace.String())
+	}
+	if got, ok := f.Files["/r/refs/heads/feature"]; !ok || string(got) != junk {
+		t.Errorf("the occupant file must survive untouched, got ok=%v content=%q", ok, got)
+	}
+}
+
+// TestHealArmDiagnosesOversizedOccupantWithoutDownload is RED (upper bound
+// — round-1 Codex): the same no-download, size-classified assertions as
+// above, but ABOVE refBandMax (a 100-byte occupant) rather than below it —
+// pinning that the band check itself is bounded on both sides, not just a
+// floor.
+func TestHealArmDiagnosesOversizedOccupantWithoutDownload(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	junk := strings.Repeat("z", 100) // 100 bytes, out-of-band (above refBandMax)
+	f.Files["/r/refs/heads/feature"] = []byte(junk)
+
+	var trace strings.Builder
+	tr := transport.NewTraced(f, &trace)
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+	res := Push(tr, "/r", gitDir, ups, map[string]string{}, nil)
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("must be refused: a file occupies the destination, got %+v", res)
+	}
+	if !strings.Contains(res[0].Err, "refs/heads/feature") {
+		t.Errorf("must name the occupied ref, got %q", res[0].Err)
+	}
+	if !strings.Contains(res[0].Err, "not a ref") {
+		t.Errorf("must say the contents are not a ref, got %q", res[0].Err)
+	}
+	if !strings.Contains(res[0].Err, "delete it first") {
+		t.Errorf("must offer the delete-first remedy, got %q", res[0].Err)
+	}
+	if strings.Contains(res[0].Err, "concurrently") {
+		t.Errorf("must not be the generic concurrent-creator refusal, got %q", res[0].Err)
+	}
+	if strings.Contains(trace.String(), "refs/heads/feature") {
+		t.Errorf("an out-of-band occupant must never be downloaded, trace: %q", trace.String())
+	}
+	if got, ok := f.Files["/r/refs/heads/feature"]; !ok || string(got) != junk {
+		t.Errorf("the occupant file must survive untouched, got ok=%v content=%q", ok, got)
+	}
+}
+
+// TestHealArmDiagnosesInBandJunkOccupant is RED: a 41-byte, non-hex
+// occupant sits IN-BAND — it must be downloaded (the traced transport
+// proves it) and diagnosed via classifyRefContent, carrying the same
+// escaped-preview wording ScanRefs' own in-band-junk skip uses (refs.go /
+// TestScanRefsInBandJunkSkipsWithPreview) — the ONE classifier, never a
+// second implementation of the same grammar.
+func TestHealArmDiagnosesInBandJunkOccupant(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	junk := strings.Repeat("x", 40) + "\n" // 41 bytes, in-band, not hex
+	f.Files["/r/refs/heads/feature"] = []byte(junk)
+
+	var trace strings.Builder
+	tr := transport.NewTraced(f, &trace)
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+	res := Push(tr, "/r", gitDir, ups, map[string]string{}, nil)
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("must be refused: a file occupies the destination, got %+v", res)
+	}
+	if !strings.Contains(trace.String(), "refs/heads/feature") {
+		t.Errorf("an in-band occupant must be downloaded, trace: %q", trace.String())
+	}
+	if !strings.Contains(res[0].Err, "not a ref") {
+		t.Errorf("must say the contents are not a ref, got %q", res[0].Err)
+	}
+	wantPreview := fmt.Sprintf("%q", junk) // classifyRefContent's escaping
+	if !strings.Contains(res[0].Err, wantPreview) {
+		t.Errorf("must carry the escaped preview %s, got %q", wantPreview, res[0].Err)
+	}
+	if !strings.Contains(res[0].Err, "delete it first") {
+		t.Errorf("must offer the delete-first remedy, got %q", res[0].Err)
+	}
+	if strings.Contains(res[0].Err, "concurrently") {
+		t.Errorf("must not be the generic concurrent-creator refusal, got %q", res[0].Err)
+	}
+}
+
+// TestHealArmRecoversNoncanonicalHex is RED ([Gemini] round 1: the draft
+// lost hex recovery in the race arm): a 42-byte CRLF-terminated occupant —
+// 40 real hex characters plus "\r\n" — is a NONCANONICAL damaged ref, not
+// generic junk. classifyRefContent recovers the hex; the race arm's message
+// must carry it forward, not fall back to a generic escaped preview.
+func TestHealArmRecoversNoncanonicalHex(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	sha := "4444444444444444444444444444444444444444"
+	f.Files["/r/refs/heads/feature"] = []byte(sha + "\r\n") // 42 bytes, in-band
+
+	var trace strings.Builder
+	tr := transport.NewTraced(f, &trace)
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+	res := Push(tr, "/r", gitDir, ups, map[string]string{}, nil)
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("must be refused: a file occupies the destination, got %+v", res)
+	}
+	if !strings.Contains(trace.String(), "refs/heads/feature") {
+		t.Errorf("an in-band occupant must be downloaded, trace: %q", trace.String())
+	}
+	if !strings.Contains(res[0].Err, "malformed terminator") {
+		t.Errorf("must carry the damaged-ref reason, got %q", res[0].Err)
+	}
+	if !strings.Contains(res[0].Err, sha) {
+		t.Errorf("must carry the recovered hex %s, got %q", sha, res[0].Err)
+	}
+	if !strings.Contains(res[0].Err, "delete it first") {
+		t.Errorf("must offer the delete-first remedy, got %q", res[0].Err)
+	}
+}
+
+// TestHealArmValidRefOccupantKeepsConcurrentCreatorMessage is the GUARD: the
+// occupant IS a syntactically valid ref (41 bytes, real-shaped sha) — a
+// genuine concurrent creator, not foreign data. The existing
+// concurrent-creator message must survive byte-unchanged; this diagnosis
+// must never fire for a true positive.
+func TestHealArmValidRefOccupantKeepsConcurrentCreatorMessage(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	winner := "3333333333333333333333333333333333333333"
+	f.Files["/r/refs/heads/feature"] = []byte(winner + "\n") // 41 bytes, a valid ref
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{}, nil)
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("must be refused: a concurrent creator won, got %+v", res)
+	}
+	const want = "ref changed concurrently; refusing to overwrite"
+	if res[0].Err != want {
+		t.Errorf("concurrent-creator message must stay byte-unchanged: got %q, want %q", res[0].Err, want)
+	}
+	if got, ok := f.Files["/r/refs/heads/feature"]; !ok || string(got) != winner+"\n" {
+		t.Errorf("the concurrent creator's ref must survive untouched, got ok=%v content=%q", ok, got)
+	}
+}
+
+// TestHealArmDiagnosticFailureFallsBackToOriginal is the GUARD: when the
+// diagnosis itself cannot complete, the ORIGINAL refusal stands with the
+// failure noted — nothing about the occupant's content is invented. Two
+// independent diagnostic stages can fail this way, and this single test
+// asserts BOTH (round-1 Codex asked for both paths to be explicit):
+//
+//   - the PRE-EXISTING Stat-error arm (push.go, unrelated to this task): the
+//     post-refusal t.Stat call itself errors. Its message text
+//     ("...diagnosis failed: %v (original: %v)") must stay byte-unchanged.
+//   - the NEW read-path-failure arm this task adds: Stat affirmatively
+//     confirms an in-band FILE, but reading it back (readRef's ReadTo) then
+//     fails with a genuine transport error, distinct from a grammar
+//     failure — errors.Is(err, errMalformedRef) is false, so nothing here
+//     may claim "not a ref": the content was never actually seen.
+func TestHealArmDiagnosticFailureFallsBackToOriginal(t *testing.T) {
+	t.Run("stat error (pre-existing arm)", func(t *testing.T) {
+		f := transport.NewFake()
+		f.Dirs["/r"] = true
+		_ = Bootstrap(f, "/r")
+		gitDir := newGitRepoForPush(t)
+
+		if err := f.EnsureDir("/r/refs/heads/feature"); err != nil {
+			t.Fatal(err)
+		}
+		tr := statFailsForPath{Fake: f, failPath: "/r/refs/heads/feature"}
+
+		ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+		res := Push(tr, "/r", gitDir, ups, map[string]string{}, nil)
+		if len(res) != 1 || res[0].OK {
+			t.Fatalf("must fail when the diagnostic Stat errors, got %+v", res)
+		}
+		const want = "ref publish failed: create of refs/heads/feature did not commit and its " +
+			"diagnosis failed: simulated stat failure (original: <nil>)"
+		if res[0].Err != want {
+			t.Errorf("Stat-error diagnosis text must stay byte-unchanged: got %q, want %q", res[0].Err, want)
+		}
+		if !f.Dirs["/r/refs/heads/feature"] {
+			t.Error("nothing should have been trashed when the diagnosis itself failed")
+		}
+	})
+
+	t.Run("read-path failure (new arm)", func(t *testing.T) {
+		f := transport.NewFake()
+		f.Dirs["/r"] = true
+		_ = Bootstrap(f, "/r")
+		gitDir := newGitRepoForPush(t)
+
+		const occupant = "/r/refs/heads/feature"
+		content := strings.Repeat("5", 40) + "\n" // 41 bytes, in-band shape
+		f.Files[occupant] = []byte(content)
+		tr := &failingReadToTransport{Fake: f, failPath: occupant}
+
+		ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+		res := Push(tr, "/r", gitDir, ups, map[string]string{}, nil)
+		if len(res) != 1 || res[0].OK {
+			t.Fatalf("must fail when the diagnostic read errors, got %+v", res)
+		}
+		if !strings.Contains(res[0].Err, "simulated transport failure") {
+			t.Errorf("must surface the read failure itself, got %q", res[0].Err)
+		}
+		if strings.Contains(res[0].Err, "not a ref") {
+			t.Errorf("must not invent a content classification when the read itself failed, got %q", res[0].Err)
+		}
+		if strings.Contains(res[0].Err, "concurrently") {
+			t.Errorf("must not fall back to the generic concurrent-creator text either, got %q", res[0].Err)
+		}
+		if got, ok := f.Files[occupant]; !ok || string(got) != content {
+			t.Errorf("the occupant file must survive untouched, got ok=%v content=%q", ok, got)
+		}
+	})
+}
+
 // TestDescribeBlockersCapsAtMaxAndSummarizesRest is the review round 4,
 // Important 1 fix: describeBlockers must not call readRef (a subprocess
 // plus a temp dir each) or grow its joined message without bound for a

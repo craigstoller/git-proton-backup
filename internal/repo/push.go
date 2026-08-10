@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -776,8 +777,77 @@ func createRefHealingCollision(t transport.Transport, root, ref, sha string) (tr
 		return transport.Ambiguous, fmt.Errorf("create of %s did not commit and its "+
 			"diagnosis failed: %v (original: %v)", ref, serr, err)
 	}
-	if !ok || !n.IsDir {
-		return out, err // not a folder collision: surface the original result
+	if !ok {
+		// Nothing occupies the name at all — not a folder collision, and
+		// nothing to diagnose either. This is what
+		// TestPushReportsFailureWhenRefCreateLosesConcurrentRace's stub
+		// exercises (it forces CreateExclusive to refuse without ever
+		// writing anything), and it is also the shape a genuinely absent
+		// occupant would take: the ORIGINAL result stands untouched, same
+		// as before this task.
+		return out, err
+	}
+	if !n.IsDir {
+		// RACE WINDOW (Task 4, secondary to Task 3's pre-advertisement
+		// occupancy preflight): this file occupant did not exist when that
+		// preflight ran — it appeared between then and this create's own
+		// WriteRef attempt, so `skipped` never named it and occupancy never
+		// refused it up front. This Stat is the only place the race is ever
+		// actually observed, so the diagnosis has to live here.
+		//
+		// Size-gate FIRST, from the Stat already in hand — no extra round
+		// trip — using the SAME [refBandMin, refBandMax] candidate band
+		// component 1 (refs.go) gates ScanRefs on: an out-of-band occupant
+		// is classified by size alone and NEVER downloaded, matching the
+		// "never download what cannot be bounded" rule. Only an in-band
+		// candidate is read and classified — with classifyRefContent, the
+		// ONE classifier (refs.go) — so this arm's wording can never drift
+		// from ScanRefs' own skip reasons or the occupancy preflight's
+		// (refscan.go's OccupancyMessage, reused below unmodified).
+		if n.Size < refBandMin || n.Size > refBandMax {
+			reason := fmt.Sprintf("not a ref: size %d outside the %d-%d candidate band",
+				n.Size, refBandMin, refBandMax)
+			if n.Size < 0 {
+				// Belt-and-braces, matching readRefClassified's own arm
+				// (refs.go): the Fake and the certified CLI never report a
+				// negative size for a real file, but nothing here refuses
+				// to download unbounded content on the strength of a
+				// transport that cannot supply a size at all.
+				reason = "not a ref: size unknown; refusing to download unbounded content"
+			}
+			sk := SkippedRef{Path: ref, Kind: SkipContent, Reason: reason}
+			return transport.Refused, errors.New(OccupancyMessage(root, sk))
+		}
+		_, rerr := readRef(t, root+"/"+ref)
+		if rerr == nil {
+			// A valid ref genuinely occupies the name: an ordinary
+			// concurrent creator, not foreign data. WriteRef's own
+			// concurrent-creator convention (refs.go) is already correct
+			// for this case — the original (out, err) stands byte-unchanged,
+			// never replaced with a diagnosis this occupant does not need.
+			return out, err
+		}
+		if errors.Is(rerr, errMalformedRef) {
+			// A grammar failure, typed (never message-text matched — same
+			// discipline as readRefClassified's own typed split): classify
+			// the bytes readRef already downloaded, so a noncanonical
+			// damaged-ref shape (CRLF/no-LF/double-LF terminator) recovers
+			// its hex here exactly as it would at the advertisement
+			// boundary, rather than degrading to a generic preview.
+			raw := malformedRaw(rerr)
+			reason, hex := classifyRefContent(raw)
+			sk := SkippedRef{Path: ref, Kind: SkipContent, Reason: reason, Hex: hex}
+			return transport.Refused, errors.New(OccupancyMessage(root, sk))
+		}
+		// A genuine transport/read failure (readRef's ReadTo/ReadDir/
+		// ReadFile arms) diagnosing the occupant — distinct from a grammar
+		// failure by TYPE, never by message text. Nothing is invented about
+		// content that was never actually read: the original result stands,
+		// with the diagnosis failure noted alongside it — the same
+		// only-act-on-positive-evidence posture as the Stat-error arm
+		// above and the folder heal below.
+		return out, fmt.Errorf("create of %s did not commit and its diagnosis is "+
+			"unavailable: %v (original: %v)", ref, rerr, err)
 	}
 	if protectedNamespaceRoots[ref] {
 		// A create whose OWN destination is "refs", "refs/heads", or
