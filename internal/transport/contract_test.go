@@ -287,11 +287,11 @@ var contractCases = []contractCase{
 
 	// F1 (Stage 5 gate): `filesystem download` on a DIRECTORY exits 0 and
 	// recursively downloads the whole subtree. sethead.go's Stat-IsDir-first
-	// guard comment still calls this "NO verified contract at all" — that
-	// comment names the live CLI's directory-download behaviour, not this
-	// row, and is out of this task's file list, so it is left as is; this row
-	// is what now actually pins the shape. Fake.ReadTo had no directory
-	// behaviour at all before this row: a directory path missed on f.Files
+	// guard comment now cites this row by name ("download of a directory
+	// recursively materialises the subtree (F1)") instead of calling it "NO
+	// verified contract at all" (Task 8 updated it) — this row is what
+	// actually pins the shape. Fake.ReadTo had no directory behaviour at
+	// all before this row: a directory path missed on f.Files
 	// and was misreported as an absent file. Fixture is the pinned F1 shape:
 	// one folder containing one file and one subfolder with a file — both
 	// must land, relative layout preserved under <dest>/<leaf>/.... Live half

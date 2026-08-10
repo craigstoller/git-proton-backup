@@ -38,8 +38,9 @@
   the object pointer isn't lost from the log even though the file itself is skipped.
 - **git-remote-proton:** if a foreign file appears at a ref's name in the narrow window between
   push's advertisement and its own create attempt, the create failure now names what's actually
-  there (contents-not-a-ref, with the reason) instead of a generic "already exists" — unless it's
-  a genuine concurrent ref creation, which still reports as that.
+  there (contents-not-a-ref, with the reason) instead of the generic "ref changed concurrently;
+  refusing to overwrite" — unless it's a genuine concurrent ref creation, which still reports as
+  that.
 - **git-remote-proton (internal):** `filesystem download` on a directory is now a pinned contract
   fact (exit 0, recursive download of the whole subtree) rather than an unprobed assumption — no
   user-visible change, but it makes `--set-head`'s directory-vs-branch guard regression-safe.

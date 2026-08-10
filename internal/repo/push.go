@@ -534,11 +534,13 @@ func Push(t transport.Transport, root, gitDir string,
 			// WriteRef (refs.go) returns (Refused, nil) — no error —
 			// specifically when this is a create (exists == false) and a
 			// concurrent creator won the race; it deliberately did not
-			// overwrite. createRefHealingCollision can reach this arm the
-			// same way, via its own inner WriteRef call, whenever the
-			// collision it found was NOT a folder at all (its own doc
-			// comment: "not a folder collision: surface the original
-			// result"). Either way this is not success: our newSha was never
+			// overwrite. createRefHealingCollision can reach this same
+			// (Refused, nil) arm two ways, both surfacing that original
+			// WriteRef result unmodified (its own doc comment above):
+			// nothing occupies the name at all (a Stat race — the
+			// occupant vanished between WriteRef's attempt and this Stat),
+			// or the occupant IS a valid ref, i.e. a genuine concurrent
+			// creator. Either way this is not success: our newSha was never
 			// published, so reporting OK: true here would make git update
 			// its remote-tracking ref to a sha that disagrees with what is
 			// actually on the remote, with nothing to signal the mismatch.
@@ -763,10 +765,16 @@ func describeBlockers(t transport.Transport, root string, files []string) string
 // this is the correctness half of that pair — prune's best-effort stance is
 // only safe because this exists to clean up what it can leave behind.
 //
-// A non-Committed outcome that is NOT a folder collision (an ordinary
-// concurrent-creator Refused, or any other transport failure) is surfaced
-// unmodified: this function invents no new diagnosis for a failure mode it
-// has no positive evidence for.
+// A non-Committed outcome is surfaced unmodified only where this function
+// has no positive evidence to diagnose beyond the original result: nothing
+// occupies the name at all, or the occupant is a protected namespace root
+// (a permanent, non-residue collision) — see each arm below. A FILE
+// occupant is classified instead: a valid ref (an ordinary concurrent
+// creator) still surfaces the original result unmodified, but foreign or
+// malformed content gets its own new diagnosis, matching the read
+// boundary's own classification. A FOLDER occupant is either self-healed
+// (empty residue, trashed and retried once) or refused naming each
+// blocking file as a ref or as foreign data.
 func createRefHealingCollision(t transport.Transport, root, ref, sha string) (transport.Outcome, error) {
 	out, err := WriteRef(t, root, ref, sha, false)
 	if err == nil && out == transport.Committed {
