@@ -59,7 +59,13 @@ been checked against this distinction.
    - `/my-files/GitRemotes/stage6-gate` — the demo repo, plus the gate-authorized creation of
      `/my-files/GitRemotes` itself if absent. (It is very likely absent: Stage 5's own cleanup
      trashed the entire `/my-files/GitRemotes` folder and its subtree —
-     `docs/research/gates/stage5-gate.md:532`.)
+     `docs/research/gates/stage5-gate.md:532`.) **This authorization is symmetric: this gate also
+     trashes `/my-files/GitRemotes` itself in outline step 5's cleanup**, after verifying it
+     holds nothing but this gate's own subtree — the same close every prior gate took
+     (`docs/research/gates/stage3b-gate.md:270`, `stage4-gate.md:747`, `stage5-gate.md:512`).
+     Creating it without ever authorizing its own removal would leave the Preconditions-step-4
+     baseline permanently unmatchable by the post-run listing (one extra row, forever) — see
+     outline step 5 below.
    - `/my-files/GitRemotes/stage6-gate-contract` — **the contract table's live root for this
      gate (checklist item 8), named explicitly here and nowhere implicit.** Outline step 3 below
      points `GPB_CONTRACT_LIVE_ROOT` at this path so the live contract half never needs to write
@@ -75,10 +81,10 @@ been checked against this distinction.
 touches `internal/repo/refs.go`, `internal/repo/refscan.go`, `internal/repo/push.go`,
 `cmd/git-remote-proton/main.go`'s protocol loop, and `internal/transport/contract_test.go` — it
 does not touch `internal/transport/cli.go` at all (confirmed: the certified-CLI allowlist and
-`notFoundSignature`/`alreadyExistsSignature` were last changed in a Stage 5 commit,
-`d55d6da`). Both were already proven live at the Stage 4 and Stage 5 gates and are covered
-hermetically ever since (`internal/testcli`, the contract table's Fake half). Re-provoking them
-here would reprove something already proven, for no new information.
+`notFoundSignature`/`alreadyExistsSignature` were last changed in a Stage 5 commit, `6a43ed1`,
+2026-08-07, Task 9b's review round). Both were already proven live at the Stage 4 and Stage 5
+gates and are covered hermetically ever since (`internal/testcli`, the contract table's Fake
+half). Re-provoking them here would reprove something already proven, for no new information.
 
 ---
 
@@ -100,6 +106,17 @@ output; `git-remote-proton` runs as a **local subprocess** git launches directly
 Stage 5's stale-lock message and heal note were observed directly
 (`docs/research/gates/stage5-gate.md`, S1 and outline step 2). Every quote below is therefore
 TERMINAL-visible without `GIT_TRACE` — unlike a helper's protocol `ok` lines, which are not.
+
+**One more legitimate stderr source, not itself a runner-asserted string but expected
+throughout:** `main.go` wraps the CLI transport in `transport.NewTraced` before the protocol
+loop ever runs (`cmd/git-remote-proton/main.go:173`), and `Traced.ReadTo` prints one line per
+SUCCESSFUL download — `gpb: downloaded <remote path> (<n> bytes)\n` — to the same `os.Stderr`
+(`internal/transport/trace.go:38-48`; its own doc comment calls the `"gpb: downloaded "` prefix
+NORMATIVE). Every `readRef` call goes through `t.ReadTo`, so this line fires on every in-band
+candidate `ScanRefs` actually downloads — including a junk file, before its grammar check fails.
+Seeing `gpb: downloaded ...` lines interleaved with the strings below is expected, not an
+anomaly; outline step 1 below asserts the specific positive/negative pair this stage's size gate
+predicts.
 
 1. **The strict-fetch enumerated error** (`cmd/git-remote-proton/main.go`, the `case line ==
    "list":` arm, ~line 372). Surfaced by `git ls-remote`, `git fetch`, or `git clone` against
@@ -228,12 +245,11 @@ Per spec component 5's live-gate outline item 1.
      noncanonical damaged-ref branch, since the bytes are not 40-hex).
    - `gate-junk-b` (out-of-band, never downloaded): `not a ref: size 100 outside the 40-42
      candidate band` — `readRefClassified`'s pre-download size gate,
-     `internal/repo/refs.go:144-157`. **The absence of a download for this file is not
-     independently observable from outside the helper process** (the size-gate branch never
-     shells out to `proton-drive filesystem download` at all, and there is no separate CLI
-     transfer log visible to this brief's runner) — the wording of the note IS the evidence:
-     only the pre-download branch produces the "size N outside the ... band" phrasing, so its
-     appearance here is definitionally proof no read happened for this file.
+     `internal/repo/refs.go:144-158`. **The absence of a download for this file IS
+     independently observable** — see item 2 below for the exact trace-line pair this predicts;
+     do not rely on the note's wording alone as the only evidence (an earlier draft of this
+     brief claimed the wording was the only available evidence — it was wrong: the helper's
+     download tracer makes the absence directly visible on stderr).
 2. **Push of an unrelated ref succeeds** (tolerant direction — long timeout/background, per the
    standing note above):
    ```
@@ -251,6 +267,22 @@ Per spec component 5's live-gate outline item 1.
    run instead — either count is consistent with the code, since nothing in the design commits
    to exactly one `ScanRefs` call per push. The content of each note (once you have it) is what
    this brief asserts, from "Runner-asserted strings" item 4 above.
+
+   **Also expect the positive/negative `gpb: downloaded` trace pair — this IS the spec's
+   "observed via the absence of a transfer" requirement, made concrete:**
+   ```
+   gpb: downloaded /my-files/GitRemotes/stage6-gate/refs/heads/gate-junk-a (41 bytes)
+   ```
+   must appear on stderr at least once (the in-band candidate — `readRefClassified` downloads it
+   via `readRef`/`t.ReadTo` before the grammar check fails; `Traced.ReadTo`,
+   `internal/transport/trace.go:38-48`, logs every successful download regardless of what
+   happens to the bytes afterward) — it may appear more than once, for the same reason
+   `skipNote` can. **No line naming `gate-junk-b` may EVER appear** — not once, not with any
+   byte count — for the whole rest of this brief up to and including its deletion in outline
+   step 2: the size gate refuses it before `ReadTo` is ever called, so its absence from every
+   `gpb: downloaded` line in this gate's entire transcript is the live, terminal-visible evidence
+   that no read happened for it. A `gpb: downloaded .../gate-junk-b ...` line appearing ANYWHERE
+   is a BLOCK — it would mean the pre-download size gate did not fire.
 3. **`git ls-remote` FAILS with the enumerated error** (strict direction):
    ```
    git ls-remote proton::/my-files/GitRemotes/stage6-gate
@@ -272,10 +304,37 @@ Per spec component 5's live-gate outline item 2. Same repo/alias as outline step
    `proton-drive filesystem list /my-files/GitRemotes/stage6-gate/packs --json` (row-set form,
    checklist item 1) — record it; this is what the post-refusal listing below must match
    exactly, proving no pack was uploaded by the refused batch.
-2. **Push onto the occupied name** (long timeout/background):
+2. **Create a withheld object, THEN push onto the occupied name** (long timeout/background):
    ```
+   git commit --allow-empty -m "gate: stage6 withheld object"
    git push proton-v2 main:gate-junk-a
    ```
+   **The `commit --allow-empty` here is load-bearing, not filler.** Without it, `main`'s local
+   tip is still the SAME commit that both `refs/heads/main` and `refs/heads/push-ok` already
+   advertise on the remote — `gitcmd.WritePack`'s `haves` set (built from every currently-
+   advertised remote ref this local repo already holds, `internal/repo/push.go:389-394`) would
+   already cover that object, so `wants` minus `haves` is empty and NO pack would be uploaded
+   for this push **even if the occupancy refusal had a bug and let it through** — making item 3
+   below ("row-set proof no pack was uploaded") pass regardless of whether the refusal actually
+   fired. The new commit is a genuinely unpublished object: if the phase-2 preflight refuses this
+   push (the expected, correct outcome), the new commit is never packed or uploaded, because
+   `valid[i]` stays `false` and `newShas[i]` is never populated by the occupancy `continue`
+   (`internal/repo/push.go:222-233`) — it never reaches the pack engine's own phase 3
+   `wants`-building loop at all (`internal/repo/push.go:356-361`, which only appends `newShas[i]`
+   for entries where `valid[i]` is true — note this "phase 3" is `Push`'s internal five-phase
+   engine, unrelated to this brief's own outline steps). If a bug let the create through instead,
+   THIS object — new, not already on the remote via any other ref — would force a real,
+   non-empty pack upload, which item 3 below's row-set comparison would then catch. This restores
+   the check's discriminating power.
+
+   **Local-only side effect, carried forward:** local `main` now sits one commit ahead of remote
+   `refs/heads/main` (which is never touched by this refused push and stays at the original
+   bootstrap commit). Outline step 4 branches `feature/x` from whatever `main` currently is, so
+   `feature/x` will include this "stage6 withheld object" commit as an ancestor — harmless, and
+   means outline step 4's own push of `feature/x` (unlike `push-ok`'s push in outline step 1)
+   WILL upload a real, non-empty pack, since that withheld object has still never been published
+   to any remote ref by the time step 4 pushes it. This is expected, not a regression signal.
+
    `gate-junk-a` has no local or remote ref, so git's own push-refspec DWIM resolves the bare
    name to `refs/heads/gate-junk-a` — the same resolution Stage 5's brief relied on for
    `main:heal-empty` and `main:feature`. `refs/heads/gate-junk-a` is an EXACT-NAME occupancy hit
@@ -316,16 +375,25 @@ Per spec component 5's live-gate outline item 2. Same repo/alias as outline step
    consumes and resolves before printing; plain `git ls-remote` renders it as an ordinary
    `<sha>\tHEAD` row, exactly as recorded live in `docs/research/gates/stage5-gate.md:222`.
    ```
-   git clone -o proton-v2 proton::/my-files/GitRemotes/stage6-gate <short-local-path>
+   git clone -o proton-v2 proton::/my-files/GitRemotes/stage6-gate C:\gpb6\clone1
    ```
    into a short local path (Stage 4's R2-2 MAX_PATH lesson — keep every clone destination
-   shallow, e.g. `C:\gpb6\clone1`). Expect success, `main` checked out. **Keep this clone** —
-   outline step 4 reuses it.
+   shallow; `C:\gpb6\clone1` is short enough, substitute another equally short path if it's
+   already taken on the runner's machine). Expect success, `main` checked out. **Keep this
+   clone** — outline step 4 reuses it.
 
 ## Outline step 3 — Contract table live, including F1
 
 Per spec component 5's live-gate outline item 3, and checklist item 8.
 
+**Working directory for this step, stated explicitly: the git-proton-backup SOURCE checkout this
+gate is being run from — its repository root (where `go.mod` lives, and `./internal/transport/`
+resolves as a package path).** This is NOT the demo repo (`stage6-gate`) and NOT either of its
+clones from outline steps 1–2 — every prior command in this brief has been inside one of those,
+so change back to the source checkout's root first (`cd` there, using wherever this gate's own
+`git-proton-backup` clone actually lives on the runner's machine) before running the block below,
+the same anchoring Stage 3b/4/5's briefs assumed for their own `go test ./internal/transport/
+...` invocations (`docs/research/gates/stage3b-gate.md:69,389`):
 ```
 $env:GPB_LIVE_ACCOUNT = "1"
 $env:GPB_CONTRACT_LIVE_ROOT = "/my-files/GitRemotes/stage6-gate-contract"
@@ -379,15 +447,43 @@ outline-step-1 gate repo (main checked out) and the outline-step-2 clone.
 Per spec component 5's live-gate outline item 5, and checklist items 1/3/7 inline.
 
 - **Verify-before-trash with full subtree enumeration** (checklist item 3): `filesystem list`
-  the full subtree of `/my-files/GitRemotes/stage6-gate` (refs/heads: `main`, `push-ok`,
-  `feature/x`; refs/tags: empty; `packs/`; the repo marker) and confirm it contains only this
-  gate's own artifacts. Separately, `filesystem list /my-files/GitRemotes/stage6-gate-contract`
-  and confirm it is now EMPTY (every per-test subfolder already auto-trashed by outline step 3's
-  `t.Cleanup`) before trashing the base folder itself.
-- **Trash both roots**:
+  the full subtree of `/my-files/GitRemotes/stage6-gate` (refs/heads holding `main` and
+  `push-ok` as FILES, plus a `feature` FOLDER containing `x` — outline step 4's nested branch is
+  a folder, not a third flat file; refs/tags: empty; `packs/`; the repo marker) and confirm it
+  contains only this gate's own artifacts. Separately, `filesystem list
+  /my-files/GitRemotes/stage6-gate-contract` and confirm it is now EMPTY (every per-test
+  subfolder already auto-trashed by outline step 3's `t.Cleanup`) before trashing the base
+  folder itself. **Apply the same transient-lag tolerance here as the `/my-files/GitRemotes`
+  check below**: if this listing still shows a just-trashed per-test subfolder carrying a
+  `trashTime` field, wait briefly and re-list before concluding it is non-empty — only a
+  persistent non-empty listing after a re-list means it is not actually empty (and is itself a
+  BLOCK, since it would mean a subfolder `t.Cleanup` was supposed to trash did not commit).
+- **First, check the Preconditions-step-4 baseline: did `/my-files/GitRemotes` already have a
+  row there BEFORE this gate ran?** The expected case (per Preconditions step 5) is NO — this
+  gate creates it fresh. **If the baseline already shows a `GitRemotes` row, this gate did NOT
+  create it, and the folder itself is NOT this gate's to trash** — trash only its two children
+  below and stop there; `/my-files/GitRemotes` itself must then reappear unchanged in the
+  post-run comparison, and the "Confirm the listing is empty" step below does not apply. This
+  brief expects the fresh-creation case; the paragraph below assumes it.
+- **Trash both roots, THEN verify and trash `/my-files/GitRemotes` itself** (fresh-creation case
+  only) — the demo repo and the contract root are `GitRemotes`' only two children (both
+  gate-created; Preconditions step 5 authorizes this symmetrically with authorizing
+  `GitRemotes`' own creation, same close every prior gate took:
+  `docs/research/gates/stage3b-gate.md:268-270`, `stage4-gate.md:743-749`,
+  `stage5-gate.md:508-514`):
   ```
   proton-drive filesystem trash /my-files/GitRemotes/stage6-gate
   proton-drive filesystem trash /my-files/GitRemotes/stage6-gate-contract
+  proton-drive filesystem list /my-files/GitRemotes --json
+  ```
+  Confirm the listing is empty (no rows) — if a just-trashed row still appears carrying a
+  `trashTime` field, this is the **transient post-trash listing lag** prior gates recorded
+  live (`docs/research/gates/stage5-gate.md:536-538`: the first post-trash listing still showed
+  the just-trashed row for several seconds; `stage4-gate.md` noted the same window). Wait briefly
+  and re-list; only a listing that STILL shows a non-trashed row after a re-list is a BLOCK.
+  Once genuinely empty:
+  ```
+  proton-drive filesystem trash /my-files/GitRemotes
   ```
 - **All listing comparisons as row sets** (checklist item 1), not raw JSON byte equality, for
   every pre/post comparison in this gate — not only this final one.
@@ -398,8 +494,10 @@ Per spec component 5's live-gate outline item 5, and checklist items 1/3/7 inlin
   5. For the record, tally: the two junk FILES trashed by hand in outline step 2
   (`gate-junk-a`, `gate-junk-b`); the 17 per-test SCRATCH FOLDERS `TestContractCLI`'s own
   `t.Cleanup` auto-trashed during outline step 3 (test-harness housekeeping, not a v2 prune
-  event — do not conflate the two classes); and the two gate ROOT folders trashed just above
-  (the demo repo subtree, the contract base folder).
+  event — do not conflate the two classes); and the gate ROOT folders trashed just above — THREE
+  in the expected fresh-creation case (the demo repo subtree, the contract base folder, and
+  `/my-files/GitRemotes` itself), only TWO if the baseline check above found `GitRemotes`
+  pre-existing (the demo repo subtree and the contract base folder only).
 - **Post-run `/my-files` listing** must be row-set-identical to the pre-run listing from
   Preconditions step 4 (no `trashTime` on any of the four untouchable rows; same uids, same
   creation/modification times).
@@ -435,7 +533,10 @@ companion commit performs `docs/releasing.md` step 2 (the CHANGELOG flip, `## Un
 - Writes only under `/my-files/GitRemotes/stage6-gate` and
   `/my-files/GitRemotes/stage6-gate-contract` (the contract table's live root — checklist item 8,
   named explicitly per Preconditions step 5) — plus the gate-authorized creation of
-  `/my-files/GitRemotes` itself if absent.
+  `/my-files/GitRemotes` itself if absent, AND the symmetric authorization to trash
+  `/my-files/GitRemotes` itself in cleanup once both children are gone (outline step 5) — a
+  gate-created folder is a gate-owned folder, torn down same as its contents, same close every
+  prior gate took.
 - Untouchables (`GitBackups`, `Sensitive Project Sources`, `Project Repo Bundles`, `ChatGPT
   Export Text Backup`) read-only: rows in listings only, never named in a write command.
 - Verify-before-trash, full subtree enumeration, every time (checklist item 3).
