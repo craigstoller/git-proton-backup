@@ -204,12 +204,78 @@ func (f *Fake) Stat(p string) (Node, bool, error) {
 // always means a caller bug that auto-creation would hide: *CLI.ReadTo now
 // stats localDir and refuses before spawning anything, and this Fake agrees
 // with the wrapper, not with the raw binary.
+//
+// p may also name a DIRECTORY (f.Dirs[p]): the Stage 5 gate's Finding F1
+// established that `filesystem download` on a directory exits 0 and
+// recursively downloads the whole subtree, so this Fake is taught the same
+// fidelity — see readDirTo below, and the live contract row "download of a
+// directory recursively materialises the subtree (F1)" (contract_test.go)
+// that pins the exact shape. Before this, a directory path here missed on
+// f.Files and was misreported as an absent file — the same wrong-branch
+// mistake the testcli shim still makes deliberately (its runDownload doc
+// comment cites this fix).
+//
+// The dest-exists check below runs FIRST, unconditionally, regardless of
+// which branch p takes below it: a directory branch that os.MkdirAll'd
+// beneath an unvalidated local would make this Fake accept a missing
+// destination the live CLI wrapper rejects (C16, round-2 Codex) — MkdirAll
+// creates missing parents rather than failing on them, unlike the plain
+// os.WriteFile the file branch used to rely on for this same validation
+// implicitly, so the check must now be explicit and shared by both branches.
 func (f *Fake) ReadTo(p, local string) error {
+	st, err := os.Stat(local)
+	if err != nil {
+		return fmt.Errorf("download destination %s: %w", local, err)
+	}
+	if !st.IsDir() {
+		return fmt.Errorf("download destination %s is not a directory", local)
+	}
+	if f.Dirs[p] {
+		return f.readDirTo(p, local)
+	}
 	b, ok := f.Files[p]
 	if !ok {
 		return fmt.Errorf("not found: %s", p)
 	}
 	return os.WriteFile(filepath.Join(local, path.Base(p)), b, 0o644)
+}
+
+// readDirTo recursively materialises p's subtree under local/<p's remote
+// basename>/..., walking both f.Files and f.Dirs for keys under p+"/" so
+// nested subfolders at any depth land too, not just one level (the F1
+// fixture pins depth 2: a file directly under the folder, and a file one
+// subfolder deeper). Called only from ReadTo, after its dest-exists
+// validation has already run — see that doc comment for why this must never
+// be the first thing to learn whether local exists.
+func (f *Fake) readDirTo(p, local string) error {
+	base := filepath.Join(local, path.Base(p))
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		return err
+	}
+	prefix := p + "/"
+	for k, b := range f.Files {
+		rel, ok := strings.CutPrefix(k, prefix)
+		if !ok {
+			continue
+		}
+		target := filepath.Join(base, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(target, b, 0o644); err != nil {
+			return err
+		}
+	}
+	for d := range f.Dirs {
+		rel, ok := strings.CutPrefix(d, prefix)
+		if !ok {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Join(base, filepath.FromSlash(rel)), 0o755); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // checkUploadBasename mechanically enforces the caller contract: `filesystem

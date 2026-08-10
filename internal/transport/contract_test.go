@@ -165,6 +165,62 @@ var contractCases = []contractCase{
 		}
 	}},
 
+	// F1 (Stage 5 gate): `filesystem download` on a DIRECTORY exits 0 and
+	// recursively downloads the whole subtree. sethead.go's Stat-IsDir-first
+	// guard comment still calls this "NO verified contract at all" — that
+	// comment names the live CLI's directory-download behaviour, not this
+	// row, and is out of this task's file list, so it is left as is; this row
+	// is what now actually pins the shape. Fake.ReadTo had no directory
+	// behaviour at all before this row: a
+	// directory path missed on f.Files and was misreported as an absent
+	// file. Fixture is the pinned F1 shape: one folder containing one file
+	// and one subfolder with a file — both must land, relative layout
+	// preserved under <dest>/<leaf>/.... Live half records the verbatim
+	// output of the raw download call; both halves then assert the same
+	// resulting layout.
+	{"download of a directory recursively materialises the subtree (F1)", func(t *testing.T, tr Transport, root string, stage func(string, string) string) {
+		d := root + "/d"
+		if err := tr.EnsureDir(d); err != nil {
+			t.Fatalf("EnsureDir: %v", err)
+		}
+		if out, err := tr.CreateExclusive(d+"/a", stage("a", "A")); err != nil || out != Committed {
+			t.Fatalf("seed create a: %v %v", out, err)
+		}
+		sub := d + "/sub"
+		if err := tr.EnsureDir(sub); err != nil {
+			t.Fatalf("EnsureDir: %v", err)
+		}
+		if out, err := tr.CreateExclusive(sub+"/b", stage("b", "B")); err != nil || out != Committed {
+			t.Fatalf("seed create b: %v %v", out, err)
+		}
+
+		dest := t.TempDir()
+		if c, ok := tr.(*CLI); ok {
+			out, code, runErr := c.run("filesystem", "download", d, dest)
+			if code != 0 {
+				t.Fatalf("expected exit 0 downloading a directory (F1), got %d (out=%q, err=%v)", code, out, runErr)
+			}
+			t.Logf("live directory-download output (F1): %q", out)
+		} else if err := tr.ReadTo(d, dest); err != nil {
+			t.Fatalf("ReadTo on a directory: %v", err)
+		}
+
+		gotA, err := os.ReadFile(filepath.Join(dest, "d", "a"))
+		if err != nil {
+			t.Fatalf("expected downloaded file at dest/d/a: %v", err)
+		}
+		if string(gotA) != "A" {
+			t.Errorf("dest/d/a = %q, want %q", gotA, "A")
+		}
+		gotB, err := os.ReadFile(filepath.Join(dest, "d", "sub", "b"))
+		if err != nil {
+			t.Fatalf("expected downloaded file at dest/d/sub/b: %v", err)
+		}
+		if string(gotB) != "B" {
+			t.Errorf("dest/d/sub/b = %q, want %q", gotB, "B")
+		}
+	}},
+
 	// C4: trash on a missing target is Committed — the desired end state is
 	// "not there", and the CLI's own exit 1 is absorbed by the implementation.
 	{"trash on a missing target is committed", func(t *testing.T, tr Transport, root string, stage func(string, string) string) {

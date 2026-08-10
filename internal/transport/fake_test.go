@@ -189,6 +189,66 @@ func TestFakeReadToIntoMissingDirectoryErrors(t *testing.T) {
 	}
 }
 
+// TestFakeReadToOnDirectoryRecursivelyMaterialisesSubtree: RED (Task 5, F1).
+// Fake.ReadTo had no directory behaviour at all — it only ever looked up
+// f.Files[p], so a directory path (present only in f.Dirs) missed and read as
+// an absent file. The Stage 5 gate's Finding F1 established that the real
+// CLI's `filesystem download` on a directory exits 0 and recursively
+// downloads the whole subtree, landing under <dest>/<leaf>/.... This is the
+// exact fixture shape pinned by the brief and by the live contract row
+// (contract_test.go): one folder containing one file and one subfolder with
+// a file — both must land, relative layout preserved.
+func TestFakeReadToOnDirectoryRecursivelyMaterialisesSubtree(t *testing.T) {
+	f := NewFake()
+	f.Dirs["/r/d"] = true
+	f.Files["/r/d/a"] = []byte("A")
+	f.Dirs["/r/d/sub"] = true
+	f.Files["/r/d/sub/b"] = []byte("B")
+
+	dest := t.TempDir()
+	if err := f.ReadTo("/r/d", dest); err != nil {
+		t.Fatalf("ReadTo on a directory: %v", err)
+	}
+
+	gotA, err := os.ReadFile(filepath.Join(dest, "d", "a"))
+	if err != nil {
+		t.Fatalf("expected downloaded file at dest/d/a: %v", err)
+	}
+	if string(gotA) != "A" {
+		t.Errorf("dest/d/a = %q, want %q", gotA, "A")
+	}
+
+	gotB, err := os.ReadFile(filepath.Join(dest, "d", "sub", "b"))
+	if err != nil {
+		t.Fatalf("expected downloaded file at dest/d/sub/b: %v", err)
+	}
+	if string(gotB) != "B" {
+		t.Errorf("dest/d/sub/b = %q, want %q", gotB, "B")
+	}
+}
+
+// TestFakeReadToOnDirectoryIntoMissingDestErrorsAndCreatesNothing: GUARD
+// (Task 5, round-2 Codex). The C16 wrapper contract — destination must
+// already exist, the CLI wrapper stats before spawning anything — applies to
+// directory downloads exactly as it does to files. A directory branch that
+// os.MkdirAll'd beneath an unvalidated destination would make this Fake
+// accept a missing destination the live CLI wrapper rejects, so this pins
+// that the dest-exists validation runs BEFORE the directory branch, not
+// after: nothing may be created when the destination itself is absent.
+func TestFakeReadToOnDirectoryIntoMissingDestErrorsAndCreatesNothing(t *testing.T) {
+	f := NewFake()
+	f.Dirs["/r/d"] = true
+	f.Files["/r/d/a"] = []byte("A")
+
+	missingDest := filepath.Join(t.TempDir(), "does-not-exist")
+	if err := f.ReadTo("/r/d", missingDest); err == nil {
+		t.Fatal("ReadTo on a directory into a missing destination must error, not silently succeed")
+	}
+	if _, err := os.Stat(missingDest); !os.IsNotExist(err) {
+		t.Errorf("ReadTo must not create the destination directory for the caller; stat error = %v", err)
+	}
+}
+
 func TestFakeEnsureDirAndList(t *testing.T) {
 	f := NewFake()
 	// "/refs" is not a mount root (only "/my-files" and "/devices" are), so
