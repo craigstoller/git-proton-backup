@@ -1,6 +1,7 @@
 package repo
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,7 +19,7 @@ import (
 // own reads like corruption rather than an unsupported repository format.
 var shaRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
-// ListRefs recurses the WHOLE refs/ tree, not just the direct children of
+// ScanRefs recurses the WHOLE refs/ tree, not just the direct children of
 // refs/heads and refs/tags: hierarchical names (refs/heads/feat/x, which git
 // accepts and users create constantly), and other namespaces entirely
 // (refs/notes/commits, refs/stash, a name some other tool or the web UI left
@@ -35,22 +36,36 @@ var shaRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 // transport's remote-glob behaviour on characters like "{" is UNVERIFIED
 // (probe C13 only confirmed LOCAL glob-expansion on upload, never what
 // List() does with such a path remotely). checkComponent's refusal is what
-// keeps ListRefs from ever probing that: an invalid folder skips its entire
+// keeps ScanRefs from ever probing that: an invalid folder skips its entire
 // subtree with a note, and no List() call is ever made naming it.
 //
 // A node that fails validation — folder or leaf — is SKIPPED WITH A NOTE
-// (skipNote, below) to os.Stderr, never fatal: this remote can hold names v2
-// itself would never create (a foreign tool, a stray web-UI upload), and one
-// such name must not deny the advertisement to every other ref in the repo
-// (spec §1). Malformed CONTENT of a well-named, already-advertisable ref is
-// a different failure — that ref IS one this remote is supposed to serve, so
-// a corrupt sha stays fatal (readRef never coerces it into a best guess).
+// (skipNote, below) to os.Stderr and recorded in the returned RefScan's
+// Skipped set (SkipInvalidName / SkipInvalidNameFolder), never fatal: this
+// remote can hold names v2 itself would never create (a foreign tool, a
+// stray web-UI upload), and one such name must not deny the advertisement to
+// every other ref in the repo (spec §1).
+//
+// Malformed CONTENT of a well-named, already-advertisable-by-name candidate
+// used to be a different, FATAL failure (Stage 5): that name IS one this
+// remote is supposed to serve, so a corrupt sha was never coerced into a
+// best guess. Stage 6 replaces the fatal rule with SIZE-GATED
+// CLASSIFICATION (readRefClassified, below): a candidate outside the
+// [refBandMin, refBandMax] byte band is skipped without ever being
+// downloaded; an in-band candidate is downloaded and, on a grammar failure,
+// classified (classifyRefContent) and skipped with Kind=SkipContent rather
+// than aborting the whole scan. This is STILL never an error at the scan
+// layer — only a genuine transport/read failure (readRef's ReadTo/ReadDir/
+// ReadFile arms) stays fatal, distinguished from a grammar failure by TYPE
+// (errors.Is(err, errMalformedRef)), never by message text: the fetch-
+// direction survey's stricter policy over this same scan lands in Task 2,
+// not here.
 //
 // Cost: one List() subprocess per folder, run serially, plus an in-process
 // name check per ref — linear in the size of the ref tree, the same shape as
 // the pack-count cost noted beside gitcmd.WritePack.
-func ListRefs(t transport.Transport, root string) (map[string]string, error) {
-	out := map[string]string{}
+func ScanRefs(t transport.Transport, root string) (*RefScan, error) {
+	scan := &RefScan{Refs: map[string]string{}}
 	var walk func(rel string) error
 	walk = func(rel string) error {
 		nodes, err := t.List(root + "/" + rel)
@@ -65,9 +80,17 @@ func ListRefs(t transport.Transport, root string) (map[string]string, error) {
 			full := rel + "/" + n.Name
 			// Directories included, BEFORE recursion — see the doc comment
 			// above: this is what stops an invalid folder name from ever
-			// reaching a List() argument.
+			// reaching a List() argument. n.IsDir picks SkipInvalidNameFolder
+			// vs SkipInvalidName here because this is the ONLY skip site that
+			// ever sees a directory node — advertisableName below runs only
+			// after the IsDir branch has already recursed-or-continued.
 			if err := checkComponent(n.Name); err != nil {
 				skipNote(os.Stderr, root, full, err)
+				kind := SkipInvalidName
+				if n.IsDir {
+					kind = SkipInvalidNameFolder
+				}
+				scan.Skipped = append(scan.Skipped, SkippedRef{Path: full, Kind: kind, Reason: err.Error()})
 				continue
 			}
 			if n.IsDir {
@@ -79,37 +102,84 @@ func ListRefs(t transport.Transport, root string) (map[string]string, error) {
 			if err := advertisableName(full); err != nil {
 				// Skip-with-note, NEVER fatal: see the doc comment above.
 				skipNote(os.Stderr, root, full, err)
+				scan.Skipped = append(scan.Skipped, SkippedRef{Path: full, Kind: SkipInvalidName, Reason: err.Error()})
 				continue
 			}
-			sha, err := readRef(t, root+"/"+full)
+			sha, err := readRefClassified(t, root, full, n.Size, scan)
 			if err != nil {
-				// Malformed CONTENT stays fatal. Note this fires BEFORE the
-				// name is advertised — it is a candidate discovered file, not
-				// an already-advertised ref — and the recursion widened its
-				// reach to any well-named file anywhere under refs/. Recorded
-				// as an open question for the owner in the design doc's v6.5
-				// revision entry; unchanged here by instruction.
-				return err
+				return err // transport/read failure — fatal, unchanged
 			}
-			out[full] = sha
+			if sha != "" {
+				scan.Refs[full] = sha
+			}
 		}
 		return nil
 	}
 	if err := walk("refs"); err != nil {
 		return nil, err
 	}
-	return out, nil
+	return scan, nil
 }
 
-// skipNote writes the standard "skip with a note" line for a name ListRefs
-// declined to advertise. Skip notes are never fatal (see ListRefs above) but
+// refBandMin and refBandMax bound the candidate band: a discovered file's
+// SIZE (from the listing's metadata, before any download) must fall inside
+// this band for readRefClassified to download and grammar-check it at all.
+// A valid ref file is exactly 41 bytes (40 lowercase hex + "\n"); the three
+// noncanonical damaged-ref shapes classifyRefContent recognises sit within a
+// byte of that: no-LF = 40, CRLF = 42, double-LF = 42. See the design spec,
+// component 1, "Classification is size-gated" — and its revision note below
+// for why the band is exactly these three shapes and not wider.
+const (
+	refBandMin = 40
+	refBandMax = 42
+)
+
+// readRefClassified applies the size gate and grammar check for ONE
+// candidate discovered under refs/. It returns ("", nil) after recording a
+// SkippedRef on scan (a skip is never an error at this layer); (sha, nil) on
+// a successful parse; ("", err) ONLY for a transport/read failure — the
+// typed split (errors.Is(err, errMalformedRef)) is what keeps a network
+// failure from ever being silently misreported as "this file is not a ref".
+func readRefClassified(t transport.Transport, root, full string, size int64, scan *RefScan) (string, error) {
+	if size < refBandMin || size > refBandMax {
+		reason := fmt.Sprintf("not a ref: size %d outside the %d-%d candidate band", size, refBandMin, refBandMax)
+		if size < 0 {
+			// The CLI never reports a negative size for a real file; this arm
+			// is belt-and-braces for a transport that cannot supply one at
+			// all (Stat/List degradation), and refuses to download unbounded
+			// content rather than guess (spec: "never download what cannot
+			// be bounded").
+			reason = "not a ref: size unknown; refusing to download unbounded content"
+		}
+		s := SkippedRef{Path: full, Kind: SkipContent, Reason: reason}
+		scan.Skipped = append(scan.Skipped, s)
+		skipNote(os.Stderr, root, full, errors.New(s.Reason))
+		return "", nil
+	}
+	sha, err := readRef(t, root+"/"+full)
+	if err == nil {
+		return sha, nil
+	}
+	if !errors.Is(err, errMalformedRef) {
+		return "", err // transport failure stays fatal (typed split)
+	}
+	raw := malformedRaw(err)
+	reason, hex := classifyRefContent(raw)
+	s := SkippedRef{Path: full, Kind: SkipContent, Reason: reason, Hex: hex}
+	scan.Skipped = append(scan.Skipped, s)
+	skipNote(os.Stderr, root, full, errors.New(s.Reason))
+	return "", nil
+}
+
+// skipNote writes the standard "skip with a note" line for a name ScanRefs
+// declined to advertise. Skip notes are never fatal (see ScanRefs above) but
 // must still tell the operator exactly which remote path was skipped and
 // why, so a foreign name is diagnosable rather than silently invisible.
 //
 // The writer is a parameter rather than a hardcoded os.Stderr specifically so
 // the exact note text can be pinned in a focused unit test
 // (TestSkipNoteText, repo_test.go) without forking the process or installing
-// a pipe to capture the real os.Stderr. ListRefs itself always calls this
+// a pipe to capture the real os.Stderr. ScanRefs itself always calls this
 // with os.Stderr — the package's convention for advisory warnings that must
 // not fail the operation they describe (idxcache.go and sethead.go's
 // lock-release warning do the same).
@@ -121,10 +191,17 @@ func skipNote(w io.Writer, root, full string, reason error) {
 // EXACT grammar: 40 lowercase hex characters followed by exactly one "\n"
 // and nothing else. WriteRef (below) always writes sha+"\n", so only a
 // foreign or damaged file can differ from that — no trailing newline, a CRLF
-// terminator, a double-LF terminator, or non-hex content — and those are
-// precisely what must be fatal here, never coerced into a best guess. This
-// used to TrimRight "\r\n" before matching, which silently tolerated all of
-// the above; the exact-grammar rewrite (Task 8) closes that gap.
+// terminator, a double-LF terminator, or non-hex content. This used to
+// TrimRight "\r\n" before matching, which silently tolerated all of the
+// above; the exact-grammar rewrite (Task 8) closed that gap.
+//
+// A grammar failure returns a *malformedRefError (wrapping errMalformedRef
+// via Unwrap, carrying the raw bytes forward) rather than a plain
+// fmt.Errorf: readRefClassified (above) needs to distinguish THIS failure —
+// skippable, classifiable — from every other error readRef can return
+// (MkdirTemp, ReadTo, ReadDir, ReadFile), which are transport/host failures
+// and must stay fatal. The two are told apart by TYPE (errors.Is), never by
+// message text (Stage 6, component 1's typed-split requirement).
 func readRef(t transport.Transport, p string) (string, error) {
 	dir, err := os.MkdirTemp("", "gpb-ref-*")
 	if err != nil {
@@ -143,16 +220,102 @@ func readRef(t transport.Transport, p string) (string, error) {
 		return "", err
 	}
 	if len(raw) != 41 || raw[40] != '\n' || !shaRe.Match(raw[:40]) {
-		return "", fmt.Errorf("corrupt ref file %s: content is not exactly 40 lowercase hex "+
-			"characters plus a single trailing newline (got %q)", p, previewBytes(raw))
+		return "", &malformedRefError{p: p, raw: raw}
 	}
 	return string(raw[:40]), nil
+}
+
+// errMalformedRef is the sentinel readRefClassified tests for with
+// errors.Is to decide "skip and classify" versus "propagate as fatal". It is
+// unexported and never returned directly — only *malformedRefError (below)
+// wraps it — because the raw bytes classifyRefContent needs travel with the
+// concrete type, not the sentinel alone.
+var errMalformedRef = errors.New("ref content does not match the exact grammar")
+
+// malformedRefError is readRef's grammar-failure return value: it carries
+// the raw bytes it already downloaded forward (via malformedRaw) so
+// readRefClassified's classification never re-downloads the file, and it
+// wraps errMalformedRef (via Unwrap) so callers classify with errors.Is
+// rather than matching this type's Error() text, which is free to change.
+type malformedRefError struct {
+	p   string
+	raw []byte
+}
+
+func (e *malformedRefError) Error() string {
+	return fmt.Sprintf("corrupt ref file %s: content is not exactly 40 lowercase hex "+
+		"characters plus a single trailing newline (got %q)", e.p, previewBytes(e.raw))
+}
+
+func (e *malformedRefError) Unwrap() error { return errMalformedRef }
+
+// malformedRaw extracts the raw bytes a *malformedRefError carries, for
+// classifyRefContent to classify without a second download. Every call site
+// in this package first confirms errors.Is(err, errMalformedRef), so a miss
+// here (err is some other error, or nil) returns nil raw bytes rather than
+// panicking — classifyRefContent on nil bytes degrades to the generic
+// "not a ref" preview branch, which is a safe (if uninformative) answer to
+// a caller-contract violation this function itself cannot happen.
+func malformedRaw(err error) []byte {
+	var m *malformedRefError
+	if errors.As(err, &m) {
+		return m.raw
+	}
+	return nil
+}
+
+// classifyRefContent classifies the raw bytes of an IN-BAND candidate that
+// failed readRef's exact grammar — the ONE place both the scan
+// (readRefClassified, Task 1) and the create-heal race-window diagnosis
+// (Task 4) decide what a non-ref file's bytes mean, so the two arms can
+// never drift into different wording for the same bytes.
+//
+// 40 lowercase hex followed by a remainder made ONLY of '\r'/'\n' bytes
+// (empty, "\n", "\r\n", or "\n\n" — the only shapes the 40-42-byte candidate
+// band admits alongside a valid 40-hex prefix) is the NONCANONICAL
+// damaged-ref class: a real object pointer with a malformed terminator,
+// recoverable and worth surfacing rather than losing behind a generic
+// preview. Anything else is generic junk: previewed with "%q" (which
+// escapes control bytes, so the operator's log line stays one line even for
+// binary content) and capped at 42 bytes — independently of previewBytes'
+// 64-byte cap, because the size gate's own best-effort race window (the
+// file can grow between the List() stat and this ReadTo download,
+// component 1's "best-effort metadata bound") must never let an oversized
+// read widen this particular log line past what the in-band candidates
+// themselves are supposed to be.
+func classifyRefContent(raw []byte) (reason string, hex string) {
+	if len(raw) >= 40 && shaRe.Match(raw[:40]) {
+		rest := raw[40:]
+		onlyTerminatorBytes := true
+		for _, b := range rest {
+			if b != '\r' && b != '\n' {
+				onlyTerminatorBytes = false
+				break
+			}
+		}
+		if onlyTerminatorBytes {
+			hex = string(raw[:40])
+			return "damaged ref? contents are 40-hex with a malformed terminator: " + hex, hex
+		}
+	}
+	const previewMax = 42
+	preview := raw
+	truncated := false
+	if len(preview) > previewMax {
+		preview = preview[:previewMax]
+		truncated = true
+	}
+	s := fmt.Sprintf("%q", preview)
+	if truncated {
+		s += "...(truncated)"
+	}
+	return "not a ref: " + s, ""
 }
 
 // previewBytes caps a diagnostic preview at 64 bytes. This error used to
 // embed the WHOLE file via a bare %q on raw — harmless back when every ref
 // file readRef could reach lived under this package's own control (only
-// refs/heads and refs/tags, listed non-recursively). ListRefs' recursion
+// refs/heads and refs/tags, listed non-recursively). ScanRefs' recursion
 // (Task 8) now reaches readRef for any well-NAMED, advertisable ref anywhere
 // under refs/, and a well-named file can still hold arbitrary foreign
 // content — a multi-megabyte accidental upload, binary junk — with nothing

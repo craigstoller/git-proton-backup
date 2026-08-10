@@ -58,10 +58,14 @@ func SetHead(t transport.Transport, root, branchArg string) (string, error) {
 	// creates) must be refused HERE, before readRef ever sees it. Stat
 	// affirmatively confirms presence, so falling through to readRef would
 	// call t.ReadTo on a DIRECTORY — against the Fake that just reads as a
-	// misleading generic "not found", and against the live CLI it has NO
-	// verified contract at all (`filesystem download` on a directory is
-	// unprobed; peer-review finding on this task). The branch check must
-	// come first.
+	// misleading generic "not found", and against the live CLI it is now a
+	// KNOWN, pinned contract fact (not merely unverified): Finding F1 and
+	// its contract-table row "download of a directory recursively
+	// materialises the subtree (F1)" (internal/transport/contract_test.go)
+	// established that `filesystem download` on a directory exits 0 and
+	// downloads the whole subtree — content readRef is never prepared to
+	// interpret as a ref. F1 makes this guard permanently regression-safe;
+	// it does not remove the need for it. The branch check must come first.
 	if ok && node.IsDir {
 		branches, lerr := existingBranchNames(t, root)
 		if lerr != nil {
@@ -119,17 +123,17 @@ func SetHead(t transport.Transport, root, branchArg string) (string, error) {
 // refs/heads/ prefix stripped), sorted — the "branches that exist"
 // suggestion list shared by SetHead's error-path arms (target absent;
 // target present but only as a namespace folder, not a branch itself).
-// Built from ListRefs, which walks the WHOLE ref tree (Task 8), so nested
+// Built from ScanRefs, which walks the WHOLE ref tree (Task 8), so nested
 // branches are included — e.g. a request for the folder "feature" itself
 // suggests "feature/x" if that is the real branch living beneath it. Only
 // ever called on an error path: SetHead's happy path never calls this.
 func existingBranchNames(t transport.Transport, root string) ([]string, error) {
-	refs, err := ListRefs(t, root)
+	scan, err := ScanRefs(t, root)
 	if err != nil {
 		return nil, err
 	}
 	var branches []string
-	for name := range refs {
+	for name := range scan.Refs {
 		if strings.HasPrefix(name, "refs/heads/") {
 			branches = append(branches, strings.TrimPrefix(name, "refs/heads/"))
 		}

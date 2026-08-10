@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -35,9 +36,12 @@ type Result struct {
 //     duplicate destinations (every holder of a duplicated destination is
 //     refused, not a first-seen-wins loop), delete-side HEAD protection (one
 //     non-mutating ReadHEAD for the whole batch), namespace-specific
-//     force/ancestry rules, and a final-state directory/file preflight over
-//     the refs that will exist once the batch lands. Failures here cost
-//     nothing: no pack has been built yet.
+//     force/ancestry rules, occupancy against every path ScanRefs skipped
+//     (component 2: a create/update/delete landing on, above, or beneath a
+//     skipped path is refused, kind-aware, naming the occupant), and a
+//     final-state directory/file preflight over the refs that will exist
+//     once the batch lands. Failures here cost nothing: no pack has been
+//     built yet.
 //  3. Build, upload, and confirm ONE pack for every valid create/update —
 //     the design's normative "Object transfer per batch", which Stage 2's
 //     per-ref packing quietly diverged from (see gitcmd.WritePack's doc
@@ -51,7 +55,7 @@ type Result struct {
 // ensureHEAD runs last, after all five phases, unchanged from the per-ref
 // version.
 func Push(t transport.Transport, root, gitDir string,
-	ups []protocol.RefUpdate, remote map[string]string) []Result {
+	ups []protocol.RefUpdate, remote map[string]string, skipped []SkippedRef) []Result {
 
 	results := make([]Result, len(ups))
 	// fail/okResult flatten every outcome through the same funnel pushOne
@@ -107,6 +111,18 @@ func Push(t transport.Transport, root, gitDir string,
 		head, hasHead, headErr = ReadHEAD(t, root)
 	}
 
+	// occupied indexes `skipped` by exact Path for O(1) exact-name and
+	// ancestor-walk lookups below (component 2). Built ONCE, before the
+	// per-update loop that consults it, exactly like dstCount/hasBranchDelete
+	// above: a nil or empty skipped (Stage 5 callers, and every non-occupancy
+	// test in this file) makes this an empty map, so every lookup below
+	// misses and the loop behaves exactly as it did before this task — the
+	// GUARD TestPushNilSkippedIsStage5Behaviour pins that.
+	occupied := make(map[string]SkippedRef, len(skipped))
+	for _, s := range skipped {
+		occupied[s.Path] = s
+	}
+
 	valid := make([]bool, len(ups))
 	isDelete := make([]bool, len(ups))
 	isCreate := make([]bool, len(ups)) // valid non-delete whose dst is not already on the remote
@@ -123,6 +139,21 @@ func Push(t transport.Transport, root, gitDir string,
 
 		if u.Src == "" {
 			isDelete[i] = true
+			// Occupancy (component 2) is checked BEFORE the already-absent
+			// shortcut just below, deliberately: a skipped foreign path is
+			// NEVER a key in `remote` (ScanRefs classifies a path as either
+			// advertised or skipped, never both), so a delete of a skipped
+			// name would otherwise fall straight into that shortcut and
+			// report OK without ever touching — let alone removing — the
+			// foreign file it was actually asked to delete. Only an EXACT
+			// match matters here: t.Trash below operates on root+"/"+u.Dst
+			// alone, so an ancestor/descendant occupancy can never be
+			// disturbed by deleting u.Dst itself (unlike the create/update
+			// three-check block below, which walks both directions).
+			if s, ok := occupied[u.Dst]; ok {
+				fail(i, OccupancyMessage(root, s))
+				continue
+			}
 			if _, exists := remote[u.Dst]; !exists {
 				// Already absent: OK without even consulting HEAD, exactly
 				// like shipped pushOne — deleting a name already gone is a
@@ -155,6 +186,49 @@ func Push(t transport.Transport, root, gitDir string,
 
 		if dstCount[u.Dst] > 1 {
 			fail(i, "duplicate destination in one batch")
+			continue
+		}
+
+		// Occupancy preflight (component 2), CREATE/UPDATE side. Run here,
+		// before resolve() and the namespace/ancestry machinery below, so a
+		// doomed collision costs nothing: no `git rev-parse`, no object-type
+		// or ancestry check, and — since valid[i] stays false and newShas[i]
+		// stays unset — no place in phase 3's `wants`, so the pack never
+		// includes it either.
+		//
+		// Ordering relative to checkDst ABOVE this loop is a deliberate,
+		// adjudicated decision (round-1 Codex proposed running occupancy
+		// first): occupancy only ever applies to a dst checkDst has already
+		// accepted as a legitimate ref name. An invalid dst gets checkDst's
+		// own refusal instead, which is correct because this helper could
+		// never create or delete such a name regardless of what occupies it.
+		// The "beneath an invalid name" case still lands here despite that:
+		// create refs/heads/foo when refs/heads/foo/.bad is itself an
+		// invalid-named occupant reaches the DESCENDANT check below — the
+		// occupied entry's own Path (refs/heads/foo/.bad) carries the
+		// invalid component, while u.Dst (refs/heads/foo) is perfectly
+		// valid and was never in question. checkDst would only ever block
+		// the reverse shape (a dst that is ITSELF invalid), which the
+		// ancestor check can therefore never actually reach in practice —
+		// any ancestor with an invalid name component would already make
+		// u.Dst invalid too, and checkDst above has already refused it.
+		//
+		// Three checks, in order, first hit wins: exact name (u.Dst IS a
+		// skipped path), ancestor (u.Dst would be CREATED BENEATH a skipped
+		// FILE — a leaf occupant that cannot become this create's parent
+		// folder), descendant (u.Dst would be CREATED ABOVE skipped content —
+		// this create needs to become a leaf, but something the helper never
+		// touches still lives underneath it).
+		if s, ok := occupied[u.Dst]; ok {
+			fail(i, OccupancyMessage(root, s))
+			continue
+		}
+		if s, ok := occupiedAncestor(occupied, u.Dst); ok {
+			fail(i, OccupancyMessage(root, s))
+			continue
+		}
+		if s, ok := occupiedDescendant(skipped, u.Dst); ok {
+			fail(i, OccupancyMessage(root, s))
 			continue
 		}
 
@@ -460,11 +534,13 @@ func Push(t transport.Transport, root, gitDir string,
 			// WriteRef (refs.go) returns (Refused, nil) — no error —
 			// specifically when this is a create (exists == false) and a
 			// concurrent creator won the race; it deliberately did not
-			// overwrite. createRefHealingCollision can reach this arm the
-			// same way, via its own inner WriteRef call, whenever the
-			// collision it found was NOT a folder at all (its own doc
-			// comment: "not a folder collision: surface the original
-			// result"). Either way this is not success: our newSha was never
+			// overwrite. createRefHealingCollision can reach this same
+			// (Refused, nil) arm two ways, both surfacing that original
+			// WriteRef result unmodified (its own doc comment above):
+			// nothing occupies the name at all (a Stat race — the
+			// occupant vanished between WriteRef's attempt and this Stat),
+			// or the occupant IS a valid ref, i.e. a genuine concurrent
+			// creator. Either way this is not success: our newSha was never
 			// published, so reporting OK: true here would make git update
 			// its remote-tracking ref to a sha that disagrees with what is
 			// actually on the remote, with nothing to signal the mismatch.
@@ -495,6 +571,37 @@ func parentOf(ref string) string {
 		return ""
 	}
 	return ref[:i]
+}
+
+// occupiedAncestor walks dst's ref-name ancestry upward (repeated parentOf)
+// and reports the first level that is itself a skipped path — a CREATE/UPDATE
+// landing BENEATH a skipped FILE (e.g. refs/heads/foo is a skipped occupant;
+// dst is refs/heads/foo/bar). The skipped entry's own Path IS the colliding
+// ancestor, so it is returned as-is for OccupancyMessage to render.
+func occupiedAncestor(occupied map[string]SkippedRef, dst string) (SkippedRef, bool) {
+	for p := parentOf(dst); p != ""; p = parentOf(p) {
+		if s, ok := occupied[p]; ok {
+			return s, true
+		}
+	}
+	return SkippedRef{}, false
+}
+
+// occupiedDescendant linear-scans skipped for an entry strictly BENEATH dst
+// — a CREATE/UPDATE landing ABOVE skipped content (e.g. refs/heads/foo/bar is
+// a skipped occupant; dst is refs/heads/foo). dst would have to become a leaf
+// ref sitting where skipped content this helper never modifies or deletes
+// still lives underneath it, so the create must be refused instead. A linear
+// scan over the original slice (not a map) so ties among multiple skipped
+// descendants resolve in ScanRefs' own walk order, deterministically.
+func occupiedDescendant(skipped []SkippedRef, dst string) (SkippedRef, bool) {
+	prefix := dst + "/"
+	for _, s := range skipped {
+		if strings.HasPrefix(s.Path, prefix) {
+			return s, true
+		}
+	}
+	return SkippedRef{}, false
 }
 
 // protectedNamespaceRoots are the folders Bootstrap creates as part of the
@@ -658,10 +765,16 @@ func describeBlockers(t transport.Transport, root string, files []string) string
 // this is the correctness half of that pair — prune's best-effort stance is
 // only safe because this exists to clean up what it can leave behind.
 //
-// A non-Committed outcome that is NOT a folder collision (an ordinary
-// concurrent-creator Refused, or any other transport failure) is surfaced
-// unmodified: this function invents no new diagnosis for a failure mode it
-// has no positive evidence for.
+// A non-Committed outcome is surfaced unmodified only where this function
+// has no positive evidence to diagnose beyond the original result: nothing
+// occupies the name at all, or the occupant is a protected namespace root
+// (a permanent, non-residue collision) — see each arm below. A FILE
+// occupant is classified instead: a valid ref (an ordinary concurrent
+// creator) still surfaces the original result unmodified, but foreign or
+// malformed content gets its own new diagnosis, matching the read
+// boundary's own classification. A FOLDER occupant is either self-healed
+// (empty residue, trashed and retried once) or refused naming each
+// blocking file as a ref or as foreign data.
 func createRefHealingCollision(t transport.Transport, root, ref, sha string) (transport.Outcome, error) {
 	out, err := WriteRef(t, root, ref, sha, false)
 	if err == nil && out == transport.Committed {
@@ -672,8 +785,77 @@ func createRefHealingCollision(t transport.Transport, root, ref, sha string) (tr
 		return transport.Ambiguous, fmt.Errorf("create of %s did not commit and its "+
 			"diagnosis failed: %v (original: %v)", ref, serr, err)
 	}
-	if !ok || !n.IsDir {
-		return out, err // not a folder collision: surface the original result
+	if !ok {
+		// Nothing occupies the name at all — not a folder collision, and
+		// nothing to diagnose either. This is what
+		// TestPushReportsFailureWhenRefCreateLosesConcurrentRace's stub
+		// exercises (it forces CreateExclusive to refuse without ever
+		// writing anything), and it is also the shape a genuinely absent
+		// occupant would take: the ORIGINAL result stands untouched, same
+		// as before this task.
+		return out, err
+	}
+	if !n.IsDir {
+		// RACE WINDOW (Task 4, secondary to Task 3's pre-advertisement
+		// occupancy preflight): this file occupant did not exist when that
+		// preflight ran — it appeared between then and this create's own
+		// WriteRef attempt, so `skipped` never named it and occupancy never
+		// refused it up front. This Stat is the only place the race is ever
+		// actually observed, so the diagnosis has to live here.
+		//
+		// Size-gate FIRST, from the Stat already in hand — no extra round
+		// trip — using the SAME [refBandMin, refBandMax] candidate band
+		// component 1 (refs.go) gates ScanRefs on: an out-of-band occupant
+		// is classified by size alone and NEVER downloaded, matching the
+		// "never download what cannot be bounded" rule. Only an in-band
+		// candidate is read and classified — with classifyRefContent, the
+		// ONE classifier (refs.go) — so this arm's wording can never drift
+		// from ScanRefs' own skip reasons or the occupancy preflight's
+		// (refscan.go's OccupancyMessage, reused below unmodified).
+		if n.Size < refBandMin || n.Size > refBandMax {
+			reason := fmt.Sprintf("not a ref: size %d outside the %d-%d candidate band",
+				n.Size, refBandMin, refBandMax)
+			if n.Size < 0 {
+				// Belt-and-braces, matching readRefClassified's own arm
+				// (refs.go): the Fake and the certified CLI never report a
+				// negative size for a real file, but nothing here refuses
+				// to download unbounded content on the strength of a
+				// transport that cannot supply a size at all.
+				reason = "not a ref: size unknown; refusing to download unbounded content"
+			}
+			sk := SkippedRef{Path: ref, Kind: SkipContent, Reason: reason}
+			return transport.Refused, errors.New(OccupancyMessage(root, sk))
+		}
+		_, rerr := readRef(t, root+"/"+ref)
+		if rerr == nil {
+			// A valid ref genuinely occupies the name: an ordinary
+			// concurrent creator, not foreign data. WriteRef's own
+			// concurrent-creator convention (refs.go) is already correct
+			// for this case — the original (out, err) stands byte-unchanged,
+			// never replaced with a diagnosis this occupant does not need.
+			return out, err
+		}
+		if errors.Is(rerr, errMalformedRef) {
+			// A grammar failure, typed (never message-text matched — same
+			// discipline as readRefClassified's own typed split): classify
+			// the bytes readRef already downloaded, so a noncanonical
+			// damaged-ref shape (CRLF/no-LF/double-LF terminator) recovers
+			// its hex here exactly as it would at the advertisement
+			// boundary, rather than degrading to a generic preview.
+			raw := malformedRaw(rerr)
+			reason, hex := classifyRefContent(raw)
+			sk := SkippedRef{Path: ref, Kind: SkipContent, Reason: reason, Hex: hex}
+			return transport.Refused, errors.New(OccupancyMessage(root, sk))
+		}
+		// A genuine transport/read failure (readRef's ReadTo/ReadDir/
+		// ReadFile arms) diagnosing the occupant — distinct from a grammar
+		// failure by TYPE, never by message text. Nothing is invented about
+		// content that was never actually read: the original result stands,
+		// with the diagnosis failure noted alongside it — the same
+		// only-act-on-positive-evidence posture as the Stat-error arm
+		// above and the folder heal below.
+		return out, fmt.Errorf("create of %s did not commit and its diagnosis is "+
+			"unavailable: %v (original: %v)", ref, rerr, err)
 	}
 	if protectedNamespaceRoots[ref] {
 		// A create whose OWN destination is "refs", "refs/heads", or

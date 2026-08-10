@@ -403,22 +403,51 @@ func TestWriteAndListRefs(t *testing.T) {
 	if out, err := WriteRef(f, "/r", "refs/heads/main", sha, false); err != nil || out != transport.Committed {
 		t.Fatalf("create ref: %v %v", out, err)
 	}
-	refs, err := ListRefs(f, "/r")
+	scan, err := ScanRefs(f, "/r")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if refs["refs/heads/main"] != sha {
-		t.Errorf("got %q", refs["refs/heads/main"])
+	if scan.Refs["refs/heads/main"] != sha {
+		t.Errorf("got %q", scan.Refs["refs/heads/main"])
 	}
 }
 
-func TestListRefsRejectsCorruptRefFile(t *testing.T) {
+// TestScanRefsOutOfBandCorruptFileNowSkipsWithIntactSiblings — SEMANTIC
+// CONVERSION from the retired TestListRefsRejectsCorruptRefFile (Stage 5's
+// "malformed content is fatal" premise). "not-a-sha\n" is 10 bytes, well
+// outside the 40-42 candidate band, so under Stage 6's size-gated
+// classification it is now an out-of-band SKIP, never a fatal error
+// (round-1 Codex: the draft plan claimed only the exact-grammar test below
+// flips — this one does too). A good sibling is asserted intact, per the
+// brief's Step 4 instruction to convert this test to "the skip + intact
+// siblings".
+func TestScanRefsOutOfBandCorruptFileNowSkipsWithIntactSiblings(t *testing.T) {
 	f := transport.NewFake()
 	f.Dirs["/r"] = true
 	_ = Bootstrap(f, "/r")
-	f.Files["/r/refs/heads/bad"] = []byte("not-a-sha\n")
-	if _, err := ListRefs(f, "/r"); err == nil {
-		t.Error("a malformed ref file must be fatal, never coerced")
+	sha := "1111111111111111111111111111111111111111"
+	f.Files["/r/refs/heads/main"] = []byte(sha + "\n")
+	f.Files["/r/refs/heads/bad"] = []byte("not-a-sha\n") // 10 bytes, out-of-band
+
+	scan, err := ScanRefs(f, "/r")
+	if err != nil {
+		t.Fatalf("an out-of-band candidate must never be fatal: %v", err)
+	}
+	if scan.Refs["refs/heads/main"] != sha {
+		t.Errorf("the intact sibling must still be advertised, got %v", scan.Refs)
+	}
+	if _, ok := scan.Refs["refs/heads/bad"]; ok {
+		t.Errorf("the junk file must not be advertised, got %v", scan.Refs)
+	}
+	if len(scan.Skipped) != 1 {
+		t.Fatalf("want exactly one skip, got %+v", scan.Skipped)
+	}
+	sk := scan.Skipped[0]
+	if sk.Path != "refs/heads/bad" || sk.Kind != SkipContent {
+		t.Errorf("want SkippedRef{Path: refs/heads/bad, Kind: SkipContent}, got %+v", sk)
+	}
+	if !strings.Contains(sk.Reason, "size 10") {
+		t.Errorf("reason must cite the size, got %q", sk.Reason)
 	}
 }
 
@@ -442,10 +471,11 @@ func TestListRefsRecursesAllNamespaces(t *testing.T) {
 		f.Files["/r/"+name] = []byte(sha + "\n")
 	}
 
-	refs, err := ListRefs(f, "/r")
+	scan, err := ScanRefs(f, "/r")
 	if err != nil {
-		t.Fatalf("ListRefs: %v", err)
+		t.Fatalf("ScanRefs: %v", err)
 	}
+	refs := scan.Refs
 	for _, name := range seed {
 		if refs[name] != sha {
 			t.Errorf("refs[%q] = %q, want %q (full map: %v)", name, refs[name], sha, refs)
@@ -475,13 +505,14 @@ func TestListRefsSkipsInvalidNamesWithNoteNeverFatal(t *testing.T) {
 	// specifically; the folder-skip path is the next test.
 	f.Files["/r/refs/heads/a{b}"] = []byte(sha + "\n")
 
-	var refs map[string]string
+	var scan *RefScan
 	var err error
-	stderr := captureStderr(t, func() { refs, err = ListRefs(f, "/r") })
+	stderr := captureStderr(t, func() { scan, err = ScanRefs(f, "/r") })
 
 	if err != nil {
 		t.Fatalf("a foreign junk name must never be fatal: %v", err)
 	}
+	refs := scan.Refs
 	if refs["refs/heads/main"] != sha {
 		t.Errorf("the well-named sibling must still be advertised, got %v", refs)
 	}
@@ -537,13 +568,14 @@ func TestListRefsNeverListsBeneathAnInvalidFolderName(t *testing.T) {
 	f.Files["/r/refs/heads/a{b}/y"] = []byte(sha + "\n")
 
 	tr := &tracedListTransport{Fake: f}
-	var refs map[string]string
+	var scan *RefScan
 	var err error
-	stderr := captureStderr(t, func() { refs, err = ListRefs(tr, "/r") })
+	stderr := captureStderr(t, func() { scan, err = ScanRefs(tr, "/r") })
 
 	if err != nil {
 		t.Fatalf("an invalid folder name must never be fatal: %v", err)
 	}
+	refs := scan.Refs
 	if refs["refs/heads/main"] != sha {
 		t.Errorf("the valid sibling must still be advertised, got %v", refs)
 	}
@@ -586,14 +618,17 @@ func TestSkipNoteText(t *testing.T) {
 	}
 }
 
-// TestListRefsMalformedContentStillFatal pins the readRef tightening: the
-// OLD TrimRight(sha, "\r\n") tolerated a bare sha with no trailing newline, a
-// CRLF terminator, and (because TrimRight strips a whole trailing run of
-// \r/\n bytes) even a double-LF terminator — none of those are bytes v2
-// itself ever writes (WriteRef always writes sha+"\n"), so all three are
-// foreign or damaged data and must be fatal under the spec's exact grammar:
-// 40 lowercase hex plus a single trailing newline, nothing else.
-func TestListRefsMalformedContentStillFatal(t *testing.T) {
+// TestScanRefsMalformedContentSkipsWithHex — RETITLED from
+// TestListRefsMalformedContentStillFatal (SEMANTIC CONVERSION #1 of the
+// brief's Step 4: "the retitled exact-grammar test"). The OLD test pinned
+// the Stage 5 premise that malformed content is fatal; Stage 6 retires that
+// premise for exactly these three shapes, because all three sit inside the
+// 40-42 candidate band (no-LF=40, CRLF=42, double-LF=42) — they are now
+// in-band SKIPS with the recoverable 40-hex carried forward in Hex, never
+// fatal errors. Fixture bytes preserved byte-for-byte from the retired test
+// per the brief ("reuse the exact fixture bytes... the old test name must
+// not survive, its premise is retired by the spec").
+func TestScanRefsMalformedContentSkipsWithHex(t *testing.T) {
 	sha := "1111111111111111111111111111111111111111"
 	cases := []struct {
 		name    string
@@ -609,10 +644,387 @@ func TestListRefsMalformedContentStillFatal(t *testing.T) {
 			f.Dirs["/r"] = true
 			_ = Bootstrap(f, "/r")
 			f.Files["/r/refs/heads/bad"] = c.content
-			if _, err := ListRefs(f, "/r"); err == nil {
-				t.Errorf("%s must be fatal under the exact grammar, got no error", c.name)
+
+			scan, err := ScanRefs(f, "/r")
+			if err != nil {
+				t.Fatalf("%s must skip under the size-gated band, never be fatal: %v", c.name, err)
+			}
+			if _, ok := scan.Refs["refs/heads/bad"]; ok {
+				t.Errorf("%s must not be advertised, got %v", c.name, scan.Refs)
+			}
+			if len(scan.Skipped) != 1 {
+				t.Fatalf("%s: want exactly one skip, got %+v", c.name, scan.Skipped)
+			}
+			sk := scan.Skipped[0]
+			if sk.Kind != SkipContent {
+				t.Errorf("%s: want Kind=SkipContent, got %v", c.name, sk.Kind)
+			}
+			if !strings.Contains(sk.Reason, "malformed terminator") {
+				t.Errorf("%s: reason must say malformed terminator, got %q", c.name, sk.Reason)
+			}
+			if sk.Hex != sha {
+				t.Errorf("%s: want recovered Hex %q, got %q", c.name, sha, sk.Hex)
 			}
 		})
+	}
+}
+
+// RED: junk beside good refs — Refs has the good refs only; Skipped carries
+// the junk with Kind=SkipContent and its classified Reason; note emitted.
+func TestScanRefsClassifiesContentJunkBesideGoodRefs(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	f.Files["/r/refs/heads/main"] = []byte(sha + "\n")
+	f.Files["/r/refs/heads/junk"] = []byte("hello world\n") // 12 bytes, out-of-band
+
+	var scan *RefScan
+	var err error
+	stderr := captureStderr(t, func() { scan, err = ScanRefs(f, "/r") })
+	if err != nil {
+		t.Fatalf("content junk must never be fatal: %v", err)
+	}
+	if len(scan.Refs) != 1 || scan.Refs["refs/heads/main"] != sha {
+		t.Errorf("want exactly the good ref advertised, got %v", scan.Refs)
+	}
+	if len(scan.Skipped) != 1 {
+		t.Fatalf("want exactly one skip, got %+v", scan.Skipped)
+	}
+	sk := scan.Skipped[0]
+	if sk.Path != "refs/heads/junk" || sk.Kind != SkipContent {
+		t.Errorf("want SkippedRef{Path: refs/heads/junk, Kind: SkipContent}, got %+v", sk)
+	}
+	if !strings.Contains(sk.Reason, "size 12") {
+		t.Errorf("reason must cite the size, got %q", sk.Reason)
+	}
+	if !strings.Contains(stderr, "refs/heads/junk") {
+		t.Errorf("skipping the junk file must emit a note naming it, got stderr %q", stderr)
+	}
+}
+
+// RED (size gate, trace-asserted): an out-of-band file is skipped WITHOUT any
+// ReadTo — the traced transport records no download of its path.
+func TestScanRefsOutOfBandSkipsWithoutDownload(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	f.Files["/r/refs/heads/main"] = []byte(sha + "\n")
+	f.Files["/r/refs/heads/junk"] = []byte("hello world\n") // 12 bytes, out-of-band
+
+	var trace strings.Builder
+	tr := transport.NewTraced(f, &trace)
+	scan, err := ScanRefs(tr, "/r")
+	if err != nil {
+		t.Fatalf("ScanRefs: %v", err)
+	}
+	if scan.Refs["refs/heads/main"] != sha {
+		t.Fatalf("the in-band control must be read, got %v", scan.Refs)
+	}
+	if strings.Contains(trace.String(), "refs/heads/junk") {
+		t.Errorf("an out-of-band file must never be downloaded, trace: %q", trace.String())
+	}
+	if !strings.Contains(trace.String(), "refs/heads/main") {
+		t.Errorf("the in-band control must be downloaded, trace: %q", trace.String())
+	}
+}
+
+// RED: in-band non-ref (41B of junk, e.g. "x" repeated 40 + "\n") downloads,
+// fails grammar, skips with escaped preview in Reason.
+func TestScanRefsInBandJunkSkipsWithPreview(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	junk := strings.Repeat("x", 40) + "\n" // 41 bytes, in-band, not hex
+	f.Files["/r/refs/heads/junk"] = []byte(junk)
+
+	var trace strings.Builder
+	tr := transport.NewTraced(f, &trace)
+	scan, err := ScanRefs(tr, "/r")
+	if err != nil {
+		t.Fatalf("ScanRefs: %v", err)
+	}
+	if len(scan.Refs) != 0 {
+		t.Errorf("junk must not be advertised, got %v", scan.Refs)
+	}
+	if !strings.Contains(trace.String(), "refs/heads/junk") {
+		t.Errorf("an in-band candidate must be downloaded, trace: %q", trace.String())
+	}
+	if len(scan.Skipped) != 1 {
+		t.Fatalf("want exactly one skip, got %+v", scan.Skipped)
+	}
+	sk := scan.Skipped[0]
+	if sk.Kind != SkipContent {
+		t.Errorf("want Kind=SkipContent, got %v", sk.Kind)
+	}
+	if !strings.Contains(sk.Reason, "not a ref") {
+		t.Errorf("reason must say not a ref, got %q", sk.Reason)
+	}
+	wantPreview := fmt.Sprintf("%q", junk) // classifyRefContent's escaping
+	if !strings.Contains(sk.Reason, wantPreview) {
+		t.Errorf("reason must carry the escaped preview %s, got %q", wantPreview, sk.Reason)
+	}
+	if sk.Hex != "" {
+		t.Errorf("non-hex junk must not recover a Hex, got %q", sk.Hex)
+	}
+}
+
+// RED (noncanonical): 40B no-LF and 42B CRLF fixtures — both downloaded
+// (in-band), both skipped, Reason says malformed terminator, Hex carries the
+// 40-hex.
+func TestScanRefsNoncanonicalHexRecovered(t *testing.T) {
+	sha := "2222222222222222222222222222222222222222"
+	cases := []struct {
+		name    string
+		content []byte
+	}{
+		{"no-LF (40B)", []byte(sha)},
+		{"CRLF (42B)", []byte(sha + "\r\n")},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := transport.NewFake()
+			f.Dirs["/r"] = true
+			_ = Bootstrap(f, "/r")
+			f.Files["/r/refs/heads/bad"] = c.content
+
+			var trace strings.Builder
+			tr := transport.NewTraced(f, &trace)
+			scan, err := ScanRefs(tr, "/r")
+			if err != nil {
+				t.Fatalf("%s: ScanRefs: %v", c.name, err)
+			}
+			if !strings.Contains(trace.String(), "refs/heads/bad") {
+				t.Errorf("%s: must be downloaded (in-band), trace: %q", c.name, trace.String())
+			}
+			if len(scan.Skipped) != 1 {
+				t.Fatalf("%s: want exactly one skip, got %+v", c.name, scan.Skipped)
+			}
+			sk := scan.Skipped[0]
+			if !strings.Contains(sk.Reason, "malformed terminator") {
+				t.Errorf("%s: reason must say malformed terminator, got %q", c.name, sk.Reason)
+			}
+			if sk.Hex != sha {
+				t.Errorf("%s: want recovered hex %q, got %q", c.name, sha, sk.Hex)
+			}
+		})
+	}
+}
+
+// RED: 42B non-hex junk (in-band, wrong content) -> SkipContent, no Hex.
+func TestScanRefsInBandNonHexHasNoHex(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	f.Files["/r/refs/heads/bad"] = []byte(strings.Repeat("y", 42)) // 42 bytes, in-band, not hex at all
+
+	scan, err := ScanRefs(f, "/r")
+	if err != nil {
+		t.Fatalf("ScanRefs: %v", err)
+	}
+	if len(scan.Skipped) != 1 {
+		t.Fatalf("want exactly one skip, got %+v", scan.Skipped)
+	}
+	sk := scan.Skipped[0]
+	if sk.Kind != SkipContent {
+		t.Errorf("want Kind=SkipContent, got %v", sk.Kind)
+	}
+	if sk.Hex != "" {
+		t.Errorf("non-hex junk must not recover a Hex, got %q", sk.Hex)
+	}
+}
+
+// failingReadToTransport wraps a Fake and fails ReadTo for exactly one
+// path, simulating a transport/network failure distinct from a grammar
+// failure — the fixture TestScanRefsTransportFailureStaysFatalWhileGrammarSkips
+// needs to prove the typed split does not conflate the two.
+type failingReadToTransport struct {
+	*transport.Fake
+	failPath string
+}
+
+func (tr *failingReadToTransport) ReadTo(p, local string) error {
+	if p == tr.failPath {
+		return fmt.Errorf("simulated transport failure reading %s", p)
+	}
+	return tr.Fake.ReadTo(p, local)
+}
+
+// GUARD (typed split — deliberate regression required): a transport ReadTo
+// failure during the walk stays FATAL (error names the path; no partial map);
+// the grammar failure beside it skips. "aaa-junk" sorts before "zzz-fails"
+// (Fake.List sorts by name), so the walk processes the grammar-failing file
+// first (an internal skip) before reaching the ReadTo failure and aborting —
+// proving the typed split, not merely absence of any download at all.
+func TestScanRefsTransportFailureStaysFatalWhileGrammarSkips(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	junk := strings.Repeat("x", 40) + "\n" // 41 bytes, in-band, grammar failure
+	f.Files["/r/refs/heads/aaa-junk"] = []byte(junk)
+	sha := "1111111111111111111111111111111111111111"
+	f.Files["/r/refs/heads/zzz-fails"] = []byte(sha + "\n") // 41 bytes, in-band, ReadTo fails
+
+	tr := &failingReadToTransport{Fake: f, failPath: "/r/refs/heads/zzz-fails"}
+	scan, err := ScanRefs(tr, "/r")
+	if err == nil {
+		t.Fatal("a transport ReadTo failure must be fatal, not a skip")
+	}
+	if !strings.Contains(err.Error(), "refs/heads/zzz-fails") {
+		t.Errorf("the fatal error must name the failing path, got: %v", err)
+	}
+	if scan != nil {
+		t.Errorf("a fatal error must not return a partial scan, got %+v", scan)
+	}
+}
+
+// RED: name-skips now recorded — invalid-named file -> SkipInvalidName;
+// invalid-named folder -> SkipInvalidNameFolder (and STILL no List beneath
+// it — extends TestListRefsNeverListsBeneathAnInvalidFolderName's trace
+// assertion above, does not weaken it).
+func TestScanRefsRecordsNameSkipsAsOccupancies(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	f.Files["/r/refs/heads/main"] = []byte(sha + "\n")
+	f.Files["/r/refs/heads/a{b}"] = []byte(sha + "\n")      // invalid-named FILE
+	f.Files["/r/refs/heads/.hidden/x"] = []byte(sha + "\n") // invalid-named FOLDER
+
+	tr := &tracedListTransport{Fake: f}
+	scan, err := ScanRefs(tr, "/r")
+	if err != nil {
+		t.Fatalf("name-skips must never be fatal: %v", err)
+	}
+	if scan.Refs["refs/heads/main"] != sha {
+		t.Errorf("the valid sibling must still be advertised, got %v", scan.Refs)
+	}
+
+	var fileSkip, folderSkip *SkippedRef
+	for i := range scan.Skipped {
+		switch scan.Skipped[i].Path {
+		case "refs/heads/a{b}":
+			fileSkip = &scan.Skipped[i]
+		case "refs/heads/.hidden":
+			folderSkip = &scan.Skipped[i]
+		}
+	}
+	if fileSkip == nil || fileSkip.Kind != SkipInvalidName {
+		t.Errorf("want refs/heads/a{b} recorded as SkipInvalidName, got %+v (all: %+v)", fileSkip, scan.Skipped)
+	}
+	if folderSkip == nil || folderSkip.Kind != SkipInvalidNameFolder {
+		t.Errorf("want refs/heads/.hidden recorded as SkipInvalidNameFolder, got %+v (all: %+v)", folderSkip, scan.Skipped)
+	}
+	for _, p := range tr.listed {
+		if strings.Contains(p, ".hidden") {
+			t.Errorf("List() must never be called beneath the invalid folder, but got %q (all calls: %v)", p, tr.listed)
+		}
+	}
+}
+
+// RED: OccupancyMessage renders all three kinds; folder text contains
+// "inspect" and never the word "file"; SkipInvalidName says "contents never
+// examined"; SkipContent contains the CLI trash grammar with the full path.
+func TestOccupancyMessageKindAware(t *testing.T) {
+	root := "/r"
+	p := "refs/heads/junk"
+
+	content := OccupancyMessage(root, SkippedRef{
+		Path: p, Kind: SkipContent,
+		Reason: "not a ref: size 12 outside the 40-42 candidate band",
+	})
+	if !strings.Contains(content, "proton-drive filesystem trash "+root+"/"+p) {
+		t.Errorf("SkipContent message must contain the CLI trash grammar with the full path, got %q", content)
+	}
+
+	name := OccupancyMessage(root, SkippedRef{Path: p, Kind: SkipInvalidName})
+	if !strings.Contains(name, "contents never examined") {
+		t.Errorf("SkipInvalidName message must say contents never examined, got %q", name)
+	}
+
+	folder := OccupancyMessage(root, SkippedRef{Path: "refs/heads/.hidden", Kind: SkipInvalidNameFolder})
+	if !strings.Contains(folder, "inspect") {
+		t.Errorf("SkipInvalidNameFolder message must say inspect, got %q", folder)
+	}
+	if strings.Contains(folder, "file") {
+		t.Errorf("SkipInvalidNameFolder message must never say the word file, got %q", folder)
+	}
+}
+
+// sizeOverrideTransport wraps a Fake's List, overriding the Size reported
+// for one specific leaf name to -1 (the cannot-know sentinel this package
+// uses for "size unavailable" — the certified CLI itself never reports a
+// negative size for a real file; this wrapper simulates the belt-and-braces
+// arm readRefClassified carries for a transport that cannot supply one).
+type sizeOverrideTransport struct {
+	*transport.Fake
+	leaf string
+}
+
+func (tr *sizeOverrideTransport) List(p string) ([]transport.Node, error) {
+	nodes, err := tr.Fake.List(p)
+	if err != nil {
+		return nil, err
+	}
+	for i := range nodes {
+		if nodes[i].Name == tr.leaf {
+			nodes[i].Size = -1
+		}
+	}
+	return nodes, nil
+}
+
+// GUARD: size-unknown arm — a wrapper transport that zeroes Size... NOTE:
+// Fake reports real sizes, so build a listWrapper that sets Size=-1 for one
+// file; assert skip-without-download with "size unknown" in Reason.
+func TestScanRefsUnknownSizeSkipsWithoutDownload(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	sha := "1111111111111111111111111111111111111111"
+	f.Files["/r/refs/heads/main"] = []byte(sha + "\n")
+
+	var trace strings.Builder
+	tr := transport.NewTraced(&sizeOverrideTransport{Fake: f, leaf: "main"}, &trace)
+	scan, err := ScanRefs(tr, "/r")
+	if err != nil {
+		t.Fatalf("ScanRefs: %v", err)
+	}
+	if len(scan.Refs) != 0 {
+		t.Errorf("a size-unknown candidate must not be advertised, got %v", scan.Refs)
+	}
+	if strings.Contains(trace.String(), "refs/heads/main") {
+		t.Errorf("a size-unknown candidate must never be downloaded, trace: %q", trace.String())
+	}
+	if len(scan.Skipped) != 1 || !strings.Contains(scan.Skipped[0].Reason, "size unknown") {
+		t.Errorf("want one skip with 'size unknown' in the reason, got %+v", scan.Skipped)
+	}
+}
+
+// RED (upper bound — round-1 Codex: without it an implementation checking
+// only size<40 passes everything): a 100-byte junk file skips WITHOUT any
+// ReadTo (trace-asserted), Reason cites the size.
+func TestScanRefsOversizedSkipsWithoutDownload(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	f.Files["/r/refs/heads/huge"] = []byte(strings.Repeat("z", 100))
+
+	var trace strings.Builder
+	tr := transport.NewTraced(f, &trace)
+	scan, err := ScanRefs(tr, "/r")
+	if err != nil {
+		t.Fatalf("ScanRefs: %v", err)
+	}
+	if len(scan.Refs) != 0 {
+		t.Errorf("an oversized candidate must not be advertised, got %v", scan.Refs)
+	}
+	if strings.Contains(trace.String(), "refs/heads/huge") {
+		t.Errorf("an oversized candidate must never be downloaded, trace: %q", trace.String())
+	}
+	if len(scan.Skipped) != 1 || !strings.Contains(scan.Skipped[0].Reason, "size 100") {
+		t.Errorf("want one skip citing the size, got %+v", scan.Skipped)
 	}
 }
 
@@ -625,12 +1037,12 @@ func TestListRefsIgnoresEmptyFolders(t *testing.T) {
 	if err := f.EnsureDir("/r/refs/heads/empty"); err != nil {
 		t.Fatalf("EnsureDir: %v", err)
 	}
-	refs, err := ListRefs(f, "/r")
+	scan, err := ScanRefs(f, "/r")
 	if err != nil {
-		t.Fatalf("ListRefs: %v", err)
+		t.Fatalf("ScanRefs: %v", err)
 	}
-	if len(refs) != 0 {
-		t.Errorf("an empty tree must advertise nothing, got %v", refs)
+	if len(scan.Refs) != 0 {
+		t.Errorf("an empty tree must advertise nothing, got %v", scan.Refs)
 	}
 }
 
@@ -701,7 +1113,7 @@ func TestPushResolveFailureCarriesGitsOwnReason(t *testing.T) {
 	gitDir := newGitRepoForPush(t)
 
 	ups := []protocol.RefUpdate{{Src: "refs/heads/no-such-branch", Dst: "refs/heads/main"}}
-	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	res := Push(f, "/r", gitDir, ups, map[string]string{}, nil)
 	if len(res) != 1 || res[0].OK {
 		t.Fatalf("an unresolvable source must fail, got %+v", res)
 	}
@@ -910,7 +1322,7 @@ func TestPushRejectsNonFastForward(t *testing.T) {
 
 	gitDir := newGitRepoForPush(t)
 	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/main"}}
-	res := Push(f, "/r", gitDir, ups, map[string]string{"refs/heads/main": old})
+	res := Push(f, "/r", gitDir, ups, map[string]string{"refs/heads/main": old}, nil)
 	if len(res) != 1 || res[0].OK {
 		t.Fatalf("want one failed result, got %+v", res)
 	}
@@ -933,7 +1345,7 @@ func TestPushDeleteRef(t *testing.T) {
 	_, _ = WriteRef(f, "/r", "refs/heads/tmp", sha, false)
 
 	ups := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/tmp"}}
-	res := Push(f, "/r", t.TempDir(), ups, map[string]string{"refs/heads/tmp": sha})
+	res := Push(f, "/r", t.TempDir(), ups, map[string]string{"refs/heads/tmp": sha}, nil)
 	if len(res) != 1 || !res[0].OK {
 		t.Fatalf("delete should succeed: %+v", res)
 	}
@@ -973,7 +1385,7 @@ func TestPushOrderingPackAndIdxLandBeforeRef(t *testing.T) {
 	head := headOf(t, gitDir)
 
 	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/main"}}
-	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	res := Push(f, "/r", gitDir, ups, map[string]string{}, nil)
 	if len(res) != 1 || !res[0].OK {
 		t.Fatalf("push should succeed: %+v", res)
 	}
@@ -1020,7 +1432,7 @@ func TestPushRefNotPublishedWhenPackUploadIsAmbiguous(t *testing.T) {
 	amb := ambiguousPackUploadTransport{f}
 
 	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/main"}}
-	res := Push(amb, "/r", gitDir, ups, map[string]string{})
+	res := Push(amb, "/r", gitDir, ups, map[string]string{}, nil)
 	if len(res) != 1 || res[0].OK {
 		t.Fatalf("want a failed result when the pack upload is ambiguous, got %+v", res)
 	}
@@ -1063,7 +1475,7 @@ func TestPushAcceptsHierarchicalDestinationNowThatListRefsRecurses(t *testing.T)
 	head := headOf(t, gitDir)
 
 	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feat/x"}}
-	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	res := Push(f, "/r", gitDir, ups, map[string]string{}, nil)
 
 	if len(res) != 1 || !res[0].OK {
 		t.Fatalf("a hierarchical destination must now be accepted, got %+v", res)
@@ -1071,12 +1483,12 @@ func TestPushAcceptsHierarchicalDestinationNowThatListRefsRecurses(t *testing.T)
 	if packs, idxs := countPackFiles(f, "/r"); packs == 0 || idxs == 0 {
 		t.Errorf("a successful push must still upload a pack/idx pair, got pack=%d idx=%d", packs, idxs)
 	}
-	refs, err := ListRefs(f, "/r")
+	scan, err := ScanRefs(f, "/r")
 	if err != nil {
-		t.Fatalf("ListRefs: %v", err)
+		t.Fatalf("ScanRefs: %v", err)
 	}
-	if refs["refs/heads/feat/x"] != head {
-		t.Errorf("the ref just published must be advertised back, got %v", refs)
+	if scan.Refs["refs/heads/feat/x"] != head {
+		t.Errorf("the ref just published must be advertised back, got %v", scan.Refs)
 	}
 }
 
@@ -1106,7 +1518,7 @@ func TestPushRejectsPseudorefDestination(t *testing.T) {
 			f.Dirs["/r"] = true
 			_ = Bootstrap(f, "/r")
 			ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: dst}}
-			res := Push(f, "/r", gitDir, ups, map[string]string{})
+			res := Push(f, "/r", gitDir, ups, map[string]string{}, nil)
 			if len(res) != 1 || res[0].OK {
 				t.Fatalf("%q must be rejected with a named reason, got %+v", dst, res)
 			}
@@ -1131,14 +1543,15 @@ func TestPushAcceptsNamespacedDestinations(t *testing.T) {
 			gitDir := newGitRepoForPush(t)
 
 			ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: dst}}
-			res := Push(f, "/r", gitDir, ups, map[string]string{})
+			res := Push(f, "/r", gitDir, ups, map[string]string{}, nil)
 			if len(res) != 1 || !res[0].OK {
 				t.Fatalf("%q must now be accepted, got %+v", dst, res)
 			}
-			refs, err := ListRefs(f, "/r")
+			scan, err := ScanRefs(f, "/r")
 			if err != nil {
-				t.Fatalf("ListRefs: %v", err)
+				t.Fatalf("ScanRefs: %v", err)
 			}
+			refs := scan.Refs
 			if _, ok := refs[dst]; !ok {
 				t.Errorf("%q must be advertised back after publish, got %v", dst, refs)
 			}
@@ -1182,7 +1595,7 @@ func TestPushToRefsHeadsItselfFailsAtPublishNotAtCheckDst(t *testing.T) {
 	}
 
 	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads"}}
-	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	res := Push(f, "/r", gitDir, ups, map[string]string{}, nil)
 	if len(res) != 1 || res[0].OK {
 		t.Fatalf("must still fail (D/F collision with the refs/heads folder), got %+v", res)
 	}
@@ -1215,7 +1628,7 @@ func TestPushRejectsUnsupportedDeleteDestination(t *testing.T) {
 	f.Files["/r/HEAD"] = []byte("ref: refs/heads/main\n")
 
 	ups := []protocol.RefUpdate{{Src: "", Dst: "HEAD"}}
-	res := Push(f, "/r", t.TempDir(), ups, map[string]string{})
+	res := Push(f, "/r", t.TempDir(), ups, map[string]string{}, nil)
 
 	if len(res) != 1 || res[0].OK {
 		t.Fatalf("deleting an unsupported destination must be rejected, not reported ok, got %+v", res)
@@ -1303,7 +1716,7 @@ func TestPushForceSkipsAncestryCheck(t *testing.T) {
 	_, _ = WriteRef(f, "/r", "refs/heads/main", old, false)
 
 	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/main", Force: true}}
-	res := Push(f, "/r", gitDir, ups, map[string]string{"refs/heads/main": old})
+	res := Push(f, "/r", gitDir, ups, map[string]string{"refs/heads/main": old}, nil)
 	if len(res) != 1 || !res[0].OK {
 		t.Fatalf("forced push should succeed despite an unresolvable old sha: %+v", res)
 	}
@@ -1359,7 +1772,7 @@ func TestPushReportsFailureWhenRefCreateLosesConcurrentRace(t *testing.T) {
 	stub := refusedRefCreateTransport{f}
 
 	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/main"}}
-	res := Push(stub, "/r", gitDir, ups, map[string]string{})
+	res := Push(stub, "/r", gitDir, ups, map[string]string{}, nil)
 	if len(res) != 1 || res[0].OK {
 		t.Fatalf("want a failed result when ref create loses a concurrent race, got %+v", res)
 	}
@@ -1385,7 +1798,7 @@ func TestPushRefusedCorruptPackIsRejected(t *testing.T) {
 	f.Files["/r/packs/"+packName] = corrupt // same NAME, different bytes
 
 	tr := &refusingUploadTransport{Fake: f, refuseSuffix: ".pack"}
-	res := Push(tr, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/heads/main"}}, map[string]string{})
+	res := Push(tr, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/heads/main"}}, map[string]string{}, nil)
 	if len(res) != 1 || res[0].OK {
 		t.Fatalf("a refused pack whose bytes differ must fail: %+v", res)
 	}
@@ -1409,7 +1822,7 @@ func TestPushRefusedCorruptIdxIsRejected(t *testing.T) {
 	f.Files["/r/packs/"+idxName] = corrupt
 
 	tr := &refusingUploadTransport{Fake: f, refuseSuffix: ".idx"}
-	res := Push(tr, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/heads/main"}}, map[string]string{})
+	res := Push(tr, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/heads/main"}}, map[string]string{}, nil)
 	if len(res) != 1 || res[0].OK {
 		t.Fatalf("a refused index that does not verify must fail: %+v", res)
 	}
@@ -1475,7 +1888,7 @@ func TestPushRefusedValidButDifferentIdxIsAccepted(t *testing.T) {
 	f.Files["/r/packs/"+idxName] = v1
 
 	tr := &refusingUploadTransport{Fake: f, refuseSuffix: ".idx"}
-	res := Push(tr, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/heads/main"}}, map[string]string{})
+	res := Push(tr, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/heads/main"}}, map[string]string{}, nil)
 	if len(res) != 1 || !res[0].OK {
 		t.Fatalf("a valid but byte-different remote index must be accepted: %+v", res)
 	}
@@ -1493,7 +1906,7 @@ func TestPushRefusedPackWithNoRemoteIdxRepairsTheOrphan(t *testing.T) {
 	f.Files["/r/packs/"+packName] = packBytes // pack only
 
 	tr := &refusingUploadTransport{Fake: f, refuseSuffix: ".pack"}
-	res := Push(tr, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/heads/main"}}, map[string]string{})
+	res := Push(tr, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/heads/main"}}, map[string]string{}, nil)
 	if len(res) != 1 || !res[0].OK {
 		t.Fatalf("a refused pack with no remote idx must be repaired: %+v", res)
 	}
@@ -1576,7 +1989,7 @@ func TestPushRefusesDuplicateDestinationsWholeBatchUntouched(t *testing.T) {
 		{Src: head, Dst: "refs/heads/dup"},
 		{Src: "refs/heads/main", Dst: "refs/heads/solo"},
 	}
-	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	res := Push(f, "/r", gitDir, ups, map[string]string{}, nil)
 	if len(res) != 3 {
 		t.Fatalf("want 3 results, got %+v", res)
 	}
@@ -1612,7 +2025,7 @@ func TestPushFinalStateDFPreflightRefusesConflictingCreates(t *testing.T) {
 		{Src: "refs/heads/main", Dst: "refs/heads/feature"},
 		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"},
 	}
-	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	res := Push(f, "/r", gitDir, ups, map[string]string{}, nil)
 	if len(res) != 2 {
 		t.Fatalf("want 2 results, got %+v", res)
 	}
@@ -1624,12 +2037,12 @@ func TestPushFinalStateDFPreflightRefusesConflictingCreates(t *testing.T) {
 			t.Errorf("result %d must name the conflicting ref, got %q", i, r.Err)
 		}
 	}
-	refs, err := ListRefs(f, "/r")
+	scan, err := ScanRefs(f, "/r")
 	if err != nil {
-		t.Fatalf("ListRefs: %v", err)
+		t.Fatalf("ScanRefs: %v", err)
 	}
-	if len(refs) != 0 {
-		t.Errorf("remote listing must be unchanged, got %v", refs)
+	if len(scan.Refs) != 0 {
+		t.Errorf("remote listing must be unchanged, got %v", scan.Refs)
 	}
 	if packs, idxs := countPackFiles(f, "/r"); packs != 0 || idxs != 0 {
 		t.Errorf("no pack may be built when nothing survives the preflight, got pack=%d idx=%d", packs, idxs)
@@ -1655,7 +2068,7 @@ func TestPushPreflightDFAgainstExistingRefs(t *testing.T) {
 		{Src: "refs/heads/main", Dst: "refs/heads/feature"},
 		{Src: "refs/heads/main", Dst: "refs/heads/unrelated"},
 	}
-	res := Push(f, "/r", gitDir, ups, remote)
+	res := Push(f, "/r", gitDir, ups, remote, nil)
 	if len(res) != 2 {
 		t.Fatalf("want 2 results, got %+v", res)
 	}
@@ -1706,7 +2119,7 @@ func TestPushFinalStateDFPreflightOrderIndependentOfInputOrder(t *testing.T) {
 		{Src: "", Dst: "refs/heads/feature"},                             // delete, listed SECOND
 		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"},            // dependent create
 	}
-	res := Push(f, "/r", gitDir, ups, remote)
+	res := Push(f, "/r", gitDir, ups, remote, nil)
 	if len(res) != 3 {
 		t.Fatalf("want 3 results, got %+v", res)
 	}
@@ -1760,7 +2173,7 @@ func TestPushOtherNamespaceRequiresForce(t *testing.T) {
 		f.Dirs["/r"] = true
 		_ = Bootstrap(f, "/r")
 		ups := []protocol.RefUpdate{{Src: blobSha, Dst: "refs/notes/commits"}}
-		res := Push(f, "/r", gitDir, ups, map[string]string{})
+		res := Push(f, "/r", gitDir, ups, map[string]string{}, nil)
 		if len(res) != 1 || !res[0].OK {
 			t.Fatalf("a create in another namespace needs no force: %+v", res)
 		}
@@ -1771,7 +2184,7 @@ func TestPushOtherNamespaceRequiresForce(t *testing.T) {
 		f.Dirs["/r"] = true
 		_ = Bootstrap(f, "/r")
 		ups := []protocol.RefUpdate{{Src: blobSha, Dst: "refs/notes/commits"}}
-		res := Push(f, "/r", gitDir, ups, map[string]string{"refs/notes/commits": absentOld})
+		res := Push(f, "/r", gitDir, ups, map[string]string{"refs/notes/commits": absentOld}, nil)
 		if len(res) != 1 || res[0].OK {
 			t.Fatalf("an unforced update outside refs/heads/ and refs/tags/ must require force: %+v", res)
 		}
@@ -1789,7 +2202,7 @@ func TestPushOtherNamespaceRequiresForce(t *testing.T) {
 		f.Dirs["/r"] = true
 		_ = Bootstrap(f, "/r")
 		ups := []protocol.RefUpdate{{Src: blobSha, Dst: "refs/notes/commits", Force: true}}
-		res := Push(f, "/r", gitDir, ups, map[string]string{"refs/notes/commits": absentOld})
+		res := Push(f, "/r", gitDir, ups, map[string]string{"refs/notes/commits": absentOld}, nil)
 		if len(res) != 1 || !res[0].OK {
 			t.Fatalf("a forced update outside refs/heads/ and refs/tags/ must succeed: %+v", res)
 		}
@@ -1812,7 +2225,7 @@ func TestPushTagUpdateRequiresForceNoAncestry(t *testing.T) {
 	newSha := commitOnPushRepo(t, gitDir, "b.txt", "two") // old IS an ancestor of newSha
 
 	ups := []protocol.RefUpdate{{Src: newSha, Dst: "refs/tags/v1"}}
-	res := Push(f, "/r", gitDir, ups, map[string]string{"refs/tags/v1": old})
+	res := Push(f, "/r", gitDir, ups, map[string]string{"refs/tags/v1": old}, nil)
 	if len(res) != 1 || res[0].OK {
 		t.Fatalf("an unforced tag update must be refused even though it is fast-forwardable, got %+v", res)
 	}
@@ -1839,7 +2252,7 @@ func TestPushTagAcceptsNonCommitObjectWithForce(t *testing.T) {
 	absentOld := "9999999999999999999999999999999999999999"
 
 	ups := []protocol.RefUpdate{{Src: blobSha, Dst: "refs/tags/v1", Force: true}}
-	res := Push(f, "/r", gitDir, ups, map[string]string{"refs/tags/v1": absentOld})
+	res := Push(f, "/r", gitDir, ups, map[string]string{"refs/tags/v1": absentOld}, nil)
 	if len(res) != 1 || !res[0].OK {
 		t.Fatalf("a forced tag update must accept a non-commit object with no object-type check: %+v", res)
 	}
@@ -1872,7 +2285,7 @@ func TestPushDeletionsRunAfterPackConfirmBeforeCreates(t *testing.T) {
 		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"}, // create, listed first
 		{Src: "", Dst: "refs/heads/old"},                      // delete, listed second
 	}
-	res := Push(tr, "/r", gitDir, ups, remote)
+	res := Push(tr, "/r", gitDir, ups, remote, nil)
 	for _, r := range res {
 		if !r.OK {
 			t.Fatalf("both updates must succeed: %+v", res)
@@ -1920,7 +2333,7 @@ func TestPushPackFailureFailsCreatesButDeletionsProceed(t *testing.T) {
 		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"},
 		{Src: "", Dst: "refs/heads/old"},
 	}
-	res := Push(f, "/r", gitDir, ups, remote)
+	res := Push(f, "/r", gitDir, ups, remote, nil)
 	if len(res) != 2 {
 		t.Fatalf("want 2 results, got %+v", res)
 	}
@@ -1957,7 +2370,7 @@ func TestPushNonBranchDeleteProceedsUnderUnreadableHEAD(t *testing.T) {
 		{Src: "", Dst: "refs/heads/main"},
 	}
 	res := Push(f, "/r", t.TempDir(), ups,
-		map[string]string{"refs/heads/main": sha, "refs/tags/v1": sha})
+		map[string]string{"refs/heads/main": sha, "refs/tags/v1": sha}, nil)
 
 	if len(res) != 2 {
 		t.Fatalf("want 2 results, got %+v", res)
@@ -1998,7 +2411,7 @@ func TestPushDeleteOfHEADBranchRefusedAtPreflight(t *testing.T) {
 		{Src: "", Dst: "refs/heads/main"},
 		{Src: "refs/heads/main", Dst: "refs/heads/main/child"},
 	}
-	res := Push(f, "/r", gitDir, ups, remote)
+	res := Push(f, "/r", gitDir, ups, remote, nil)
 	if len(res) != 2 {
 		t.Fatalf("want 2 results, got %+v", res)
 	}
@@ -2043,16 +2456,17 @@ func TestPushDeleteThenCreateSameNameOneBatch(t *testing.T) {
 		{Src: "", Dst: "refs/heads/feature"},
 		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"},
 	}
-	res := Push(f, "/r", gitDir, ups, remote)
+	res := Push(f, "/r", gitDir, ups, remote, nil)
 	for _, r := range res {
 		if !r.OK {
 			t.Fatalf("both the delete and the dependent create must succeed: %+v", res)
 		}
 	}
-	refs, err := ListRefs(f, "/r")
+	scan, err := ScanRefs(f, "/r")
 	if err != nil {
-		t.Fatalf("ListRefs: %v", err)
+		t.Fatalf("ScanRefs: %v", err)
 	}
+	refs := scan.Refs
 	if _, ok := refs["refs/heads/feature"]; ok {
 		t.Errorf("the deleted ref must be gone, got %v", refs)
 	}
@@ -2072,7 +2486,7 @@ func TestPushCreatesNestedBranchCreatingParents(t *testing.T) {
 	head := headOf(t, gitDir)
 
 	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature/deep/x"}}
-	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	res := Push(f, "/r", gitDir, ups, map[string]string{}, nil)
 	if len(res) != 1 || !res[0].OK {
 		t.Fatalf("push should succeed: %+v", res)
 	}
@@ -2106,7 +2520,7 @@ func TestPushReverseDFRefusedNamingTheBlockingRef(t *testing.T) {
 	}
 
 	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature/x"}}
-	res := Push(f, "/r", gitDir, ups, map[string]string{}) // remote map does NOT know about refs/heads/feature
+	res := Push(f, "/r", gitDir, ups, map[string]string{}, nil) // remote map does NOT know about refs/heads/feature
 	if len(res) != 1 || res[0].OK {
 		t.Fatalf("must be refused (D/F collision with an existing ref file), got %+v", res)
 	}
@@ -2115,6 +2529,245 @@ func TestPushReverseDFRefusedNamingTheBlockingRef(t *testing.T) {
 	}
 	if _, ok := f.Files["/r/refs/heads/feature/x"]; ok {
 		t.Error("the ref must not have been written")
+	}
+}
+
+// --- Task 3: occupancy-aware push — preflight and delete arm (component 2) ---
+//
+// These tests drive Push directly with a manufactured `skipped` slice, not
+// via ScanRefs: the fixture only needs a plausible foreign occupant in the
+// Fake's state (so an unfixed implementation that actually touched it would
+// be caught) and a SkippedRef describing it. Expected refusal text is always
+// composed by calling OccupancyMessage itself, never hand-duplicated: a
+// parked Task 1 minor may reword that message at final review, and a
+// composed fixture cannot drift out of sync with it.
+
+// TestPushCreateOfSkippedNameRefusedPrePack: a create whose dst IS a skipped
+// path itself must be refused, pre-pack (no pack ever built), and the
+// foreign file must survive untouched.
+func TestPushCreateOfSkippedNameRefusedPrePack(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	f.Files["/r/refs/heads/junk"] = []byte("hello world\n")
+
+	skipped := []SkippedRef{{
+		Path:   "refs/heads/junk",
+		Kind:   SkipContent,
+		Reason: "not a ref: size 12 outside the 40-42 candidate band",
+	}}
+	sha := "3333333333333333333333333333333333333333"
+	ups := []protocol.RefUpdate{{Src: sha, Dst: "refs/heads/junk"}}
+
+	res := Push(f, "/r", t.TempDir(), ups, map[string]string{}, skipped)
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("create of a skipped name itself must be refused, got %+v", res)
+	}
+	want := OccupancyMessage("/r", skipped[0])
+	if res[0].Err != want {
+		t.Errorf("res[0].Err = %q, want %q", res[0].Err, want)
+	}
+	if packs, idxs := countPackFiles(f, "/r"); packs != 0 || idxs != 0 {
+		t.Errorf("no pack may be built for a preflight refusal, got pack=%d idx=%d", packs, idxs)
+	}
+	if got := string(f.Files["/r/refs/heads/junk"]); got != "hello world\n" {
+		t.Errorf("the foreign file must survive byte-identical, got %q", got)
+	}
+}
+
+// TestPushCreateBeneathSkippedFileRefusedPrePack: refs/heads/foo is skipped
+// (a foreign FILE); a create of refs/heads/foo/bar would need foo to become a
+// folder, which it never can while a foreign file occupies that exact name —
+// refused pre-pack, naming foo (the ANCESTOR check).
+func TestPushCreateBeneathSkippedFileRefusedPrePack(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	f.Files["/r/refs/heads/foo"] = []byte("hello world\n")
+
+	skipped := []SkippedRef{{
+		Path:   "refs/heads/foo",
+		Kind:   SkipContent,
+		Reason: "not a ref: size 12 outside the 40-42 candidate band",
+	}}
+	sha := "3333333333333333333333333333333333333333"
+	ups := []protocol.RefUpdate{{Src: sha, Dst: "refs/heads/foo/bar"}}
+
+	res := Push(f, "/r", t.TempDir(), ups, map[string]string{}, skipped)
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("create beneath a skipped file must be refused, got %+v", res)
+	}
+	want := OccupancyMessage("/r", skipped[0])
+	if res[0].Err != want {
+		t.Errorf("res[0].Err = %q, want %q", res[0].Err, want)
+	}
+	if !strings.Contains(res[0].Err, "refs/heads/foo") {
+		t.Errorf("must name the blocking occupant foo, got %q", res[0].Err)
+	}
+	if packs, idxs := countPackFiles(f, "/r"); packs != 0 || idxs != 0 {
+		t.Errorf("no pack may be built for a preflight refusal, got pack=%d idx=%d", packs, idxs)
+	}
+	if got := string(f.Files["/r/refs/heads/foo"]); got != "hello world\n" {
+		t.Errorf("the foreign file must survive byte-identical, got %q", got)
+	}
+}
+
+// TestPushCreateAboveSkippedFileRefusedPrePack: refs/heads/foo/bar is skipped
+// (a foreign FILE); a create of refs/heads/foo would need foo to become a
+// leaf ref, but foo/bar still lives underneath it — refused pre-pack, naming
+// foo/bar (the DESCENDANT check).
+func TestPushCreateAboveSkippedFileRefusedPrePack(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	f.Files["/r/refs/heads/foo/bar"] = []byte("hello world\n")
+
+	skipped := []SkippedRef{{
+		Path:   "refs/heads/foo/bar",
+		Kind:   SkipContent,
+		Reason: "not a ref: size 12 outside the 40-42 candidate band",
+	}}
+	sha := "3333333333333333333333333333333333333333"
+	ups := []protocol.RefUpdate{{Src: sha, Dst: "refs/heads/foo"}}
+
+	res := Push(f, "/r", t.TempDir(), ups, map[string]string{}, skipped)
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("create above skipped content must be refused, got %+v", res)
+	}
+	want := OccupancyMessage("/r", skipped[0])
+	if res[0].Err != want {
+		t.Errorf("res[0].Err = %q, want %q", res[0].Err, want)
+	}
+	if !strings.Contains(res[0].Err, "refs/heads/foo/bar") {
+		t.Errorf("must name the blocking occupant foo/bar, got %q", res[0].Err)
+	}
+	if packs, idxs := countPackFiles(f, "/r"); packs != 0 || idxs != 0 {
+		t.Errorf("no pack may be built for a preflight refusal, got pack=%d idx=%d", packs, idxs)
+	}
+	if got := string(f.Files["/r/refs/heads/foo/bar"]); got != "hello world\n" {
+		t.Errorf("the foreign file must survive byte-identical, got %q", got)
+	}
+}
+
+// TestPushSkippedFolderOccupancyMessageKindAware: the descendant check hits a
+// SkipInvalidNameFolder occupant (an invalid-named folder ScanRefs' walk
+// never entered, so its contents are unknown) rather than a SkipContent
+// file — the rendered message must be KIND-AWARE: it says "inspect" (never
+// examined, don't blindly delete) and never calls a folder "a file". dst
+// itself (refs/heads/foo) is a perfectly valid name; only the occupant
+// beneath it (refs/heads/foo/.hidden) carries the invalid component — this is
+// the only way an invalid-named occupancy can ever reach the preflight at
+// all (checkDst would refuse dst itself first if the invalid component were
+// in dst's own ancestry, per the ordering comment in push.go).
+func TestPushSkippedFolderOccupancyMessageKindAware(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	f.Files["/r/refs/heads/foo/.hidden/x"] = []byte("1111111111111111111111111111111111111111\n")
+
+	skipped := []SkippedRef{{Path: "refs/heads/foo/.hidden", Kind: SkipInvalidNameFolder}}
+	sha := "3333333333333333333333333333333333333333"
+	ups := []protocol.RefUpdate{{Src: sha, Dst: "refs/heads/foo"}}
+
+	res := Push(f, "/r", t.TempDir(), ups, map[string]string{}, skipped)
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("create above a skipped invalid-named folder must be refused, got %+v", res)
+	}
+	want := OccupancyMessage("/r", skipped[0])
+	if res[0].Err != want {
+		t.Errorf("res[0].Err = %q, want %q", res[0].Err, want)
+	}
+	if !strings.Contains(res[0].Err, "inspect") {
+		t.Errorf("a folder occupant's message must say inspect, got %q", res[0].Err)
+	}
+	if strings.Contains(res[0].Err, "file") {
+		t.Errorf("must never call an invalid-named FOLDER a file, got %q", res[0].Err)
+	}
+}
+
+// TestPushDeleteOfSkippedNameRefusedUntouched: a delete of a skipped path
+// must be refused with OccupancyMessage — NOT reported ok on the strength of
+// the pre-Task-3 "already absent from remote" shortcut, since a skipped path
+// is never a key in `remote` either. The foreign file must survive
+// byte-identical: this helper never modifies or deletes what it did not
+// advertise.
+func TestPushDeleteOfSkippedNameRefusedUntouched(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	f.Files["/r/refs/heads/junk"] = []byte("hello world\n")
+
+	skipped := []SkippedRef{{
+		Path:   "refs/heads/junk",
+		Kind:   SkipContent,
+		Reason: "not a ref: size 12 outside the 40-42 candidate band",
+	}}
+	ups := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/junk"}}
+
+	res := Push(f, "/r", t.TempDir(), ups, map[string]string{}, skipped)
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("delete of a skipped name must be refused, not reported ok, got %+v", res)
+	}
+	want := OccupancyMessage("/r", skipped[0])
+	if res[0].Err != want {
+		t.Errorf("res[0].Err = %q, want %q", res[0].Err, want)
+	}
+	if got := string(f.Files["/r/refs/heads/junk"]); got != "hello world\n" {
+		t.Errorf("the foreign file must survive byte-identical, got %q", got)
+	}
+}
+
+// TestPushOccupancyRefusalIsPerRef is a GUARD: an occupancy collision on one
+// ref in a batch must not touch an unrelated ref's own outcome — Push's
+// per-ref Result contract holds for this new refusal exactly as it does for
+// every other phase-2 refusal.
+func TestPushOccupancyRefusalIsPerRef(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	f.Files["/r/refs/heads/junk"] = []byte("hello world\n")
+
+	skipped := []SkippedRef{{
+		Path:   "refs/heads/junk",
+		Kind:   SkipContent,
+		Reason: "not a ref: size 12 outside the 40-42 candidate band",
+	}}
+	ups := []protocol.RefUpdate{
+		{Src: "refs/heads/main", Dst: "refs/heads/junk"},      // occupancy-refused
+		{Src: "refs/heads/main", Dst: "refs/heads/unrelated"}, // must still succeed
+	}
+
+	res := Push(f, "/r", gitDir, ups, map[string]string{}, skipped)
+	if len(res) != 2 {
+		t.Fatalf("want 2 results, got %+v", res)
+	}
+	if res[0].OK {
+		t.Fatalf("the occupancy collision must be refused, got %+v", res[0])
+	}
+	if !res[1].OK {
+		t.Fatalf("an unrelated ref in the same batch must still succeed, got %+v", res[1])
+	}
+}
+
+// TestPushNilSkippedIsStage5Behaviour is a GUARD: a nil skipped slice (every
+// caller before this task, and Stage 5's own behaviour) must produce zero new
+// refusals — the occupied map built from nil is empty, so every lookup below
+// misses and an ordinary push completes exactly as it always did, pack and
+// all.
+func TestPushNilSkippedIsStage5Behaviour(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/main"}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{}, nil)
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("push should succeed exactly as Stage 5 did: %+v", res)
+	}
+	if packs, idxs := countPackFiles(f, "/r"); packs == 0 || idxs == 0 {
+		t.Errorf("want a pack/idx pair under packs/, got pack=%d idx=%d", packs, idxs)
 	}
 }
 
@@ -3265,7 +3918,7 @@ func TestSetHeadRefusesNamespaceFolderBranch(t *testing.T) {
 	gitDir := newGitRepoForPush(t)
 
 	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature/x"}}
-	if res := Push(f, "/r", gitDir, ups, map[string]string{}); len(res) != 1 || !res[0].OK {
+	if res := Push(f, "/r", gitDir, ups, map[string]string{}, nil); len(res) != 1 || !res[0].OK {
 		t.Fatalf("setup push failed: %+v", res)
 	}
 	if !f.Dirs["/r/refs/heads/feature"] {
@@ -3300,7 +3953,7 @@ func TestPushWritesHeadOnFirstPush(t *testing.T) {
 	d := newGitRepoForPush(t)
 	head := headOfPushRepo(t, d)
 
-	res := Push(f, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/heads/main"}}, map[string]string{})
+	res := Push(f, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/heads/main"}}, map[string]string{}, nil)
 	if len(res) != 1 || !res[0].OK {
 		t.Fatalf("push: %+v", res)
 	}
@@ -3325,7 +3978,7 @@ func TestPushBackfillsHeadFromAllRemoteBranches(t *testing.T) {
 	remote := map[string]string{"refs/heads/alpha": head}
 
 	// Today we push "zeta" only.
-	res := Push(f, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/heads/zeta"}}, remote)
+	res := Push(f, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/heads/zeta"}}, remote, nil)
 	if len(res) != 1 || !res[0].OK {
 		t.Fatalf("push: %+v", res)
 	}
@@ -3343,7 +3996,7 @@ func TestPushNeverRewritesAnExistingHead(t *testing.T) {
 	head := headOfPushRepo(t, d)
 	f.Files["/r/HEAD"] = []byte("ref: refs/heads/chosen\n")
 
-	res := Push(f, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/heads/main"}}, map[string]string{})
+	res := Push(f, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/heads/main"}}, map[string]string{}, nil)
 	if len(res) != 1 || !res[0].OK {
 		t.Fatalf("push: %+v", res)
 	}
@@ -3360,7 +4013,7 @@ func TestPushTagOnlyLeavesRepoHeadless(t *testing.T) {
 	d := newGitRepoForPush(t)
 	head := headOfPushRepo(t, d)
 
-	res := Push(f, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/tags/v1"}}, map[string]string{})
+	res := Push(f, "/r", d, []protocol.RefUpdate{{Src: head, Dst: "refs/tags/v1"}}, map[string]string{}, nil)
 	if len(res) != 1 || !res[0].OK {
 		t.Fatalf("push: %+v", res)
 	}
@@ -3392,7 +4045,7 @@ func TestPushRefusesToDeleteTheBranchHeadPointsAt(t *testing.T) {
 	}
 
 	ups := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/main"}}
-	res := Push(f, "/r", t.TempDir(), ups, map[string]string{"refs/heads/main": sha})
+	res := Push(f, "/r", t.TempDir(), ups, map[string]string{"refs/heads/main": sha}, nil)
 
 	if len(res) != 1 {
 		t.Fatalf("want one result, got %+v", res)
@@ -3433,7 +4086,7 @@ func TestPushDeletesABranchHeadDoesNotPointAt(t *testing.T) {
 
 	ups := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/dev"}}
 	res := Push(f, "/r", t.TempDir(), ups,
-		map[string]string{"refs/heads/main": sha, "refs/heads/dev": sha})
+		map[string]string{"refs/heads/main": sha, "refs/heads/dev": sha}, nil)
 
 	if len(res) != 1 || !res[0].OK {
 		t.Fatalf("deleting a branch HEAD does not point at must succeed: %+v", res)
@@ -3458,7 +4111,7 @@ func TestPushDeleteFailsClosedOnAnUnreadableHead(t *testing.T) {
 	f.Files["/r/HEAD"] = []byte("this is not a symref\n")
 
 	ups := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/main"}}
-	res := Push(f, "/r", t.TempDir(), ups, map[string]string{"refs/heads/main": sha})
+	res := Push(f, "/r", t.TempDir(), ups, map[string]string{"refs/heads/main": sha}, nil)
 
 	if len(res) != 1 {
 		t.Fatalf("want one result, got %+v", res)
@@ -3495,7 +4148,7 @@ func TestPushDeleteThenRecreateInOneBatchStillDerivesHead(t *testing.T) {
 		{Src: "", Dst: "refs/heads/main"},
 		{Src: head, Dst: "refs/heads/main"},
 	}
-	res := Push(f, "/r", d, ups, map[string]string{"refs/heads/main": head})
+	res := Push(f, "/r", d, ups, map[string]string{"refs/heads/main": head}, nil)
 	for _, r := range res {
 		if !r.OK {
 			t.Fatalf("both updates must succeed: %+v", res)
@@ -3564,7 +4217,7 @@ func TestPushDeleteThenRecreateInOneBatchOrderIndependent(t *testing.T) {
 		{Src: head, Dst: "refs/heads/main"}, // update/recreate, listed FIRST
 		{Src: "", Dst: "refs/heads/main"},   // delete, listed SECOND
 	}
-	res := Push(tr, "/r", d, ups, remote)
+	res := Push(tr, "/r", d, ups, remote, nil)
 	for _, r := range res {
 		if !r.OK {
 			t.Fatalf("both updates must succeed regardless of input order: %+v", res)
@@ -3660,7 +4313,7 @@ func TestPushUpdateRoutesViaUpdateRevisionWhenSameBatchDeleteFails(t *testing.T)
 		{Src: "", Dst: "refs/heads/main"},      // delete — will FAIL (Trash forced Ambiguous)
 		{Src: newHead, Dst: "refs/heads/main"}, // update — must still succeed via UpdateRevision
 	}
-	res := Push(tr, "/r", d, ups, remote)
+	res := Push(tr, "/r", d, ups, remote, nil)
 	if len(res) != 2 {
 		t.Fatalf("want 2 results, got %+v", res)
 	}
@@ -3698,7 +4351,7 @@ func TestPushDeleteOfTheOnlyBranchLeavesTheRepoHeadless(t *testing.T) {
 	// against an empty candidate set afterwards.
 
 	ups := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/main"}}
-	res := Push(f, "/r", t.TempDir(), ups, map[string]string{"refs/heads/main": sha})
+	res := Push(f, "/r", t.TempDir(), ups, map[string]string{"refs/heads/main": sha}, nil)
 
 	if len(res) != 1 || !res[0].OK {
 		t.Fatalf("delete should succeed when no HEAD points at the branch: %+v", res)
@@ -3731,7 +4384,7 @@ func TestDeletePrunesEmptyParentsStopsAtNamespaceRoots(t *testing.T) {
 		{Src: "refs/heads/main", Dst: "refs/heads/main"},
 		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"},
 	}
-	res := Push(f, "/r", gitDir, createUps, map[string]string{})
+	res := Push(f, "/r", gitDir, createUps, map[string]string{}, nil)
 	for _, r := range res {
 		if !r.OK {
 			t.Fatalf("setup creates must succeed: %+v", res)
@@ -3743,7 +4396,7 @@ func TestDeletePrunesEmptyParentsStopsAtNamespaceRoots(t *testing.T) {
 
 	delUps := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/feature/x"}}
 	remote := map[string]string{"refs/heads/main": head, "refs/heads/feature/x": head}
-	res = Push(f, "/r", gitDir, delUps, remote)
+	res = Push(f, "/r", gitDir, delUps, remote, nil)
 	if len(res) != 1 || !res[0].OK {
 		t.Fatalf("delete should succeed: %+v", res)
 	}
@@ -3783,7 +4436,7 @@ func TestDeletePruneStopsAtNonEmptyParent(t *testing.T) {
 		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"},
 		{Src: "refs/heads/main", Dst: "refs/heads/feature/y"},
 	}
-	res := Push(f, "/r", gitDir, createUps, map[string]string{})
+	res := Push(f, "/r", gitDir, createUps, map[string]string{}, nil)
 	for _, r := range res {
 		if !r.OK {
 			t.Fatalf("setup creates must succeed: %+v", res)
@@ -3796,7 +4449,7 @@ func TestDeletePruneStopsAtNonEmptyParent(t *testing.T) {
 		"refs/heads/feature/x": head,
 		"refs/heads/feature/y": head,
 	}
-	res = Push(f, "/r", gitDir, delUps, remote)
+	res = Push(f, "/r", gitDir, delUps, remote, nil)
 	if len(res) != 1 || !res[0].OK {
 		t.Fatalf("delete should succeed: %+v", res)
 	}
@@ -3822,7 +4475,7 @@ func TestDeletePrunesOnDemandNamespaceRoot(t *testing.T) {
 	head := headOf(t, gitDir)
 
 	createUps := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/notes/commits"}}
-	res := Push(f, "/r", gitDir, createUps, map[string]string{})
+	res := Push(f, "/r", gitDir, createUps, map[string]string{}, nil)
 	if len(res) != 1 || !res[0].OK {
 		t.Fatalf("setup create failed: %+v", res)
 	}
@@ -3831,7 +4484,7 @@ func TestDeletePrunesOnDemandNamespaceRoot(t *testing.T) {
 	}
 
 	delUps := []protocol.RefUpdate{{Src: "", Dst: "refs/notes/commits"}}
-	res = Push(f, "/r", gitDir, delUps, map[string]string{"refs/notes/commits": head})
+	res = Push(f, "/r", gitDir, delUps, map[string]string{"refs/notes/commits": head}, nil)
 	if len(res) != 1 || !res[0].OK {
 		t.Fatalf("delete should succeed: %+v", res)
 	}
@@ -3883,7 +4536,7 @@ func TestPruneFailureIsAdvisoryOnly(t *testing.T) {
 		{Src: "refs/heads/main", Dst: "refs/heads/main"},
 		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"},
 	}
-	res := Push(f, "/r", gitDir, createUps, map[string]string{})
+	res := Push(f, "/r", gitDir, createUps, map[string]string{}, nil)
 	for _, r := range res {
 		if !r.OK {
 			t.Fatalf("setup creates must succeed: %+v", res)
@@ -3893,7 +4546,7 @@ func TestPruneFailureIsAdvisoryOnly(t *testing.T) {
 	tr := trashFailsForPath{Fake: f, failPath: "/r/refs/heads/feature"}
 	delUps := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/feature/x"}}
 	remote := map[string]string{"refs/heads/main": head, "refs/heads/feature/x": head}
-	res = Push(tr, "/r", gitDir, delUps, remote)
+	res = Push(tr, "/r", gitDir, delUps, remote, nil)
 	if len(res) != 1 || !res[0].OK {
 		t.Fatalf("the ref delete itself must still report ok even though the prune trash "+
 			"failed: %+v", res)
@@ -3926,7 +4579,7 @@ func TestDeletePruneNeverFiresFromAlreadyAbsentDeleteArm(t *testing.T) {
 	tr := listCallRecorder{Fake: f, calls: &calls}
 
 	ups := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/feature/z"}}
-	res := Push(tr, "/r", gitDir, ups, map[string]string{})
+	res := Push(tr, "/r", gitDir, ups, map[string]string{}, nil)
 	if len(res) != 1 || !res[0].OK {
 		t.Fatalf("an already-absent delete must still report ok: %+v", res)
 	}
@@ -3956,7 +4609,7 @@ func TestCreateSelfHealsEmptyFolderCollision(t *testing.T) {
 	}
 
 	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
-	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	res := Push(f, "/r", gitDir, ups, map[string]string{}, nil)
 	if len(res) != 1 || !res[0].OK {
 		t.Fatalf("self-heal should let the create succeed: %+v", res)
 	}
@@ -3990,7 +4643,7 @@ func TestCreateSelfHealsNestedEmptyResidue(t *testing.T) {
 	}
 
 	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
-	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	res := Push(f, "/r", gitDir, ups, map[string]string{}, nil)
 	if len(res) != 1 || !res[0].OK {
 		t.Fatalf("self-heal must clear a NESTED empty-folder residue too: %+v", res)
 	}
@@ -4017,7 +4670,7 @@ func TestCreateRefusesFolderWithForeignFileUntouched(t *testing.T) {
 	f.Files["/r/refs/heads/feature/notes.txt"] = []byte(notesContent)
 
 	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
-	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	res := Push(f, "/r", gitDir, ups, map[string]string{}, nil)
 	if len(res) != 1 || res[0].OK {
 		t.Fatalf("must be refused: a foreign file blocks the folder collision, got %+v", res)
 	}
@@ -4058,12 +4711,12 @@ func TestCreateRefusesFolderWithLiveSubRefs(t *testing.T) {
 	head := headOf(t, gitDir)
 
 	seedUps := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature/x"}}
-	if res := Push(f, "/r", gitDir, seedUps, map[string]string{}); len(res) != 1 || !res[0].OK {
+	if res := Push(f, "/r", gitDir, seedUps, map[string]string{}, nil); len(res) != 1 || !res[0].OK {
 		t.Fatalf("setup create failed: %+v", res)
 	}
 
 	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
-	res := Push(f, "/r", gitDir, ups, map[string]string{}) // remote map does NOT know about x
+	res := Push(f, "/r", gitDir, ups, map[string]string{}, nil) // remote map does NOT know about x
 	if len(res) != 1 || res[0].OK {
 		t.Fatalf("must be refused: a live sub-ref blocks the folder collision, got %+v", res)
 	}
@@ -4112,7 +4765,7 @@ func TestSelfHealAbortsOnDiagnosticFailure(t *testing.T) {
 	tr := statFailsForPath{Fake: f, failPath: "/r/refs/heads/feature"}
 
 	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
-	res := Push(tr, "/r", gitDir, ups, map[string]string{})
+	res := Push(tr, "/r", gitDir, ups, map[string]string{}, nil)
 	if len(res) != 1 || res[0].OK {
 		t.Fatalf("must fail when the diagnostic Stat errors, got %+v", res)
 	}
@@ -4160,7 +4813,7 @@ func TestSelfHealFailsClosedOnInvalidComponentInSubtree(t *testing.T) {
 	tr := listCallRecorder{Fake: f, calls: &calls}
 
 	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
-	res := Push(tr, "/r", gitDir, ups, map[string]string{})
+	res := Push(tr, "/r", gitDir, ups, map[string]string{}, nil)
 	if len(res) != 1 || res[0].OK {
 		t.Fatalf("must fail closed on an invalid component in the subtree, got %+v", res)
 	}
@@ -4213,7 +4866,7 @@ func TestSelfHealNamesInvalidNamedFileAsForeignDataNotAnEnumerationFailure(t *te
 	f.Files["/r/refs/heads/feature/"+badName] = []byte("not a ref")
 
 	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
-	res := Push(f, "/r", gitDir, ups, map[string]string{})
+	res := Push(f, "/r", gitDir, ups, map[string]string{}, nil)
 	if len(res) != 1 || res[0].OK {
 		t.Fatalf("must be refused: an invalid-named file still blocks the folder collision, got %+v", res)
 	}
@@ -4230,6 +4883,288 @@ func TestSelfHealNamesInvalidNamedFileAsForeignDataNotAnEnumerationFailure(t *te
 	if _, ok := f.Files["/r/refs/heads/feature/"+badName]; !ok {
 		t.Error("the invalid-named file must survive untouched")
 	}
+}
+
+// ===================== Task 4: create-heal race-window diagnosis ==========
+//
+// The occupancy preflight (component 2, Task 3) refuses a create/update/
+// delete landing on a path ScanRefs already SAW and skipped — but it can
+// only act on what the CALLER'S skipped slice already contains. An occupant
+// that appears AFTER that scan ran (a genuinely concurrent write — some
+// other actor, or a stray upload, landing between the advertisement and
+// this push's own create attempt) is invisible to that preflight: the
+// caller passes an empty (or scan-stale) skipped slice, exactly as every
+// test below does, mirroring TestCreateRefusesFolderWithLiveSubRefs' own
+// technique for the folder-collision arm. createRefHealingCollision's
+// post-refusal Stat is the ONLY place this race is ever actually observed,
+// so diagnosing it has to live there.
+//
+// All six tests route through the whole Push() entry point rather than
+// calling createRefHealingCollision directly — the same convention every
+// other self-heal test above already uses — so the assertions also pin
+// how the diagnosis surfaces in a real Result.Err.
+
+// TestHealArmDiagnosesUnderBandOccupantWithoutDownload is RED: a 12-byte
+// junk file occupies the destination — below refBandMin (40), so it is
+// classified BY SIZE ALONE, with no download at all (the traced transport
+// proves no ReadTo of the occupant's own path). The refusal must name the
+// occupant as a file whose contents are not a ref, offer the delete-first
+// remedy, and must NOT say "concurrently" — that generic WriteRef-only text
+// is what this diagnosis replaces for a race the preflight could not see.
+func TestHealArmDiagnosesUnderBandOccupantWithoutDownload(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	const junk = "hello world\n" // 12 bytes, out-of-band (below refBandMin)
+	f.Files["/r/refs/heads/feature"] = []byte(junk)
+
+	var trace strings.Builder
+	tr := transport.NewTraced(f, &trace)
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+	res := Push(tr, "/r", gitDir, ups, map[string]string{}, nil)
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("must be refused: a file occupies the destination, got %+v", res)
+	}
+	if !strings.Contains(res[0].Err, "refs/heads/feature") {
+		t.Errorf("must name the occupied ref, got %q", res[0].Err)
+	}
+	if !strings.Contains(res[0].Err, "not a ref") {
+		t.Errorf("must say the contents are not a ref, got %q", res[0].Err)
+	}
+	if !strings.Contains(res[0].Err, "delete it first") {
+		t.Errorf("must offer the delete-first remedy, got %q", res[0].Err)
+	}
+	if strings.Contains(res[0].Err, "concurrently") {
+		t.Errorf("must not be the generic concurrent-creator refusal, got %q", res[0].Err)
+	}
+	if strings.Contains(trace.String(), "refs/heads/feature") {
+		t.Errorf("an out-of-band occupant must never be downloaded, trace: %q", trace.String())
+	}
+	if got, ok := f.Files["/r/refs/heads/feature"]; !ok || string(got) != junk {
+		t.Errorf("the occupant file must survive untouched, got ok=%v content=%q", ok, got)
+	}
+}
+
+// TestHealArmDiagnosesOversizedOccupantWithoutDownload is RED (upper bound
+// — round-1 Codex): the same no-download, size-classified assertions as
+// above, but ABOVE refBandMax (a 100-byte occupant) rather than below it —
+// pinning that the band check itself is bounded on both sides, not just a
+// floor.
+func TestHealArmDiagnosesOversizedOccupantWithoutDownload(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	junk := strings.Repeat("z", 100) // 100 bytes, out-of-band (above refBandMax)
+	f.Files["/r/refs/heads/feature"] = []byte(junk)
+
+	var trace strings.Builder
+	tr := transport.NewTraced(f, &trace)
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+	res := Push(tr, "/r", gitDir, ups, map[string]string{}, nil)
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("must be refused: a file occupies the destination, got %+v", res)
+	}
+	if !strings.Contains(res[0].Err, "refs/heads/feature") {
+		t.Errorf("must name the occupied ref, got %q", res[0].Err)
+	}
+	if !strings.Contains(res[0].Err, "not a ref") {
+		t.Errorf("must say the contents are not a ref, got %q", res[0].Err)
+	}
+	if !strings.Contains(res[0].Err, "delete it first") {
+		t.Errorf("must offer the delete-first remedy, got %q", res[0].Err)
+	}
+	if strings.Contains(res[0].Err, "concurrently") {
+		t.Errorf("must not be the generic concurrent-creator refusal, got %q", res[0].Err)
+	}
+	if strings.Contains(trace.String(), "refs/heads/feature") {
+		t.Errorf("an out-of-band occupant must never be downloaded, trace: %q", trace.String())
+	}
+	if got, ok := f.Files["/r/refs/heads/feature"]; !ok || string(got) != junk {
+		t.Errorf("the occupant file must survive untouched, got ok=%v content=%q", ok, got)
+	}
+}
+
+// TestHealArmDiagnosesInBandJunkOccupant is RED: a 41-byte, non-hex
+// occupant sits IN-BAND — it must be downloaded (the traced transport
+// proves it) and diagnosed via classifyRefContent, carrying the same
+// escaped-preview wording ScanRefs' own in-band-junk skip uses (refs.go /
+// TestScanRefsInBandJunkSkipsWithPreview) — the ONE classifier, never a
+// second implementation of the same grammar.
+func TestHealArmDiagnosesInBandJunkOccupant(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	junk := strings.Repeat("x", 40) + "\n" // 41 bytes, in-band, not hex
+	f.Files["/r/refs/heads/feature"] = []byte(junk)
+
+	var trace strings.Builder
+	tr := transport.NewTraced(f, &trace)
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+	res := Push(tr, "/r", gitDir, ups, map[string]string{}, nil)
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("must be refused: a file occupies the destination, got %+v", res)
+	}
+	if !strings.Contains(trace.String(), "refs/heads/feature") {
+		t.Errorf("an in-band occupant must be downloaded, trace: %q", trace.String())
+	}
+	if !strings.Contains(res[0].Err, "not a ref") {
+		t.Errorf("must say the contents are not a ref, got %q", res[0].Err)
+	}
+	wantPreview := fmt.Sprintf("%q", junk) // classifyRefContent's escaping
+	if !strings.Contains(res[0].Err, wantPreview) {
+		t.Errorf("must carry the escaped preview %s, got %q", wantPreview, res[0].Err)
+	}
+	if !strings.Contains(res[0].Err, "delete it first") {
+		t.Errorf("must offer the delete-first remedy, got %q", res[0].Err)
+	}
+	if strings.Contains(res[0].Err, "concurrently") {
+		t.Errorf("must not be the generic concurrent-creator refusal, got %q", res[0].Err)
+	}
+}
+
+// TestHealArmRecoversNoncanonicalHex is RED ([Gemini] round 1: the draft
+// lost hex recovery in the race arm): a 42-byte CRLF-terminated occupant —
+// 40 real hex characters plus "\r\n" — is a NONCANONICAL damaged ref, not
+// generic junk. classifyRefContent recovers the hex; the race arm's message
+// must carry it forward, not fall back to a generic escaped preview.
+func TestHealArmRecoversNoncanonicalHex(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	sha := "4444444444444444444444444444444444444444"
+	f.Files["/r/refs/heads/feature"] = []byte(sha + "\r\n") // 42 bytes, in-band
+
+	var trace strings.Builder
+	tr := transport.NewTraced(f, &trace)
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+	res := Push(tr, "/r", gitDir, ups, map[string]string{}, nil)
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("must be refused: a file occupies the destination, got %+v", res)
+	}
+	if !strings.Contains(trace.String(), "refs/heads/feature") {
+		t.Errorf("an in-band occupant must be downloaded, trace: %q", trace.String())
+	}
+	if !strings.Contains(res[0].Err, "malformed terminator") {
+		t.Errorf("must carry the damaged-ref reason, got %q", res[0].Err)
+	}
+	if !strings.Contains(res[0].Err, sha) {
+		t.Errorf("must carry the recovered hex %s, got %q", sha, res[0].Err)
+	}
+	if !strings.Contains(res[0].Err, "delete it first") {
+		t.Errorf("must offer the delete-first remedy, got %q", res[0].Err)
+	}
+}
+
+// TestHealArmValidRefOccupantKeepsConcurrentCreatorMessage is the GUARD: the
+// occupant IS a syntactically valid ref (41 bytes, real-shaped sha) — a
+// genuine concurrent creator, not foreign data. The existing
+// concurrent-creator message must survive byte-unchanged; this diagnosis
+// must never fire for a true positive.
+func TestHealArmValidRefOccupantKeepsConcurrentCreatorMessage(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+
+	winner := "3333333333333333333333333333333333333333"
+	f.Files["/r/refs/heads/feature"] = []byte(winner + "\n") // 41 bytes, a valid ref
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+	res := Push(f, "/r", gitDir, ups, map[string]string{}, nil)
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("must be refused: a concurrent creator won, got %+v", res)
+	}
+	const want = "ref changed concurrently; refusing to overwrite"
+	if res[0].Err != want {
+		t.Errorf("concurrent-creator message must stay byte-unchanged: got %q, want %q", res[0].Err, want)
+	}
+	if got, ok := f.Files["/r/refs/heads/feature"]; !ok || string(got) != winner+"\n" {
+		t.Errorf("the concurrent creator's ref must survive untouched, got ok=%v content=%q", ok, got)
+	}
+}
+
+// TestHealArmDiagnosticFailureFallsBackToOriginal is the GUARD: when the
+// diagnosis itself cannot complete, the ORIGINAL refusal stands with the
+// failure noted — nothing about the occupant's content is invented. Two
+// independent diagnostic stages can fail this way, and this single test
+// asserts BOTH (round-1 Codex asked for both paths to be explicit):
+//
+//   - the PRE-EXISTING Stat-error arm (push.go, unrelated to this task): the
+//     post-refusal t.Stat call itself errors. Its message text
+//     ("...diagnosis failed: %v (original: %v)") must stay byte-unchanged.
+//   - the NEW read-path-failure arm this task adds: Stat affirmatively
+//     confirms an in-band FILE, but reading it back (readRef's ReadTo) then
+//     fails with a genuine transport error, distinct from a grammar
+//     failure — errors.Is(err, errMalformedRef) is false, so nothing here
+//     may claim "not a ref": the content was never actually seen.
+func TestHealArmDiagnosticFailureFallsBackToOriginal(t *testing.T) {
+	t.Run("stat error (pre-existing arm)", func(t *testing.T) {
+		f := transport.NewFake()
+		f.Dirs["/r"] = true
+		_ = Bootstrap(f, "/r")
+		gitDir := newGitRepoForPush(t)
+
+		if err := f.EnsureDir("/r/refs/heads/feature"); err != nil {
+			t.Fatal(err)
+		}
+		tr := statFailsForPath{Fake: f, failPath: "/r/refs/heads/feature"}
+
+		ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+		res := Push(tr, "/r", gitDir, ups, map[string]string{}, nil)
+		if len(res) != 1 || res[0].OK {
+			t.Fatalf("must fail when the diagnostic Stat errors, got %+v", res)
+		}
+		const want = "ref publish failed: create of refs/heads/feature did not commit and its " +
+			"diagnosis failed: simulated stat failure (original: <nil>)"
+		if res[0].Err != want {
+			t.Errorf("Stat-error diagnosis text must stay byte-unchanged: got %q, want %q", res[0].Err, want)
+		}
+		if !f.Dirs["/r/refs/heads/feature"] {
+			t.Error("nothing should have been trashed when the diagnosis itself failed")
+		}
+	})
+
+	t.Run("read-path failure (new arm)", func(t *testing.T) {
+		f := transport.NewFake()
+		f.Dirs["/r"] = true
+		_ = Bootstrap(f, "/r")
+		gitDir := newGitRepoForPush(t)
+
+		const occupant = "/r/refs/heads/feature"
+		content := strings.Repeat("5", 40) + "\n" // 41 bytes, in-band shape
+		f.Files[occupant] = []byte(content)
+		tr := &failingReadToTransport{Fake: f, failPath: occupant}
+
+		ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+		res := Push(tr, "/r", gitDir, ups, map[string]string{}, nil)
+		if len(res) != 1 || res[0].OK {
+			t.Fatalf("must fail when the diagnostic read errors, got %+v", res)
+		}
+		if !strings.Contains(res[0].Err, "simulated transport failure") {
+			t.Errorf("must surface the read failure itself, got %q", res[0].Err)
+		}
+		if strings.Contains(res[0].Err, "not a ref") {
+			t.Errorf("must not invent a content classification when the read itself failed, got %q", res[0].Err)
+		}
+		if strings.Contains(res[0].Err, "concurrently") {
+			t.Errorf("must not fall back to the generic concurrent-creator text either, got %q", res[0].Err)
+		}
+		if got, ok := f.Files[occupant]; !ok || string(got) != content {
+			t.Errorf("the occupant file must survive untouched, got ok=%v content=%q", ok, got)
+		}
+	})
 }
 
 // TestDescribeBlockersCapsAtMaxAndSummarizesRest is the review round 4,
@@ -4348,7 +5283,7 @@ func TestPushDeletePrunesThenCreateReusesFolderInOneBatch(t *testing.T) {
 		{Src: "refs/heads/main", Dst: "refs/heads/main"},
 		{Src: "refs/heads/main", Dst: "refs/heads/feature/x"},
 	}
-	seedRes := Push(f, "/r", gitDir, seedUps, map[string]string{})
+	seedRes := Push(f, "/r", gitDir, seedUps, map[string]string{}, nil)
 	for _, r := range seedRes {
 		if !r.OK {
 			t.Fatalf("setup creates must succeed: %+v", seedRes)
@@ -4363,7 +5298,7 @@ func TestPushDeletePrunesThenCreateReusesFolderInOneBatch(t *testing.T) {
 		{Src: "refs/heads/main", Dst: "refs/heads/feature"},
 	}
 	remote := map[string]string{"refs/heads/main": head, "refs/heads/feature/x": head}
-	res := Push(tr, "/r", gitDir, ups, remote)
+	res := Push(tr, "/r", gitDir, ups, remote, nil)
 	for _, r := range res {
 		if !r.OK {
 			t.Fatalf("both the delete and the create must succeed in one batch: %+v", res)
@@ -6125,6 +7060,53 @@ func TestEnsureParentsNeverCreatesMountRoots(t *testing.T) {
 			t.Errorf("no loud notes when nothing was created, got %q", stderr.String())
 		}
 	})
+}
+
+// mountIsFileTransport wraps a Fake but forces Stat to report ONE specific
+// path (the mount) as an EXISTING FILE, not a folder. Ordinary Fake state
+// cannot model this: /my-files and every "/devices/<id>" are built-in mounts
+// (fake.go's isBuiltinMountParent, the Stage 5 Task 11 leniency wired into
+// Fake.Stat) that always report present-as-a-folder regardless of f.Dirs/
+// f.Files contents, so there is no way to seed a FILE at a mount path through
+// the Fake's own maps. This wrapper — same technique as absentMountTransport
+// above — is the only route into EnsureParents' `!n.IsDir` mount-check arm
+// (parents.go).
+type mountIsFileTransport struct {
+	*transport.Fake
+	mount string
+}
+
+func (m mountIsFileTransport) Stat(p string) (transport.Node, bool, error) {
+	if p == m.mount {
+		return transport.Node{IsDir: false}, true, nil
+	}
+	return m.Fake.Stat(p)
+}
+
+// TestEnsureParentsMountIsAFile is a GUARD (Task 7, Stage 6 plan), not a RED:
+// the `!n.IsDir` arm of EnsureParents' mount check (parents.go) already
+// exists and is already correct — this pins the exact "mount %s is not a
+// folder" error text against regression, using mountIsFileTransport since a
+// plain Fake cannot manufacture a file at a mount path.
+func TestEnsureParentsMountIsAFile(t *testing.T) {
+	f := transport.NewFake()
+	tr := mountIsFileTransport{Fake: f, mount: "/my-files"}
+	var stderr strings.Builder
+
+	err := EnsureParents(tr, "/my-files/repo", true, &stderr)
+	if err == nil {
+		t.Fatal("a mount occupied by a file must be refused")
+	}
+	wantMsg := "mount /my-files is not a folder"
+	if err.Error() != wantMsg {
+		t.Errorf("error = %q, want %q", err.Error(), wantMsg)
+	}
+	if len(f.Dirs) != 0 || len(f.Files) != 0 {
+		t.Errorf("nothing may be created when the mount itself is not a folder, got Dirs=%v Files=%v", f.Dirs, f.Files)
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("a refusal writes no loud notes, got stderr %q", stderr.String())
+	}
 }
 
 // TestEnsureParentsRefusesFileOccupyingParentName is RED (Task 11, round-1

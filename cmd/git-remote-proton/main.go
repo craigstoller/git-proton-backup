@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -354,37 +355,69 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 				warn(err)
 				return 1
 			}
-			refs, err := repo.ListRefs(t, root)
+			scan, err := repo.ScanRefs(t, root)
 			if err != nil {
 				warn(err)
 				return 1
 			}
+			if cs := scan.ContentSkips(); len(cs) > 0 {
+				// STRICT fetch survey (design spec, component 1): a well-named
+				// ref file whose CONTENT does not parse could be a damaged
+				// real ref, so its silent absence would be a false-success
+				// restore — a clone that succeeds while quietly lacking a
+				// branch. Complete-or-loudly-incomplete: the whole "list" call
+				// fails with one error enumerating every content-skipped
+				// path, rather than advertising a subset and hoping the
+				// operator notices what is missing.
+				var b strings.Builder
+				fmt.Fprintf(&b, "cannot serve a fetch: %d file(s) under refs/ are not valid refs "+
+					"and a restore would silently lack them:\n", len(cs))
+				for _, s := range cs {
+					fmt.Fprintf(&b, "  %s/%s: %s\n", root, s.Path, s.Reason)
+				}
+				fmt.Fprintf(&b, "delete these files first (proton-drive filesystem trash <path>, or the "+
+					"web UI; Proton trash keeps them restorable), then retry")
+				warn(errors.New(b.String()))
+				return 1
+			}
+			refs := scan.Refs
 			for name, sha := range refs {
 				fmt.Fprintf(out, "%s %s\n", sha, name)
 			}
 			if branch, ok, err := repo.ReadHEAD(t, root); err != nil {
 				warn(err)
 				return 1
-			} else if _, listed := refs[branch]; ok && listed {
-				// The symref line is what lets clone check something out — and
-				// it is emitted ONLY when the branch it names is in the ref
-				// list we just advertised.
-				//
-				// A remote can hold a HEAD pointing at a branch that no longer
-				// exists: v2 never rewrites an existing HEAD, so any remote
-				// that lost its default branch before the delete refusal in
-				// repo.pushOne shipped is stuck that way permanently. Advertised
-				// verbatim, that symref makes clone fetch every object and then
-				// check out nothing — which the design names as a failure.
-				// Suppressing the line instead presents the remote as HEADLESS,
-				// which IS a defined state: clone reports that no default branch
-				// exists rather than silently producing an empty worktree.
-				//
-				// Checked against the just-listed refs rather than by a second
-				// remote read, so the advertisement is internally consistent by
-				// construction: the symref cannot name something the same
-				// response failed to advertise.
-				fmt.Fprintf(out, "@%s HEAD\n", branch)
+			} else if ok {
+				if _, listed := refs[branch]; listed {
+					// The symref line is what lets clone check something out — and
+					// it is emitted ONLY when the branch it names is in the ref
+					// list we just advertised.
+					//
+					// A remote can hold a HEAD pointing at a branch that no longer
+					// exists: v2 never rewrites an existing HEAD, so any remote
+					// that lost its default branch before the delete refusal in
+					// repo.pushOne shipped is stuck that way permanently. Advertised
+					// verbatim, that symref makes clone fetch every object and then
+					// check out nothing — which the design names as a failure.
+					// Suppressing the line instead presents the remote as HEADLESS,
+					// which IS a defined state: clone reports that no default branch
+					// exists rather than silently producing an empty worktree.
+					//
+					// Checked against the just-listed refs rather than by a second
+					// remote read, so the advertisement is internally consistent by
+					// construction: the symref cannot name something the same
+					// response failed to advertise.
+					fmt.Fprintf(out, "@%s HEAD\n", branch)
+				} else if sk, matched := scanSkipMatch(scan, branch); matched {
+					// HEAD names something the scan skipped rather than
+					// something simply absent (the pre-Task-2 case above
+					// still covers that silently, unchanged). Only NAME-skips
+					// can reach here in the fetch direction: a content-skip
+					// would already have failed the whole command above, so
+					// this branch is unreachable for Kind==SkipContent by
+					// construction, not by a check here.
+					headSkipNote(os.Stderr, branch, sk)
+				}
 			}
 			fmt.Fprint(out, "\n")
 			out.Flush()
@@ -411,16 +444,47 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 				return 1
 			}
 			lock = l
-			refs, err := repo.ListRefs(t, root)
+			scan, err := repo.ScanRefs(t, root)
 			if err != nil {
 				warn(err)
 				return 1
 			}
+			// scan.Skipped is not consulted here: this is the ADVERTISEMENT
+			// (what refs a client is told exist before it builds a push
+			// batch), not the execution arm. Occupancy enforcement against a
+			// skipped path happens where the batch is actually applied —
+			// repo.Push's phase-2 preflight and delete arm (component 2,
+			// below at the "push " case) — this call site's only job is to
+			// hand scan.Refs to the client unchanged.
+			refs := scan.Refs
 			for name, sha := range refs {
 				fmt.Fprintf(out, "%s %s\n", sha, name)
 			}
 			fmt.Fprint(out, "\n")
 			out.Flush()
+
+			// The push-survey HEAD diagnostic: ADVISORY, and COST-GATED on
+			// something already having been skipped. This is deliberately
+			// AFTER the advertisement above — it can never change what was
+			// just advertised, only add a note about it. Gating on
+			// len(scan.Skipped) > 0 means a clean repo's push survey stays
+			// exactly as read-free as it was before this task: Stage 5's fix
+			// round removed an unconditional per-push HEAD read for cost, and
+			// this must not reintroduce it for the common case.
+			if len(scan.Skipped) > 0 {
+				branch, ok, herr := repo.ReadHEAD(t, root)
+				if herr != nil {
+					// A failing diagnostic read must never fail the push
+					// advertisement itself — that would reintroduce, from a
+					// different angle, exactly the backup-stopping wedge the
+					// tolerant policy exists to remove.
+					warn(fmt.Errorf("HEAD unreadable during skip diagnostics: %v", herr))
+				} else if ok {
+					if sk, matched := scanSkipMatch(scan, branch); matched {
+						headSkipNote(os.Stderr, branch, sk)
+					}
+				}
+			}
 
 		case strings.HasPrefix(line, "push "):
 			// The lock is only ever set by a prior successful "list for-push",
@@ -473,12 +537,19 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 				out.Flush()
 				continue
 			}
-			remote, err := repo.ListRefs(t, root)
+			scan, err := repo.ScanRefs(t, root)
 			if err != nil {
 				warn(err)
 				return 1
 			}
-			for _, r := range repo.Push(t, root, gitDir, ups, remote) {
+			// scan.Skipped is handed straight to repo.Push (component 2): its
+			// phase-2 preflight and delete arm are what actually enforce
+			// occupancy against it — a create/update/delete landing on,
+			// above, or beneath a skipped path is refused there, kind-aware,
+			// before any pack is built. This call site's job is only to pass
+			// through what ScanRefs just found.
+			remote := scan.Refs
+			for _, r := range repo.Push(t, root, gitDir, ups, remote, scan.Skipped) {
 				if r.OK {
 					fmt.Fprintf(out, "ok %s\n", r.Ref)
 				} else {
@@ -566,6 +637,42 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 		return 1
 	}
 	return 0
+}
+
+// scanSkipMatch reports whether branch matches an entry in scan's skipped
+// set, and which one — the one matcher both the fetch-direction and
+// push-direction HEAD arms above call, so the two directions can never drift
+// into different notions of "HEAD names a skipped ref" (design spec,
+// "Degraded states").
+//
+// An exact Path match works for ANY Kind. A SkipInvalidNameFolder entry
+// additionally matches any path strictly BENEATH it (branch has s.Path+"/"
+// as a prefix): ScanRefs' walk never enters an invalid folder's subtree, so
+// the folder itself is the only occupancy it can ever record — HEAD naming
+// something inside it (e.g. "refs/heads/.hidden/topic" when only
+// "refs/heads/.hidden" was skipped) is still naming something the scan
+// skipped, and must not be reported as ordinary, unremarkable absence. This
+// prefix rule does NOT apply to SkipInvalidName or SkipContent, both of
+// which are leaf FILES with no subtree to be a descendant of.
+func scanSkipMatch(scan *repo.RefScan, branch string) (repo.SkippedRef, bool) {
+	for _, s := range scan.Skipped {
+		if s.Path == branch {
+			return s, true
+		}
+		if s.Kind == repo.SkipInvalidNameFolder && strings.HasPrefix(branch, s.Path+"/") {
+			return s, true
+		}
+	}
+	return repo.SkippedRef{}, false
+}
+
+// headSkipNote writes the stderr note both HEAD arms emit when HEAD names a
+// path the scan skipped — one wording shared by both call sites, so the
+// fetch- and push-direction surveys can never report the same degraded state
+// in different words.
+func headSkipNote(w io.Writer, branch string, sk repo.SkippedRef) {
+	fmt.Fprintf(w, "git-remote-proton: HEAD names %s, which was skipped (%s); "+
+		"advertising no default branch\n", branch, sk.Reason)
 }
 
 // fetchShaRe matches a fetch batch line's <sha> field: 40 lowercase hex, the

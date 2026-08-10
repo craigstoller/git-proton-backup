@@ -108,8 +108,9 @@ BeforeAll {
 
     # Mock HKCU\Environment key. Speaks exactly the surface install.ps1 uses:
     # GetValue($name, $default, $options), GetValueKind($name), SetValue($name, $value, $kind),
-    # Close(). Backed by a hashtable ($state) plus a SetCalls recorder (List) and a CloseCalls
-    # counter ([ref]).
+    # Close(). Backed by a hashtable ($state) plus a SetCalls recorder (List), a GetCalls
+    # recorder (List, Task 7: records every GetValue $options argument so tests can pin which
+    # RegistryValueOptions flags install.ps1 actually passes), and a CloseCalls counter ([ref]).
     #
     # IMPORTANT: these are captured via .GetNewClosure() on each scriptblock, NOT via $script:
     # scope. Verified interactively that Add-Member ScriptMethod blocks referencing $script:
@@ -119,7 +120,7 @@ BeforeAll {
     # not this test file's, and silently read/write $null. GetNewClosure() captures the actual
     # local variables below by reference, which works correctly across that script boundary.
     # The recorders are exposed as NoteProperties on the mock object itself so each test reads
-    # $mock.SetCalls / $mock.CloseCalls.Value rather than any shared scope.
+    # $mock.SetCalls / $mock.GetCalls / $mock.CloseCalls.Value rather than any shared scope.
     function New-MockEnvironmentKey {
         param(
             [AllowNull()][string]$InitialPath = $null,
@@ -129,12 +130,14 @@ BeforeAll {
         )
         $state = @{ Path = $InitialPath; Kind = $InitialKind; PathExists = $PathExists }
         $setCalls = New-Object System.Collections.Generic.List[object]
+        $getCalls = New-Object System.Collections.Generic.List[object]
         $closeCalls = [ref]0
         $throwOnSetValue = [bool]$ThrowOnSetValue
 
         $mock = [pscustomobject]@{}
         $mock | Add-Member -MemberType ScriptMethod -Name GetValue -Value ({
             param($name, $default, $options)
+            $getCalls.Add([pscustomobject]@{ Name = $name; Options = $options })
             if ($name -ne 'Path' -or -not $state.PathExists) { return $default }
             return $state.Path
         }.GetNewClosure())
@@ -155,6 +158,7 @@ BeforeAll {
         }.GetNewClosure())
 
         $mock | Add-Member -MemberType NoteProperty -Name SetCalls -Value $setCalls
+        $mock | Add-Member -MemberType NoteProperty -Name GetCalls -Value $getCalls
         $mock | Add-Member -MemberType NoteProperty -Name CloseCalls -Value $closeCalls
         return $mock
     }
@@ -261,5 +265,33 @@ Describe 'install.ps1 PATH registry seam (-EnvironmentKey)' {
 
         $mock.SetCalls.Count   | Should -Be 1 -Because 'SetValue was attempted before it threw'
         $mock.CloseCalls.Value | Should -Be 1 -Because 'finally must run Close() even when the try body throws'
+    }
+
+    It 'RED: install.ps1 passes DoNotExpandEnvironmentNames on its PATH read' {
+        # Task 7: pins install.ps1's own comment/behaviour (line ~52: "DoNotExpandEnvironmentNames
+        # keeps the raw value") against regression. A PathExists=$true mock is required: install.ps1
+        # only reaches the flagged GetValue call (line 61-62) after its existence check (line 60,
+        # $envKey.GetValue('Path') with no $options) finds a non-null value.
+        $ctx = New-InstallerCopy
+        $env:LOCALAPPDATA = $ctx.LocalAppData
+        $mock = New-MockEnvironmentKey -InitialPath 'C:\Existing\Path' -InitialKind ([Microsoft.Win32.RegistryValueKind]::String)
+
+        & $ctx.InstallScript -SkipPathUpdate:$false -EnvironmentKey $mock -HelperExe $ctx.HelperExe -EffectivePath '' | Out-Null
+
+        $flagged = [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
+        ($mock.GetCalls | Where-Object { $_.Options -eq $flagged }).Count |
+            Should -BeGreaterThan 0 -Because 'install.ps1 must read the raw (unexpanded) Path value before comparing entries'
+    }
+
+    It 'GUARD: the recorder distinguishes a flagless call' {
+        # Pins the spy itself (round-1 Gemini): a call made WITHOUT the flag must not be
+        # confused with a flagged one, or the RED test above would be worthless.
+        $mock = New-MockEnvironmentKey -InitialPath 'C:\Whatever' -InitialKind ([Microsoft.Win32.RegistryValueKind]::String)
+
+        $mock.GetValue('Path', '', $null) | Out-Null
+
+        $flagged = [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
+        $mock.GetCalls.Count       | Should -Be 1
+        $mock.GetCalls[0].Options  | Should -Not -Be $flagged -Because 'a flagless call must be recorded as distinguishable from a flagged one'
     }
 }

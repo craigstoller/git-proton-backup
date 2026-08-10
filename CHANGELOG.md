@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.5.0 — 2026-08-09
+
+- **git-remote-proton: `push` no longer fails outright because of a junk file under `refs/`.**
+  This is the headline behaviour change, and it is **breaking-ish in one specific way — read it
+  before upgrading if you rely on push failing as your junk-file alarm.** Previously, a ref file
+  that was well-named but whose contents didn't parse as a ref (a stray web-UI upload, a damaged
+  file, foreign junk) was **uniformly fatal**: both `list` and `list for-push` walked the same ref
+  tree, and a single such file aborted the whole advertisement — so an unattended cron `push`
+  stopped dead on a file it never created, with no way to skip past it but deleting the file by
+  hand. `push` now **tolerates** it: the file is skipped with a loud, classified note, the push
+  proceeds, and pushing (or deleting) onto that exact name is still refused, actionably, by the new
+  occupancy machinery below. **The trade:** a junk file that used to stop backups loudly no longer
+  stops them — anyone who was relying on that fatal failure as a "something's wrong" signal loses
+  it and should watch the new skip notes instead. `fetch`/`clone`/`ls-remote` **still fail by
+  design** on the same class of file — that direction was never silently succeeding, it already
+  failed loudly before this change — but the failure is now more useful: one error enumerating
+  every content-skipped path, its classified reason, and the remedy, instead of the previous single
+  generic error naming just the first file the walk happened to reach. Files with **invalid names**
+  (never valid refs to begin with) stay note-only in both directions, unchanged. See the README's
+  new foreign-data paragraph and `docs/v2-remote-helper-design.md`'s "Foreign data at the read
+  boundary" section (v6.6) for the full rule and remedy.
+- **git-remote-proton:** pushing (or deleting) onto a name a foreign file or folder occupies is now
+  refused **before any pack is built**, with a message naming exactly what occupies the path and
+  how to clear it — instead of failing later, more expensively, and with generic wording. The
+  message is kind-aware: a file whose contents aren't a ref names the reason; a file with an
+  invalid name says its contents were never examined; a folder with an invalid name says the same
+  and tells you to inspect before deleting anything, since blind deletion could destroy a foreign
+  subtree the helper never looked inside. A delete of such a name is refused the same way and
+  never trashed. Separately: because such a name was never advertised, `git push --delete` of it
+  is refused by git itself ("remote ref does not exist") before it ever reaches the helper — the
+  CLI or the Proton Drive web UI is the only way to clear it (Proton trash keeps the deletion
+  restorable).
+- **git-remote-proton:** a damaged ref file with a malformed terminator (no trailing newline, a
+  CRLF terminator, or a doubled newline around an otherwise-valid 40-hex sha) now has its
+  recoverable hex quoted in the skip note or refusal message, instead of a generic preview — so
+  the object pointer isn't lost from the log even though the file itself is skipped.
+- **git-remote-proton:** if a foreign file appears at a ref's name in the narrow window between
+  push's advertisement and its own create attempt, the create failure now names what's actually
+  there (contents-not-a-ref, with the reason) instead of the generic "ref changed concurrently;
+  refusing to overwrite" — unless it's a genuine concurrent ref creation, which still reports as
+  that.
+- **git-remote-proton (internal):** `filesystem download` on a directory is now a pinned contract
+  fact (exit 0, recursive download of the whole subtree) rather than an unprobed assumption — no
+  user-visible change, but it makes `--set-head`'s directory-vs-branch guard regression-safe.
+
 ## 0.4.0 — 2026-08-07
 
 - **git-remote-proton:** hierarchical refs are fully supported — nested branch and tag names

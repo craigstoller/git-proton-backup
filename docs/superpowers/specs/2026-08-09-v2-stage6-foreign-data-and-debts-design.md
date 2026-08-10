@@ -101,7 +101,12 @@ metadata *before* any download:
   carrying the escaped preview (≤42 bytes, control bytes hex-escaped) — and the noncanonical
   classification below. (Round-2 [Both] blocker: the round-1 gate downloaded only exactly-41-
   byte files, which made the damaged-pointer note below physically impossible for the 40- and
-  42-byte shapes it exists for; the band restores it while keeping every download ≤44 bytes.)
+  42-byte shapes it exists for; the band restores it while keeping every download ≤42 bytes.
+  **Task 1 revision note (2026-08-09):** this line still read "≤44 bytes" after the disclosed
+  band edit above landed — a leftover from the pre-edit 40–44 band, not a second band value.
+  Corrected here for the same reason as the disclosed edit: BOM-corrupted content is not
+  "malformed terminator" damage, so the band — and every bound derived from it, including this
+  one — is 40–42, not 40–44.)
 - size unavailable → **skipped without downloading**, note says so. (Fail-safe: never download
   what cannot be bounded. The certified CLI reports sizes for files; this arm is belt-and-
   braces, and the note makes its firing visible if the assumption ever breaks.)
@@ -383,83 +388,3 @@ gap round-1 Codex named); same-sha idempotent-create reconciliation (component 2
 | Fetch tolerance escape hatch | Not built (delete-the-file is available and trash-recoverable) | GPB_TOLERATE_FOREIGN env var now |
 | Scope shape | Full debt ledger rides along, one small gate, v0.5.0 | Decision-only minimal; debts + compaction start |
 | Foreign-file handling | Observe and report only, never modify or delete | Auto-trash; quarantine-move |
-
-## Revisions
-
-*Scaffolding for the review loop; delete before the spec is treated as final.*
-
-**Round 1 (Codex + Gemini, 2026-08-09) — applied:** `ListRefs` result restructured (advertised
-map + typed skipped-occupancy set + typed errors) and the skip keyed on a TYPED grammar
-failure with a transport-failure GUARD ([Codex] critical: an untyped implementation could turn
-network failures into false absence); occupancy set fed into the batch preflight and delete
-arm so same-name/both-direction D/F collisions and deletes of skipped names refuse PRE-pack
-with the remedy message ([Both]: the draft's "preflight unaffected" was wrong — late failures
-bypassed the new diagnosis); size-gated classification — only exactly-41-byte candidates are
-ever downloaded, wrong-size and unknown-size files skip on metadata alone ([Both]: unbounded
-download DoS; also bounds log disclosure to escaped 41-byte previews); noncanonical-40-hex
-notes quote the hex so a damaged ref's object pointer survives in the log ([Codex]); the
-occupant message asserts present observation only, not "was skipped at advertisement"
-([Codex]); degraded states defined + tested (HEAD→skipped, all-skipped) ([Codex]); git-
-porcelain delete lock-out documented with the CLI remedy ([Gemini]); `GPB_CONTRACT_LIVE_ROOT`
-validated in code (below /my-files, never an untouchable) ([Codex]); F1 row pinned to an
-exact fixture/layout and scoped to the transport layer ([Codex]); the install.ps1 mock became
-a flag SPY with both present and omitted cases ([Codex] + [Gemini]); README wording
-("contents are not valid refs", "never modified or deleted") ([Codex]). **Rejected with
-reasons:** per-operation strictness / strict-clone default ([Both] re-litigated the
-brainstorm-adjudicated availability decision; the scenario — including exit-0-reads-as-success
-— was argued before Craig chose; flagged to Craig at the review gate rather than adopted);
-same-sha idempotent create reconciliation ([Codex] — changes Stage 2 concurrent-creator
-semantics for an unobserved case; deferred); a verify/health command ([Codex] — real gap,
-wrong stage; recorded as a Stage 7 candidate in Out of scope).
-
-**Round 2 (Codex + Gemini, 2026-08-09) — applied:** the round-1 size gate was DEFECTIVE and
-both engines caught it as a blocker — "download only exactly 41 bytes" made the damaged-
-pointer note physically impossible for the 40-byte (no-LF) and 42-byte (CRLF/double-LF)
-shapes it exists for; replaced with a 40–44-byte candidate band (every download still ≤44
-bytes; wrong-terminator hex recovery restored; component-5 fixtures now assert their
-classified notes) ([Both] blocker). The occupancy set widened from content-skips to ALL
-skipped paths — name-skipped files and name-skipped folders included (folder itself recorded;
-its subtree is never entered) — closing the late-failure reproduction for invalid-named
-foreign data, with a preflight test ([Codex] major). The size gate is now explicitly a
-best-effort metadata bound with the replace-between-observe-and-read race accepted and
-stated (no byte-capped download exists in the certified CLI; same single-writer posture as
-design §2c), in both components 1 and 2 ([Codex] major, honesty option adopted).
-
-**Round 3 (Codex + Gemini, 2026-08-09, final round — cap reached; these fixes are applied but
-NOT re-verified by a further engine round; Craig's spec review and the plan's own review
-rounds are the net):** round 2's band fix was incompletely propagated and both engines caught
-the stale exact-41 phrasings — component 1's note grammar (`!= 41` → outside-the-band) and
-noncanonical clause ("41-byte candidate" → in-band candidate at 40/42 bytes), and component
-2's create-heal wrapper (now the same 40–44 band) ([Both]). The occupancy refusal messages
-became kind-aware — content-skipped file / name-skipped file (contents never examined) /
-name-skipped folder (inspect, never blind deletion) — because a one-size "a file whose
-contents are not a ref" message was false for name-skips and its trash remedy dangerous for
-folders ([Codex] major). `GPB_CONTRACT_LIVE_ROOT` validation is segment-wise and rejects
-`.`/`..` segments, with hermetic traversal cases ([Codex] major). No other new blocker/major
-findings in round 3; Gemini explicitly reported none beyond the stale-phrasing items.
-
-**Round 4 (Craig-directed reversal, 2026-08-09):** on Craig's review of the round-1 rejection
-list, the per-operation-strictness proposal ([Both], round 1) was RE-EXAMINED on merits — the
-original rejection reasoned circularly ("re-litigates an adjudicated decision" whose
-adjudication had followed the author's own recommendation). The re-argument: the push and
-fetch directions are different trades with different people present (unattended cron backups
-vs attended restores/alarming mirrors), so uniformity forced one answer onto two questions;
-the round-1 structured scan makes per-operation policy a small protocol-layer switch.
-**Adopted:** push survey tolerant (unchanged from rounds 1–3); fetch survey
-(`list`/fetch/clone/`ls-remote`) fails on a nonempty content-skip set with full enumeration
-(reasons + damaged-ref hex + remedy in the blocking error); name-skips stay non-fatal in both
-directions (they can never be refs — no silent-loss class); no fetch tolerance env var
-(YAGNI, recorded in Out of scope). Components 1, 4, 5, the scope rationale, and the decisions
-log were revised accordingly. These edits are Craig-adjudicated and post-date the three
-engine rounds.
-
-**Round 5 (Codex + Gemini, 2026-08-09, verification of round 4) — applied:** gate steps 1–2
-reordered — round 4's edit deleted the junk files before the push-onto-junk step needed them
-to collide with ([Codex] blocker); the README's fetch-blocking class qualified to
-valid-ref-named files with unparseable contents, name-skips documented note-only in both
-directions ([Codex] major); the degraded states corrected — for NAME-skips they are
-reachable in BOTH directions since name-skips never fail a survey (HEAD→name-skipped and
-all-name-skipped defined and tested for the fetch direction too) ([Gemini] major). Both
-engines otherwise explicitly reported no further blocker/major findings. These round-5 fixes
-are propagation corrections applied at the loop's end without a further engine round; the
-plan-review rounds re-cover the spec.

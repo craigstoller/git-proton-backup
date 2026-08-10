@@ -36,3 +36,19 @@ the rules from scratch.
 7. **Trash accounting must count folders the run's prune operations trashed, not only files.**
    When tallying what a gate run trashed for the record, include folders that prune operations
    sent to trash — a files-only count understates what actually left the account's live tree.
+
+8. **State the contract table's live root in the brief, and include it in the confinement
+   list.** `internal/transport/contract_test.go`'s `TestContractCLI` writes under
+   `GPB_CONTRACT_LIVE_ROOT` if set, else the `liveRoot` const
+   (`/my-files/_cas-probe/contract`) — whichever applies must be named explicitly and folded
+   into the brief's confinement list (rule 2), not left implicit. Established by Stage 5's S2
+   (`docs/research/gates/stage5-gate.md`): the gate's authorised confinement did not include
+   the hardcoded `liveRoot`, so the table refused to run under the gate's own root — a defect
+   in the brief, not the product.
+
+9. **Run pushes with a long tool timeout, or in the background.** A harness's default tool
+   timeout can kill a `git push` mid-flight; the push itself keeps running against the account,
+   so the runner is left diagnosing and clearing an orphaned remote lock rather than seeing a
+   clean failure. Established by Stage 5's S1 (`docs/research/gates/stage5-gate.md`): a
+   2-minute harness timeout killed the bootstrap push mid-flight and orphaned the `.lock`,
+   which then had to be diagnosed and cleared by hand before the push could be re-issued.

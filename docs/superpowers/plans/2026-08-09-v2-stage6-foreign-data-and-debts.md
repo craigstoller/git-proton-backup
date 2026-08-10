@@ -486,7 +486,22 @@ git commit -m "test: registry-mock options spy (DoNotExpandEnvironmentNames pinn
 
 - [ ] **Step 1: v6.6 edits, one revision entry** per spec component 4: per-operation content rows (push-survey skip+note vs fetch-survey enumerated failure — quote the Task 2 error shape); the v6.5 OPEN question replaced with the adjudicated per-operation rationale + spec pointer; occupancy refusal rows (kind-aware, pre-pack) + delete refusal + git-porcelain lock-out row; heal-arm race diagnosis row; HEAD/all-skipped degraded states (per-direction as specced); F1 recorded beside ReadTo/C16 with the row cited; size-gate band + best-effort residual documented.
 - [ ] **Step 2: README** foreign-data paragraph exactly as specced (component 4 wording: fetch-blocking class is valid-ref-named files with unparseable contents; invalid-named note-only both directions; mirror-alarm intended; lock-out + CLI/web-UI remedy; trash restorable).
-- [ ] **Step 3: CHANGELOG Unreleased entries:** per-operation foreign-data policy (user-visible behaviour change: fetch/clone/ls-remote now fail loudly on unparseable ref files instead of silently succeeding without them — BREAKING-ish, flag prominently; push unaffected); occupancy refusals with actionable messages; damaged-ref hex recovery in errors/notes; F1 contract fact. Do NOT flip the version (Task 9).
+- [ ] **Step 3: CHANGELOG Unreleased entries:**
+
+  > **SUPERSEDED (2026-08-09, Task 8 review round 1).** The parenthetical this step shipped with —
+  > "fetch/clone/ls-remote now fail loudly on unparseable ref files instead of silently succeeding
+  > without them — BREAKING-ish; push unaffected" — described the change relative to the spec's
+  > ABANDONED round-1–3 uniform-skip draft, not relative to the shipped v0.4.0 baseline. At v0.4.0,
+  > malformed ref-file contents were uniformly FATAL: both `list` arms called the same walk whose
+  > content failure aborted the whole advertisement, so junk blocked `push` too, and fetch never
+  > "silently succeeded" (it failed with one generic error). The accurate entry, which governs:
+  > **push is the direction that changes** (was fatally blocked by any junk under refs/, now
+  > tolerant with classified notes + occupancy refusals — the unattended-backup fix); **fetch stays
+  > failing by design**, upgraded from one generic error to full enumeration + remedy. Flag
+  > prominently that a junk file that used to stop backups loudly no longer stops them (the only
+  > honest "breaking-ish" angle: anyone relying on push failure as a junk alarm loses that signal).
+
+  Corrected content: per-operation foreign-data policy as described in the banner above; occupancy refusals with actionable messages; damaged-ref hex recovery in errors/notes; F1 contract fact. Do NOT flip the version (Task 9).
 - [ ] **Step 4: Commit.**
 ```bash
 git add docs/v2-remote-helper-design.md README.md CHANGELOG.md
@@ -518,49 +533,3 @@ git commit -m "chore(release): v0.5.0 CHANGELOG flip; Stage 6 live gate brief"
 1. **Spec coverage:** component 1 → Tasks 1–2 (scan, size gate, typed split, notes, degraded states, strict/tolerant policies); component 2 → Tasks 3–4 (preflight/delete occupancy, heal-arm race diagnosis); component 3 → Tasks 5–7 (F1, live root, mock spy, leftovers, checklist lines); component 4 → Task 8; component 5 → every task's tests + Task 9's brief. Execution-note ordering honoured (scan → policy → occupancy; debts interleave; docs after behaviour; release last).
 2. **Known deliberate divergences to defend in review:** the `-1` unknown-size sentinel (Node.Size zero-value is a real 0-byte file, out-of-band anyway — the sentinel only exists for the wrapper-transport test; the CLI never reports negatives); `ScanRefs` hard rename (no compat wrapper — four call sites, YAGNI); occupancy checks live in the existing phase-2 loop rather than a separate phase (the invariant "refused before newShas/valid assignment ⇒ no pack" is the existing structure).
 3. **Type consistency:** `SkippedRef`/`SkipKind`/`RefScan`/`ContentSkips`/`OccupancyMessage` (Task 1) are the single vocabulary consumed by Tasks 2, 3, 4, 8, 9; `errMalformedRef` + band constants shared by Tasks 1 and 4; `contractLiveRoot` (Task 6) consumed by Task 5's live row and Task 9's brief.
-
-## Revisions
-
-*Scaffolding for the review loop; delete before execution dispatch.*
-
-**Round 1 (Codex + Gemini, 2026-08-09) — applied:** Task 2 gains the push-survey HEAD note the
-draft had dismissed — `list for-push` reads HEAD when (and only when) the scan skipped
-anything (cost-gated per Stage 5's M1 lesson) and notes a skipped HEAD target ([Both]
-blocker); Task 6 splits a pure `validateContractLiveRoot(string) error` out of the
-Fatalf-wrapping helper so rejection subtests can exist, and the split logic TrimPrefixes the
-leading slash before segment checks ([Codex] blocker + [Gemini] split-yields-empty-first-
-element); the band shrinks to 40–42 with BOM shapes declassified to generic junk — a
-DISCLOSED SPEC EDIT in the same commit ([Codex] moderate); a shared `classifyRefContent`
-feeds both the scan and the heal race arm so hex recovery survives into race refusals
-([Gemini]); upper-bound (100-byte) no-download fixtures added to both scan and heal tests
-([Codex]: size<40-only would have passed everything); `TestWriteAndListRefs`' fatal-content
-assertion named for conversion alongside the retitled test ([Codex]); loop-level
-`ScanRefs→Push` wiring test added ([Codex]: manufactured slices left main.go's nil
-pass green); hermetic two-phase restore-shape loop test added ([Codex]);
-`TestLoop_ListTolerantOnNameSkips` relabelled GUARD ([Gemini]: passes against unpatched
-code); heal-arm Stat-error conformance made explicit (both diagnostic-failure paths asserted)
-([Codex]); trailer-brevity note added to Global Constraints ([Codex]). **Rejected with
-reason:** reordering occupancy checks BEFORE `checkDst` ([Codex] blocker as filed) — an
-invalid dst gets `checkDst`'s own refusal, which is correct (the helper could never create or
-delete that name regardless of occupancy), and the beneath-an-invalid-name case lands via the
-descendant check whose occupancy Path carries the invalid component while the dst stays
-valid; the plan now states this ordering rationale in Task 3 Step 3 and the kind-aware test
-manufactures a legal scan state.
-
-**Round 2 (Codex + Gemini, 2026-08-09) — Gemini: no new blocker/major findings, explicitly
-("the plan is ready for execution"). Codex: three majors, all applied:** Task 5's directory
-branch runs AFTER the existing dest-exists validation with a missing-dest GUARD (the C16
-wrapper contract applies to directory downloads; MkdirAll under an unvalidated dest would
-make the Fake accept what the CLI rejects); Task 2's push-survey HEAD diagnostic is
-explicitly ADVISORY with a failing-ReadHEAD GUARD (undefined semantics would let a natural
-fatal implementation reintroduce the backup-stopping wedge); Task 3 gains a loop-level
-NAME-skip occupancy wiring case (content-junk-only wiring would stay green if main.go passed
-ContentSkips() instead of Skipped).
-
-**Round 3 (Codex + Gemini, 2026-08-09, final round) — Gemini: no new blocker/major findings,
-explicitly ("sound and ready for execution"). Codex: one major, applied:** HEAD matching
-against the skipped set is exact-Path OR descendant-of-`SkipInvalidNameFolder` prefix (via a
-shared `scanSkipMatch` helper, both arms, descendant tests both directions) — the scan
-records only the skipped folder, never its unentered subtree, so HEAD naming a branch INSIDE
-a name-skipped folder previously suppressed the symref with no note. The loop ends at the
-three-round cap with every tracked finding applied or rejected-with-reason and none deferred.

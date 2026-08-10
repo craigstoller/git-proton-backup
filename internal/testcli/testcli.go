@@ -318,6 +318,20 @@ func runUpload(tree string, args []string, stdout, stderr io.Writer) int {
 // this shim will ever see has already guaranteed the directory exists; a
 // missing one here would signal a bug in the caller, not something to paper
 // over.
+//
+// FILE-ORIENTED ONLY, deliberately, and this is a real divergence from the
+// certified CLI, not an oversight: os.ReadFile below fails on a directory
+// path, so a directory target here misreports as notFound rather than being
+// downloaded. That is NOT the real contract — the Stage 5 gate's Finding F1
+// established that `filesystem download` on a directory exits 0 and
+// recursively downloads the whole subtree, now pinned by
+// internal/transport/contract_test.go's "download of a directory recursively
+// materialises the subtree (F1)" row and modelled by Fake.ReadTo's own
+// directory branch (internal/transport/fake.go). This shim was never
+// extended to match, so no test anywhere in this codebase may rely on it
+// downloading a directory — doing so would certify a shim behaviour
+// (notFound) that contradicts the certified CLI's real one (recursive
+// success).
 func runDownload(tree string, args []string, stderr io.Writer) int {
 	if len(args) < 2 {
 		fmt.Fprintln(stderr, "testcli: download requires a remote path and a destination directory")
