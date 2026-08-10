@@ -1628,6 +1628,136 @@ func TestLoop_ListForPushHeadDiagnosticFailureIsAdvisory(t *testing.T) {
 	}
 }
 
+// --- Task 3: occupancy-aware push wired end to end through loop() ---
+
+// TestLoop_PushCollidesWithScannedOccupancy is RED (round-1 Codex): every
+// test in internal/repo manufactures its own `skipped` slice directly, so a
+// main.go that kept passing nil to repo.Push would stay green against all of
+// them. This test instead drives loop() against a Fake holding a REAL junk
+// file the scan itself discovers — proving scan.Skipped is actually wired
+// from "push "'s ScanRefs call through to repo.Push, not merely that
+// repo.Push's own logic works when handed a slice by hand.
+//
+// refs/heads/blocked is a genuine content-skip (out-of-band size, exactly
+// the "junk file" fixture used throughout Task 2's tests); the push batch
+// creates refs/heads/blocked/x, an ANCESTOR collision. The refusal must be
+// pre-pack (no pack uploaded) and the junk file must survive untouched.
+func TestLoop_PushCollidesWithScannedOccupancy(t *testing.T) {
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	if err := repo.Bootstrap(ft, root); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	ft.Files[root+"/refs/heads/blocked"] = []byte("hello world\n") // real junk file: content-skip
+
+	gitDir := newGitRepoWithCommit(t)
+
+	scan, err := repo.ScanRefs(ft, root)
+	if err != nil {
+		t.Fatalf("ScanRefs: %v", err)
+	}
+	var sk repo.SkippedRef
+	found := false
+	for _, s := range scan.Skipped {
+		if s.Path == "refs/heads/blocked" {
+			sk, found = s, true
+		}
+	}
+	if !found {
+		t.Fatalf("fixture setup: want refs/heads/blocked recorded as a skip, got %+v", scan.Skipped)
+	}
+	wantMsg := repo.OccupancyMessage(root, sk)
+
+	script := "list for-push\npush refs/heads/main:refs/heads/blocked/x\n\n"
+	in := bufio.NewScanner(strings.NewReader(script))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	got := loop(ft, root, gitDir, in, out)
+	out.Flush()
+
+	if got != 0 {
+		t.Fatalf("loop() = %d, want 0: a per-ref refusal must not fail the whole session, stdout=%q",
+			got, outBuf.String())
+	}
+	if !strings.Contains(outBuf.String(), "error refs/heads/blocked/x "+wantMsg) {
+		t.Errorf("stdout = %q, want the occupancy refusal naming refs/heads/blocked/x with %q",
+			outBuf.String(), wantMsg)
+	}
+	for p := range ft.Files {
+		if strings.HasPrefix(p, root+"/packs/") {
+			t.Errorf("no pack may be uploaded for a preflight refusal, found %s", p)
+		}
+	}
+	if got := string(ft.Files[root+"/refs/heads/blocked"]); got != "hello world\n" {
+		t.Errorf("the junk file must survive byte-identical, got %q", got)
+	}
+}
+
+// TestLoop_PushCollidesWithScannedNameSkipOccupancy is RED (round-2 Codex):
+// with only the content-junk wiring case above, main.go could pass
+// scan.ContentSkips() instead of scan.Skipped and stay green — silently
+// dropping name-skip protection, since ContentSkips() only ever returns
+// Kind==SkipContent entries. This fixture is instead a scanned INVALID-NAMED
+// FILE (refs/heads/blocked/.hidden, Kind SkipInvalidName): only present in
+// the full scan.Skipped set, never in ContentSkips(). The push targets
+// refs/heads/blocked directly — a DESCENDANT collision — and must still be
+// refused pre-pack, kind-aware, with the file surviving untouched.
+func TestLoop_PushCollidesWithScannedNameSkipOccupancy(t *testing.T) {
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	if err := repo.Bootstrap(ft, root); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	sha := "1111111111111111111111111111111111111111"
+	ft.Files[root+"/refs/heads/blocked/.hidden"] = []byte(sha + "\n") // invalid-named FILE; contents never examined
+
+	gitDir := newGitRepoWithCommit(t)
+
+	scan, err := repo.ScanRefs(ft, root)
+	if err != nil {
+		t.Fatalf("ScanRefs: %v", err)
+	}
+	var sk repo.SkippedRef
+	found := false
+	for _, s := range scan.Skipped {
+		if s.Path == "refs/heads/blocked/.hidden" {
+			sk, found = s, true
+		}
+	}
+	if !found || sk.Kind != repo.SkipInvalidName {
+		t.Fatalf("fixture setup: want refs/heads/blocked/.hidden recorded as SkipInvalidName, got %+v", scan.Skipped)
+	}
+	if len(scan.ContentSkips()) != 0 {
+		t.Fatalf("fixture setup: this occupancy must NOT be a content-skip, got %+v", scan.ContentSkips())
+	}
+	wantMsg := repo.OccupancyMessage(root, sk)
+
+	script := "list for-push\npush refs/heads/main:refs/heads/blocked\n\n"
+	in := bufio.NewScanner(strings.NewReader(script))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	got := loop(ft, root, gitDir, in, out)
+	out.Flush()
+
+	if got != 0 {
+		t.Fatalf("loop() = %d, want 0, stdout=%q", got, outBuf.String())
+	}
+	if !strings.Contains(outBuf.String(), "error refs/heads/blocked "+wantMsg) {
+		t.Errorf("stdout = %q, want the pre-pack kind-aware refusal naming refs/heads/blocked/.hidden: %q",
+			outBuf.String(), wantMsg)
+	}
+	for p := range ft.Files {
+		if strings.HasPrefix(p, root+"/packs/") {
+			t.Errorf("passing only ContentSkips() would let this reach the pack build; no pack may exist, found %s", p)
+		}
+	}
+	if got := string(ft.Files[root+"/refs/heads/blocked/.hidden"]); got != sha+"\n" {
+		t.Errorf("the name-skipped file must survive byte-identical, got %q", got)
+	}
+}
+
 // TestLoop_RestoreShapeBlockedThenRecovers is RED (restore shape, hermetic —
 // round-1 Codex: the spec's clone sequence needs a loop-level pin, not only
 // the live gate). Phase 1: "list" with content junk present fails with

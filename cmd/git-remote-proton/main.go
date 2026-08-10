@@ -449,7 +449,14 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 				warn(err)
 				return 1
 			}
-			refs := scan.Refs // Task 2 wires scan.Skipped into the push-side occupancy preflight
+			// scan.Skipped is not consulted here: this is the ADVERTISEMENT
+			// (what refs a client is told exist before it builds a push
+			// batch), not the execution arm. Occupancy enforcement against a
+			// skipped path happens where the batch is actually applied —
+			// repo.Push's phase-2 preflight and delete arm (component 2,
+			// below at the "push " case) — this call site's only job is to
+			// hand scan.Refs to the client unchanged.
+			refs := scan.Refs
 			for name, sha := range refs {
 				fmt.Fprintf(out, "%s %s\n", sha, name)
 			}
@@ -535,8 +542,14 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 				warn(err)
 				return 1
 			}
-			remote := scan.Refs // Task 2 wires scan.Skipped into the push-side occupancy preflight
-			for _, r := range repo.Push(t, root, gitDir, ups, remote) {
+			// scan.Skipped is handed straight to repo.Push (component 2): its
+			// phase-2 preflight and delete arm are what actually enforce
+			// occupancy against it — a create/update/delete landing on,
+			// above, or beneath a skipped path is refused there, kind-aware,
+			// before any pack is built. This call site's job is only to pass
+			// through what ScanRefs just found.
+			remote := scan.Refs
+			for _, r := range repo.Push(t, root, gitDir, ups, remote, scan.Skipped) {
 				if r.OK {
 					fmt.Fprintf(out, "ok %s\n", r.Ref)
 				} else {
