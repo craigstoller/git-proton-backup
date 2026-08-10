@@ -219,7 +219,7 @@ Per spec component 5's live-gate outline item 1.
    cd stage6-gate
    git commit --allow-empty -m "gate: stage6 initial commit"
    git remote add proton-v2 "proton::/my-files/GitRemotes/stage6-gate"
-   proton-drive filesystem create-folder /my-files/GitRemotes
+   proton-drive filesystem create-folder /my-files GitRemotes
    git push -u proton-v2 main
    ```
    (`-b main` is explicit, not `init.defaultBranch` — every later command in this brief names
@@ -228,7 +228,9 @@ Per spec component 5's live-gate outline item 1.
    refuses missing parents unless `GPB_CREATE_PARENTS=1` is set, which this brief never sets.
    The explicit `create-folder` above (authorized by Preconditions step 5) is the correct
    bootstrap when the folder is absent; run 1's runner performed exactly this as an
-   adjudicated-accepted in-spirit deviation. The push then creates the repo marker and
+   adjudicated-accepted in-spirit deviation. Note the TWO-argument form, `parentPath name` —
+   the first draft of this amendment wrote a one-path form, which the CLI rejects with
+   `Expected 2 arguments, got 1` (run 2's R2-D1). The push then creates the repo marker and
    `refs/heads/main`.
 1. **Manufacture two junk files** at valid ref names under `refs/heads` — CLI upload of a
    non-ref file, the web-UI-equivalent action. One lands IN the 40–42-byte candidate band (gets
