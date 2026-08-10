@@ -1628,9 +1628,9 @@ func TestLoop_ListForPushHeadDiagnosticFailureIsAdvisory(t *testing.T) {
 	}
 }
 
-// TestLoop_RestoreShapeBlockedThenRecovers is the restore-shape pin (round-1
-// Codex: the spec's clone sequence needs a loop-level test, not only the
-// live gate), hermetic. Phase 1: "list" with content junk present fails with
+// TestLoop_RestoreShapeBlockedThenRecovers is RED (restore shape, hermetic —
+// round-1 Codex: the spec's clone sequence needs a loop-level pin, not only
+// the live gate). Phase 1: "list" with content junk present fails with
 // the enumerated error. Phase 2: the junk is removed and a FRESH loop drive
 // (a real "list" followed by a real fetch batch, against a genuine git
 // repository pushed via pushViaLoop) succeeds and materialises the ref's
@@ -1692,9 +1692,9 @@ func TestLoop_RestoreShapeBlockedThenRecovers(t *testing.T) {
 	}
 }
 
-// TestLoop_ListDegradedStates pins both all-skipped shapes named in the
-// design spec's "Degraded states" section: all-name-skipped succeeds as a
-// clone-of-empty (empty advertisement, notes for every file); all-
+// TestLoop_ListDegradedStates is RED: pins both all-skipped shapes named in
+// the design spec's "Degraded states" section: all-name-skipped succeeds as
+// a clone-of-empty (empty advertisement, notes for every file); all-
 // content-skipped fails with EVERY path enumerated in the one error, not
 // just the first.
 func TestLoop_ListDegradedStates(t *testing.T) {
