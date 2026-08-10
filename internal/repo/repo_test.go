@@ -7062,6 +7062,53 @@ func TestEnsureParentsNeverCreatesMountRoots(t *testing.T) {
 	})
 }
 
+// mountIsFileTransport wraps a Fake but forces Stat to report ONE specific
+// path (the mount) as an EXISTING FILE, not a folder. Ordinary Fake state
+// cannot model this: /my-files and every "/devices/<id>" are built-in mounts
+// (fake.go's isBuiltinMountParent, the Stage 5 Task 11 leniency wired into
+// Fake.Stat) that always report present-as-a-folder regardless of f.Dirs/
+// f.Files contents, so there is no way to seed a FILE at a mount path through
+// the Fake's own maps. This wrapper — same technique as absentMountTransport
+// above — is the only route into EnsureParents' `!n.IsDir` mount-check arm
+// (parents.go).
+type mountIsFileTransport struct {
+	*transport.Fake
+	mount string
+}
+
+func (m mountIsFileTransport) Stat(p string) (transport.Node, bool, error) {
+	if p == m.mount {
+		return transport.Node{IsDir: false}, true, nil
+	}
+	return m.Fake.Stat(p)
+}
+
+// TestEnsureParentsMountIsAFile is a GUARD (Task 7, Stage 6 plan), not a RED:
+// the `!n.IsDir` arm of EnsureParents' mount check (parents.go) already
+// exists and is already correct — this pins the exact "mount %s is not a
+// folder" error text against regression, using mountIsFileTransport since a
+// plain Fake cannot manufacture a file at a mount path.
+func TestEnsureParentsMountIsAFile(t *testing.T) {
+	f := transport.NewFake()
+	tr := mountIsFileTransport{Fake: f, mount: "/my-files"}
+	var stderr strings.Builder
+
+	err := EnsureParents(tr, "/my-files/repo", true, &stderr)
+	if err == nil {
+		t.Fatal("a mount occupied by a file must be refused")
+	}
+	wantMsg := "mount /my-files is not a folder"
+	if err.Error() != wantMsg {
+		t.Errorf("error = %q, want %q", err.Error(), wantMsg)
+	}
+	if len(f.Dirs) != 0 || len(f.Files) != 0 {
+		t.Errorf("nothing may be created when the mount itself is not a folder, got Dirs=%v Files=%v", f.Dirs, f.Files)
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("a refusal writes no loud notes, got stderr %q", stderr.String())
+	}
+}
+
 // TestEnsureParentsRefusesFileOccupyingParentName is RED (Task 11, round-1
 // Codex finding: an earlier draft accepted ANY existing node — including a
 // file — as a usable parent folder). A file occupying a parent's name is
