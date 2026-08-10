@@ -1244,3 +1244,514 @@ func TestLoop_FetchBatch_CheckConnectivityFalse_NoConnectivityOk(t *testing.T) {
 		t.Errorf("stdout = %q, must NOT contain connectivity-ok: the option was never turned on", stdout)
 	}
 }
+
+// --- Task 2: per-operation policy at the protocol layer ---
+//
+// Stage 6, design spec component 1 ("The two policies over the one scan"):
+// the SAME scan.Skipped set is consumed two different ways depending on
+// which command is being served. "list" (fetch/clone/ls-remote, the attended
+// direction) is STRICT: a nonempty ContentSkips() fails the whole command
+// with one enumerated error, because a well-named ref file whose content
+// does not parse could be a damaged real ref, and silently omitting it would
+// be a false-success restore. "list for-push" (the unattended cron-backup
+// direction) stays TOLERANT: content-skips are skipped with a note, exactly
+// as they already were, plus a cost-gated advisory HEAD diagnostic. Name-
+// skips (invalid ref NAME, file or folder) never fail either direction — the
+// principled line: a name-invalid path can never be a ref git could hold, so
+// its absence is never silent loss.
+
+// TestLoop_ListIsStrictOnContentSkipsListForPushTolerant is the per-operation
+// core, driving the SAME Fake fixture (good ref + content junk) through both
+// commands in sequence (neither one mutates the fixture the other depends
+// on: "list" is read-only).
+//
+// RED before Task 2: "list" advertised the good ref and skipped the junk
+// with a note (Task 1's ScanRefs behaviour, wired through unchanged) instead
+// of failing closed — the "got1 != 1" assertion below fired, with got1 == 0
+// and the good ref present on stdout.
+func TestLoop_ListIsStrictOnContentSkipsListForPushTolerant(t *testing.T) {
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	if err := repo.Bootstrap(ft, root); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	sha := "1111111111111111111111111111111111111111"
+	if _, err := repo.WriteRef(ft, root, "refs/heads/main", sha, false); err != nil {
+		t.Fatalf("WriteRef: %v", err)
+	}
+	ft.Files[root+"/refs/heads/junk"] = []byte("hello world\n") // 12 bytes, out-of-band content junk
+
+	// "list" (fetch direction): must fail closed with ONE enumerated error
+	// block, and NO ref lines on stdout at all — complete-or-loudly-incomplete.
+	in1 := bufio.NewScanner(strings.NewReader("list\n\n"))
+	var out1Buf bytes.Buffer
+	out1 := bufio.NewWriter(&out1Buf)
+	var got1 int
+	stderr1 := captureStderr(t, func() { got1 = loop(ft, root, ".", in1, out1) })
+	out1.Flush()
+
+	if got1 != 1 {
+		t.Fatalf("list with content junk present: loop() = %d, want 1: stdout=%q stderr=%q",
+			got1, out1Buf.String(), stderr1)
+	}
+	if out1Buf.String() != "" {
+		t.Errorf("list must emit NO ref lines on stdout when it fails, got %q", out1Buf.String())
+	}
+	if !strings.Contains(stderr1, "refs/heads/junk") {
+		t.Errorf("stderr = %q, want the junk path named", stderr1)
+	}
+	if !strings.Contains(stderr1, "cannot serve a fetch") {
+		t.Errorf("stderr = %q, want the enumerated-error preamble", stderr1)
+	}
+	if !strings.Contains(stderr1, "trash") {
+		t.Errorf("stderr = %q, want the trash remedy", stderr1)
+	}
+
+	// "list for-push" against the SAME fixture: junk skipped with a note, the
+	// good ref still advertised, exit flow normal.
+	in2 := bufio.NewScanner(strings.NewReader("list for-push\n\n"))
+	var out2Buf bytes.Buffer
+	out2 := bufio.NewWriter(&out2Buf)
+	var got2 int
+	stderr2 := captureStderr(t, func() { got2 = loop(ft, root, ".", in2, out2) })
+	out2.Flush()
+
+	if got2 != 0 {
+		t.Fatalf("list for-push with content junk present: loop() = %d, want 0: stdout=%q stderr=%q",
+			got2, out2Buf.String(), stderr2)
+	}
+	if !strings.Contains(out2Buf.String(), sha+" refs/heads/main") {
+		t.Errorf("stdout = %q, want the good ref advertised", out2Buf.String())
+	}
+	if strings.Contains(out2Buf.String(), "junk") {
+		t.Errorf("stdout = %q, must not advertise the junk path", out2Buf.String())
+	}
+	if !strings.Contains(stderr2, "refs/heads/junk") {
+		t.Errorf("stderr = %q, want the junk path noted (tolerant direction)", stderr2)
+	}
+}
+
+// TestLoop_ListStrictErrorCarriesDamagedRefHex: the enumerated error must
+// carry a recovered Hex forward when the scan found one — a CRLF-terminated
+// candidate (42 bytes, in-band) classifies as the noncanonical damaged-ref
+// shape, and the strict fetch survey's error is the one place a human is
+// guaranteed to read it, since deleting the file without ever seeing the sha
+// could destroy the only surviving pointer to remote-only objects.
+//
+// RED before Task 2: same defect as the previous test — "list" advertised
+// instead of failing, so the recovered hex never reached stderr at all.
+func TestLoop_ListStrictErrorCarriesDamagedRefHex(t *testing.T) {
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	if err := repo.Bootstrap(ft, root); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	sha := "1111111111111111111111111111111111111111"
+	if _, err := repo.WriteRef(ft, root, "refs/heads/main", sha, false); err != nil {
+		t.Fatalf("WriteRef: %v", err)
+	}
+	damagedSha := "2222222222222222222222222222222222222222"
+	ft.Files[root+"/refs/heads/damaged"] = []byte(damagedSha + "\r\n") // CRLF terminator, 42 bytes, in-band
+
+	in := bufio.NewScanner(strings.NewReader("list\n\n"))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(ft, root, ".", in, out) })
+	out.Flush()
+
+	if got != 1 {
+		t.Fatalf("loop() = %d, want 1: stdout=%q stderr=%q", got, outBuf.String(), stderr)
+	}
+	if !strings.Contains(stderr, damagedSha) {
+		t.Errorf("stderr = %q, want the recovered hex %q in the enumerated error", stderr, damagedSha)
+	}
+	if !strings.Contains(stderr, "refs/heads/damaged") {
+		t.Errorf("stderr = %q, want the damaged path named", stderr)
+	}
+}
+
+// TestLoop_ListTolerantOnNameSkips is a GUARD (round-1 Gemini): it passes
+// against UNPATCHED code too — Stage 5's list arm already tolerates
+// name-skips — and pins that Task 2's strict check does not overreach onto
+// them. Only a well-named file's unparseable CONTENT triggers fetch-side
+// strictness; a name-invalid file can never be a ref git could hold, so its
+// absence is never silent loss (the "principled line").
+func TestLoop_ListTolerantOnNameSkips(t *testing.T) {
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	if err := repo.Bootstrap(ft, root); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	sha := "1111111111111111111111111111111111111111"
+	if _, err := repo.WriteRef(ft, root, "refs/heads/main", sha, false); err != nil {
+		t.Fatalf("WriteRef: %v", err)
+	}
+	ft.Files[root+"/refs/heads/.hidden"] = []byte(sha + "\n") // name-invalid leaf, contents never examined
+
+	in := bufio.NewScanner(strings.NewReader("list\n\n"))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(ft, root, ".", in, out) })
+	out.Flush()
+
+	if got != 0 {
+		t.Fatalf("list with only a name-skip present must succeed: loop() = %d, stdout=%q stderr=%q",
+			got, outBuf.String(), stderr)
+	}
+	if !strings.Contains(outBuf.String(), sha+" refs/heads/main") {
+		t.Errorf("stdout = %q, want the good ref advertised", outBuf.String())
+	}
+	if !strings.Contains(stderr, ".hidden") {
+		t.Errorf("stderr = %q, want the name-skipped path noted", stderr)
+	}
+}
+
+// TestLoop_ListForPushHeadNamingContentSkippedRefNoted is a RED ([Both]
+// round-1 blocker — the draft dismissed this spec state): the PUSH survey's
+// HEAD note. HEAD names a content-skipped ref directly; the advertisement
+// must still complete (others intact), and a stderr note must name HEAD's
+// target and why it was skipped. The cost gate (len(scan.Skipped) > 0) is
+// armed by the same junk file that makes the ref content-skipped, so this
+// also exercises the gated ReadHEAD call.
+func TestLoop_ListForPushHeadNamingContentSkippedRefNoted(t *testing.T) {
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	if err := repo.Bootstrap(ft, root); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	sha := "1111111111111111111111111111111111111111"
+	if _, err := repo.WriteRef(ft, root, "refs/heads/main", sha, false); err != nil {
+		t.Fatalf("WriteRef: %v", err)
+	}
+	ft.Files[root+"/refs/heads/junk"] = []byte("hello world\n") // content-skip
+	if _, err := repo.WriteHEAD(ft, root, "refs/heads/junk"); err != nil {
+		t.Fatalf("WriteHEAD: %v", err)
+	}
+
+	in := bufio.NewScanner(strings.NewReader("list for-push\n\n"))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(ft, root, ".", in, out) })
+	out.Flush()
+
+	if got != 0 {
+		t.Fatalf("list for-push must stay tolerant: loop() = %d, stdout=%q stderr=%q",
+			got, outBuf.String(), stderr)
+	}
+	if !strings.Contains(outBuf.String(), sha+" refs/heads/main") {
+		t.Errorf("stdout = %q, want the good ref advertised", outBuf.String())
+	}
+	if !strings.Contains(stderr, "HEAD names refs/heads/junk") {
+		t.Errorf("stderr = %q, want a note naming HEAD's skipped target", stderr)
+	}
+}
+
+// TestLoop_ListHeadNamingNameSkippedRefNotedNotAdvertised: the fetch-survey
+// HEAD case reachable here is NAME-skips only — a content-skip beside it
+// would already fail the whole "list" command before this code is ever
+// reached (the previous tests above). HEAD names a name-skipped ref exactly
+// (not a descendant — see the folder/descendant test below): the symref
+// line stays absent (existing Stage 5 logic, unchanged), and NEW here, a
+// note names why.
+func TestLoop_ListHeadNamingNameSkippedRefNotedNotAdvertised(t *testing.T) {
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	if err := repo.Bootstrap(ft, root); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	sha := "1111111111111111111111111111111111111111"
+	if _, err := repo.WriteRef(ft, root, "refs/heads/main", sha, false); err != nil {
+		t.Fatalf("WriteRef: %v", err)
+	}
+	ft.Files[root+"/refs/heads/.hidden"] = []byte(sha + "\n") // name-invalid leaf
+	if _, err := repo.WriteHEAD(ft, root, "refs/heads/.hidden"); err != nil {
+		t.Fatalf("WriteHEAD: %v", err)
+	}
+
+	in := bufio.NewScanner(strings.NewReader("list\n\n"))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(ft, root, ".", in, out) })
+	out.Flush()
+	stdout := outBuf.String()
+
+	if got != 0 {
+		t.Fatalf("list with only a name-skip present (even naming HEAD) must succeed: "+
+			"loop() = %d, stdout=%q stderr=%q", got, stdout, stderr)
+	}
+	if strings.Contains(stdout, "@") {
+		t.Errorf("stdout = %q, must not advertise a symref to a skipped name", stdout)
+	}
+	if !strings.Contains(stdout, sha+" refs/heads/main") {
+		t.Errorf("stdout = %q, want the good ref advertised", stdout)
+	}
+	if !strings.Contains(stderr, "HEAD names refs/heads/.hidden") {
+		t.Errorf("stderr = %q, want a note naming HEAD's skipped target", stderr)
+	}
+}
+
+// TestLoop_ListHeadNamingNameSkippedFolderDescendantNotedNotAdvertised is the
+// fetch-direction half of the descendant case the brief calls out
+// separately from the exact-match test above: ScanRefs never enters an
+// invalid folder's subtree, so the ONLY occupancy it can ever record for
+// ".hidden/topic" is the folder itself, "refs/heads/.hidden" — HEAD naming a
+// path strictly BENEATH that folder must still match via scanSkipMatch's
+// prefix rule (SkipInvalidNameFolder only), not be treated as a HEAD naming
+// something merely absent.
+func TestLoop_ListHeadNamingNameSkippedFolderDescendantNotedNotAdvertised(t *testing.T) {
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	if err := repo.Bootstrap(ft, root); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	sha := "1111111111111111111111111111111111111111"
+	if _, err := repo.WriteRef(ft, root, "refs/heads/main", sha, false); err != nil {
+		t.Fatalf("WriteRef: %v", err)
+	}
+	// ".hidden" is a name-invalid FOLDER; the file underneath makes the Fake
+	// synthesise it as a directory node, but the walk never lists inside it.
+	ft.Files[root+"/refs/heads/.hidden/topic"] = []byte(sha + "\n")
+	// HEAD names a DESCENDANT of the skipped folder, never the folder's own
+	// path — exactly the case the prefix-match rule exists for.
+	if _, err := repo.WriteHEAD(ft, root, "refs/heads/.hidden/topic"); err != nil {
+		t.Fatalf("WriteHEAD: %v", err)
+	}
+
+	in := bufio.NewScanner(strings.NewReader("list\n\n"))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(ft, root, ".", in, out) })
+	out.Flush()
+	stdout := outBuf.String()
+
+	if got != 0 {
+		t.Fatalf("a name-skipped folder must never fail the fetch survey: loop() = %d, stdout=%q stderr=%q",
+			got, stdout, stderr)
+	}
+	if strings.Contains(stdout, "@") {
+		t.Errorf("stdout = %q, must not advertise a symref into an unentered subtree", stdout)
+	}
+	if !strings.Contains(stdout, sha+" refs/heads/main") {
+		t.Errorf("stdout = %q, want the good ref advertised", stdout)
+	}
+	if !strings.Contains(stderr, "HEAD names refs/heads/.hidden/topic") {
+		t.Errorf("stderr = %q, want a note naming HEAD's descendant target", stderr)
+	}
+}
+
+// TestLoop_ListForPushHeadNamingNameSkippedFolderDescendantNoted is the
+// push-direction twin of the descendant test above — both directions share
+// scanSkipMatch, and both must be pinned separately since the two call sites
+// are two different code paths in loop().
+func TestLoop_ListForPushHeadNamingNameSkippedFolderDescendantNoted(t *testing.T) {
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	if err := repo.Bootstrap(ft, root); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	sha := "1111111111111111111111111111111111111111"
+	if _, err := repo.WriteRef(ft, root, "refs/heads/main", sha, false); err != nil {
+		t.Fatalf("WriteRef: %v", err)
+	}
+	ft.Files[root+"/refs/heads/.hidden/topic"] = []byte(sha + "\n")
+	if _, err := repo.WriteHEAD(ft, root, "refs/heads/.hidden/topic"); err != nil {
+		t.Fatalf("WriteHEAD: %v", err)
+	}
+
+	in := bufio.NewScanner(strings.NewReader("list for-push\n\n"))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(ft, root, ".", in, out) })
+	out.Flush()
+
+	if got != 0 {
+		t.Fatalf("list for-push must stay tolerant: loop() = %d, stdout=%q stderr=%q",
+			got, outBuf.String(), stderr)
+	}
+	if !strings.Contains(outBuf.String(), sha+" refs/heads/main") {
+		t.Errorf("stdout = %q, want the good ref advertised", outBuf.String())
+	}
+	if !strings.Contains(stderr, "HEAD names refs/heads/.hidden/topic") {
+		t.Errorf("stderr = %q, want a note naming HEAD's descendant target", stderr)
+	}
+}
+
+// TestLoop_ListForPushHeadDiagnosticFailureIsAdvisory is a GUARD (round-2
+// Codex: undefined failure semantics would let a natural fatal-error
+// implementation reintroduce the backup-stopping wedge). Corrupt HEAD bytes
+// plus a skipped file (arming the cost gate) must produce an advisory stderr
+// note and let "list for-push" complete normally — the advertisement is
+// intact and the exit flow is unchanged, because a diagnostic read failure
+// must never fail a push.
+func TestLoop_ListForPushHeadDiagnosticFailureIsAdvisory(t *testing.T) {
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	if err := repo.Bootstrap(ft, root); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	sha := "1111111111111111111111111111111111111111"
+	if _, err := repo.WriteRef(ft, root, "refs/heads/main", sha, false); err != nil {
+		t.Fatalf("WriteRef: %v", err)
+	}
+	ft.Files[root+"/refs/heads/junk"] = []byte("hello world\n")      // arms the cost gate
+	ft.Files[root+"/"+repo.HeadName] = []byte("not a symref at all") // corrupt HEAD content
+
+	in := bufio.NewScanner(strings.NewReader("list for-push\n\n"))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(ft, root, ".", in, out) })
+	out.Flush()
+
+	if got != 0 {
+		t.Fatalf("a corrupt HEAD during skip diagnostics must be advisory only: loop() = %d, stdout=%q stderr=%q",
+			got, outBuf.String(), stderr)
+	}
+	if !strings.Contains(outBuf.String(), sha+" refs/heads/main") {
+		t.Errorf("stdout = %q, want the advertisement to complete despite the HEAD read failure", outBuf.String())
+	}
+	if !strings.Contains(stderr, "HEAD unreadable during skip diagnostics") {
+		t.Errorf("stderr = %q, want the advisory note naming the failure", stderr)
+	}
+}
+
+// TestLoop_RestoreShapeBlockedThenRecovers is the restore-shape pin (round-1
+// Codex: the spec's clone sequence needs a loop-level test, not only the
+// live gate), hermetic. Phase 1: "list" with content junk present fails with
+// the enumerated error. Phase 2: the junk is removed and a FRESH loop drive
+// (a real "list" followed by a real fetch batch, against a genuine git
+// repository pushed via pushViaLoop) succeeds and materialises the ref's
+// object in a destination repo that never had it.
+func TestLoop_RestoreShapeBlockedThenRecovers(t *testing.T) {
+	src := newGitRepoWithCommit(t)
+	sha := headOf(t, src)
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	pushViaLoop(t, ft, root, src)
+
+	// Phase 1: content junk present -> "list" fails closed, no ref lines.
+	ft.Files[root+"/refs/heads/junk"] = []byte("hello world\n")
+
+	in1 := bufio.NewScanner(strings.NewReader("list\n\n"))
+	var out1Buf bytes.Buffer
+	out1 := bufio.NewWriter(&out1Buf)
+	var got1 int
+	stderr1 := captureStderr(t, func() { got1 = loop(ft, root, ".", in1, out1) })
+	out1.Flush()
+	if got1 != 1 {
+		t.Fatalf("phase 1: loop() = %d, want 1: stdout=%q stderr=%q", got1, out1Buf.String(), stderr1)
+	}
+	if out1Buf.String() != "" {
+		t.Errorf("phase 1: stdout = %q, want no ref lines while blocked", out1Buf.String())
+	}
+
+	// Phase 2: remove the junk; a FRESH loop drive succeeds.
+	delete(ft.Files, root+"/refs/heads/junk")
+
+	in2 := bufio.NewScanner(strings.NewReader("list\n\n"))
+	var out2Buf bytes.Buffer
+	out2 := bufio.NewWriter(&out2Buf)
+	got2 := loop(ft, root, ".", in2, out2)
+	out2.Flush()
+	if got2 != 0 {
+		t.Fatalf("phase 2 list: loop() = %d, want 0: stdout=%q", got2, out2Buf.String())
+	}
+	if !strings.Contains(out2Buf.String(), sha+" refs/heads/main") {
+		t.Errorf("phase 2 list: stdout = %q, want the real ref advertised", out2Buf.String())
+	}
+
+	dst := emptyGitRepo(t)
+	script := "option check-connectivity true\nfetch " + sha + " refs/heads/main\n\n"
+	in3 := bufio.NewScanner(strings.NewReader(script))
+	var out3Buf bytes.Buffer
+	out3 := bufio.NewWriter(&out3Buf)
+	got3 := loop(ft, root, dst, in3, out3)
+	out3.Flush()
+	stdout3 := out3Buf.String()
+	if got3 != 0 {
+		t.Fatalf("phase 2 fetch: loop() = %d, want 0: stdout=%q", got3, stdout3)
+	}
+	if !strings.Contains(stdout3, "connectivity-ok") {
+		t.Errorf("phase 2 fetch: stdout = %q, want connectivity-ok: the closure must materialise", stdout3)
+	}
+	if err := exec.Command("git", "-C", dst, "cat-file", "-e", sha).Run(); err != nil {
+		t.Errorf("phase 2 fetch: object %s did not materialise in %s: %v", sha, dst, err)
+	}
+}
+
+// TestLoop_ListDegradedStates pins both all-skipped shapes named in the
+// design spec's "Degraded states" section: all-name-skipped succeeds as a
+// clone-of-empty (empty advertisement, notes for every file); all-
+// content-skipped fails with EVERY path enumerated in the one error, not
+// just the first.
+func TestLoop_ListDegradedStates(t *testing.T) {
+	t.Run("all name-skipped succeeds with empty advertisement", func(t *testing.T) {
+		ft := transport.NewFake()
+		root := "/my-files/r"
+		if err := repo.Bootstrap(ft, root); err != nil {
+			t.Fatalf("bootstrap: %v", err)
+		}
+		sha := "1111111111111111111111111111111111111111"
+		ft.Files[root+"/refs/heads/.hidden"] = []byte(sha + "\n")
+		ft.Files[root+"/refs/tags/.also-hidden"] = []byte(sha + "\n")
+
+		in := bufio.NewScanner(strings.NewReader("list\n\n"))
+		var outBuf bytes.Buffer
+		out := bufio.NewWriter(&outBuf)
+		var got int
+		stderr := captureStderr(t, func() { got = loop(ft, root, ".", in, out) })
+		out.Flush()
+
+		if got != 0 {
+			t.Fatalf("all-name-skipped: loop() = %d, want 0 (clone-of-empty): stdout=%q stderr=%q",
+				got, outBuf.String(), stderr)
+		}
+		if outBuf.String() != "\n" {
+			t.Errorf("stdout = %q, want an empty advertisement (just the terminator)", outBuf.String())
+		}
+		if !strings.Contains(stderr, ".hidden") || !strings.Contains(stderr, ".also-hidden") {
+			t.Errorf("stderr = %q, want a note per skipped file", stderr)
+		}
+	})
+
+	t.Run("all content-skipped fails with all paths enumerated", func(t *testing.T) {
+		ft := transport.NewFake()
+		root := "/my-files/r"
+		if err := repo.Bootstrap(ft, root); err != nil {
+			t.Fatalf("bootstrap: %v", err)
+		}
+		ft.Files[root+"/refs/heads/junk1"] = []byte("hello world\n")
+		ft.Files[root+"/refs/heads/junk2"] = []byte("goodbye world\n")
+
+		in := bufio.NewScanner(strings.NewReader("list\n\n"))
+		var outBuf bytes.Buffer
+		out := bufio.NewWriter(&outBuf)
+		var got int
+		stderr := captureStderr(t, func() { got = loop(ft, root, ".", in, out) })
+		out.Flush()
+
+		if got != 1 {
+			t.Fatalf("all-content-skipped: loop() = %d, want 1: stdout=%q stderr=%q",
+				got, outBuf.String(), stderr)
+		}
+		if outBuf.String() != "" {
+			t.Errorf("stdout = %q, want no ref lines while blocked", outBuf.String())
+		}
+		if !strings.Contains(stderr, "refs/heads/junk1") || !strings.Contains(stderr, "refs/heads/junk2") {
+			t.Errorf("stderr = %q, want BOTH junk paths enumerated", stderr)
+		}
+	})
+}
