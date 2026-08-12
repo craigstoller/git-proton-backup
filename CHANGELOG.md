@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- **GitProtonBackup (PowerShell module): `Invoke-ProtonBackupVerify` now gives freshly cut
+  bundles a bounded upload-lag grace before reporting them unconfirmed** — so the first run after
+  machine downtime no longer takes its verdict the instant the bundles hit disk. After any off
+  period every registered repo's digest is stale at once, so that run re-cuts a bundle for every
+  repo and then asked Proton about files only seconds old — before the Proton Drive sync app
+  could have uploaded them — reporting "newest bundle not confirmed on Proton" fleet-wide
+  (observed 2026-08-12: 15/16 repos flagged, all clean on a re-run ten minutes later). The grace
+  is one shared window of `VerifySeconds` (the same knob the push hook polls under) for the whole
+  fleet, swept in rounds, each repo dropping out as it confirms — total added wall-clock stays
+  near one window regardless of fleet size, and a run that cut nothing (or whose cuts confirm on
+  the spot) never waits at all. Eligible bundles are the freshly cut ones — by the run itself, or
+  moments before it (a push hook firing just ahead of the schedule); an upload that genuinely
+  outlives the window still alarms once and clears on the next run. New
+  `-GraceSeconds`/`-GracePollSeconds` parameters override the default (`-GraceSeconds 0`
+  disables). Bundles already older than the window keep failing fast — they're stuck, not
+  lagging — with `MaxUnconfirmedAgeDays` as the escalation path, unchanged. One correctness
+  tightening surfaced by review: a push-pending marker written *after* the run surveyed its repo
+  (a push deferring while verify holds the lock) is no longer cleared by that run's confirmation —
+  it stays pending until a later run actually confirms the coverage it tracks.
+
 ## 0.5.0 — 2026-08-09
 
 - **git-remote-proton: `push` no longer fails outright because of a junk file under `refs/`.**

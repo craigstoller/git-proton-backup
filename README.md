@@ -216,7 +216,10 @@ what macOS/Linux support would actually take.
   commit state is bundled, confirmation from the last verify run, and any pending marker.
 - `Invoke-ProtonBackupVerify` — run it ad hoc, or install `Install-ProtonBackupTask` for a daily
   scheduled check (interactive logon, since both the CLI session and the sync app live in your
-  desktop session).
+  desktop session). Freshly cut bundles — by the run itself, or moments before it — get a short
+  upload-lag grace, one shared `VerifySeconds` window for the whole fleet, before being reported
+  unconfirmed, so the first run after a stretch of downtime doesn't false-alarm every repo at once
+  while the sync app catches up.
 - **Local toast, no external service** — pipe the exit code into a one-liner. With the
   [BurntToast](https://github.com/Windos/BurntToast) module (`Install-Module BurntToast`):
   `if ((Invoke-ProtonBackupVerify).ExitCode -ne 0) { New-BurntToastNotification -Text 'GitProtonBackup', 'attention needed' }`.

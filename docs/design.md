@@ -74,6 +74,47 @@ flight*; the digest comparison is what tells you the repo's actual coverage has 
 the thing that matters. Markers still carry useful timing detail (how long something's been
 pending, and why) — they're just not what decides whether a repo needs a new bundle.
 
+### The first run after downtime
+
+Verify's cut-then-confirm sequence has a built-in false-alarm mode: after any stretch with the
+machine off, every registered repo's digest is stale at once, so the next run cuts a fresh bundle
+for the whole fleet — and then asks Proton about files that have existed for only seconds, before
+the sync app could possibly have uploaded them. Taking the verdict immediately reports "newest
+bundle not confirmed on Proton" for every repo at once, and a re-run minutes later is clean
+(observed live, 2026-08-12: 15 of 16 repos false-flagged by one first-run-after-downtime pass).
+
+The push flow already solves this for its single repo by polling for up to `VerifySeconds`. Verify
+applies the same idea fleet-shaped: bundles that are still unconfirmed but *freshly cut* — by this
+run, or (a peer-review catch) by another process moments before it, a push hook firing just ahead
+of the schedule — get re-checked inside one shared grace window: a single `VerifySeconds` deadline
+for the whole fleet, swept in rounds with every still-pending repo checked each round and dropped
+the moment it confirms. `VerifySeconds` is deliberately the same knob the push path polls under —
+both answer "how long will we wait for Proton to confirm an upload," and a dedicated config key
+would break the strict missing-key check every existing install's config passes through
+(`-GraceSeconds` overrides it per run, `0` disables; `-GracePollSeconds` tunes the sweep interval).
+A repo that confirms during the grace looks like one that confirmed instantly: state ok, marker
+cleared, nothing to report (a corrupt marker still surfaces via quarantine, as ever). The shared
+deadline keeps the added wall-clock near one `VerifySeconds` no matter how many repos are
+pending — never repos × the window. It is a target, not a hard ceiling: the final sweep may start
+at the deadline, and each probe takes however long the CLI takes (the same per-probe exposure the
+in-pass check always had) — so the true bound is the window plus one sweep's probe latency. A
+steady-state run (nothing freshly cut, or everything confirming on the spot) never waits at all.
+And the window is a bet, not a guarantee: a sync app still cold-starting after downtime can need
+longer than any reasonable grace — the grace removes the instant-verdict false-alarm class, and a
+repo whose upload genuinely outlives the window still alarms once and comes back clean on the next
+run, exactly as before.
+
+Freshness is the eligibility line, on purpose. A bundle that was already sitting unconfirmed —
+older than the window itself — before the run started is not suffering from upload lag: it has
+already had at least a full window to upload, it's stuck, and polling it can't change the verdict,
+only burn the shared window and delay the report. Those repos keep failing fast, with
+`MaxUnconfirmedAgeDays` as their escalation path. Retention still runs for a repo that confirms
+during the grace — the bundling step's own prune fires only when the in-pass check confirms, so
+the grace path runs the same prune after its late confirmation. That isn't pedantry: a busy repo
+whose refs change before every scheduled run and whose uploads always outlast the in-pass moment
+would otherwise *never* prune, while its confirmed state suppresses the very spool warning that
+would have surfaced the pile-up (a peer-review catch).
+
 Verify also prunes old bundles under retention once the newest one is confirmed, watches for
 bundles that have gone unconfirmed for too long (`MaxUnconfirmedAgeDays`, default 7 — a sign the
 sync app itself may be stopped), quarantines a marker file it can't parse (renamed `.bad`, never
@@ -95,7 +136,17 @@ is the opposite: it takes the same lock for its *entire* per-repo pass — inclu
 confirmation check against the Proton CLI — with a longer bound (about 30 seconds), so a hook's
 brief hold can't make a scheduled verify run skip its work outright; it waits the hold out instead
 of bailing, and holds it through confirmation because a reconciliation pass that let another run
-start mid-check could double-cut or double-confirm the same bundle.
+start mid-check could double-cut or double-confirm the same bundle. The upload-lag grace above
+extends that same hold, by up to one `VerifySeconds` window, on exactly the runs where waiting can
+change the verdict (something was freshly cut and is still pending) — bounded, and by the same
+double-confirm reasoning deliberately not lock-free. Two knock-ons of the longer hold, both loud
+rather than silent: a push landing inside the window defers with a `deferred_lock` marker just as
+it would during the rest of the pass — and a marker written after this run surveyed its repo is
+never cleared by this run's verdict (the verdict says nothing about the coverage that marker
+tracks), so it surfaces as pending until a later confirming run clears it. And a *second* verify
+run arriving mid-grace may exhaust its own ~30-second lock wait and exit with the lock-unavailable
+finding instead of waiting the hold out — visible in its report, and moot on a schedule that
+doesn't overlap runs.
 
 ## Threat model & limits
 
