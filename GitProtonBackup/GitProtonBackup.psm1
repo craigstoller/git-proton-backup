@@ -259,6 +259,29 @@ function Get-BundleToPrune {
     }
 }
 
+function Invoke-GpbRetentionPrune {
+    # Retention prune for one repo's spool: keep the newest $Keep confirmed bundles plus monthly
+    # checkpoints (up to $KeepCheckpoints); unconfirmed bundles are never pruned. The count gate
+    # keeps per-bundle SyncCheck probes off the hot path when nothing could be pruned. Called from
+    # the bundling step when the in-pass check confirms, and from Verify's phase C when a repo
+    # confirms during the upload-lag grace instead — without the latter, a busy repo that always
+    # confirms late would never prune and never warn (review finding).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$BundleDir,
+        [Parameter(Mandatory)][string]$BundleBaseName,
+        [Parameter(Mandatory)][scriptblock]$SyncCheck,
+        [int]$Keep = 5,
+        [int]$KeepCheckpoints = 24
+    )
+    if (@(Get-ChildItem -LiteralPath $BundleDir -Filter "$BundleBaseName-*.bundle" -ErrorAction SilentlyContinue).Count -le $Keep) { return }
+    $bundleObjects = @(Get-BundleObjects -BundleDir $BundleDir -BundleBaseName $BundleBaseName -SyncCheck $SyncCheck)
+    $toPrune = @(Get-BundleToPrune -Bundles $bundleObjects -Keep $Keep -KeepCheckpoints $KeepCheckpoints)
+    foreach ($b in $toPrune) {
+        Remove-Item -LiteralPath $b.FullName -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Invoke-RepoBundleBackup {
     [CmdletBinding()]
     param(
@@ -273,7 +296,7 @@ function Invoke-RepoBundleBackup {
     $findings = New-Object System.Collections.Generic.List[object]
     $pre = Get-RepoPreflight -RepoPath $RepoPath
     if (-not $pre.Safe) {
-        return [pscustomobject]@{ RepoPath=$RepoPath; State='detected_not_backed_up'; Findings=@([pscustomobject]@{ Severity='warn'; Kind='preflight'; Detail=$pre.Reason }) }
+        return [pscustomobject]@{ RepoPath=$RepoPath; State='detected_not_backed_up'; Created=$false; Findings=@([pscustomobject]@{ Severity='warn'; Kind='preflight'; Detail=$pre.Reason }) }
     }
     $digest = Get-RepoRefDigest -RepoPath $RepoPath
     $stateFile = Join-Path $BundleDir ".$BundleBaseName.lastdigest"
@@ -285,6 +308,7 @@ function Invoke-RepoBundleBackup {
     $newest = (Get-ChildItem -LiteralPath $BundleDir -Filter "$BundleBaseName-*.bundle" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1)?.FullName
     $newestIsCurrent = [bool]($newest -and $newest -match "-$([regex]::Escape($digest8))\.bundle$")
     $bundlePath = $null
+    $created = $false
     if ($digest -ne $last -or -not $newestIsCurrent) {
         if (-not (Test-Path -LiteralPath $BundleDir)) { New-Item -ItemType Directory -Path $BundleDir -Force | Out-Null }
         $target  = Join-Path $BundleDir "$BundleBaseName-$Stamp-$digest8.bundle"
@@ -312,13 +336,17 @@ function Invoke-RepoBundleBackup {
         if ($failedStage) {
             Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
             $findings.Add([pscustomobject]@{ Severity='high'; Kind='bundle_failed'; Detail="bundle $failedStage failed for $RepoPath" })
-            return [pscustomobject]@{ RepoPath=$RepoPath; State='detected_not_backed_up'; BundlePath=$null; Findings=$findings.ToArray() }
+            return [pscustomobject]@{ RepoPath=$RepoPath; State='detected_not_backed_up'; BundlePath=$null; Created=$false; Findings=$findings.ToArray() }
         }
         # Fail-closed: the digest is stamped only after the bundle is verified and in place.
         # A stamp failure is non-fatal (the bundle exists); the next run just re-creates.
         try { Set-Content -LiteralPath $stateFile -Value $digest -NoNewline -ErrorAction Stop }
         catch { $findings.Add([pscustomobject]@{ Severity='warn'; Kind='bundle_failed'; Detail="digest stamp failed for $RepoPath (bundle published; next run re-bundles)" }) }
         $bundlePath = $target
+        # Created: this call cut AND published the newest bundle — the caller-visible line between
+        # "seconds old, plausibly still uploading" and "a spool that was already stuck before this
+        # run". Verify's upload-lag grace keys on it.
+        $created = $true
     } else {
         $bundlePath = $newest
     }
@@ -328,18 +356,13 @@ function Invoke-RepoBundleBackup {
     if ($findings.Count -and $state -eq 'backed_up') { $state = 'detected_not_backed_up' }
 
     # Retention: prune whenever the newest bundle is observed confirmed (not only when created
-    # this call — asynchronous confirmation is the hook's normal path). The count gate keeps
-    # per-bundle SyncCheck probes off the hot path when nothing could be pruned (Keep default 5).
-    if ($state -eq 'backed_up' -and
-        @(Get-ChildItem -LiteralPath $BundleDir -Filter "$BundleBaseName-*.bundle" -ErrorAction SilentlyContinue).Count -gt $RetentionKeep) {
-        $bundleObjects = @(Get-BundleObjects -BundleDir $BundleDir -BundleBaseName $BundleBaseName -SyncCheck $SyncCheck)
-        $toPrune = @(Get-BundleToPrune -Bundles $bundleObjects -Keep $RetentionKeep -KeepCheckpoints $RetentionCheckpoints)
-        foreach ($b in $toPrune) {
-            Remove-Item -LiteralPath $b.FullName -Force -ErrorAction SilentlyContinue
-        }
+    # this call — asynchronous confirmation is the hook's normal path).
+    if ($state -eq 'backed_up') {
+        Invoke-GpbRetentionPrune -BundleDir $BundleDir -BundleBaseName $BundleBaseName -SyncCheck $SyncCheck `
+            -Keep $RetentionKeep -KeepCheckpoints $RetentionCheckpoints
     }
 
-    [pscustomobject]@{ RepoPath=$RepoPath; State=$state; BundlePath=$bundlePath; Findings=$findings.ToArray() }
+    [pscustomobject]@{ RepoPath=$RepoPath; State=$state; BundlePath=$bundlePath; Created=$created; Findings=$findings.ToArray() }
 }
 
 # --- Option A: Proton Drive CLI verification ---------------------------------
@@ -1037,8 +1060,11 @@ function Invoke-ProtonBackupVerify {
     # not just what clears a marker. Every exit path (config failure, lock contention, or normal
     # completion) writes the durable last-verify.json + verify.log AND best-effort pings the
     # heartbeat URL — the whole point of a dead-man's switch is that it never goes silent.
+    # Bundles cut by the run itself get one fleet-shared bounded upload-lag grace before any
+    # "not confirmed" verdict (spec: docs/design.md — the first run after downtime).
     [CmdletBinding()]
-    param([scriptblock]$SyncCheck, [scriptblock]$InfoRunner, [scriptblock]$CliReadyRunner, [scriptblock]$WebRunner, [int]$LockTimeoutSeconds = 30)
+    param([scriptblock]$SyncCheck, [scriptblock]$InfoRunner, [scriptblock]$CliReadyRunner, [scriptblock]$WebRunner, [int]$LockTimeoutSeconds = 30,
+          [ValidateRange(0, 3600)][int]$GraceSeconds, [ValidateRange(1, 3600)][int]$GracePollSeconds = 5)
     $findings = [System.Collections.Generic.List[string]]@()
     $repoResults = [System.Collections.Generic.List[object]]@()
     $exit = 0
@@ -1057,6 +1083,25 @@ function Invoke-ProtonBackupVerify {
             try { & $runner "$rawHb/fail" } catch { Write-Warning "heartbeat ping failed: $($_.Exception.Message)" }
         }
         return [pscustomobject]@{ ExitCode = 2; Complete = $false; IncompleteReason = 'config'; Findings = @($_.Exception.Message); Repos = @() }
+    }
+    # The upload-lag grace budget defaults to the SAME knob the push path polls under
+    # (cfg.VerifySeconds): both answer "how long are we willing to wait for Proton to confirm an
+    # upload". A dedicated config key would break Read-GpbConfig's strict missing-key check on
+    # every existing install, for a setting that means the same thing. 0 disables the grace. The
+    # clamp mirrors the parameter's own ceiling — freshness-by-age doubles as the eligibility
+    # line, so an outsized window would reclassify genuinely stuck spools as "fresh" and hold the
+    # lock accordingly. TryParse, never a cast: this line sits ahead of the durable-report
+    # protections, and a hand-edited non-numeric VerifySeconds must degrade to the stock default,
+    # not kill the run before last-verify.json and the heartbeat (both review findings).
+    # The clamp is two-sided on purpose: $GraceSeconds carries [ValidateRange(0,3600)], and
+    # PowerShell re-validates a parameter variable on every in-body assignment — a negative
+    # (TryParse-accepted) VerifySeconds fed through a one-sided Min would throw right here,
+    # outside every try, recreating the exact crash-before-report this block exists to prevent.
+    # Negative means "don't wait": it clamps to 0 (grace disabled), not the stock default.
+    if (-not $PSBoundParameters.ContainsKey('GraceSeconds')) {
+        $vs = 0
+        if (-not [int]::TryParse([string]$cfg.VerifySeconds, [ref]$vs)) { $vs = 60 }
+        $GraceSeconds = [Math]::Min([Math]::Max($vs, 0), 3600)
     }
 
     $lock = Wait-GpbLock -TimeoutSeconds $LockTimeoutSeconds
@@ -1097,44 +1142,163 @@ function Invoke-ProtonBackupVerify {
             } elseif ($SyncCheck) { & $SyncCheck $p } else { (& $getCloudFileSyncStateFn -Path $p).InSync }
         }.GetNewClosure()
 
+        # --- Repo pass, phase A: reconcile coverage (re-cut when stale) and collect every finding
+        # that does NOT depend on the final confirmation verdict. Confirmation-dependent findings
+        # wait for phase C, AFTER the upload-lag grace below — a bundle this run just cut gets its
+        # second look before any verdict is written.
+        $repoRecords = [System.Collections.Generic.List[object]]@()
+        # Freshness is judged against the RUN START, not against wherever the fleet pass happens
+        # to be when it reaches a repo — a hook-cut bundle fresh at run start must not age out of
+        # eligibility while earlier fleet entries (or a slow probe) run (review finding).
+        $graceFreshCutoffUtc = [DateTime]::UtcNow.AddSeconds(-$GraceSeconds)
         foreach ($repo in @($cfg.Repos)) {
-            $rf = [System.Collections.Generic.List[string]]@(); $state = 'ok'
+            $rec = [pscustomobject]@{
+                RepoPath = $repo
+                Findings = [System.Collections.Generic.List[string]]@()
+                State = 'ok'
+                Res = $null
+                BundleDir = $null
+                SurveyedAtUtc = $null   # when THIS run surveyed the repo; markers newer than this are never cleared by its verdict
+                Confirmed = $false      # final verdict; may flip during the grace pass
+                GraceEligible = $false  # freshly cut + still pending → worth a second look
+                GraceFaulted = $false   # its re-check threw; dropped from later rounds
+            }
             try {
-                if (-not (Test-Path -LiteralPath $repo)) { $rf.Add("registered repo missing on disk: $repo — Uninstall-ProtonBackup to deregister"); $state = 'attention' }
+                if (-not (Test-Path -LiteralPath $repo)) { $rec.Findings.Add("registered repo missing on disk: $repo — Uninstall-ProtonBackup to deregister"); $rec.State = 'attention' }
                 else {
                     $m = Test-GpbMirror -RepoPath $repo
                     if (-not ($m.HasRemote -and $m.MirrorExists -and $m.HookExists -and $m.WorkRepoOk)) {
-                        $rf.Add("wiring broken for $repo — run Repair-ProtonBackup"); $state = 'attention'
+                        $rec.Findings.Add("wiring broken for $repo — run Repair-ProtonBackup"); $rec.State = 'attention'
                     }
                     # Digest reconciliation: re-cut when coverage is stale, marker or not.
                     $bd = Get-GpbBundleDir -Config $cfg -RepoPath $repo
+                    # Captured BEFORE the bundling step reads the repo's refs: a marker written at
+                    # any point after this moment may track coverage the digest snapshot below has
+                    # not seen, so phase C must never clear it (review finding — capturing after
+                    # the call left the whole bundling step as a window in which a deferring
+                    # push's marker looked "old" and was wrongly cleared).
+                    $rec.SurveyedAtUtc = [DateTime]::UtcNow
                     $res = Invoke-RepoBundleBackup -RepoPath $repo -BundleDir $bd -BundleBaseName (Split-Path $repo -Leaf) `
                         -SyncCheck $effectiveCheck -RetentionKeep $cfg.RetentionKeep -RetentionCheckpoints $cfg.RetentionCheckpoints
-                    foreach ($f in @($res.Findings)) { $rf.Add("$($f.Kind): $($f.Detail)"); $state = 'attention' }
-                    if ($res.State -ne 'backed_up') { $rf.Add("newest bundle not confirmed on Proton for $repo"); $state = 'attention' }
+                    foreach ($f in @($res.Findings)) { $rec.Findings.Add("$($f.Kind): $($f.Detail)"); $rec.State = 'attention' }
+                    $rec.Res = $res; $rec.BundleDir = $bd
+                    $rec.Confirmed = ($res.State -eq 'backed_up')
+                    # Grace-eligible: the bundle is otherwise healthy, just pending, AND freshly
+                    # cut — by this run (Created; robust even when the fleet pass itself outlives
+                    # the age window), or by another process moments before it (a push hook's cut
+                    # seconds before the scheduled run fires — upload lag is a property of the
+                    # file's age, not of which process cut it; peer-review round-1 catch). A spool
+                    # already old when this run started is stuck, not lagging: it can never
+                    # confirm within the window and would only burn the shared budget.
+                    if ((-not $rec.Confirmed) -and $res.State -eq 'pending_sync' -and
+                        $res.PSObject.Properties['BundlePath'] -and $res.BundlePath) {
+                        if ($res.PSObject.Properties['Created'] -and $res.Created) { $rec.GraceEligible = $true }
+                        elseif ($GraceSeconds -gt 0) {
+                            $bundleItem = Get-Item -LiteralPath $res.BundlePath -ErrorAction SilentlyContinue
+                            $rec.GraceEligible = [bool]($bundleItem -and $bundleItem.LastWriteTimeUtc -ge $graceFreshCutoffUtc)
+                        }
+                    }
+                }
+            } catch { $rec.Findings.Add("verify failed for ${repo}: $($_.Exception.Message)"); $rec.State = 'attention' }
+            $repoRecords.Add($rec)
+        }
+
+        # --- Phase B: bounded upload-lag grace, fleet-shaped. After any machine-off period every
+        # repo's digest is stale at once, so phase A cuts a fleet of fresh bundles and asks Proton
+        # about files that are seconds old — before the sync app can possibly have uploaded them.
+        # Verdicts taken immediately would false-alarm the whole fleet (observed live 2026-08-12:
+        # 15/16 repos, all clean on a re-run minutes later). This is the verify-path analogue of
+        # the push flow's VerifySeconds poll loop, with ONE shared deadline for however many repos
+        # are pending: each round sweeps every still-pending repo once, repos drop out as they
+        # confirm, and total added wall-clock is bounded by roughly GraceSeconds regardless of
+        # fleet size — never repos × GraceSeconds. A steady-state run (nothing freshly cut, or
+        # everything confirmed on the spot) never waits at all.
+        $gracePending = @($repoRecords | Where-Object { $_.GraceEligible })
+        if ($GraceSeconds -gt 0 -and $gracePending.Count -gt 0) {
+            # Monotonic, not wall-clock (post-branch review fix): this loop runs on exactly the
+            # runs that follow machine downtime — when w32time is most likely to step the clock —
+            # and a backward step under a Get-Date deadline stretches both the grace and the held
+            # lock by the correction amount, unbounded by the parameter clamp. Stopwatch is immune.
+            $graceBudgetMs = [double]$GraceSeconds * 1000
+            $graceClock = [System.Diagnostics.Stopwatch]::StartNew()
+            do {
+                foreach ($p in $gracePending) {
+                    if ($p.Confirmed -or $p.GraceFaulted) { continue }
+                    try { if (& $effectiveCheck $p.Res.BundlePath) { $p.Confirmed = $true } }
+                    catch {
+                        # Same fault isolation as the rest of this function: one repo's bad probe
+                        # must not abort the fleet's grace. Dropped from later rounds — a throwing
+                        # probe is not upload lag, and re-polling it wastes the shared window.
+                        $p.GraceFaulted = $true
+                        $p.Findings.Add("grace re-check failed for $($p.RepoPath): $($_.Exception.Message)"); $p.State = 'attention'
+                    }
+                }
+                if (-not @($gracePending | Where-Object { -not $_.Confirmed -and -not $_.GraceFaulted }).Count) { break }
+                $remainingMs = $graceBudgetMs - $graceClock.Elapsed.TotalMilliseconds
+                if ($remainingMs -le 0) { break }
+                # Sleep capped at the remaining window so the deadline is never overshot by a
+                # near-full poll interval (matters whenever GraceSeconds < GracePollSeconds).
+                Start-Sleep -Milliseconds ([int][Math]::Min($GracePollSeconds * 1000, $remainingMs))
+            } while ($true)
+        }
+
+        # --- Phase C: confirmation-dependent findings + finalization, in registration order.
+        foreach ($rec in $repoRecords) {
+            $repo = $rec.RepoPath
+            try {
+                if ($rec.Res) {
+                    $res = $rec.Res; $bd = $rec.BundleDir
+                    if (-not $rec.Confirmed) { $rec.Findings.Add("newest bundle not confirmed on Proton for $repo"); $rec.State = 'attention' }
                     elseif ($res.PSObject.Properties['BundlePath'] -and $res.BundlePath) {
                         # Read BEFORE removing: a malformed marker under this slug must be
                         # quarantined (Read-GpbMarker renames it .bad), never deleted unseen.
                         $mkFile = Get-Item -LiteralPath (Join-Path (Get-GpbMarkerDir) "$(Get-GpbSlug -RepoPath $repo).json") -ErrorAction SilentlyContinue
                         if ($mkFile) {
-                            if (Read-GpbMarker -File $mkFile) { Remove-PushPendingMarker -RepoPath $repo }
-                            else { $rf.Add("unreadable marker quarantined for $repo (renamed with a .bad suffix)"); $state = 'attention' }
+                            $mk = Read-GpbMarker -File $mkFile
+                            if (-not $mk) { $rec.Findings.Add("unreadable marker quarantined for $repo (renamed with a .bad suffix)"); $rec.State = 'attention' }
+                            else {
+                                # Stale-safe: a marker NEWER than this run's own survey of the repo
+                                # (a push deferring against our held lock mid-grace) tracks coverage
+                                # this run's verdict says nothing about — clearing it would silence
+                                # a real gap until the next reconciliation (peer-review round-1
+                                # catch, Codex). Left in place, the marker pass below surfaces it as
+                                # pending. EXCEPTION — identity trumps age (post-branch review fix):
+                                # the push hook polls LOCK-FREE after cutting, so its verify_timeout
+                                # marker can land mid-run naming the exact bundle this run is
+                                # confirming; that marker's coverage IS this verdict's coverage, and
+                                # leaving it turned every push-poll/verify overlap into a false
+                                # exit-1. A deferred push never bundled, so its marker carries no
+                                # BundlePath and stays protected by the age guard alone.
+                                $newerThanSurvey = $rec.SurveyedAtUtc -and $mkFile.LastWriteTimeUtc -gt $rec.SurveyedAtUtc
+                                $namesConfirmedBundle = [bool]($mk.PSObject.Properties['BundlePath'] -and $mk.BundlePath -and
+                                    [string]::Equals($mk.BundlePath, $res.BundlePath, [System.StringComparison]::OrdinalIgnoreCase))
+                                if (-not $newerThanSurvey -or $namesConfirmedBundle) { Remove-PushPendingMarker -RepoPath $repo }
+                            }
                         }
+                    }
+                    # A repo confirmed during the grace skipped the bundling step's own retention
+                    # prune (that prune runs only when the in-pass check confirms). Run it here —
+                    # a busy repo whose refs change before every run and whose uploads always
+                    # outlast the in-pass moment would otherwise never prune, while its spool
+                    # warning below is suppressed by Confirmed (review finding).
+                    if ($rec.Confirmed -and $res.State -ne 'backed_up') {
+                        Invoke-GpbRetentionPrune -BundleDir $bd -BundleBaseName (Split-Path $repo -Leaf) -SyncCheck $effectiveCheck `
+                            -Keep $cfg.RetentionKeep -KeepCheckpoints $cfg.RetentionCheckpoints
                     }
                     # Spool guard.
                     $allBundles = @(Get-ChildItem -LiteralPath $bd -Filter '*.bundle' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime)
                     $newest = $allBundles | Select-Object -Last 1
-                    if ($newest -and $res.State -ne 'backed_up' -and $newest.LastWriteTime -lt (Get-Date).AddDays(-[int]$cfg.MaxUnconfirmedAgeDays)) {
-                        $rf.Add("bundle unconfirmed for over $($cfg.MaxUnconfirmedAgeDays) day(s) — is the Proton Drive app running?"); $state = 'attention'
+                    if ($newest -and -not $rec.Confirmed -and $newest.LastWriteTime -lt (Get-Date).AddDays(-[int]$cfg.MaxUnconfirmedAgeDays)) {
+                        $rec.Findings.Add("bundle unconfirmed for over $($cfg.MaxUnconfirmedAgeDays) day(s) — is the Proton Drive app running?"); $rec.State = 'attention'
                     }
-                    if ($res.State -ne 'backed_up' -and $allBundles.Count -gt [int]$cfg.RetentionKeep) {
-                        $rf.Add("$($allBundles.Count) bundles spooling unconfirmed (retention can't prune until one confirms)"); $state = 'attention'
+                    if (-not $rec.Confirmed -and $allBundles.Count -gt [int]$cfg.RetentionKeep) {
+                        $rec.Findings.Add("$($allBundles.Count) bundles spooling unconfirmed (retention can't prune until one confirms)"); $rec.State = 'attention'
                     }
                 }
-            } catch { $rf.Add("verify failed for ${repo}: $($_.Exception.Message)"); $state = 'attention' }
-            if ($state -eq 'attention') { $exit = [Math]::Max($exit, 1) }
-            $repoResults.Add([pscustomobject]@{ RepoPath = $repo; State = $state; Findings = $rf.ToArray() })
-            foreach ($x in $rf) { $findings.Add($x) }
+            } catch { $rec.Findings.Add("verify failed for ${repo}: $($_.Exception.Message)"); $rec.State = 'attention' }
+            if ($rec.State -eq 'attention') { $exit = [Math]::Max($exit, 1) }
+            $repoResults.Add([pscustomobject]@{ RepoPath = $repo; State = $rec.State; Findings = $rec.Findings.ToArray() })
+            foreach ($x in $rec.Findings) { $findings.Add($x) }
         }
 
         # Marker pass: anything the repo loop didn't clear. Fault-isolated the same way as the
