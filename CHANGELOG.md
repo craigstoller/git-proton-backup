@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — 2026-08-12
+
+Module and repo version series UNIFY at 0.6.0: tags v0.3.0–v0.5.0 were helper-only releases
+while the module stayed 0.2.4; from 0.6.0 the tag and ModuleVersion move together. Helper
+unchanged this release.
 
 - **GitProtonBackup (PowerShell module): `Invoke-ProtonBackupVerify` now detects a stalled Proton
   Drive sync app instead of waiting up to a week for `MaxUnconfirmedAgeDays`.** Observed live
