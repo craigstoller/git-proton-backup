@@ -638,6 +638,81 @@ Describe 'Invoke-ProtonBackupVerify upload-lag grace' {
         $script:aCalls | Should -Be 2
         (Get-Content (Join-Path (Get-GpbRoot) 'last-verify.json') -Raw | ConvertFrom-Json).ExitCode | Should -Be 1
     }
+
+    It 'a hand-edited NEGATIVE VerifySeconds cannot crash verify past its durable report (grace degrades to disabled)' {
+        # RED (post-branch review fix pass): [int]::TryParse accepts "-1", and assigning it into
+        # the [ValidateRange(0,3600)] $GraceSeconds parameter re-fires validation OUTSIDE every
+        # try — killing the run before last-verify.json and the heartbeat, exactly the silence the
+        # non-numeric test above exists to prevent (that test's 'sixty' is rejected by TryParse
+        # and never reaches the assignment). A negative wait means "don't wait": it must clamp to
+        # 0 (grace disabled, the push path's effective behavior for a negative window), not crash
+        # and not inherit the 60s stock default.
+        $raw = Get-Content (Get-GpbConfigPath) -Raw | ConvertFrom-Json
+        $raw.VerifySeconds = -1
+        Write-GpbJsonAtomic -Path (Get-GpbConfigPath) -Object $raw
+        $script:syncCalls = @{}
+        $r = Invoke-ProtonBackupVerify -CliReadyRunner { $false } -WarningAction SilentlyContinue -SyncCheck {
+            param($p)
+            $script:syncCalls[$p] = 1 + [int]$script:syncCalls[$p]
+            $script:syncCalls[$p] -ge 2   # would confirm on a second look — the grace must not grant one
+        }
+        $r.ExitCode | Should -Be 1
+        (Get-Content (Join-Path (Get-GpbRoot) 'last-verify.json') -Raw | ConvertFrom-Json).ExitCode | Should -Be 1
+        # clamped to 0, not defaulted to 60: exactly the one in-pass check, no grace rounds
+        @($script:syncCalls.Values) | Should -Be @(1)
+    }
+
+    It 'a mid-run verify_timeout marker naming the SAME bundle this run confirms is cleared (identity trumps age)' {
+        # RED (post-branch review fix pass): the push hook cuts its bundle, RELEASES the lock, and
+        # polls lock-free — so its poll can time out and write a verify_timeout marker naming that
+        # bundle WHILE verify holds the lock and is confirming the very same file. That marker's
+        # mtime postdates SurveyedAtUtc, so the age-only stale-safe guard refused to clear it and
+        # the marker pass reported a false 'pending backup not confirmed' + exit 1 for coverage
+        # this run's verdict fully vouches for. Every push-poll/verify overlap produced one false
+        # alarm. Identity must trump age: a marker whose BundlePath IS res.BundlePath is cleared.
+        $bd = Get-GpbBundleDir -Config (Read-GpbConfig) -RepoPath $script:repo
+        $baseName = Split-Path $script:repo -Leaf
+        $script:calls = 0
+        $r = Invoke-ProtonBackupVerify -CliReadyRunner { $false } -WarningAction SilentlyContinue `
+            -GraceSeconds 30 -GracePollSeconds 1 -SyncCheck {
+                param($p)
+                $script:calls++
+                if ($script:calls -eq 1) {
+                    # the push's lock-free confirm poll timing out mid-run, naming the same bundle
+                    Write-PushPendingMarker -RepoPath $script:repo -Reason verify_timeout `
+                        -BundleDir $bd -BundleBaseName $baseName -BundlePath $p
+                }
+                $script:calls -ge 2
+            }
+        $r.ExitCode | Should -Be 0
+        @(Get-ChildItem (Get-GpbMarkerDir) -Filter '*.json' -ErrorAction SilentlyContinue).Count | Should -Be 0
+        ($r.Findings -join "`n") | Should -Not -Match 'pending backup not confirmed'
+    }
+
+    It 'a mid-run marker naming a DIFFERENT bundle still survives the confirm-time clear (no blanket clearing)' {
+        # GUARD for the identity exception above: it must not regress the round-1 stale-safe
+        # guard. A marker naming coverage this run did NOT confirm — a push racing ahead with a
+        # newer cut — stays pending until a run that actually confirms it, exactly like the
+        # deferred_lock (no-BundlePath) case the original guard was built for.
+        $bd = Get-GpbBundleDir -Config (Read-GpbConfig) -RepoPath $script:repo
+        $baseName = Split-Path $script:repo -Leaf
+        $script:calls = 0
+        $r = Invoke-ProtonBackupVerify -CliReadyRunner { $false } -WarningAction SilentlyContinue `
+            -GraceSeconds 30 -GracePollSeconds 1 -SyncCheck {
+                param($p)
+                $script:calls++
+                if ($script:calls -eq 1) {
+                    Write-PushPendingMarker -RepoPath $script:repo -Reason verify_timeout `
+                        -BundleDir $bd -BundleBaseName $baseName -BundlePath "$p.raced-ahead"
+                }
+                $script:calls -ge 2
+            }
+        $r.ExitCode | Should -Be 1
+        @(Get-ChildItem (Get-GpbMarkerDir) -Filter '*.json').Count | Should -Be 1
+        ($r.Findings -join "`n") | Should -Match 'pending backup not confirmed \(reason: verify_timeout\)'
+        # the repo row itself still reports ok — the marker is the racing push's story
+        (@($r.Repos) | Where-Object RepoPath -eq (Resolve-Path $script:repo).Path).State | Should -Be 'ok'
+    }
 }
 
 Describe 'Status + scheduled task' {

@@ -20,7 +20,13 @@
   lagging — with `MaxUnconfirmedAgeDays` as the escalation path, unchanged. One correctness
   tightening surfaced by review: a push-pending marker written *after* the run surveyed its repo
   (a push deferring while verify holds the lock) is no longer cleared by that run's confirmation —
-  it stays pending until a later run actually confirms the coverage it tracks.
+  it stays pending until a later run actually confirms the coverage it tracks — unless it names
+  the very bundle that run confirmed (a push's lock-free poll timing out mid-run on the same
+  upload), which is cleared as confirmed coverage. A post-branch review fix pass also hardened
+  the config fallback — a hand-edited *negative* `VerifySeconds` now clamps to 0 (grace disabled)
+  instead of tripping the parameter's own `[ValidateRange]` outside every try and killing the run
+  before `last-verify.json` and the heartbeat — and made the grace deadline monotonic
+  (`Stopwatch`), so a post-resume clock step can't stretch the window or the lock hold.
 
 ## 0.5.0 — 2026-08-09
 

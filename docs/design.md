@@ -81,7 +81,11 @@ machine off, every registered repo's digest is stale at once, so the next run cu
 for the whole fleet — and then asks Proton about files that have existed for only seconds, before
 the sync app could possibly have uploaded them. Taking the verdict immediately reports "newest
 bundle not confirmed on Proton" for every repo at once, and a re-run minutes later is clean
-(observed live, 2026-08-12: 15 of 16 repos false-flagged by one first-run-after-downtime pass).
+(observed live and root-caused, 2026-08-12: after an Aug 10–11 machine-off gap, one
+first-run-after-downtime pass false-flagged 15 of 16 repos. The CLI session was valid throughout —
+the readiness probe passed, the one passing repo was simply a bundle pushed and uploaded minutes
+earlier, and the whole fleet confirmed clean on a re-run minutes later with no sign-in — ruling
+out the auth theory the incident was first reported under).
 
 The push flow already solves this for its single repo by polling for up to `VerifySeconds`. Verify
 applies the same idea fleet-shaped: bundles that are still unconfirmed but *freshly cut* — by this
@@ -143,7 +147,11 @@ double-confirm reasoning deliberately not lock-free. Two knock-ons of the longer
 rather than silent: a push landing inside the window defers with a `deferred_lock` marker just as
 it would during the rest of the pass — and a marker written after this run surveyed its repo is
 never cleared by this run's verdict (the verdict says nothing about the coverage that marker
-tracks), so it surfaces as pending until a later confirming run clears it. And a *second* verify
+tracks), so it surfaces as pending until a later confirming run clears it. One exception, keyed on
+identity rather than age: the push hook confirms lock-free after cutting, so its `verify_timeout`
+marker can land mid-run naming the exact bundle this run is confirming — that coverage is
+precisely what this verdict vouches for, and the marker is cleared (a deferred push never bundled,
+carries no `BundlePath`, and stays protected by the age guard alone). And a *second* verify
 run arriving mid-grace may exhaust its own ~30-second lock wait and exit with the lock-unavailable
 finding instead of waiting the hold out — visible in its report, and moot on a schedule that
 doesn't overlap runs.

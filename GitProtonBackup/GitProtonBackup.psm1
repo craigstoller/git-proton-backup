@@ -1093,10 +1093,15 @@ function Invoke-ProtonBackupVerify {
     # lock accordingly. TryParse, never a cast: this line sits ahead of the durable-report
     # protections, and a hand-edited non-numeric VerifySeconds must degrade to the stock default,
     # not kill the run before last-verify.json and the heartbeat (both review findings).
+    # The clamp is two-sided on purpose: $GraceSeconds carries [ValidateRange(0,3600)], and
+    # PowerShell re-validates a parameter variable on every in-body assignment — a negative
+    # (TryParse-accepted) VerifySeconds fed through a one-sided Min would throw right here,
+    # outside every try, recreating the exact crash-before-report this block exists to prevent.
+    # Negative means "don't wait": it clamps to 0 (grace disabled), not the stock default.
     if (-not $PSBoundParameters.ContainsKey('GraceSeconds')) {
         $vs = 0
         if (-not [int]::TryParse([string]$cfg.VerifySeconds, [ref]$vs)) { $vs = 60 }
-        $GraceSeconds = [Math]::Min($vs, 3600)
+        $GraceSeconds = [Math]::Min([Math]::Max($vs, 0), 3600)
     }
 
     $lock = Wait-GpbLock -TimeoutSeconds $LockTimeoutSeconds
@@ -1210,7 +1215,12 @@ function Invoke-ProtonBackupVerify {
         # everything confirmed on the spot) never waits at all.
         $gracePending = @($repoRecords | Where-Object { $_.GraceEligible })
         if ($GraceSeconds -gt 0 -and $gracePending.Count -gt 0) {
-            $deadline = (Get-Date).AddSeconds($GraceSeconds)
+            # Monotonic, not wall-clock (post-branch review fix): this loop runs on exactly the
+            # runs that follow machine downtime — when w32time is most likely to step the clock —
+            # and a backward step under a Get-Date deadline stretches both the grace and the held
+            # lock by the correction amount, unbounded by the parameter clamp. Stopwatch is immune.
+            $graceBudgetMs = [double]$GraceSeconds * 1000
+            $graceClock = [System.Diagnostics.Stopwatch]::StartNew()
             do {
                 foreach ($p in $gracePending) {
                     if ($p.Confirmed -or $p.GraceFaulted) { continue }
@@ -1224,7 +1234,7 @@ function Invoke-ProtonBackupVerify {
                     }
                 }
                 if (-not @($gracePending | Where-Object { -not $_.Confirmed -and -not $_.GraceFaulted }).Count) { break }
-                $remainingMs = ($deadline - (Get-Date)).TotalMilliseconds
+                $remainingMs = $graceBudgetMs - $graceClock.Elapsed.TotalMilliseconds
                 if ($remainingMs -le 0) { break }
                 # Sleep capped at the remaining window so the deadline is never overshot by a
                 # near-full poll interval (matters whenever GraceSeconds < GracePollSeconds).
@@ -1243,15 +1253,27 @@ function Invoke-ProtonBackupVerify {
                         # Read BEFORE removing: a malformed marker under this slug must be
                         # quarantined (Read-GpbMarker renames it .bad), never deleted unseen.
                         $mkFile = Get-Item -LiteralPath (Join-Path (Get-GpbMarkerDir) "$(Get-GpbSlug -RepoPath $repo).json") -ErrorAction SilentlyContinue
-                        # Stale-safe: a marker NEWER than this run's own survey of the repo (a
-                        # push deferring against our held lock mid-grace) tracks coverage this
-                        # run's verdict says nothing about — clearing it would silence a real
-                        # gap until the next reconciliation (peer-review round-1 catch, Codex).
-                        # Left in place, the marker pass below surfaces it as pending.
-                        if ($mkFile -and $rec.SurveyedAtUtc -and $mkFile.LastWriteTimeUtc -gt $rec.SurveyedAtUtc) { $mkFile = $null }
                         if ($mkFile) {
-                            if (Read-GpbMarker -File $mkFile) { Remove-PushPendingMarker -RepoPath $repo }
-                            else { $rec.Findings.Add("unreadable marker quarantined for $repo (renamed with a .bad suffix)"); $rec.State = 'attention' }
+                            $mk = Read-GpbMarker -File $mkFile
+                            if (-not $mk) { $rec.Findings.Add("unreadable marker quarantined for $repo (renamed with a .bad suffix)"); $rec.State = 'attention' }
+                            else {
+                                # Stale-safe: a marker NEWER than this run's own survey of the repo
+                                # (a push deferring against our held lock mid-grace) tracks coverage
+                                # this run's verdict says nothing about — clearing it would silence
+                                # a real gap until the next reconciliation (peer-review round-1
+                                # catch, Codex). Left in place, the marker pass below surfaces it as
+                                # pending. EXCEPTION — identity trumps age (post-branch review fix):
+                                # the push hook polls LOCK-FREE after cutting, so its verify_timeout
+                                # marker can land mid-run naming the exact bundle this run is
+                                # confirming; that marker's coverage IS this verdict's coverage, and
+                                # leaving it turned every push-poll/verify overlap into a false
+                                # exit-1. A deferred push never bundled, so its marker carries no
+                                # BundlePath and stays protected by the age guard alone.
+                                $newerThanSurvey = $rec.SurveyedAtUtc -and $mkFile.LastWriteTimeUtc -gt $rec.SurveyedAtUtc
+                                $namesConfirmedBundle = [bool]($mk.PSObject.Properties['BundlePath'] -and $mk.BundlePath -and
+                                    [string]::Equals($mk.BundlePath, $res.BundlePath, [System.StringComparison]::OrdinalIgnoreCase))
+                                if (-not $newerThanSurvey -or $namesConfirmedBundle) { Remove-PushPendingMarker -RepoPath $repo }
+                            }
                         }
                     }
                     # A repo confirmed during the grace skipped the bundling step's own retention
