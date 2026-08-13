@@ -715,6 +715,218 @@ Describe 'Invoke-ProtonBackupVerify upload-lag grace' {
     }
 }
 
+Describe 'Invoke-ProtonBackupVerify sync-app stall detection' {
+    # 2026-08-12 ~18:50 PT incident (same day as the upload-lag one above, hours later): the
+    # Proton Drive sync app silently stopped uploading (last successful upload 13:51 PT) while its
+    # Cloud Files provider kept marking freshly cut bundles InSync — locally "in sync", yet
+    # `proton-drive filesystem info` said Node not found for the same files, and a direct CLI
+    # upload succeeded instantly, proving the CLI/API channel live and the sync app stalled.
+    # Waiting doesn't help this class (it is NOT upload lag), and the only watchdog was
+    # MaxUnconfirmedAgeDays (7 days). When CLI verification is available and a bundle stays
+    # unconfirmed because the server says the node is ABSENT, verify now cross-checks the local
+    # Cloud Files state: CF-InSync while the server still says absent at the same instant is the
+    # stall signature (a signature, not a proof — docs/design.md names the transients and the
+    # debounce), surfaced as its own finding with the remedy (restart the app) instead of the
+    # generic — and wait-and-see — "newest bundle not confirmed on Proton".
+    BeforeEach {
+        $script:drive = New-Sandbox; $script:repo = New-TestRepo
+        Install-ProtonBackup -RepoPath $script:repo
+        # Grace budget (defaults from cfg.VerifySeconds): 1s keeps never-confirming runs fast.
+        Set-ProtonBackupConfig -Key VerifySeconds -Value 1
+    }
+    AfterEach { Clear-Sandbox }
+
+    It 'CF-InSync bundles absent on Proton across the fleet → distinct stall finding, not the generic unconfirmed one' {
+        # RED: reproduces the incident. Two repos, CLI live, every info call answers Node not
+        # found, while the local Cloud Files probe reports InSync. Pre-detector code reported the
+        # generic "newest bundle not confirmed on Proton" — indistinguishable from upload lag,
+        # inviting exactly the wrong response (wait), while nothing uploads for up to 7 days.
+        $repo2 = New-TestRepo; Install-ProtonBackup -RepoPath $repo2
+        $r = Invoke-ProtonBackupVerify -CliReadyRunner { $true } `
+            -InfoRunner { param($cp, $cli) [pscustomobject]@{ ExitCode = 1; Output = 'Node not found' } } `
+            -SyncCheck { param($p) $true }
+        $r.ExitCode | Should -Be 1
+        @($r.Repos | Where-Object State -ne 'attention').Count | Should -Be 0
+        $joined = $r.Findings -join "`n"
+        $joined | Should -Match 'sync app appears stalled'
+        $joined | Should -Match 'restart the Proton Drive app'
+        $joined | Should -Not -Match 'not confirmed on Proton'
+        # per-repo rows carry the stall finding too — the report says WHICH repos are affected
+        @($r.Repos | Where-Object { ($_.Findings -join ' ') -match 'stalled' }).Count | Should -Be 2
+        # and the durable report — what Get-ProtonBackupStatus and post-mortems actually read —
+        # carries the diagnosis, not just the in-memory return (round-1 peer review, Kimi)
+        $lv = Get-Content (Join-Path (Get-GpbRoot) 'last-verify.json') -Raw | ConvertFrom-Json
+        @($lv.Repos | Where-Object { ($_.Findings -join ' ') -match 'sync app appears stalled' }).Count | Should -Be 2
+    }
+
+    It 'TWO contradicting repos with the grace disabled are still diagnosed (fleet corroboration needs no window)' {
+        # GUARD (mutation-checked: gating every diagnosis on a nonzero grace fails this): the
+        # debounce arms are independent by design — corroboration across repos stands on its own
+        # because one machine-wide app owns every upload. Known residual, documented in
+        # design.md: with the grace explicitly off, correlated server-side metadata lag across
+        # simultaneously-landing uploads could in principle satisfy both halves at once; the
+        # same-instant re-probe narrows that window but no instant observation can close it.
+        # Accepted because grace-off is an explicit operator override, never the default.
+        $repo2 = New-TestRepo; Install-ProtonBackup -RepoPath $repo2
+        $r = Invoke-ProtonBackupVerify -CliReadyRunner { $true } -GraceSeconds 0 `
+            -InfoRunner { param($cp, $cli) [pscustomobject]@{ ExitCode = 1; Output = 'Node not found' } } `
+            -SyncCheck { param($p) $true }
+        $r.ExitCode | Should -Be 1
+        ($r.Findings -join "`n") | Should -Match 'sync app appears stalled'
+        ($r.Findings -join "`n") | Should -Not -Match 'not confirmed on Proton'
+    }
+
+    It 'a SINGLE contradictory repo that out-waited the grace window is a stall; a repo confirming during grace never counts' {
+        # RED: debounce arm 2. One contradictory repo could be transient metadata lag (the upload
+        # landed; the info endpoint hasn't caught up) — but a repo still server-absent after a
+        # full nonzero grace window of polling has persistence, not a moment's lag. Mixed fleet:
+        # repo A confirms on its second info call (ordinary upload lag, resolved in-window) and
+        # must NOT count as a suspect; repo B never confirms and its CF state claims InSync.
+        $repoB = New-TestRepo; Install-ProtonBackup -RepoPath $repoB
+        $slugB = Get-GpbSlug -RepoPath $repoB
+        $script:infoCalls = @{}
+        $r = Invoke-ProtonBackupVerify -CliReadyRunner { $true } -GraceSeconds 1 -GracePollSeconds 1 `
+            -InfoRunner {
+                param($cp, $cli)
+                $script:infoCalls[$cp] = 1 + [int]$script:infoCalls[$cp]
+                if ($cp -like "*$slugB*" -or $script:infoCalls[$cp] -lt 2) {
+                    [pscustomobject]@{ ExitCode = 1; Output = 'Node not found' }
+                } else { [pscustomobject]@{ ExitCode = 0; Output = "state: 'active'" } }
+            } `
+            -SyncCheck { param($p) $true }
+        $r.ExitCode | Should -Be 1
+        $resolvedA = (Resolve-Path $script:repo).Path
+        $resolvedB = (Resolve-Path $repoB).Path
+        (@($r.Repos) | Where-Object RepoPath -eq $resolvedA).State | Should -Be 'ok'
+        (@($r.Repos) | Where-Object RepoPath -eq $resolvedB).State | Should -Be 'attention'
+        $joined = $r.Findings -join "`n"
+        $joined | Should -Match ([regex]::Escape("sync app appears stalled: bundle marked in-sync locally but absent on Proton for $resolvedB"))
+        $joined | Should -Not -Match ([regex]::Escape($resolvedA))
+        $joined | Should -Not -Match 'not confirmed on Proton'
+    }
+
+    It 'a throwing Cloud Files probe degrades to the generic finding: the pass completes and the report survives' {
+        # RED (fault isolation, same rule as every probe in this function): the cross-check is a
+        # diagnostic refinement — its own failure must neither abort the pass (Complete=$false,
+        # skipping the marker pass) nor mask the underlying unconfirmed verdict. It leaves its
+        # own breadcrumb finding so the broken probe doesn't hide silently either.
+        $repo2 = New-TestRepo; Install-ProtonBackup -RepoPath $repo2
+        $r = Invoke-ProtonBackupVerify -CliReadyRunner { $true } `
+            -InfoRunner { param($cp, $cli) [pscustomobject]@{ ExitCode = 1; Output = 'Node not found' } } `
+            -SyncCheck { param($p) throw 'CF probe exploded' }
+        $r.ExitCode | Should -Be 1
+        $r.Complete | Should -BeTrue
+        $joined = $r.Findings -join "`n"
+        $joined | Should -Match 'not confirmed on Proton'
+        $joined | Should -Match 'stall cross-check failed'
+        $joined | Should -Not -Match 'sync app appears stalled'
+        (Get-Content (Join-Path (Get-GpbRoot) 'last-verify.json') -Raw | ConvertFrom-Json).ExitCode | Should -Be 1
+    }
+
+    It 'an upload landing between the cached CLI verdict and the cross-check is a late confirmation, not a stall (same-instant re-probe)' {
+        # RED (round-1 peer review — the one finding all four engines raised): the contradiction
+        # used to be assembled from observations taken at different times — the CLI's "node
+        # absent" cached during the in-pass check or grace rounds, the Cloud Files probe run
+        # after the grace wait. A healthy upload completing in between yields CF-InSync against
+        # a STALE absent verdict — the exact stall signature — and diagnosed a working sync app,
+        # telling the user to restart it. The cross-check must re-ask the server at the same
+        # moment and take a fresh 'active' as the late confirmation it is. Ordering is
+        # deterministic without timing games: in CLI mode -SyncCheck is invoked ONLY by the
+        # cross-check, so its first call IS the moment the upload "lands" (it drops the flag) —
+        # every info call before it answers absent, every one after answers active.
+        $script:flag = Join-Path $TestDrive "uploaded-$([guid]::NewGuid().ToString('N').Substring(0,8)).flag"
+        $r = Invoke-ProtonBackupVerify -CliReadyRunner { $true } -GraceSeconds 1 -GracePollSeconds 1 `
+            -InfoRunner {
+                param($cp, $cli)
+                if (Test-Path -LiteralPath $script:flag) { [pscustomobject]@{ ExitCode = 0; Output = "state: 'active'" } }
+                else { [pscustomobject]@{ ExitCode = 1; Output = 'Node not found' } }
+            } `
+            -SyncCheck { param($p) New-Item -ItemType File -Path $script:flag -Force | Out-Null; $true }
+        $r.ExitCode | Should -Be 0
+        @($r.Findings) | Should -BeNullOrEmpty
+        (@($r.Repos) | Where-Object RepoPath -eq (Resolve-Path $script:repo).Path).State | Should -Be 'ok'
+    }
+
+    It 'a SINGLE contradictory repo with the grace disabled stays generic (debounce: one instant observation could be transient)' {
+        # GUARD (mutation-checked: diagnosing lone suspects unconditionally fails this): with
+        # -GraceSeconds 0 the one contradictory observation happened an instant after the cut —
+        # transient metadata lag (upload landed, info endpoint behind) can't be ruled out, and a
+        # false "restart the app" costs the user a manual intervention. Fleet corroboration (the
+        # first test) or an out-waited window (the mixed-fleet test) is what upgrades it.
+        $r = Invoke-ProtonBackupVerify -CliReadyRunner { $true } -GraceSeconds 0 `
+            -InfoRunner { param($cp, $cli) [pscustomobject]@{ ExitCode = 1; Output = 'Node not found' } } `
+            -SyncCheck { param($p) $true }
+        $r.ExitCode | Should -Be 1
+        ($r.Findings -join "`n") | Should -Match 'not confirmed on Proton'
+        ($r.Findings -join "`n") | Should -Not -Match 'sync app appears stalled'
+    }
+
+    It 'CLI-absent with the local CF state still pending is plain upload lag: generic finding, no stall claim' {
+        # GUARD (mutation-checked: suspecting every CLI-absent repo without the CF half fails
+        # this): a genuinely still-uploading bundle is absent on the server AND not yet marked
+        # InSync locally — both channels agree, no contradiction. This is the ordinary
+        # upload-outlives-the-window case; the verdict must stay "wait/re-run", not "restart".
+        $repo2 = New-TestRepo; Install-ProtonBackup -RepoPath $repo2
+        $r = Invoke-ProtonBackupVerify -CliReadyRunner { $true } `
+            -InfoRunner { param($cp, $cli) [pscustomobject]@{ ExitCode = 1; Output = 'Node not found' } } `
+            -SyncCheck { param($p) $false }
+        $r.ExitCode | Should -Be 1
+        ($r.Findings -join "`n") | Should -Match 'not confirmed on Proton'
+        ($r.Findings -join "`n") | Should -Not -Match 'sync app appears stalled'
+    }
+
+    It 'a CLI auth failure with CF-InSync is NOT a stall: the contradiction requires the server saying the node is absent' {
+        # GUARD (mutation-checked: keying on "unconfirmed" instead of the not_in_cloud reason
+        # fails this): an auth_error verdict means the CLI couldn't answer whether the node
+        # exists — there is no server-truth half to contradict. Diagnosing a stall from it would
+        # send the user to restart an app that may be fine when the real fix is the CLI session.
+        $repo2 = New-TestRepo; Install-ProtonBackup -RepoPath $repo2
+        $r = Invoke-ProtonBackupVerify -CliReadyRunner { $true } `
+            -InfoRunner { param($cp, $cli) [pscustomobject]@{ ExitCode = 1; Output = 'you need to login' } } `
+            -SyncCheck { param($p) $true }
+        $r.ExitCode | Should -Be 1
+        ($r.Findings -join "`n") | Should -Match 'not confirmed on Proton'
+        ($r.Findings -join "`n") | Should -Not -Match 'sync app appears stalled'
+    }
+
+    It 'degraded mode (CLI unavailable) is untouched: an unconfirmed fleet reports the generic finding, never a stall' {
+        # GUARD: without the CLI there is no server-truth channel — the local Cloud Files state
+        # IS the verifier, so the contradiction is unobservable (an InSync answer would simply
+        # have confirmed the bundle) and no stall diagnosis must be attempted. Structurally
+        # immune twice over: phase B2 is gated on cliReady AND keys on CLI verdict reasons that
+        # degraded mode never records.
+        $repo2 = New-TestRepo; Install-ProtonBackup -RepoPath $repo2
+        $r = Invoke-ProtonBackupVerify -CliReadyRunner { $false } -WarningAction SilentlyContinue `
+            -SyncCheck { param($p) $false }
+        $r.ExitCode | Should -Be 1
+        ($r.Findings -join "`n") | Should -Match 'not confirmed on Proton'
+        ($r.Findings -join "`n") | Should -Not -Match 'sync app appears stalled'
+    }
+
+    It 'a push-pending marker on a stall-diagnosed repo carries the stall context, not bare wait-and-see text' {
+        # RED (post-branch review fix pass): during a real stall every push leaves a
+        # verify_timeout/cli_unready marker (the 2026-08-12 incident had exactly this shape), and
+        # the marker pass re-emitted the bare wait-and-see wording — "pending backup not
+        # confirmed (reason: ...)" — alongside the stall diagnosis, restoring exactly the
+        # "just wait/re-run" reading the stall finding exists to replace. The marker line must
+        # carry the stall context for repos this run diagnosed; markers on undiagnosed repos
+        # keep the plain wording (pinned by the degraded-mode marker tests above).
+        $repo2 = New-TestRepo; Install-ProtonBackup -RepoPath $repo2
+        Write-PushPendingMarker -RepoPath $script:repo -Reason verify_timeout `
+            -BundleDir (Get-GpbBundleDir -Config (Read-GpbConfig) -RepoPath $script:repo) `
+            -BundleBaseName (Split-Path $script:repo -Leaf)
+        $r = Invoke-ProtonBackupVerify -CliReadyRunner { $true } `
+            -InfoRunner { param($cp, $cli) [pscustomobject]@{ ExitCode = 1; Output = 'Node not found' } } `
+            -SyncCheck { param($p) $true }
+        $r.ExitCode | Should -Be 1
+        $joined = $r.Findings -join "`n"
+        $joined | Should -Match 'sync app appears stalled'
+        # the marker line itself names the stall — one narrative, not two contradicting ones
+        # (single-line match: . does not cross the newline-joined findings)
+        $joined | Should -Match 'pending backup not confirmed \(reason: verify_timeout\).*sync app appears stalled'
+    }
+}
+
 Describe 'Status + scheduled task' {
     BeforeEach { $script:drive = New-Sandbox; $script:repo = New-TestRepo; Install-ProtonBackup -RepoPath $script:repo }
     AfterEach  { Clear-Sandbox }

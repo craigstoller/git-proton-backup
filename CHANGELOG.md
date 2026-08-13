@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- **GitProtonBackup (PowerShell module): `Invoke-ProtonBackupVerify` now detects a stalled Proton
+  Drive sync app instead of waiting up to a week for `MaxUnconfirmedAgeDays`.** Observed live
+  2026-08-12 (~18:50 PT): the sync app silently stopped uploading while its Cloud Files provider
+  kept marking freshly cut bundles in-sync — every local signal said "synced", `proton-drive
+  filesystem info` said Node not found for the same files, and a direct CLI upload succeeded
+  instantly (CLI/API channel live; the app was the fault). When CLI verification is available and
+  a bundle stays unconfirmed *because the server says the node is absent* (not an auth failure or
+  indeterminate output), verify now cross-checks the file's local Cloud Files state — and when
+  that claims in-sync, re-asks the server at the same instant, taking a late-landing upload as
+  the late confirmation it is rather than as evidence (a peer-review catch raised by every
+  reviewing engine: the first absent verdict can be a full grace window old). Still absent while
+  marked in-sync locally is the signature of a stalled sync app, and it surfaces as a distinct
+  finding — "sync app appears stalled: bundle marked in-sync locally but absent on Proton …
+  restart the Proton Drive app" — replacing the generic (and wait-and-see) "newest bundle not
+  confirmed on Proton". Debounced against transient metadata lag: two or more contradicting repos
+  are always diagnosed; a lone one only when a nonzero grace window (the upload-lag entry below)
+  vouches for the absence being persistent. The cross-check is fault-isolated (a failing local
+  probe leaves a breadcrumb finding and falls back to the generic verdict), and degraded mode (no
+  CLI) is untouched — without server truth the contradiction is unobservable, and the local sync
+  state remains the verifier (which also means this class stays *invisible* to degraded
+  verification: a falsely in-sync bundle looks confirmed there — CLI verification is what catches
+  it). A post-branch review fix pass extended the one-narrative rule to the marker pass —
+  push-pending markers on stall-diagnosed repos now carry the stall context on their own line
+  instead of re-introducing the generic wait-and-see wording — and tightened the docs to state
+  the lone-suspect evidence grades (a polled window vs. age plus a same-instant double-check)
+  and the degraded-mode consequence (exit 0, markers cleared, spool pruned on a false sync claim)
+  at full strength.
 - **GitProtonBackup (PowerShell module): `Invoke-ProtonBackupVerify` now gives freshly cut
   bundles a bounded upload-lag grace before reporting them unconfirmed** — so the first run after
   machine downtime no longer takes its verdict the instant the bundles hit disk. After any off
