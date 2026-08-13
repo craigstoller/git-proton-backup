@@ -439,6 +439,90 @@ func TestParseNodeJSONBothShapes(t *testing.T) {
 	}
 }
 
+// --- Task 1.4 (0.8.0 cert plan): the -1 size-unknown sentinel ---------------
+//
+// Before this fix, a type:"file" node whose revision size never resolved
+// silently fell through to Go's zero value (0) — indistinguishable from a
+// genuine zero-byte file, and making the size-unknown arm (refs.go's
+// readRefClassified band gate, push.go's matching heal-arm gate) UNREACHABLE
+// in production: both arms only ever saw a real -1 via a hand-built wrapper
+// transport (repo_test.go's sizeOverrideTransport), never via a genuine
+// parse. These tests pin parseNodeJSON's own -1 defaulting directly; the
+// existing wrapper-transport test (TestScanRefsUnknownSizeSkipsWithoutDownload,
+// repo_test.go) already confirms refs.go's arm fires on size<0 and is not
+// duplicated here (Task 1.4 audit, evidence file: both consumers already
+// branch correctly on size<0; the fix is contained to this parser).
+
+// RED: activeRevision absent entirely for a type:"file" node.
+func TestParseNodeJSONFileWithNoActiveRevisionGetsTheSizeUnknownSentinel(t *testing.T) {
+	const noRevision = `{"uid":"u1","name":{"value":"x.bundle"},"type":"file"}`
+	n, err := parseNodeJSON([]byte(noRevision))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n.Size != -1 {
+		t.Errorf("a file with no activeRevision must get the -1 sentinel, got Size=%d", n.Size)
+	}
+}
+
+// RED: activeRevision present and its state parses, but claimedSize itself
+// is absent from the JSON — must not silently read as a genuine 0.
+func TestParseNodeJSONFileWithClaimedSizeMissingGetsTheSizeUnknownSentinel(t *testing.T) {
+	const noClaimedSize = `{"uid":"u1","name":{"value":"x.bundle"},"type":"file",
+	 "activeRevision":{"uid":"r1","state":"active"}}`
+	n, err := parseNodeJSON([]byte(noClaimedSize))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n.Size != -1 {
+		t.Errorf("a file whose revision omits claimedSize must get the -1 sentinel, got Size=%d", n.Size)
+	}
+}
+
+// RED: claimedSize present but wrong-typed (a string, not a number) — the
+// unmarshal into both known shapes fails, and the sentinel must survive
+// rather than a zero value leaking through.
+func TestParseNodeJSONFileWithClaimedSizeWrongTypedGetsTheSizeUnknownSentinel(t *testing.T) {
+	const wrongTyped = `{"uid":"u1","name":{"value":"x.bundle"},"type":"file",
+	 "activeRevision":{"uid":"r1","state":"active","claimedSize":"not-a-number"}}`
+	n, err := parseNodeJSON([]byte(wrongTyped))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n.Size != -1 {
+		t.Errorf("a wrong-typed claimedSize must get the -1 sentinel, got Size=%d", n.Size)
+	}
+}
+
+// GUARD: a genuine "claimedSize": 0 must still yield a real 0, never
+// confused with the -1 sentinel (a real zero-byte file is a legitimate,
+// distinct outcome from "size unknown").
+func TestParseNodeJSONFileWithGenuineZeroClaimedSizeStaysZero(t *testing.T) {
+	const genuineZero = `{"uid":"u1","name":{"value":"empty.txt"},"type":"file",
+	 "activeRevision":{"uid":"r1","state":"active","claimedSize":0}}`
+	n, err := parseNodeJSON([]byte(genuineZero))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n.Size != 0 {
+		t.Errorf("a genuine claimedSize:0 must stay 0, got Size=%d", n.Size)
+	}
+}
+
+// GUARD: the sentinel is FILE-only — a folder (which the CLI never gives an
+// activeRevision to at all) must keep Size at plain 0, not -1. Scope check
+// against the Task 1.4 cut line: this fix must not touch folder semantics.
+func TestParseNodeJSONFolderSizeStaysZeroNotTheSentinel(t *testing.T) {
+	const folder = `{"uid":"u1","name":{"value":"sub"},"type":"folder"}`
+	n, err := parseNodeJSON([]byte(folder))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n.Size != 0 {
+		t.Errorf("a folder's Size must stay 0 (the sentinel is file-only), got %d", n.Size)
+	}
+}
+
 // TestCLIStatStartFailureIsNotConfirmedAbsence locks in the fix from Task 4
 // review round 1: when the CLI executable itself cannot start (missing from
 // PATH, permission denied, ...), run's nil-ProcessState guard must not let

@@ -87,9 +87,14 @@ type nodeWire struct {
 	ActiveRevision json.RawMessage `json:"activeRevision"`
 }
 
+// ClaimedSize is a pointer, not a plain int64, for the same reason
+// transferSummary's count fields are (below): a JSON key that is ABSENT
+// must decode as "missing", never silently default to the zero value — an
+// absent claimedSize alongside a valid state must not be confused with a
+// genuine "claimedSize": 0 (Task 1.4, 0.8.0 cert plan).
 type revWire struct {
 	State       string `json:"state"`
-	ClaimedSize int64  `json:"claimedSize"`
+	ClaimedSize *int64 `json:"claimedSize"`
 }
 
 func parseNodeJSON(b []byte) (Node, error) {
@@ -113,11 +118,30 @@ func parseNodeJSON(b []byte) (Node, error) {
 			w.Type, CertifiedCLI)
 	}
 	n := Node{Name: w.Name.Value, IsDir: isDir}
+	if !isDir {
+		// type:"file": default to the -1 size-unknown sentinel unless a
+		// revision parse below genuinely resolves a claimed size. Before
+		// Task 1.4 (0.8.0 cert plan) this fell through to Go's zero value
+		// (0) on every parse-miss shape (activeRevision absent, present but
+		// claimedSize missing, or claimedSize wrong-typed), indistinguishable
+		// from a genuine zero-byte file and making the size-unknown arm
+		// (refs.go's readRefClassified band gate, push.go's matching
+		// heal-arm gate — both already branch on size<0) UNREACHABLE in
+		// production. Folders are untouched: the CLI never gives them an
+		// activeRevision at all, and Size has never meant anything for a
+		// folder, so this default is scoped to files only.
+		n.Size = -1
+	}
 	if len(w.ActiveRevision) > 0 {
 		var r revWire
 		// 0.7.0: unwrapped.
 		if err := json.Unmarshal(w.ActiveRevision, &r); err == nil && r.State != "" {
-			n.Size = r.ClaimedSize
+			if r.ClaimedSize != nil {
+				n.Size = *r.ClaimedSize
+			}
+			// else: state parsed but claimedSize itself was absent from the
+			// JSON — leave the -1 sentinel rather than read a missing field
+			// as a genuine zero.
 			return n, nil
 		}
 		// 0.4.6: {ok, value}.
@@ -126,7 +150,9 @@ func parseNodeJSON(b []byte) (Node, error) {
 			Value revWire `json:"value"`
 		}
 		if err := json.Unmarshal(w.ActiveRevision, &wrap); err == nil && wrap.OK {
-			n.Size = wrap.Value.ClaimedSize
+			if wrap.Value.ClaimedSize != nil {
+				n.Size = *wrap.Value.ClaimedSize
+			}
 		}
 	}
 	return n, nil
