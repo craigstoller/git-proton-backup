@@ -441,19 +441,29 @@ func (c *CLI) CreateExclusive(p, localFile string) (Outcome, error) {
 	return c.upload("skip", dirOf(p), localFile)
 }
 
-// UpdateRevision maps to `merge`, which revises the existing node in place
-// (Stage 1 C1: node uid stable, revision uid changes) and upserts a node
-// that does not yet exist (Stage 1 C8: exit 0, transferred=1), so no prior
-// existence check is needed for correctness. NOT `replace`, which trashes
-// the node before creating the new one and can destroy a ref on a crash.
-// Subject to the same caller contract as CreateExclusive, above, and checked
-// the same way: localFile's basename must equal p's leaf (probe C11), or the
+// UpdateRevision maps to `create-new-revision` (0.8.0 vocabulary; Task 1
+// step 3, 0.8.0 cert plan — was `merge` under 0.7.0's general
+// conflict-strategy option, which 0.8.0 removed in favour of separate
+// -f/-d file/folder strategies). `create-new-revision`'s help text ("Create
+// a new revision of the existing file") matches the same intent `merge`
+// served: it revises the existing node in place (Stage 1 C1: node uid
+// stable, revision uid changes) and upserts a node that does not yet exist
+// (Stage 1 C8: exit 0, transferred=1), so no prior existence check is
+// needed for correctness. Whether 0.8.0's REMOTE semantics under the new
+// name match C1/C8 exactly is a hypothesis Task 2's live invariants
+// re-verify (same node uid, no duplicate) — this is a value rename on our
+// side, not yet a live-reverified behaviour. NOT `replace`, which trashes
+// the node before creating the new one and can destroy a ref on a crash —
+// present in both 0.7.0's and 0.8.0's vocabularies, but never the value we
+// pass, for the same never-touch-foreign-data reason as before. Subject to
+// the same caller contract as CreateExclusive, above, and checked the same
+// way: localFile's basename must equal p's leaf (probe C11), or the
 // revision lands under the wrong remote name.
 func (c *CLI) UpdateRevision(p, localFile string) (Outcome, error) {
 	if err := checkUploadBasename(p, localFile); err != nil {
 		return Ambiguous, err
 	}
-	return c.upload("merge", dirOf(p), localFile)
+	return c.upload("create-new-revision", dirOf(p), localFile)
 }
 
 // trashItem mirrors one element of a `trash --json` response: a JSON array
@@ -507,26 +517,69 @@ func dirOf(p string) string {
 	return "/"
 }
 
-// CertifiedCLI is the exact build docs/research/probes/stage1-results.json was
-// certified against. Support is an allowlist, not a floor: 0.4.6 and 0.7.0
-// differ in the activeRevision payload shape and in whether a byte-identical
-// rewrite is skipped, so a floor would admit a build that breaks verification
-// silently.
-const CertifiedCLI = "cli-drive@0.7.0+5174900c"
+// CertifiedCLI is the exact build this helper is certified against — moved
+// from 0.7.0 to 0.8.0 (Task 1, 0.8.0 certification: Proton stopped hosting
+// the 0.7.0 download the day 0.8.0 shipped, so every new install gets
+// 0.8.0). Support is an allowlist, not a floor: successive builds have
+// differed in the activeRevision payload shape, in whether a byte-identical
+// rewrite is skipped, and now in the upload conflict-strategy vocabulary
+// (the general strategy option split into -f/-d, C1's "merge" renamed to
+// "create-new-revision" for files — see UpdateRevision), so a floor would
+// admit a build that breaks verification silently. 0.7.0's own token now
+// REFUSES under this constant (exact-version philosophy, Craig-adjudicated
+// since Stage 2) — see legacyCertifiedCLI070 for the override path's
+// specific handling of that known-incompatible build.
+const CertifiedCLI = "cli-drive@0.8.0+06e8c605"
 
-// IsCertified reports whether --version output names EXACTLY the certified
-// build. Exact-token, not containment: the first whitespace-delimited field
-// starting "cli-drive@" must EQUAL CertifiedCLI. Containment was a prefix
-// match by another name — it accepted "cli-drive@0.7.0+5174900c-extra" —
-// and "exact versions, not a floor or prefix" is the design's rule. Output
-// with no such token is simply not certified (the unparseable case).
-func IsCertified(versionOutput string) bool {
-	for _, f := range strings.Fields(versionOutput) {
-		if strings.HasPrefix(f, "cli-drive@") {
-			return f == CertifiedCLI
+// legacyCertifiedCLI070 is the PREVIOUSLY-certified build's exact token,
+// kept as its own named constant (never inferred from history) so
+// EnforceCertified's override path can name the SPECIFIC incompatibility
+// when it recognises this exact build, rather than only ever printing the
+// generic "UNCERTIFIED" warning every mismatched version gets (round-2
+// [Gemini] override de-trap — see EnforceCertified, below).
+const legacyCertifiedCLI070 = "cli-drive@0.7.0+5174900c"
+
+// identityToken extracts the certified-build token from --version output,
+// if a proper identity line is present. Two shapes are recognised: a BARE
+// token (the whole line is nothing but the token — a test/helper
+// convenience already pinned by TestIsCertifiedMatchesTheRealVersionLine),
+// or the real CLI's own "Proton Drive CLI <token>" line, where the token is
+// the field immediately after "CLI". A token that merely APPEARS somewhere
+// inside a longer, unrelated line — an update nag mentioning an old or new
+// version in passing, say — is neither shape and is NOT an identity line:
+// it must never certify on that strength alone (round-3 GUARD b). Multiple
+// lines are tolerated in any order or count — hardening is about WHICH LINE
+// structurally qualifies, never how many lines there are or where the
+// qualifying one sits, so an update-nag line appended before or after the
+// real identity line changes nothing (round-3 GUARD a).
+func identityToken(versionOutput string) (string, bool) {
+	for _, line := range strings.Split(versionOutput, "\n") {
+		f := strings.Fields(line)
+		n := len(f)
+		if n == 0 {
+			continue
+		}
+		last := f[n-1]
+		if !strings.HasPrefix(last, "cli-drive@") {
+			continue
+		}
+		if n == 1 || f[n-2] == "CLI" {
+			return last, true
 		}
 	}
-	return false
+	return "", false
+}
+
+// IsCertified reports whether --version output names EXACTLY the certified
+// build, via identityToken's structural identity-line parse (above).
+// Exact-token equality, never containment: identityToken's found field must
+// EQUAL CertifiedCLI. Containment was a prefix match by another name — it
+// accepted "cli-drive@0.8.0+06e8c605-extra" — and "exact versions, not a
+// floor or prefix" is the design's rule. Output with no qualifying identity
+// line is simply not certified (the unparseable case).
+func IsCertified(versionOutput string) bool {
+	tok, ok := identityToken(versionOutput)
+	return ok && tok == CertifiedCLI
 }
 
 // Version returns the full trimmed output of `proton-drive --version`
@@ -590,6 +643,22 @@ func EnforceCertified(c *CLI, allowUncertified bool, w io.Writer) error {
 		fmt.Fprintf(w, "git-remote-proton: WARNING: proceeding with an UNCERTIFIED "+
 			"Proton CLI because GPB_UNCERTIFIED_CLI=1. Version %s; certified: %s. "+
 			"Behaviour on this build is unvalidated.\n", found, CertifiedCLI)
+		// De-trapped (round-2 [Gemini]): the override still opens the escape
+		// hatch unconditionally, but when the DETECTED build is specifically
+		// the known-incompatible 0.7.0, name that incompatibility instead of
+		// letting the operator find out later, opaquely, mid-push — 0.8.0's
+		// upload conflict-strategy vocabulary (create-new-revision) is not
+		// one 0.7.0 speaks. A selective hard-ban was considered and
+		// rejected: override means override; the cure for the trap is
+		// candor, not a second gate. Scoped to an exact match — an
+		// unrelated mismatched version gets only the generic warning above,
+		// never a false claim about 0.7.0's vocabulary.
+		if tok, ok := identityToken(v); ok && tok == legacyCertifiedCLI070 {
+			fmt.Fprintf(w, "git-remote-proton: NOTE: %s is the previously-certified build — "+
+				"its update path speaks the OLD conflict-strategy vocabulary, not %s's; "+
+				"pushes that update an existing ref will fail against it. The override does "+
+				"not make %s viable for pushes.\n", legacyCertifiedCLI070, CertifiedCLI, legacyCertifiedCLI070)
+		}
 		return nil
 	}
 	return fmt.Errorf("Proton CLI version %s, but this build is certified only "+

@@ -39,13 +39,14 @@ const (
 	roleCLIClean = "cli-clean"
 	roleLinger   = "linger"
 
-	// The four EnforceCertified stand-ins, below runVersionRole. Each ignores
+	// The five EnforceCertified stand-ins, below runVersionRole. Each ignores
 	// its args entirely, exactly like runHelperRole above — run() always
 	// calls Version() with "--version", so there is nothing to branch on.
 	roleCertified      = "version-certified"
 	roleWrongVersion   = "version-wrong"
 	roleNonzeroVersion = "version-nonzero"
 	roleNoToken        = "version-no-token"
+	roleLegacy070      = "version-legacy-070"
 
 	// The two Stat classification stand-ins, below runStatRole (Task 4). Like
 	// the version roles, each ignores its args and just reports a fixed
@@ -93,7 +94,7 @@ func TestMain(m *testing.M) {
 		runHelperRole(os.Getenv(helperEnv))
 	case roleLinger:
 		runLingerRole()
-	case roleCertified, roleWrongVersion, roleNonzeroVersion, roleNoToken:
+	case roleCertified, roleWrongVersion, roleNonzeroVersion, roleNoToken, roleLegacy070:
 		runVersionRole(os.Getenv(helperEnv))
 	case roleStatNotFound, roleStatOtherError:
 		runStatRole(os.Getenv(helperEnv))
@@ -162,6 +163,13 @@ func runVersionRole(role string) {
 		os.Exit(1)
 	case roleNoToken:
 		fmt.Println("unexpected output with no cli-drive@ token")
+	case roleLegacy070:
+		// The exact previously-certified build's identity line, literal text
+		// (not a symbolic reference to CertifiedCLI, which now names 0.8.0) —
+		// this role exists specifically to drive EnforceCertified's override
+		// de-trap test against the KNOWN-incompatible 0.7.0 build.
+		fmt.Println("Proton Drive CLI cli-drive@0.7.0+5174900c")
+		fmt.Println("Proton Drive SDK js@0.20.0+5174900c")
 	}
 	os.Exit(0)
 }
@@ -837,6 +845,12 @@ func noTokenRoleCLI(t *testing.T) *CLI {
 	return &CLI{Exe: os.Args[0]}
 }
 
+func legacy070RoleCLI(t *testing.T) *CLI {
+	t.Helper()
+	t.Setenv(helperEnv, roleLegacy070)
+	return &CLI{Exe: os.Args[0]}
+}
+
 // RED (Stage 4): EnforceCertified does not exist. The advisory warn in
 // cmd/main.go becomes this enforcing check; the design's "refuse to run"
 // rule finally matches the code.
@@ -968,6 +982,82 @@ func TestIsCertifiedIsExactTokenNotContainment(t *testing.T) {
 	// The real two-line captured output stays certified (SDK line ignored).
 	if !IsCertified("Proton Drive CLI " + CertifiedCLI + "\nProton Drive SDK js@0.20.0+5174900c") {
 		t.Error("the genuine two-line --version output must be certified")
+	}
+}
+
+// TestIsCertifiedTolerantOfAnAppendedUpdateNagLine is GUARD (a) from the
+// 0.8.0 certification plan (Task 1 step 2, round-3): 0.8.0 added an
+// up-to-date/update-nag report line after the identity line ("You are
+// running the latest version." or, post-0.8.1, an update-available
+// counterpart) — hardening must tolerate EXTRA output lines without
+// becoming line-count- or position-sensitive.
+func TestIsCertifiedTolerantOfAnAppendedUpdateNagLine(t *testing.T) {
+	v := "Proton Drive CLI " + CertifiedCLI + "\n" +
+		"Proton Drive SDK js@0.21.0+06e8c605\n" +
+		"An update to 0.8.1 is available!"
+	if !IsCertified(v) {
+		t.Errorf("an appended update-nag line must not break certification, got false for %q", v)
+	}
+}
+
+// TestIsCertifiedRefusesATokenMerelyMentionedInANagSentence is GUARD (b):
+// the certified token appearing INSIDE a longer, unrelated sentence — not
+// on a genuine identity line ("Proton Drive CLI <token>", or a bare token
+// alone) — must not certify on that strength alone. Before the round-3
+// hardening, IsCertified scanned every whitespace field across the WHOLE
+// output for the first "cli-drive@" prefix regardless of which line it sat
+// on, so a token merely glanced at inside a nag sentence would have
+// satisfied it; identityToken's structural per-line parse (cli.go) closes
+// that.
+func TestIsCertifiedRefusesATokenMerelyMentionedInANagSentence(t *testing.T) {
+	v := "Heads up: your previous session used " + CertifiedCLI + " before you updated."
+	if IsCertified(v) {
+		t.Errorf("a token embedded in a nag sentence must not certify alone, got true for %q", v)
+	}
+}
+
+// TestIsCertifiedRefuses070AfterTheBump is the plan's explicit GUARD: the
+// exact-version philosophy (Craig-adjudicated, Stage 2) means the
+// PREVIOUSLY-certified build refuses once CertifiedCLI moves on — no floor,
+// no grace window. Uses the literal 0.7.0 token text, not the CertifiedCLI
+// constant, so this test cannot silently pass by tautology after the bump.
+func TestIsCertifiedRefuses070AfterTheBump(t *testing.T) {
+	if IsCertified("Proton Drive CLI cli-drive@0.7.0+5174900c") {
+		t.Error("the previously-certified 0.7.0 token must refuse now that CertifiedCLI has moved to 0.8.0")
+	}
+}
+
+// TestEnforceCertifiedOverrideNamesTheKnown070Incompatibility is the
+// round-2 [Gemini] override de-trap: GPB_UNCERTIFIED_CLI=1 still opens the
+// escape hatch for the KNOWN-incompatible 0.7.0 build, but the warning must
+// additionally name the specific incompatibility (0.8.0's conflict-strategy
+// vocabulary) rather than fail opaquely mid-push later. A selective hard-ban
+// was considered and rejected (plan, round 1): override still means
+// override.
+func TestEnforceCertifiedOverrideNamesTheKnown070Incompatibility(t *testing.T) {
+	var buf strings.Builder
+	if err := EnforceCertified(legacy070RoleCLI(t), true, &buf); err != nil {
+		t.Fatalf("override must proceed on the legacy 0.7.0 build: %v", err)
+	}
+	for _, want := range []string{"UNCERTIFIED", "cli-drive@0.7.0+5174900c", CertifiedCLI, "pushes"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("warning must name %q, got %q", want, buf.String())
+		}
+	}
+}
+
+// TestEnforceCertifiedOverrideOmitsThe070NoteForAnUnrelatedMismatch pins
+// the de-trap's scope: the specific 0.7.0 incompatibility note must be
+// named ONLY when the detected build genuinely is 0.7.0 — an unrelated
+// mismatched version (e.g. a hypothetical 9.9.9) gets the plain generic
+// warning, not a false claim about 0.7.0's vocabulary.
+func TestEnforceCertifiedOverrideOmitsThe070NoteForAnUnrelatedMismatch(t *testing.T) {
+	var buf strings.Builder
+	if err := EnforceCertified(wrongVersionRoleCLI(t), true, &buf); err != nil {
+		t.Fatalf("override must proceed: %v", err)
+	}
+	if strings.Contains(buf.String(), "cli-drive@0.7.0+5174900c") {
+		t.Errorf("an unrelated version mismatch must not name the 0.7.0 incompatibility, got %q", buf.String())
 	}
 }
 

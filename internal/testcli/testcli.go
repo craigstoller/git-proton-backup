@@ -257,15 +257,19 @@ type transferSummary struct {
 // ["-f", strategy, "--json", localFile, remoteDir].
 //
 // Strategy handling covers exactly the two strategies cli.go ever passes
-// (CreateExclusive -> "skip", UpdateRevision -> "merge"; Stage 1 C1/C8):
-// "skip" refuses (skippedItems=1) onto an existing target and writes
-// (transferredItems=1) onto an absent one; "merge" always upserts
-// (transferredItems=1), matching C8's "UPSERTS" finding. C2's byte-
-// identical-rewrite auto-skip is deliberately NOT reproduced: nothing in
-// this codebase's write paths ever re-uploads identical bytes to the same
-// target (every write is preceded by either a fresh random nonce (the lock
-// body) or content that only gets written once (a ref, HEAD)), so scripting
-// that edge case would add fidelity risk with no caller ever exercising it.
+// (CreateExclusive -> "skip", UpdateRevision -> "create-new-revision" as of
+// the 0.8.0 certification — Task 1 step 3; "merge" under 0.7.0's now-removed
+// general conflict-strategy option, Stage 1 C1/C8): "skip" refuses
+// (skippedItems=1) onto an existing target and writes (transferredItems=1)
+// onto an absent one; "create-new-revision" always upserts
+// (transferredItems=1), matching C8's "UPSERTS" finding (the vocabulary
+// renamed; the modelled behaviour did not — Task 2's live table re-verifies
+// that 0.8.0's real semantics still match). C2's byte- identical-rewrite
+// auto-skip is deliberately NOT reproduced: nothing in this codebase's write
+// paths ever re-uploads identical bytes to the same target (every write is
+// preceded by either a fresh random nonce (the lock body) or content that
+// only gets written once (a ref, HEAD)), so scripting that edge case would
+// add fidelity risk with no caller ever exercising it.
 func runUpload(tree string, args []string, stdout, stderr io.Writer) int {
 	if len(args) != 5 || args[0] != "-f" || args[2] != "--json" {
 		fmt.Fprintf(stderr, "testcli: unexpected upload arguments %v\n", args)
@@ -295,7 +299,7 @@ func runUpload(tree string, args []string, stdout, stderr io.Writer) int {
 			writeJSONLine(stdout, transferSummary{Skipped: 1})
 			return 0
 		}
-	case "merge":
+	case "create-new-revision":
 		// upserts unconditionally — falls through to the write below either way.
 	default:
 		fmt.Fprintf(stderr, "testcli: unsupported upload strategy %q\n", strategy)
