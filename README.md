@@ -259,15 +259,19 @@ download them; you don't need this tool, or even a Windows machine, to get your 
 - **Proton Drive CLI absent or signed out:** verification degrades to Cloud Files sync state
   only — never fatal, but a weaker guarantee than CLI confirmation, and blind to one real
   failure: a sync app that falsely marks files in-sync while uploading nothing looks *healthy* to
-  it (CLI verification is what catches that — next bullet).
+  it. Worse than merely looking healthy: degraded verification acts on that false state — verify
+  reports ok (exit 0), clears push-pending markers, and lets retention prune the local spool,
+  all while nothing has reached Proton (CLI verification is what catches this — next bullet).
 - **Proton Drive sync stopped:** bundles pile up locally until sync resumes. When the CLI is
   available, `Invoke-ProtonBackupVerify` catches the tell-tale contradiction on its next run —
   bundles marked in-sync locally yet absent on Proton at the same instant — and says so ("sync
-  app appears stalled … restart the Proton Drive app"; diagnosed when two or more repos show it,
-  or one persists past the verify grace window). Without the CLI, the backlog still surfaces once
-  it's older than `MaxUnconfirmedAgeDays` (default 7) — but only while the files stay honestly
-  pending: a stall that falsely marks them in-sync is exactly the blind spot the previous bullet
-  describes, and no age check can see it.
+  app appears stalled … restart the Proton Drive app"; diagnosed when two or more repos show it
+  at once, or when a lone repo shows it and a nonzero grace window is configured — the strongest
+  case being a freshly cut bundle polled across the whole window; an already-old spool is judged
+  on its age plus a same-instant double-check, not continuous observation). Without the CLI, the
+  backlog still surfaces once it's older than `MaxUnconfirmedAgeDays` (default 7) — but only
+  while the files stay honestly pending: a stall that falsely marks them in-sync is exactly the
+  blind spot the previous bullet describes, and no age check can see it.
 - **One machine per repo:** there's no multi-machine coordination. A second machine pushing the same
   repo is safe but confusing — digest-suffixed filenames prevent corruption, not confusion.
 - **Worktrees:** a bundle carries full ref history — every branch and tag — but not the checked-out

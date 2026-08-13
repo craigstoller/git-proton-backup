@@ -1302,11 +1302,13 @@ function Invoke-ProtonBackupVerify {
         #   • two or more suspects: always a stall. One machine-wide app owns every upload;
         #     independent metadata lag striking several repos at once is not the parsimonious
         #     read (and the observed incident was exactly this fleet shape).
-        #   • exactly one suspect: a stall iff a nonzero grace window vouches for persistence.
-        #     Any repo still unconfirmed here has necessarily out-waited one full window when one
-        #     exists — grace-eligible means it was polled to the deadline; ineligible means its
-        #     bundle was already older than the window at run start. With the grace explicitly
-        #     disabled (0), there is no persistence evidence and the generic finding stands.
+        #   • exactly one suspect: a stall iff a nonzero grace window exists. Two grades of
+        #     evidence hide behind that gate (design.md states both): a grace-ELIGIBLE suspect
+        #     was polled to the deadline — genuine window-length observation; a grace-INELIGIBLE
+        #     one (bundle already older than the window at run start, so never polled this run)
+        #     offers only age plus the same-instant double-check above — NOT continuous
+        #     observation. The config value is the gate, not a per-repo persistence fact.
+        #     With the grace explicitly disabled (0), the generic finding stands.
         if ($stallSuspects.Count -ge 2 -or ($stallSuspects.Count -eq 1 -and $GraceSeconds -gt 0)) {
             foreach ($s in $stallSuspects) { $s.StallContradiction = $true }
         }
@@ -1398,6 +1400,11 @@ function Invoke-ProtonBackupVerify {
                 $exit = [Math]::Max($exit, 1)
             }
         }
+        # Markers on stall-diagnosed repos carry the diagnosis on their own line (post-branch
+        # review fix): during a real stall every push leaves a verify_timeout/cli_unready marker,
+        # and the bare "pending backup not confirmed" wording alongside the stall finding restored
+        # exactly the wait-and-see reading the stall finding replaces. One run, one narrative.
+        $stallRepoPaths = @($repoRecords | Where-Object { $_.StallContradiction } | ForEach-Object { $_.RepoPath })
         foreach ($file in $markerFiles) {
             try {
                 $mk = Read-GpbMarker -File $file
@@ -1410,7 +1417,8 @@ function Invoke-ProtonBackupVerify {
                     $findings.Add("evicted orphaned marker for $($mk.RepoPath)")
                     continue
                 }
-                $findings.Add("pending backup not confirmed (reason: $($mk.Reason)) for $($mk.RepoPath)")
+                $stallNote = if ($stallRepoPaths -contains $mk.RepoPath) { ' — sync app appears stalled; this will not confirm until the Proton Drive app is restarted' } else { '' }
+                $findings.Add("pending backup not confirmed (reason: $($mk.Reason)) for $($mk.RepoPath)$stallNote")
                 $exit = [Math]::Max($exit, 1)
             } catch {
                 $findings.Add("marker check failed ($($file.Name)): $($_.Exception.Message)")

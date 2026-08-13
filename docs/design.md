@@ -159,7 +159,15 @@ that pair. Accepted under the same reasoning as the window tail below. With the 
 disabled a lone contradiction keeps the generic finding — and the fleet arm then rests on instant
 observations alone, so correlated metadata lag across simultaneously-landing uploads could in
 principle still false-alarm it. Accepted: grace-off is an explicit operator override, never the
-default, and the cost of a false positive here is a pointless app restart, not lost data. A
+default, and the cost of a false positive here is a pointless app restart, not lost data. The
+same instant-observation grade reaches the fleet arm with the grace ON whenever the contradicting
+repos are all grace-ineligible — spools already older than the window at run start, the natural
+shape of the second and later runs against a slow backlog — so a healthy app still draining a
+queue, under a provider that marks files in-sync ahead of upload completion, could in principle
+be fleet-diagnosed there too (post-branch review catch). Accepted under the same cost reasoning —
+a "restart the app" against a healthy queue is a no-op that resumes the same queue — and because
+the alternative, requiring a polled window per suspect, would blind the detector on exactly the
+late runs where a real stall is oldest and the diagnosis most overdue. A
 narrower tail of the same transient exists with the grace on: an upload landing in the window's
 final seconds, under an info endpoint still catching up, can present the contradiction at
 cross-check time. Accepted for the same reason, plus one more — that repo was alarming either way
@@ -169,8 +177,10 @@ cross-check is fault-isolated like every other probe in Verify — a failing Clo
 leaves a breadcrumb finding and falls back to the generic verdict. Degraded mode (no CLI) is
 untouched by construction: there the local Cloud Files state *is* the verifier, so the
 contradiction is unobservable — which cuts the other way too, and belongs in the honest-limits
-column: a stalled app that falsely marks files in-sync looks *healthy* to degraded verification;
-CLI verification is the only channel that catches this class. And the detector narrows only this
+column: a stalled app that falsely marks files in-sync looks *healthy* to degraded verification,
+which then acts on the false state — verify exits 0, push-pending markers are cleared, and
+retention prunes the local spool, all on the strength of a sync claim that is false; CLI
+verification is the only channel that catches this class. And the detector narrows only this
 false-in-sync class: an app that dies *honestly* — crashed, hung, offline, files left visibly
 pending — presents no contradiction and keeps the generic finding, which is not silence (it
 alarms at exit 1 on every run) but does read as wait-and-see until `MaxUnconfirmedAgeDays`, whose

@@ -23,7 +23,12 @@
   CLI) is untouched — without server truth the contradiction is unobservable, and the local sync
   state remains the verifier (which also means this class stays *invisible* to degraded
   verification: a falsely in-sync bundle looks confirmed there — CLI verification is what catches
-  it).
+  it). A post-branch review fix pass extended the one-narrative rule to the marker pass —
+  push-pending markers on stall-diagnosed repos now carry the stall context on their own line
+  instead of re-introducing the generic wait-and-see wording — and tightened the docs to state
+  the lone-suspect evidence grades (a polled window vs. age plus a same-instant double-check)
+  and the degraded-mode consequence (exit 0, markers cleared, spool pruned on a false sync claim)
+  at full strength.
 - **GitProtonBackup (PowerShell module): `Invoke-ProtonBackupVerify` now gives freshly cut
   bundles a bounded upload-lag grace before reporting them unconfirmed** — so the first run after
   machine downtime no longer takes its verdict the instant the bundles hit disk. After any off

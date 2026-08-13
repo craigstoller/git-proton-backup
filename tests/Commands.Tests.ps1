@@ -902,6 +902,29 @@ Describe 'Invoke-ProtonBackupVerify sync-app stall detection' {
         ($r.Findings -join "`n") | Should -Match 'not confirmed on Proton'
         ($r.Findings -join "`n") | Should -Not -Match 'sync app appears stalled'
     }
+
+    It 'a push-pending marker on a stall-diagnosed repo carries the stall context, not bare wait-and-see text' {
+        # RED (post-branch review fix pass): during a real stall every push leaves a
+        # verify_timeout/cli_unready marker (the 2026-08-12 incident had exactly this shape), and
+        # the marker pass re-emitted the bare wait-and-see wording — "pending backup not
+        # confirmed (reason: ...)" — alongside the stall diagnosis, restoring exactly the
+        # "just wait/re-run" reading the stall finding exists to replace. The marker line must
+        # carry the stall context for repos this run diagnosed; markers on undiagnosed repos
+        # keep the plain wording (pinned by the degraded-mode marker tests above).
+        $repo2 = New-TestRepo; Install-ProtonBackup -RepoPath $repo2
+        Write-PushPendingMarker -RepoPath $script:repo -Reason verify_timeout `
+            -BundleDir (Get-GpbBundleDir -Config (Read-GpbConfig) -RepoPath $script:repo) `
+            -BundleBaseName (Split-Path $script:repo -Leaf)
+        $r = Invoke-ProtonBackupVerify -CliReadyRunner { $true } `
+            -InfoRunner { param($cp, $cli) [pscustomobject]@{ ExitCode = 1; Output = 'Node not found' } } `
+            -SyncCheck { param($p) $true }
+        $r.ExitCode | Should -Be 1
+        $joined = $r.Findings -join "`n"
+        $joined | Should -Match 'sync app appears stalled'
+        # the marker line itself names the stall — one narrative, not two contradicting ones
+        # (single-line match: . does not cross the newline-joined findings)
+        $joined | Should -Match 'pending backup not confirmed \(reason: verify_timeout\).*sync app appears stalled'
+    }
 }
 
 Describe 'Status + scheduled task' {
