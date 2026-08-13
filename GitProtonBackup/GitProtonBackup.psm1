@@ -1132,12 +1132,20 @@ function Invoke-ProtonBackupVerify {
         $getCloudBundlePathFn    = ${function:Get-CloudBundlePath}
         $confirmBundleUploadedFn = ${function:Confirm-BundleUploaded}
         $getCloudFileSyncStateFn = ${function:Get-CloudFileSyncState}
+        # The CLI verdict's REASON survives here, keyed by local bundle path, for the stall
+        # cross-check in phase B2 below: Confirm-BundleUploaded distinguishes "the server has no
+        # such node" (not_in_cloud) from mere non-confirmation, and $effectiveCheck's boolean
+        # return discards that. A hashtable because it's a reference type: the closure captures
+        # the reference, so writes made from inside Invoke-RepoBundleBackup's in-pass check and
+        # the grace rounds are visible out here. Last write wins — the freshest evidence.
+        $cliReasonByPath = @{}
         $effectiveCheck = {
             param($p)
             if ($cliReady) {
                 $cloudPath = & $getCloudBundlePathFn -LocalPath $p -DriveLocalRoot $cfg.ProtonDriveRoot
                 $c = if ($InfoRunner) { & $confirmBundleUploadedFn -CloudPath $cloudPath -CliPath $cli -InfoRunner $InfoRunner }
                      else             { & $confirmBundleUploadedFn -CloudPath $cloudPath -CliPath $cli }
+                $cliReasonByPath[$p] = $c.Reason
                 $c.Confirmed
             } elseif ($SyncCheck) { & $SyncCheck $p } else { (& $getCloudFileSyncStateFn -Path $p).InSync }
         }.GetNewClosure()
@@ -1162,6 +1170,7 @@ function Invoke-ProtonBackupVerify {
                 Confirmed = $false      # final verdict; may flip during the grace pass
                 GraceEligible = $false  # freshly cut + still pending → worth a second look
                 GraceFaulted = $false   # its re-check threw; dropped from later rounds
+                StallContradiction = $false  # CF says InSync, CLI says absent (phase B2 verdict)
             }
             try {
                 if (-not (Test-Path -LiteralPath $repo)) { $rec.Findings.Add("registered repo missing on disk: $repo — Uninstall-ProtonBackup to deregister"); $rec.State = 'attention' }
@@ -1242,13 +1251,83 @@ function Invoke-ProtonBackupVerify {
             } while ($true)
         }
 
+        # --- Phase B2: sync-app stall cross-check, CLI mode only. Observed live 2026-08-12
+        # ~18:50 PT: the Proton Drive sync app silently stopped uploading while its Cloud Files
+        # provider kept marking freshly cut bundles InSync — so every local signal said "synced"
+        # while `filesystem info` said Node not found for the same files (a direct CLI upload
+        # succeeding instantly proved the CLI/API channel live and implicated the app). Waiting
+        # doesn't heal this class — it is NOT upload lag — and without this check the only
+        # watchdog is MaxUnconfirmedAgeDays (default 7 days). The contradiction is diagnosable
+        # exactly when both channels are speaking: the CLI supplying server truth, the local
+        # Cloud Files state probed for the same file. Degraded mode is untouched by construction:
+        # there the local state IS the verifier, so no contradiction can be observed — and no
+        # CLI reasons were recorded to key off anyway.
+        $stallSuspects = @()
+        if ($cliReady) {
+            foreach ($rec in $repoRecords) {
+                if ($rec.Confirmed -or $rec.GraceFaulted) { continue }
+                if (-not ($rec.Res -and $rec.Res.PSObject.Properties['BundlePath'] -and $rec.Res.BundlePath)) { continue }
+                # Only the server's explicit "no such node" contradicts a local InSync. An auth
+                # failure or indeterminate CLI output is its own story (wrong session, flaky
+                # output) — diagnosing a stall from it would send the user to restart an app
+                # that may be fine.
+                if ($cliReasonByPath[$rec.Res.BundlePath] -ne 'not_in_cloud') { continue }
+                try {
+                    $cfInSync = if ($SyncCheck) { & $SyncCheck $rec.Res.BundlePath }
+                                else { (& $getCloudFileSyncStateFn -Path $rec.Res.BundlePath).InSync }
+                    if (-not $cfInSync) { continue }
+                    # Same-instant re-probe (peer-review catch, raised by all four engines): the
+                    # cached reason can be a full grace window old — a grace-ineligible spool got
+                    # exactly one CLI sample back in the repo pass — and a healthy upload landing
+                    # between that sample and this moment reads as CF-InSync against a STALE
+                    # absent verdict: the stall signature, minus the stall. Re-ask the server
+                    # NOW, through the same $effectiveCheck (which refreshes the cached reason):
+                    # a fresh confirmation is taken as the late confirmation it is, and only a
+                    # node still absent at the same moment the local state claims InSync counts
+                    # as contradiction evidence. One extra info call, only when about to accuse.
+                    if (& $effectiveCheck $rec.Res.BundlePath) { $rec.Confirmed = $true; continue }
+                    if ($cliReasonByPath[$rec.Res.BundlePath] -eq 'not_in_cloud') { $stallSuspects += $rec }
+                } catch {
+                    # Fault-isolated like every probe in this function: a failing local CF probe
+                    # just means no corroborating evidence for this repo — phase C's generic
+                    # unconfirmed finding still fires, so nothing goes silent. The breadcrumb
+                    # below keeps the broken probe itself from hiding (never-go-silent ethos);
+                    # it doesn't change the repo's verdict, which is already attention-bound.
+                    $rec.Findings.Add("stall cross-check failed for $($rec.RepoPath): $($_.Exception.Message)")
+                }
+            }
+        }
+        # Debounce — one contradictory observation could be transient (the upload landed but the
+        # server's info endpoint hasn't caught up), so a lone suspect needs persistence evidence:
+        #   • two or more suspects: always a stall. One machine-wide app owns every upload;
+        #     independent metadata lag striking several repos at once is not the parsimonious
+        #     read (and the observed incident was exactly this fleet shape).
+        #   • exactly one suspect: a stall iff a nonzero grace window vouches for persistence.
+        #     Any repo still unconfirmed here has necessarily out-waited one full window when one
+        #     exists — grace-eligible means it was polled to the deadline; ineligible means its
+        #     bundle was already older than the window at run start. With the grace explicitly
+        #     disabled (0), there is no persistence evidence and the generic finding stands.
+        if ($stallSuspects.Count -ge 2 -or ($stallSuspects.Count -eq 1 -and $GraceSeconds -gt 0)) {
+            foreach ($s in $stallSuspects) { $s.StallContradiction = $true }
+        }
+
         # --- Phase C: confirmation-dependent findings + finalization, in registration order.
         foreach ($rec in $repoRecords) {
             $repo = $rec.RepoPath
             try {
                 if ($rec.Res) {
                     $res = $rec.Res; $bd = $rec.BundleDir
-                    if (-not $rec.Confirmed) { $rec.Findings.Add("newest bundle not confirmed on Proton for $repo"); $rec.State = 'attention' }
+                    if (-not $rec.Confirmed) {
+                        # The stall finding REPLACES the generic one, not supplements it: the
+                        # generic wording invites wait-and-see (right for upload lag), which is
+                        # exactly wrong for a stalled app that will upload nothing for days.
+                        if ($rec.StallContradiction) {
+                            $rec.Findings.Add("sync app appears stalled: bundle marked in-sync locally but absent on Proton for $repo — restart the Proton Drive app")
+                        } else {
+                            $rec.Findings.Add("newest bundle not confirmed on Proton for $repo")
+                        }
+                        $rec.State = 'attention'
+                    }
                     elseif ($res.PSObject.Properties['BundlePath'] -and $res.BundlePath) {
                         # Read BEFORE removing: a malformed marker under this slug must be
                         # quarantined (Read-GpbMarker renames it .bad), never deleted unseen.

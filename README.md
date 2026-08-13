@@ -257,9 +257,17 @@ download them; you don't need this tool, or even a Windows machine, to get your 
 - **Shallow clones:** refused at install; git bundles from a shallow repo are unreliable. Un-shallow
   first (`git fetch --unshallow`).
 - **Proton Drive CLI absent or signed out:** verification degrades to Cloud Files sync state
-  only — never fatal, but a weaker guarantee than CLI confirmation.
-- **Proton Drive sync stopped:** bundles pile up locally until sync resumes; `Invoke-ProtonBackupVerify`
-  surfaces the backlog once it's older than `MaxUnconfirmedAgeDays` (default 7).
+  only — never fatal, but a weaker guarantee than CLI confirmation, and blind to one real
+  failure: a sync app that falsely marks files in-sync while uploading nothing looks *healthy* to
+  it (CLI verification is what catches that — next bullet).
+- **Proton Drive sync stopped:** bundles pile up locally until sync resumes. When the CLI is
+  available, `Invoke-ProtonBackupVerify` catches the tell-tale contradiction on its next run —
+  bundles marked in-sync locally yet absent on Proton at the same instant — and says so ("sync
+  app appears stalled … restart the Proton Drive app"; diagnosed when two or more repos show it,
+  or one persists past the verify grace window). Without the CLI, the backlog still surfaces once
+  it's older than `MaxUnconfirmedAgeDays` (default 7) — but only while the files stay honestly
+  pending: a stall that falsely marks them in-sync is exactly the blind spot the previous bullet
+  describes, and no age check can see it.
 - **One machine per repo:** there's no multi-machine coordination. A second machine pushing the same
   repo is safe but confusing — digest-suffixed filenames prevent corruption, not confusion.
 - **Worktrees:** a bundle carries full ref history — every branch and tag — but not the checked-out

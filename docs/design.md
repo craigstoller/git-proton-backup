@@ -119,6 +119,66 @@ whose refs change before every scheduled run and whose uploads always outlast th
 would otherwise *never* prune, while its confirmed state suppresses the very spool warning that
 would have surfaced the pile-up (a peer-review catch).
 
+### The stalled sync app
+
+The grace assumes upload lag — given time, the sync app catches up. The same day the lag was
+root-caused (2026-08-12, ~18:50 PT, during a post-merge live smoke) produced the opposite failure,
+observed live: the Proton Drive sync app silently *stopped uploading* (last successful upload
+13:51 PT) while its Cloud Files provider kept marking freshly cut bundles InSync. Every local
+signal said "synced"; `proton-drive filesystem info` said Node not found for the same files; and a
+direct CLI upload to a probe folder succeeded and listed instantly — proving the CLI/API channel
+live and pinning the fault on the app. Waiting doesn't heal this class, and before this check the
+only watchdog was `MaxUnconfirmedAgeDays` — up to a week of nothing uploading before anything said
+so.
+
+So when CLI verification is available and a bundle stays unconfirmed because the server says the
+node is *absent* — not an auth failure, not indeterminate CLI output; those are different stories
+with different remedies — Verify probes the same file's local Cloud Files state, and when that
+claims in-sync, immediately re-asks the server (one extra info call, made only when about to
+accuse). The re-probe is load-bearing, a peer-review catch raised by every reviewing engine: the
+first absent verdict can be a full grace window old — a spool too stale for the grace gets exactly
+one CLI sample back in the repo pass — and a healthy upload landing between that sample and the
+cross-check would otherwise read as in-sync-yet-absent, the stall signature minus the stall. A
+fresh confirmation is taken as the late confirmation it is; only a node still absent at the same
+moment the local state claims in-sync counts as contradiction evidence.
+
+That same-instant contradiction is the signature of a sync app marking work done without doing
+it, and it surfaces as its own finding ("sync app appears stalled … restart the Proton Drive
+app") *instead of* the generic "newest bundle not confirmed on Proton": the generic wording's
+wait-and-see implication is right for upload lag and exactly wrong here. A signature, not a
+proof — a server whose info endpoint lags its own upload acknowledgement can produce the same
+instant — so the diagnosis is debounced. Two or more contradicting repos are always diagnosed:
+one machine-wide app owns every upload, and the observed incident was exactly this fleet shape. A
+lone suspect is diagnosed only when a nonzero grace window backs the absence — with two grades of
+evidence, stated honestly: a grace-eligible repo was polled to the deadline, so its absence was
+observed across the whole window; a grace-ineligible one offers age plus a same-instant
+double-check (a bundle already older than the window, absent at the repo pass and still absent on
+the re-probe), which is *not* continuous observation — a healthy app that only just got around to
+uploading an old spool, under an info endpoint still catching up, can transiently present exactly
+that pair. Accepted under the same reasoning as the window tail below. With the grace explicitly
+disabled a lone contradiction keeps the generic finding — and the fleet arm then rests on instant
+observations alone, so correlated metadata lag across simultaneously-landing uploads could in
+principle still false-alarm it. Accepted: grace-off is an explicit operator override, never the
+default, and the cost of a false positive here is a pointless app restart, not lost data. A
+narrower tail of the same transient exists with the grace on: an upload landing in the window's
+final seconds, under an info endpoint still catching up, can present the contradiction at
+cross-check time. Accepted for the same reason, plus one more — that repo was alarming either way
+(the stall text replaces a generic finding on a run already at exit 1; the re-probe in fact gives
+it an extra chance to confirm late and go quiet), and the next run confirms and clears it. The
+cross-check is fault-isolated like every other probe in Verify — a failing Cloud Files probe
+leaves a breadcrumb finding and falls back to the generic verdict. Degraded mode (no CLI) is
+untouched by construction: there the local Cloud Files state *is* the verifier, so the
+contradiction is unobservable — which cuts the other way too, and belongs in the honest-limits
+column: a stalled app that falsely marks files in-sync looks *healthy* to degraded verification;
+CLI verification is the only channel that catches this class. And the detector narrows only this
+false-in-sync class: an app that dies *honestly* — crashed, hung, offline, files left visibly
+pending — presents no contradiction and keeps the generic finding, which is not silence (it
+alarms at exit 1 on every run) but does read as wait-and-see until `MaxUnconfirmedAgeDays`, whose
+finding already asks whether the app is running, escalates it. (A more active design — a canary
+upload through the CLI whenever bundles sit unconfirmed — would detect stalls without leaning on
+Cloud Files semantics at all; the passive cross-check was chosen because it adds no writes, no
+new cloud state, and no cleanup obligations to a read-only reconciliation pass.)
+
 Verify also prunes old bundles under retention once the newest one is confirmed, watches for
 bundles that have gone unconfirmed for too long (`MaxUnconfirmedAgeDays`, default 7 — a sign the
 sync app itself may be stopped), quarantines a marker file it can't parse (renamed `.bad`, never
