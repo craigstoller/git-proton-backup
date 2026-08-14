@@ -27,7 +27,10 @@ Your branch is up to date with 'proton/main'.
 **Requirements:** Windows, PowerShell 7.4+, git, the Proton Drive desktop app, and the
 [Proton Drive CLI](https://proton.me/drive) — optional but recommended. Without the CLI,
 verification degrades to Windows Cloud Files sync-state only (see
-[Honest limits](#honest-limits)); it never blocks install.
+[Honest limits](#honest-limits)); it never blocks install. Proton's CLI download page hosts only
+the current release, so a fresh install already gets the build `git-remote-proton` (v2, below)
+certifies against — currently 0.8.0 (`cli-drive@0.8.0+06e8c605`). v1's own CLI use has no version
+pin and degrades gracefully on an absent or mismatched CLI; v2 enforces the exact certified build.
 
 ```powershell
 git clone https://github.com/craigstoller/git-proton-backup.git
@@ -83,7 +86,7 @@ are not equivalent, and the restore story is where that matters most.
 |---|---|---|
 | Transport | Proton Drive's Windows sync app; a single bundle file lands in the synced folder | The Proton Drive CLI, invoked directly by the helper as a real git remote |
 | Remote name | `proton` | `proton-v2` |
-| Restore needs | git only, from any machine — the bundle itself is the backup, no account needed | git, `git-remote-proton` on PATH, and the certified Proton Drive CLI signed in |
+| Restore needs | git only, from any machine — the bundle itself is the backup, no account needed | git, `git-remote-proton` on PATH, and the certified Proton Drive CLI (0.8.0) signed in |
 
 **Install v2 first — `git-remote-proton` doesn't land on PATH by default.** Download the release
 assets (`git-remote-proton.exe`, `git-remote-proton.exe.sha256`, `install.ps1`) from a [GitHub
@@ -133,7 +136,7 @@ adopted as a v2 repo, so don't create one there even as a placeholder.
 **Restore contracts, stated honestly.** A v1 bundle restores with nothing but git —
 `git clone <bundle-path>` — from any machine, any OS, no account needed at the moment of
 restore. A v2 restore needs three things to be true at once: git, `git-remote-proton` installed
-and on PATH, and the certified Proton Drive CLI signed in. That is a real dependency v1 doesn't
+and on PATH, and the certified Proton Drive CLI — currently 0.8.0 — signed in. That is a real dependency v1 doesn't
 have, not a footnote — plan around it if a v2 remote is ever your only copy of something.
 
 **If a v2 push fails with "already exists" out of nowhere:** this has been observed once,
@@ -154,10 +157,14 @@ environment on every invocation — never cached, never remembered across runs �
 unsetting one takes effect on the very next command.
 
 - **`GPB_UNCERTIFIED_CLI=1`** overrides the certified-CLI allowlist. By default the helper refuses
-  to run against anything but the exact certified Proton Drive CLI build, naming what it found
-  versus what's certified. Setting this proceeds anyway, printing a loud stderr warning naming the
-  untested (or undetermined) CLI version on every invocation. Meant for troubleshooting a CLI
-  upgrade, not for routine use.
+  to run against anything but the exact certified Proton Drive CLI build — currently
+  `cli-drive@0.8.0+06e8c605` — naming what it found versus what's certified. Setting this proceeds
+  anyway, printing a loud stderr warning naming the untested (or undetermined) CLI version on every
+  invocation. **The override does not make an older CLI viable for pushes that update refs:** if
+  the detected build is specifically the previously-certified 0.7.0, the warning names that
+  incompatibility directly — 0.8.0 replaced the general upload conflict-strategy option with
+  separate file- and folder-scoped ones, and 0.7.0's update path has no way to speak the new
+  file-side vocabulary. Meant for troubleshooting a CLI upgrade, not for routine use.
 - **`GPB_CREATE_PARENTS=1`** lets a `push` create missing parent folders above the repo root (for
   example `/my-files/GitRemotes` when only `/my-files` exists), instead of the default: an
   actionable refusal naming the exact `proton-drive filesystem create-folder` command to run by
