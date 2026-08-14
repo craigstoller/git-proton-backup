@@ -291,6 +291,12 @@ download them; you don't need this tool, or even a Windows machine, to get your 
 > account can read them. End-to-end encryption is provided by Proton Drive for transport and cloud
 > storage.
 
+## Documentation
+
+The docs index at [docs/README.md](docs/README.md) maps everything: the two designs, the release
+procedure, the research evidence (gates and probes), and the dated spec/plan pairs feature work
+uses.
+
 ## Support
 
 Built for my own use and shared as-is. Issues and PRs are welcome; no support or response time is

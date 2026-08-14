@@ -1,5 +1,7 @@
 # git-remote-proton Stage 2 — Implementation Plan
 
+**Status: Superseded.** Stage 2 shipped; later stage work is planned in dated spec/plan pairs under [superpowers/](superpowers/), starting from [superpowers/plans/2026-08-01-v2-stage2.1-design-code-gap.md](superpowers/plans/2026-08-01-v2-stage2.1-design-code-gap.md). Kept for history.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** `git push proton-v2 main` works end to end against a real Proton Drive account.
