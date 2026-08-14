@@ -816,11 +816,17 @@ func createRefHealingCollision(t transport.Transport, root, ref, sha string) (tr
 			reason := fmt.Sprintf("not a ref: size %d outside the %d-%d candidate band",
 				n.Size, refBandMin, refBandMax)
 			if n.Size < 0 {
-				// Belt-and-braces, matching readRefClassified's own arm
-				// (refs.go): the Fake and the certified CLI never report a
-				// negative size for a real file, but nothing here refuses
-				// to download unbounded content on the strength of a
-				// transport that cannot supply a size at all.
+				// Matching readRefClassified's own arm (refs.go), including
+				// its updated rationale: the Fake and the certified CLI
+				// still never report a negative claimedSize for a real
+				// file, but as of Task 1.4 (0.8.0 cert plan) our own parser
+				// (parseNodeJSON) DOES deliberately set this -1 sentinel on
+				// a type:"file" parse-miss (activeRevision absent,
+				// claimedSize missing, or wrong-typed) rather than
+				// silently reading it as a false 0 — this arm is a live
+				// production path now, not only a hypothetical
+				// belt-and-braces for a transport that cannot supply a size
+				// at all.
 				reason = "not a ref: size unknown; refusing to download unbounded content"
 			}
 			sk := SkippedRef{Path: ref, Kind: SkipContent, Reason: reason}

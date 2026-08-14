@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.7.0 — 2026-08-13
+
+Certified Proton Drive CLI moves from 0.7.0 to 0.8.0 — the exact allowlisted build is now
+`cli-drive@0.8.0+06e8c605`. Release and module version series unified at 0.7.0 (the 0.6.0
+policy: tag and `ModuleVersion` move together). **These are two different version series, said
+explicitly so it's never misread as a typo: git-proton-backup 0.7.0 (this release, tag +
+module) certifies Proton Drive CLI 0.8.0 — and refuses Proton Drive CLI 0.7.0.**
+
+- **git-remote-proton: existing installs must update their Proton Drive CLI to 0.8.0 —
+  read this before you next `git push proton-v2`.** Proton's [CLI download
+  page](https://proton.me/download/drive/cli/index.html), and its machine-readable
+  [version.json](https://proton.me/download/drive/cli/version.json) feed, host only the
+  *current* release: the day 0.8.0 shipped (2026-08-13), the 0.7.0 download disappeared, so
+  every new install already gets a build this helper refused before this release. **Setting
+  `GPB_UNCERTIFIED_CLI=1` does not make a 0.7.0 install viable for pushes that update an
+  existing ref.** 0.8.0 removed the single general upload conflict-strategy option and split it
+  into a file-scoped and a folder-scoped one; 0.7.0's update path has no way to speak the new
+  file-side vocabulary. The override still opens the escape hatch unconditionally — override
+  means override — but when the CLI it detects is specifically that known-incompatible 0.7.0
+  build, the warning now names the incompatibility directly instead of letting the push fail
+  opaquely partway through.
+- **git-remote-proton:** `UpdateRevision` — the path a `git push` of an already-existing ref
+  runs through — now passes `--file-conflict-strategy create-new-revision` instead of the
+  removed general `merge` strategy; `merge` survives 0.8.0 only as a folder-conflict value, and
+  ours is always a single-file upload. Certified live against the real account before shipping:
+  node identity is stable across `create-new-revision` — the same node uid before and after,
+  exactly one new revision recorded, the sibling rows in the same folder untouched — so a ref
+  update still lands as a revision of the existing remote node, never a trash-and-recreate under
+  a new identity.
+- **git-remote-proton (diagnostics):** a `type:"file"` node whose revision size can't be parsed
+  out of `filesystem info --json` now reports as **size unknown** in skip notes and error text,
+  instead of a false **size 0** the wrapper could never actually produce before this fix (a
+  parse-miss fell through to Go's zero value). Behaviour is unchanged — an unresolved size still
+  causes the same skip-without-download outcome it always did; only the wording stops lying
+  about *why*.
+- v0.6.0 was tagged, but its draft release is **superseded by 0.7.0** and stays unpublished. Its
+  two verify improvements — stalled-sync-app detection and upload-lag grace — are real and ship
+  in this release too; see the 0.6.0 section directly below for the full description, unchanged
+  since that tag.
+
 ## 0.6.0 — 2026-08-12
 
 Module and repo version series UNIFY at 0.6.0: tags v0.3.0–v0.5.0 were helper-only releases

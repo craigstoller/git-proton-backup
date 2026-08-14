@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/craigstoller/git-proton-backup/internal/testcli"
+	"github.com/craigstoller/git-proton-backup/internal/transport"
 )
 
 // testcliRoleEnv, when set to testcliRoleShim, makes THIS test binary's
@@ -186,5 +187,85 @@ func TestRunSetHead_EndToEndThroughTheScriptedShim(t *testing.T) {
 	// runSetHead's own defer on every exit path.
 	if _, err := os.Stat(testcli.LocalPath(treeDir, root+"/.lock")); !os.IsNotExist(err) {
 		t.Errorf(".lock must not remain after a successful --set-head, got stat err=%v", err)
+	}
+}
+
+// TestCreateExclusiveSkipStrategyRefusesAnExistingTarget is the "skip-summary
+// fixture" the 0.8.0 certification plan calls for (Task 1 step 3): the only
+// other hermetic coverage driving the REAL shim end to end
+// (TestRunSetHead_EndToEndThroughTheScriptedShim, above) only ever exercises
+// CreateExclusive/UpdateHEAD's "-f skip" upload against an ABSENT target
+// (transferredItems=1 -> Committed) — the shim's OTHER "skip" summary shape
+// (skippedItems=1 -> Refused), which CreateExclusive's Refused detection
+// depends on, had no hermetic coverage through the real *transport.CLI
+// wrapper (only through *transport.Fake — see fake_test.go's
+// TestFakeCreateExclusiveThenRefuse). This drives it through the real
+// shim: create once onto an absent target (Committed), create again onto
+// the same now-occupied target (Refused).
+func TestCreateExclusiveSkipStrategyRefusesAnExistingTarget(t *testing.T) {
+	buildShimOnPath(t)
+	cli := transport.NewCLI("")
+
+	local := filepath.Join(t.TempDir(), "leaf.txt")
+	if err := os.WriteFile(local, []byte("hello"), 0o644); err != nil {
+		t.Fatalf("seed local file: %v", err)
+	}
+
+	out, err := cli.CreateExclusive("/my-files/r/leaf.txt", local)
+	if err != nil {
+		t.Fatalf("first CreateExclusive: %v", err)
+	}
+	if out != transport.Committed {
+		t.Fatalf("first CreateExclusive onto an absent target = %v, want Committed", out)
+	}
+
+	out, err = cli.CreateExclusive("/my-files/r/leaf.txt", local)
+	if err != nil {
+		t.Fatalf("second CreateExclusive: %v", err)
+	}
+	if out != transport.Refused {
+		t.Fatalf("second CreateExclusive onto the same target = %v, want Refused", out)
+	}
+}
+
+// TestUpdateRevisionCreateNewRevisionStrategyUpsertsThroughTheRealShim pins
+// the Task 1 step 3 vocabulary rename (upload("merge", ...) ->
+// upload("create-new-revision", ...)) end to end through the real shim, not
+// just through *transport.Fake (fake_test.go's
+// TestFakeUpdateRevisionSkipsIdenticalContent covers the Fake side, which
+// deliberately does NOT model the CLI's byte-identical auto-skip — see that
+// test's own doc comment). Before this rename, the shim's runUpload switch
+// only recognised "merge"; had the shim not been updated alongside cli.go,
+// this would fail with "unsupported upload strategy" instead of upserting.
+func TestUpdateRevisionCreateNewRevisionStrategyUpsertsThroughTheRealShim(t *testing.T) {
+	buildShimOnPath(t)
+	cli := transport.NewCLI("")
+
+	local := filepath.Join(t.TempDir(), "leaf.txt")
+	if err := os.WriteFile(local, []byte("first"), 0o644); err != nil {
+		t.Fatalf("seed local file: %v", err)
+	}
+
+	// Absent target: create-new-revision upserts (Stage 1 C8's "UPSERTS"
+	// finding — no prior existence check needed for correctness).
+	out, err := cli.UpdateRevision("/my-files/r/leaf.txt", local)
+	if err != nil {
+		t.Fatalf("first UpdateRevision (absent target): %v", err)
+	}
+	if out != transport.Committed {
+		t.Fatalf("first UpdateRevision onto an absent target = %v, want Committed", out)
+	}
+
+	// Existing target, different content: create-new-revision revises in
+	// place (Stage 1 C1's "REVISES IN PLACE" finding), never a Refused/skip.
+	if err := os.WriteFile(local, []byte("second, different content"), 0o644); err != nil {
+		t.Fatalf("rewrite local file: %v", err)
+	}
+	out, err = cli.UpdateRevision("/my-files/r/leaf.txt", local)
+	if err != nil {
+		t.Fatalf("second UpdateRevision (existing target): %v", err)
+	}
+	if out != transport.Committed {
+		t.Fatalf("second UpdateRevision onto an existing target = %v, want Committed", out)
 	}
 }

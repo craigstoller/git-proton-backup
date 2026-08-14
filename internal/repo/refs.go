@@ -144,9 +144,16 @@ func readRefClassified(t transport.Transport, root, full string, size int64, sca
 	if size < refBandMin || size > refBandMax {
 		reason := fmt.Sprintf("not a ref: size %d outside the %d-%d candidate band", size, refBandMin, refBandMax)
 		if size < 0 {
-			// The CLI never reports a negative size for a real file; this arm
-			// is belt-and-braces for a transport that cannot supply one at
-			// all (Stat/List degradation), and refuses to download unbounded
+			// The certified CLI itself never reports a negative claimedSize
+			// for a real file, but as of Task 1.4 (0.8.0 cert plan) our OWN
+			// parser (internal/transport/cli.go's parseNodeJSON) DOES cross
+			// this boundary deliberately: a type:"file" node whose revision
+			// size could not be parsed (activeRevision absent, claimedSize
+			// missing, or wrong-typed) now sets Size to this exact -1
+			// sentinel, where previously it silently fell through to a
+			// false-genuine 0. This arm was previously reachable only via a
+			// hand-built wrapper transport in tests; it is a live production
+			// path now. Same rule either way: refuse to download unbounded
 			// content rather than guess (spec: "never download what cannot
 			// be bounded").
 			reason = "not a ref: size unknown; refusing to download unbounded content"
