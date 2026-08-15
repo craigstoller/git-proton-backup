@@ -1,0 +1,51 @@
+<!doctype html>
+<!--
+  Source for this repo's GitHub social preview image (Settings > General > Social preview).
+  Re-render: capture this page at exactly 1280x640 (e.g. chrome --headless --screenshot=out.png --window-size=1280,640 file:///...), downscale to 1280x640 if the capture is DPR-scaled, keep under 1 MB, then upload manually - there is no API for social previews.
+-->
+
+<html><head><meta charset="utf-8"><style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { width:1280px; height:640px; overflow:hidden; position:relative;
+    background:#0b0918; font-family:"Segoe UI",system-ui,sans-serif; }
+  .glow { position:absolute; right:-180px; top:-160px; width:820px; height:820px;
+    background:radial-gradient(circle, rgba(109,74,255,.28) 0%, rgba(109,74,255,0) 62%); }
+  .glow2 { position:absolute; left:-220px; bottom:-260px; width:700px; height:700px;
+    background:radial-gradient(circle, rgba(109,74,255,.12) 0%, rgba(109,74,255,0) 60%); }
+  .grid { position:absolute; inset:0;
+    background-image:linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px);
+    background-size:48px 48px; }
+  .content { position:absolute; left:84px; top:150px; width:660px; }
+  .owner { font-family:ui-monospace,Consolas,monospace; font-size:26px; color:#8b81b8; letter-spacing:.5px; }
+  h1 { font-family:ui-monospace,Consolas,monospace; font-size:66px; font-weight:700;
+    color:#f2f0fa; margin-top:10px; letter-spacing:-1px; }
+  h1 .accent { color:#9d87ff; }
+  .tag { margin-top:26px; font-size:31px; line-height:1.45; color:#b3aed0; font-weight:350; }
+  .tag b { color:#e8e4fa; font-weight:600; }
+  .chips { position:absolute; left:84px; bottom:70px; display:flex; gap:14px; }
+  .chip { font-family:ui-monospace,Consolas,monospace; font-size:20px; color:#cdc6ec;
+    border:1px solid rgba(157,135,255,.45); border-radius:999px; padding:9px 22px;
+    background:rgba(109,74,255,.10); }
+  .art { position:absolute; right:96px; top:50%; transform:translateY(-50%); }
+</style></head><body>
+  <div class="glow"></div><div class="glow2"></div><div class="grid"></div>
+  <div class="content">
+    <div class="owner">craigstoller /</div>
+    <h1>git-proton<span class="accent">-backup</span></h1>
+    <div class="tag">Back up and restore git repos on <b>Proton Drive's</b> end-to-end encrypted storage.</div>
+  </div>
+  <div class="chips">
+    <div class="chip">proton::&lt;remote&gt;</div><div class="chip">Go</div><div class="chip">PowerShell</div>
+  </div>
+  <svg class="art" width="330" height="380" viewBox="0 0 330 380" fill="none">
+    <path d="M165 14 L296 62 v122 c0 92 -57 152 -131 178 C91 336 34 276 34 184 V62 Z"
+      fill="rgba(109,74,255,.13)" stroke="#8f79f2" stroke-width="5"/>
+    <path d="M165 44 L270 82 v98 c0 74 -46 122 -105 143 C106 302 60 254 60 180 V82 Z"
+      fill="rgba(11,9,24,.55)" stroke="rgba(143,121,242,.35)" stroke-width="2.5"/>
+    <circle cx="130" cy="130" r="15" fill="#c9bcff"/>
+    <circle cx="130" cy="240" r="15" fill="#c9bcff"/>
+    <circle cx="205" cy="185" r="15" fill="#9d87ff"/>
+    <path d="M130 145 v80 M130 168 c0 -26 75 -8 75 17" stroke="#a794fb" stroke-width="7" stroke-linecap="round" fill="none"/>
+  </svg>
+</body></html>
