@@ -68,6 +68,20 @@ Describe 'Install/Uninstall/Repair' {
         @((Read-GpbConfig).Repos).Count | Should -Be 0
         @(Get-ChildItem (Get-GpbMarkerDir) -Filter '*.json' -ErrorAction SilentlyContinue).Count | Should -Be 0
     }
+    It 'uninstall removes the digest stamp from both locations and leaves the bundles in place' {
+        Install-ProtonBackup -RepoPath $script:repo
+        Invoke-ProtonBackupVerify -SyncCheck { param($p) $true } -CliReadyRunner { $false } | Out-Null
+        $bd   = Get-GpbBundleDir -Config (Read-GpbConfig) -RepoPath $script:repo
+        $base = Split-Path $script:repo -Leaf
+        $new    = Get-GpbDigestStatePath -BundleDir $bd -BundleBaseName $base
+        $legacy = Get-GpbLegacyDigestStatePath -BundleDir $bd -BundleBaseName $base
+        Test-Path -LiteralPath $new | Should -BeTrue
+        Set-Content -LiteralPath $legacy -Value ('0' * 64) -NoNewline    # a pre-upgrade leftover
+        Uninstall-ProtonBackup -RepoPath $script:repo
+        Test-Path -LiteralPath $new | Should -BeFalse
+        Test-Path -LiteralPath $legacy | Should -BeFalse
+        @(Get-ChildItem -LiteralPath $bd -Filter '*.bundle').Count | Should -Be 1
+    }
     It 'relative-path uninstall of an existing repo removes the absolute registry entry (consistency)' {
         Install-ProtonBackup -RepoPath $script:repo
         Push-Location (Split-Path $script:repo -Parent)
@@ -954,6 +968,32 @@ Describe 'Status + scheduled task' {
         Set-Content "$script:repo/a.txt" 'two'; git -C $script:repo add .; git -C $script:repo commit -qm c2
         ((Get-ProtonBackupStatus -Json | ConvertFrom-Json))[0].CurrentBundled | Should -BeFalse
     }
+    It 'status honors a legacy stamp beside the bundles WITHOUT migrating it (read-only)' {
+        Invoke-ProtonBackupVerify -SyncCheck { param($p) $true } -CliReadyRunner { $false } | Out-Null
+        $bd   = Get-GpbBundleDir -Config (Read-GpbConfig) -RepoPath $script:repo
+        $base = Split-Path $script:repo -Leaf
+        $new    = Get-GpbDigestStatePath -BundleDir $bd -BundleBaseName $base
+        $legacy = Get-GpbLegacyDigestStatePath -BundleDir $bd -BundleBaseName $base
+        Move-Item -LiteralPath $new -Destination $legacy -Force
+        (Get-ProtonBackupStatus -Json | ConvertFrom-Json)[0].CurrentBundled | Should -BeTrue
+        Test-Path -LiteralPath $legacy | Should -BeTrue    # Status never writes
+        Test-Path -LiteralPath $new | Should -BeFalse
+    }
+    It 'verify migrates a legacy stamp out of the bundle dir without re-cutting' {
+        Invoke-ProtonBackupVerify -SyncCheck { param($p) $true } -CliReadyRunner { $false } | Out-Null
+        $bd   = Get-GpbBundleDir -Config (Read-GpbConfig) -RepoPath $script:repo
+        $base = Split-Path $script:repo -Leaf
+        $new    = Get-GpbDigestStatePath -BundleDir $bd -BundleBaseName $base
+        $legacy = Get-GpbLegacyDigestStatePath -BundleDir $bd -BundleBaseName $base
+        Move-Item -LiteralPath $new -Destination $legacy -Force
+        $before = @(Get-ChildItem -LiteralPath $bd -Filter '*.bundle').Count
+        $r = Invoke-ProtonBackupVerify -SyncCheck { param($p) $true } -CliReadyRunner { $false }
+        $r.ExitCode | Should -Be 0
+        @(Get-ChildItem -LiteralPath $bd -Filter '*.bundle').Count | Should -Be $before
+        Test-Path -LiteralPath $new | Should -BeTrue
+        Test-Path -LiteralPath $legacy | Should -BeFalse
+        @(Get-ChildItem -LiteralPath $bd -Force -Filter '*.lastdigest').Count | Should -Be 0
+    }
     It 'CurrentBundled: the NEWEST bundle governs, not any bundle carrying the current digest8' {
         # Fabricate two bundles in the bundle dir directly (no real Invoke-RepoBundleBackup call):
         # an OLDER one whose filename carries the CURRENT digest8, and a NEWER one carrying a
@@ -966,7 +1006,9 @@ Describe 'Status + scheduled task' {
         $digest = Get-RepoRefDigest -RepoPath $script:repo
         $digest8 = $digest.Substring(0, 8).ToLowerInvariant()
         $staleDigest8 = 'deadbeef'
-        Set-Content -LiteralPath (Join-Path $bd ".$baseName.lastdigest") -Value $digest -NoNewline
+        $stamp = Get-GpbDigestStatePath -BundleDir $bd -BundleBaseName $baseName
+        New-Item -ItemType Directory -Path (Split-Path $stamp -Parent) -Force | Out-Null
+        Set-Content -LiteralPath $stamp -Value $digest -NoNewline
 
         $older = Join-Path $bd "$baseName-20260101T000000Z-$digest8.bundle"
         Set-Content -LiteralPath $older -Value 'x' -NoNewline

@@ -100,6 +100,82 @@ function Wait-GpbLock {
     } while ($true)
 }
 
+# --- Digest stamps: the "last digest published" cache record -----------------
+# Kept under the module's own state root, NEVER in the bundle directory. That directory sits
+# inside the Proton Drive sync root, and the stamp is the one file the tool rewrites IN PLACE
+# there (bundles are write-once under unique names; the .partial is renamed). On 2026-07-30 the
+# sync app mis-recorded its own slow upload of a freshly rewritten stamp — trailing a ~92 MB
+# bundle — as a foreign remote edit and retried the phantom conflict every sync cycle for five
+# weeks ("failed to sync" badge; backups unaffected, because only the local copy is ever read).
+# Pre-relocation installs left the stamp beside the bundles: that legacy location is read as a
+# fallback and migrated (copy, then delete) by the bundling step. The stamp never claims coverage
+# on its own — the newest bundle's name must carry the digest fragment too — so a missing,
+# unreadable or stale stamp costs one re-cut, never coverage.
+# Spec: docs/superpowers/specs/2026-09-05-digest-stamp-outside-sync-root-design.md.
+
+function Get-GpbDigestStatePath {
+    [CmdletBinding()] param([Parameter(Mandatory)][string]$BundleDir, [Parameter(Mandatory)][string]$BundleBaseName)
+    # Keyed by the bundle dir's leaf — in production the repo slug (<leaf>-<hash10>, unique per
+    # repo path); the base name is appended to mirror the old <slug>\.<base>.lastdigest layout.
+    Join-Path (Get-GpbRoot) "digests\$(Split-Path $BundleDir -Leaf).$BundleBaseName.lastdigest"
+}
+function Get-GpbLegacyDigestStatePath {
+    [CmdletBinding()] param([Parameter(Mandatory)][string]$BundleDir, [Parameter(Mandatory)][string]$BundleBaseName)
+    Join-Path $BundleDir ".$BundleBaseName.lastdigest"
+}
+function Read-GpbDigestFile {
+    # Trimmed content, or $null when the file is absent or unreadable (e.g. held open without
+    # read sharing). Never throws: an unreadable stamp must read as "no stamp" (one re-cut), not
+    # abort a backup run.
+    [CmdletBinding()] param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    try { ([string](Get-Content -LiteralPath $Path -Raw -ErrorAction Stop)).Trim() } catch { $null }
+}
+function Read-GpbLastDigest {
+    # New location first, then the legacy file beside the bundles, else ''. Shared by the bundling
+    # step and Get-ProtonBackupStatus so both read the same files in the same order.
+    [CmdletBinding()] param([Parameter(Mandatory)][string]$BundleDir, [Parameter(Mandatory)][string]$BundleBaseName)
+    foreach ($p in @((Get-GpbDigestStatePath -BundleDir $BundleDir -BundleBaseName $BundleBaseName),
+                     (Get-GpbLegacyDigestStatePath -BundleDir $BundleDir -BundleBaseName $BundleBaseName))) {
+        $v = Read-GpbDigestFile -Path $p
+        if ($null -ne $v) { return $v }
+    }
+    ''
+}
+function Write-GpbLastDigest {
+    # Creates digests\ on demand: the migration below runs on cache hits too, i.e. before any
+    # publish has created the directory. Throws on failure — the publish path turns that into a
+    # warn finding, the migration swallows it.
+    [CmdletBinding()] param([Parameter(Mandatory)][string]$BundleDir, [Parameter(Mandatory)][string]$BundleBaseName, [Parameter(Mandatory)][string]$Digest)
+    $path = Get-GpbDigestStatePath -BundleDir $BundleDir -BundleBaseName $BundleBaseName
+    $dir = Split-Path $path -Parent
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null }
+    Set-Content -LiteralPath $path -Value $Digest -NoNewline -ErrorAction Stop
+}
+function Remove-GpbLegacyDigestStamp {
+    [CmdletBinding()] param([Parameter(Mandatory)][string]$BundleDir, [Parameter(Mandatory)][string]$BundleBaseName)
+    Remove-Item -LiteralPath (Get-GpbLegacyDigestStatePath -BundleDir $BundleDir -BundleBaseName $BundleBaseName) -Force -ErrorAction SilentlyContinue
+}
+function Move-GpbLegacyDigestStamp {
+    # One-time migration of a pre-relocation stamp; best-effort, never throws. Copy the legacy
+    # content to the new location only when nothing is there yet AND the content is a well-formed
+    # digest (64 hex; -match is case-insensitive, the same tolerance the cache comparison's -eq
+    # has, so no stamp the cache would honour is stranded as "malformed"). Then delete the legacy
+    # file once the new location exists, whoever wrote it. A refused delete (the sync app holding
+    # a handle) is retried on the next run; an existing new-location file is authoritative and is
+    # never overwritten.
+    [CmdletBinding()] param([Parameter(Mandatory)][string]$BundleDir, [Parameter(Mandatory)][string]$BundleBaseName)
+    $legacy = Get-GpbLegacyDigestStatePath -BundleDir $BundleDir -BundleBaseName $BundleBaseName
+    if (-not (Test-Path -LiteralPath $legacy -PathType Leaf)) { return }
+    $new = Get-GpbDigestStatePath -BundleDir $BundleDir -BundleBaseName $BundleBaseName
+    if (-not (Test-Path -LiteralPath $new -PathType Leaf)) {
+        $content = Read-GpbDigestFile -Path $legacy
+        if ($null -eq $content -or $content -notmatch '^[0-9a-f]{64}$') { return }
+        try { Write-GpbLastDigest -BundleDir $BundleDir -BundleBaseName $BundleBaseName -Digest $content.ToLowerInvariant() } catch { return }
+    }
+    Remove-GpbLegacyDigestStamp -BundleDir $BundleDir -BundleBaseName $BundleBaseName
+}
+
 # --- Bundle core: digest, fail-closed publication, retention ----------------
 
 function Get-RepoRefDigest {
@@ -299,9 +375,11 @@ function Invoke-RepoBundleBackup {
         return [pscustomobject]@{ RepoPath=$RepoPath; State='detected_not_backed_up'; Created=$false; Findings=@([pscustomobject]@{ Severity='warn'; Kind='preflight'; Detail=$pre.Reason }) }
     }
     $digest = Get-RepoRefDigest -RepoPath $RepoPath
-    $stateFile = Join-Path $BundleDir ".$BundleBaseName.lastdigest"
-
-    $last = (Test-Path -LiteralPath $stateFile) ? (Get-Content -LiteralPath $stateFile -Raw).Trim() : ''
+    # Pre-relocation installs kept the stamp beside the bundles (inside the sync root): move it out
+    # first, then read new-location-first. Runs on cache hits too, on purpose — the stamp never
+    # claims coverage, so migrating before this call's outcome is known risks nothing.
+    Move-GpbLegacyDigestStamp -BundleDir $BundleDir -BundleBaseName $BundleBaseName
+    $last = Read-GpbLastDigest -BundleDir $BundleDir -BundleBaseName $BundleBaseName
     $digest8 = if ($digest.Length -ge 8) { $digest.Substring(0, 8).ToLowerInvariant() } else { $digest.ToLowerInvariant() }
     # Cache hit requires digest match AND a newest bundle carrying the CURRENT digest fragment
     # (an older retained bundle must not satisfy it — self-heal a deleted current bundle).
@@ -340,8 +418,13 @@ function Invoke-RepoBundleBackup {
         }
         # Fail-closed: the digest is stamped only after the bundle is verified and in place.
         # A stamp failure is non-fatal (the bundle exists); the next run just re-creates.
-        try { Set-Content -LiteralPath $stateFile -Value $digest -NoNewline -ErrorAction Stop }
+        try { Write-GpbLastDigest -BundleDir $BundleDir -BundleBaseName $BundleBaseName -Digest $digest }
         catch { $findings.Add([pscustomobject]@{ Severity='warn'; Kind='bundle_failed'; Detail="digest stamp failed for $RepoPath (bundle published; next run re-bundles)" }) }
+        # With the new-location stamp in place, a legacy leftover beside the bundles — including
+        # malformed content the migration refused to copy — goes now (best-effort, retried later).
+        if (Test-Path -LiteralPath (Get-GpbDigestStatePath -BundleDir $BundleDir -BundleBaseName $BundleBaseName) -PathType Leaf) {
+            Remove-GpbLegacyDigestStamp -BundleDir $BundleDir -BundleBaseName $BundleBaseName
+        }
         $bundlePath = $target
         # Created: this call cut AND published the newest bundle — the caller-visible line between
         # "seconds old, plausibly still uploading" and "a spool that was already stuck before this
@@ -842,6 +925,12 @@ function Uninstall-ProtonBackup {
         Remove-PushPendingMarker -RepoPath $RepoPath
 
         $cfg = Read-GpbConfig
+        # The digest stamp is local bookkeeping, not a bundle: drop it from the state root and,
+        # for a pre-relocation install, from beside the bundles too (best-effort). Bundles stay.
+        $bundleDir = Get-GpbBundleDir -Config $cfg -RepoPath $RepoPath
+        $baseName  = Split-Path $RepoPath -Leaf
+        Remove-Item -LiteralPath (Get-GpbDigestStatePath -BundleDir $bundleDir -BundleBaseName $baseName) -Force -ErrorAction SilentlyContinue
+        Remove-GpbLegacyDigestStamp -BundleDir $bundleDir -BundleBaseName $baseName
         $hadRegistryEntry = @($cfg.Repos) -contains $RepoPath
         $cfg.Repos = @(@($cfg.Repos) | Where-Object { $_ -ne $RepoPath })
         Write-GpbConfig -Config $cfg
@@ -1566,8 +1655,9 @@ function Get-ProtonBackupStatus {
         $baseName  = Split-Path $repo -Leaf
         $bundleDir = Get-GpbBundleDir -Config $cfg -RepoPath $repo
         $digest    = Get-RepoRefDigest -RepoPath $repo
-        $stateFile = Join-Path $bundleDir ".$baseName.lastdigest"
-        $lastDigest = if (Test-Path -LiteralPath $stateFile) { (Get-Content -LiteralPath $stateFile -Raw).Trim() } else { '' }
+        # Shared reader (state root first, then a legacy stamp beside the bundles). Status never
+        # migrates — that is the bundling step's job on the next push or verify.
+        $lastDigest = Read-GpbLastDigest -BundleDir $bundleDir -BundleBaseName $baseName
         $digest8 = if ($digest.Length -ge 8) { $digest.Substring(0, 8).ToLowerInvariant() } else { $digest.ToLowerInvariant() }
         $newest = (Get-ChildItem -LiteralPath $bundleDir -Filter "$baseName-*.bundle" -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTime | Select-Object -Last 1)

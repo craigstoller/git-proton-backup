@@ -10,11 +10,15 @@ forgotten for the v0.3.x releases. Follow it in order; do not skip or reorder st
    Releasing from a dirty tree or a red `main` risks shipping something other than what was
    reviewed.
 
-2. **Flip `CHANGELOG.md`'s `[Unreleased]` section to `[vX.Y.Z] — YYYY-MM-DD` and commit — BEFORE
-   tagging.** This step was manual and was forgotten for the v0.3.x releases — the 0.3.1 entry
-   was only dated after publication, in a separate commit (`50704a6`), rather than before
-   tagging; it is the reason this document exists. Do this commit first, and tag it in the next
-   step — never tag a commit whose CHANGELOG still says `[Unreleased]`.
+2. **Flip `CHANGELOG.md`'s `[Unreleased]` section to `[vX.Y.Z] — YYYY-MM-DD`, bump
+   `ModuleVersion` in `GitProtonBackup/GitProtonBackup.psd1` to the same `X.Y.Z`, and commit both
+   together — BEFORE tagging.** The CHANGELOG step was manual and was forgotten for the v0.3.x
+   releases — the 0.3.1 entry was only dated after publication, in a separate commit (`50704a6`),
+   rather than before tagging; it is the reason this document exists. The manifest bump is the
+   0.6.0 policy ("the tag and `ModuleVersion` move together") and had been practice without being
+   written here (e.g. `07e7d84` for 0.7.0); it is what lets an installed module be told apart from
+   the one before it. Do this commit first, and tag it in the next step — never tag a commit whose
+   CHANGELOG still says `[Unreleased]` or whose manifest still carries the previous version.
 
 3. **Tag `vX.Y.Z` on the flipped commit.** The tag must point at the commit from step 2, not a
    later one. Push the tag only on Craig's word — do not push a release tag unilaterally.
