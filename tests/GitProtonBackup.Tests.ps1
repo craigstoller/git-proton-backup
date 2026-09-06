@@ -57,6 +57,14 @@ Describe 'State foundation' {
         Get-GpbMarkerDir            | Should -Be (Join-Path (Get-GpbRoot) 'push-pending')
         Get-GpbMirrorPath -RepoPath $repo | Should -Be (Join-Path (Get-GpbRoot) "mirrors\$slug.git")
         Get-GpbBundleDir -Config $cfg -RepoPath $repo | Should -Be (Join-Path $root "GitBackups\$slug")
+        # Digest stamp: under the module's own state root, keyed by bundle-dir leaf + base name, and
+        # never inside the bundle dir (the Proton Drive sync root) — the property the 2026-07-30
+        # sync-app wedge made load-bearing (spec: docs/superpowers/specs/2026-09-05-digest-stamp-outside-sync-root-design.md).
+        $bd = Get-GpbBundleDir -Config $cfg -RepoPath $repo
+        $stamp = Get-GpbDigestStatePath -BundleDir $bd -BundleBaseName 'hub'
+        $stamp | Should -Be (Join-Path (Get-GpbRoot) "digests\$slug.hub.lastdigest")
+        $stamp.StartsWith($bd, [System.StringComparison]::OrdinalIgnoreCase) | Should -BeFalse
+        Get-GpbLegacyDigestStatePath -BundleDir $bd -BundleBaseName 'hub' | Should -Be (Join-Path $bd '.hub.lastdigest')
     }
 }
 
@@ -129,10 +137,14 @@ Describe 'Invoke-RepoBundleBackup fail-closed publication' {
     }
     AfterEach { Remove-Item Env:GPB_CONFIG_DIR, Env:GPB_LOCK_PATH -ErrorAction SilentlyContinue }
 
-    It 'stamps the digest only after a successful publish' {
+    It 'stamps the digest only after a successful publish — in the state root, never beside the bundles' {
         $res = Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' -SyncCheck { param($p) $true }
         $res.State | Should -Be 'backed_up'
-        Test-Path (Join-Path $script:bd '.r.lastdigest') | Should -BeTrue
+        $stamp = Get-GpbDigestStatePath -BundleDir $script:bd -BundleBaseName 'r'
+        Test-Path -LiteralPath $stamp | Should -BeTrue
+        (Get-Content -LiteralPath $stamp -Raw) | Should -Be (Get-RepoRefDigest -RepoPath $script:repo)
+        # Headline property: nothing the sync app would track is written into the bundle dir.
+        @(Get-ChildItem -LiteralPath $script:bd -Force -Filter '*.lastdigest').Count | Should -Be 0
     }
     It 'an empty repo yields bundle_failed and no digest stamp (fail-visible)' {
         $empty = Join-Path $TestDrive 'fc-empty'
@@ -142,6 +154,7 @@ Describe 'Invoke-RepoBundleBackup fail-closed publication' {
         $res = Invoke-RepoBundleBackup -RepoPath $empty -BundleDir $script:bd -BundleBaseName 'e' -SyncCheck { param($p) $true }
         $res.State | Should -Be 'detected_not_backed_up'
         @($res.Findings | Where-Object { $_.Kind -eq 'bundle_failed' }).Count | Should -BeGreaterThan 0
+        Test-Path (Get-GpbDigestStatePath -BundleDir $script:bd -BundleBaseName 'e') | Should -BeFalse
         Test-Path (Join-Path $script:bd '.e.lastdigest') | Should -BeFalse
     }
     It 'a publish failure (target blocked) yields bundle_failed, no digest stamp, no partials left' {
@@ -152,6 +165,7 @@ Describe 'Invoke-RepoBundleBackup fail-closed publication' {
         $res = Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' -SyncCheck { param($p) $true } -Stamp '20260719T000000Z'
         $res.State | Should -Be 'detected_not_backed_up'
         @($res.Findings | Where-Object { $_.Kind -eq 'bundle_failed' -and $_.Detail -match 'publish' }).Count | Should -Be 1
+        Test-Path (Get-GpbDigestStatePath -BundleDir $script:bd -BundleBaseName 'r') | Should -BeFalse
         Test-Path (Join-Path $script:bd '.r.lastdigest') | Should -BeFalse
         @(Get-ChildItem $script:bd -Filter '*.partial').Count | Should -Be 0
     }
@@ -198,6 +212,92 @@ Describe 'Invoke-RepoBundleBackup fail-closed publication' {
                 -SyncCheck { param($p) $true } -Stamp ('20260720T00000' + $i + 'Z') -RetentionKeep 2 | Out-Null
         }
         @(Get-ChildItem $script:bd -Filter 'r-*.bundle').Count | Should -BeLessOrEqual 3   # keep-2 + monthly checkpoint
+    }
+
+    # --- Legacy digest stamps (pre-relocation installs kept the stamp beside the bundles, inside
+    # the sync root). Spec: docs/superpowers/specs/2026-09-05-digest-stamp-outside-sync-root-design.md.
+    It 'a legacy stamp beside the bundles is honored as a cache hit and migrated out of the bundle dir' {
+        $res1 = Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' -SyncCheck { param($p) $true } -Stamp '20260719T000001Z'
+        $new    = Get-GpbDigestStatePath -BundleDir $script:bd -BundleBaseName 'r'
+        $legacy = Get-GpbLegacyDigestStatePath -BundleDir $script:bd -BundleBaseName 'r'
+        # Pre-upgrade shape: the stamp sits beside the bundles and digests\ does not exist yet. A
+        # cache hit on the first post-upgrade sweep never reaches the publish path, so the
+        # migration itself must create the directory (review finding).
+        Move-Item -LiteralPath $new -Destination $legacy -Force
+        Remove-Item -LiteralPath (Split-Path $new -Parent) -Recurse -Force
+        $res2 = Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' -SyncCheck { param($p) $true } -Stamp '20260719T000002Z'
+        $res2.Created | Should -BeFalse
+        $res2.BundlePath | Should -Be $res1.BundlePath
+        @(Get-ChildItem -LiteralPath $script:bd -Filter 'r-*.bundle').Count | Should -Be 1
+        (Get-Content -LiteralPath $new -Raw) | Should -Be (Get-RepoRefDigest -RepoPath $script:repo)
+        Test-Path -LiteralPath $legacy | Should -BeFalse
+    }
+    It 'precedence: a current new-location stamp wins over a stale legacy one, which is removed without touching the new file' {
+        Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' -SyncCheck { param($p) $true } -Stamp '20260719T000001Z' | Out-Null
+        $new    = Get-GpbDigestStatePath -BundleDir $script:bd -BundleBaseName 'r'
+        $legacy = Get-GpbLegacyDigestStatePath -BundleDir $script:bd -BundleBaseName 'r'
+        Set-Content -LiteralPath $legacy -Value ('0' * 64) -NoNewline     # well-formed, stale
+        $before = Get-Content -LiteralPath $new -Raw
+        $res = Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' -SyncCheck { param($p) $true } -Stamp '20260719T000002Z'
+        $res.Created | Should -BeFalse
+        (Get-Content -LiteralPath $new -Raw) | Should -Be $before
+        Test-Path -LiteralPath $legacy | Should -BeFalse
+    }
+    It 'malformed legacy content is never copied; the run re-cuts, stamps the new location, and removes the junk' {
+        New-Item -ItemType Directory -Path $script:bd -Force | Out-Null
+        $new    = Get-GpbDigestStatePath -BundleDir $script:bd -BundleBaseName 'r'
+        $legacy = Get-GpbLegacyDigestStatePath -BundleDir $script:bd -BundleBaseName 'r'
+        Set-Content -LiteralPath $legacy -Value 'not-a-digest' -NoNewline
+        $res = Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' -SyncCheck { param($p) $true } -Stamp '20260719T000001Z'
+        $res.State | Should -Be 'backed_up'
+        $res.Created | Should -BeTrue
+        (Get-Content -LiteralPath $new -Raw) | Should -Be (Get-RepoRefDigest -RepoPath $script:repo)
+        Test-Path -LiteralPath $legacy | Should -BeFalse
+    }
+    It 'an UPPERCASE legacy digest — which the cache comparison honors — is migrated too, never stranded as malformed' {
+        Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' -SyncCheck { param($p) $true } -Stamp '20260719T000001Z' | Out-Null
+        $new    = Get-GpbDigestStatePath -BundleDir $script:bd -BundleBaseName 'r'
+        $legacy = Get-GpbLegacyDigestStatePath -BundleDir $script:bd -BundleBaseName 'r'
+        $digest = Get-Content -LiteralPath $new -Raw
+        Remove-Item -LiteralPath $new -Force
+        Set-Content -LiteralPath $legacy -Value $digest.ToUpperInvariant() -NoNewline
+        $res = Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' -SyncCheck { param($p) $true } -Stamp '20260719T000002Z'
+        $res.Created | Should -BeFalse
+        Test-Path -LiteralPath $new | Should -BeTrue
+        Test-Path -LiteralPath $legacy | Should -BeFalse
+    }
+    It 'best-effort cleanup: a legacy stamp held open WITH read sharing still yields a cache hit; its delete is deferred, never fatal' {
+        Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' -SyncCheck { param($p) $true } -Stamp '20260719T000001Z' | Out-Null
+        $new    = Get-GpbDigestStatePath -BundleDir $script:bd -BundleBaseName 'r'
+        $legacy = Get-GpbLegacyDigestStatePath -BundleDir $script:bd -BundleBaseName 'r'
+        Move-Item -LiteralPath $new -Destination $legacy -Force
+        $fs = [System.IO.File]::Open($legacy, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        try {
+            $res2 = Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' -SyncCheck { param($p) $true } -Stamp '20260719T000002Z'
+        } finally { $fs.Close() }
+        $res2.Created | Should -BeFalse
+        Test-Path -LiteralPath $new | Should -BeTrue
+        Test-Path -LiteralPath $legacy | Should -BeTrue       # delete refused while the handle was open
+        $res3 = Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' -SyncCheck { param($p) $true } -Stamp '20260719T000003Z'
+        $res3.Created | Should -BeFalse
+        Test-Path -LiteralPath $legacy | Should -BeFalse      # retried on the next run
+    }
+    It 'best-effort cleanup: a legacy stamp held open WITHOUT read sharing reads as absent — the run re-cuts, never throws, and cleans up next time' {
+        Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' -SyncCheck { param($p) $true } -Stamp '20260719T000001Z' | Out-Null
+        $new    = Get-GpbDigestStatePath -BundleDir $script:bd -BundleBaseName 'r'
+        $legacy = Get-GpbLegacyDigestStatePath -BundleDir $script:bd -BundleBaseName 'r'
+        Move-Item -LiteralPath $new -Destination $legacy -Force
+        $fs = [System.IO.File]::Open($legacy, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        try {
+            $res2 = Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' -SyncCheck { param($p) $true } -Stamp '20260719T000002Z'
+        } finally { $fs.Close() }
+        $res2.State | Should -Be 'backed_up'
+        $res2.Created | Should -BeTrue
+        Test-Path -LiteralPath $new | Should -BeTrue
+        Test-Path -LiteralPath $legacy | Should -BeTrue
+        $res3 = Invoke-RepoBundleBackup -RepoPath $script:repo -BundleDir $script:bd -BundleBaseName 'r' -SyncCheck { param($p) $true } -Stamp '20260719T000003Z'
+        $res3.Created | Should -BeFalse
+        Test-Path -LiteralPath $legacy | Should -BeFalse
     }
 }
 

@@ -25,7 +25,8 @@ looks like it's working. Every publish step is built to fail loudly instead of q
   written.
 - Publication is atomic: the bundle is written to a temp file in the *same directory* as its final
   name, verified, and only then renamed into place. The "this state is now covered" record (a
-  digest stamp) is written only after that rename succeeds — never before.
+  digest stamp, kept in the module's local state directory — see below — not beside the bundle)
+  is written only after that rename succeeds — never before.
 - Every bundle filename carries a fragment of its content digest:
   `<repo-name>-<timestamp>-<digest8>.bundle`. This closes a same-second race: without a unique
   name, a slow upload could let the verifier confirm a *stale* file sitting at a path a brand-new
@@ -34,6 +35,38 @@ looks like it's working. Every publish step is built to fail loudly instead of q
   current one *and* the newest bundle file on disk actually carrying that digest in its name. If the
   file is missing — deleted, moved, whatever — that's treated as a miss and a fresh bundle gets cut.
   Coverage is never claimed on the strength of a stamp alone.
+
+### Where the digest stamp lives
+
+The stamp is machine-local bookkeeping — one half of the cache-hit test above, never a restore
+input (restore is `git clone <bundle>`) and never shared with another machine — so it lives under
+the module's own state root, `%LOCALAPPDATA%\GitProtonBackup\digests\`, keyed by the repo's bundle
+directory slug, alongside the push-pending markers and mirrors. It used to sit *beside* the
+bundles, inside the Proton Drive sync root, and that placement caused a real incident (observed
+2026-07-30, diagnosed 2026-09-05): the stamp is the one file the tool ever rewrites *in place* in
+the sync root — bundles are written once under unique names and later deleted, the `.partial` is
+renamed — and the sync app mis-recorded its own slow upload of a freshly rewritten stamp, trailing
+a ~92 MB bundle, as a foreign remote edit. It then retried that phantom conflict every sync cycle
+for five weeks (a permanent "failed to sync" badge; backups were unaffected, since only the local
+copy is ever read). Nothing about the stamp needs to be on Proton, so it no longer is. The
+underlying race is not proven specific to the stamp — bundles and `.partial` files stay in the
+sync root by design, and the incident has only ever been observed on the stamp; if it ever recurs
+on a bundle, this relocation has no answer for it, and the known manual remedy for a wedged node is
+a fresh remote revision uploaded with the Proton CLI (a local delete does not clear one).
+
+Installs that predate the relocation still have a stamp beside each repo's bundles. It is read as
+a fallback (state root first, legacy second), and the bundling step migrates it once — copy to the
+state root if nothing is there yet and the content is a well-formed digest, then delete the legacy
+file once the state-root copy exists — every step best-effort and retried on the next run if the
+sync app happens to hold the file. Because the stamp never claims coverage alone, every
+intermediate state of that migration is safe: the worst case of a refused delete is a stale file
+lingering in the sync root, never a coverage error. `Get-ProtonBackupStatus` reads the same two
+locations in the same order but never migrates (it stays read-only); `Uninstall-ProtonBackup`
+removes the stamp from both locations and, as ever, leaves the bundles alone. One process caveat:
+an older module version still reads *and writes* the legacy location, so old and new code sharing
+a bundle root would ping-pong the marker back into the sync root until the old one is gone —
+upgrade every caller, including sessions that imported the module before the upgrade, in one
+sitting.
 
 ## The verification outcome table
 

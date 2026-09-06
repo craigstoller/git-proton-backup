@@ -1,5 +1,44 @@
 # Changelog
 
+## [Unreleased]
+
+- **GitProtonBackup (PowerShell module): the per-repo digest stamp moves out of the Proton Drive
+  sync root.** The "last digest published" record that `Invoke-RepoBundleBackup` keeps for its
+  cache-hit test used to be written beside each repo's bundles as `.<repo>.lastdigest` — inside
+  the folder the Proton Drive app syncs — and it is the one file the tool ever rewrites in place
+  there. On 2026-07-30 the sync app mis-recorded its own slow upload of a freshly rewritten stamp
+  (trailing a ~92 MB bundle) as a foreign remote edit and retried the phantom conflict every sync
+  cycle for five weeks, showing a permanent "failed to sync" badge. Backups were never affected
+  (only the local copy is read), but nothing about the stamp needs to be on Proton. It now lives
+  under `%LOCALAPPDATA%\GitProtonBackup\digests\`, keyed by the repo's bundle-directory slug, next
+  to the push-pending markers and mirrors. Design rationale: `docs/design.md`, "Where the digest
+  stamp lives".
+  - **Upgrading is automatic, and you will see a one-time cleanup in your Proton Drive folder.**
+    An existing stamp beside the bundles is still honored (state root first, legacy second — no
+    surprise re-bundling on upgrade), copied to the new location the first time a push or
+    `Invoke-ProtonBackupVerify` touches the repo, and then deleted from the bundle folder. The
+    deletions land in Proton trash; the files are 64 bytes of bookkeeping and nothing restores
+    from them. A file the sync app happens to hold open is simply retried on the next run.
+    `Get-ProtonBackupStatus` reads both locations but, being read-only, never migrates. To move a
+    whole fleet at once, run `Invoke-ProtonBackupVerify` once after upgrading.
+  - `Uninstall-ProtonBackup` now removes the repo's digest stamp (both locations) along with the
+    mirror and push-pending marker it already removed. Bundles are still left in place.
+  - **Do not run an older module version against the same bundle folders after upgrading.** The
+    old code knows only the legacy location: it would find no stamp, re-cut a bundle on every run,
+    and write the marker back into the sync root — re-creating exactly the hazard this change
+    removes — while the new code migrates it away again. The installer replaces the module in
+    place, but a PowerShell session that imported the module *before* the upgrade keeps running
+    the old code until it is closed or re-imports with `-Force`; upgrade, then run the first verify
+    from a fresh session. Callers that pin the module by version (`-RequiredVersion`) need their
+    pin bumped in the same sitting — under an in-place install a stale pin fails to import rather
+    than running old code, so nothing delegates until it is.
+  - Relocating the stamp does not cure a sync app that is *already* wedged on the old file; that
+    took a fresh remote revision uploaded with the Proton CLI (`filesystem upload -f
+    create-new-revision`), since a local delete does not clear one. It prevents the tool's own
+    bookkeeping from ever putting the app in that state again.
+- **Docs:** `docs/releasing.md` step 2 now names the `ModuleVersion` bump that has always landed
+  in the release commit alongside the CHANGELOG flip.
+
 ## 0.7.0 — 2026-08-13
 
 Certified Proton Drive CLI moves from 0.7.0 to 0.8.0 — the exact allowlisted build is now
