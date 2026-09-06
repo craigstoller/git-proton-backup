@@ -1,6 +1,13 @@
 # Changelog
 
-## [Unreleased]
+## 0.8.0 — 2026-09-05
+
+Module-only release: the per-repo digest stamp leaves the Proton Drive sync root. The
+`git-remote-proton` helper is unchanged in behaviour (rebuilt only so its `--version` string moves
+with the tag). **The certified Proton Drive CLI remains 0.8.0 and its exact-version pin is
+untouched — the two version series now happen to share a number, said explicitly so it is never
+misread: git-proton-backup 0.8.0 (this release, tag + `ModuleVersion`) certifies Proton Drive CLI
+0.8.0, exactly as 0.7.0 did.**
 
 - **GitProtonBackup (PowerShell module): the per-repo digest stamp moves out of the Proton Drive
   sync root.** The "last digest published" record that `Invoke-RepoBundleBackup` keeps for its
