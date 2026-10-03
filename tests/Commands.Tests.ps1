@@ -1220,3 +1220,204 @@ Describe 'Issue #2 hardening (v0.2.1)' {
         Test-Path -LiteralPath $foreign | Should -BeTrue
     }
 }
+
+Describe 'Issue #10: a path inside a repository is never wired in its place' {
+    # Spec: docs/superpowers/specs/2026-10-03-repo-top-guard-design.md. Every git call acts on
+    # the repository that CONTAINS the path, while the registry, slugs and gpb.workrepo are keyed
+    # on the path itself — so a path that is not a repository's own root must never be wired,
+    # and Uninstall of one must never reach the repository around it.
+    BeforeAll {
+        function Assert-RepoWiringIntact {
+            (git -C $script:repo remote get-url proton) | Should -Be $script:repoMirror
+            Test-Path -LiteralPath (Join-Path $script:repoMirror 'HEAD') | Should -BeTrue
+        }
+        # The state 0.8.0 left behind after `Install-ProtonBackup <subfolder>` (issue #10, repro
+        # step 3), built by hand rather than through Install-GpbMirror so the fixture survives that
+        # function ever being guarded too: the repository's remote points at a mirror named after
+        # the subfolder, whose gpb.workrepo is the subfolder; the repository's own mirror is gone;
+        # the registry holds both paths.
+        function New-Issue10LeftoverState {
+            $script:subMirror = Get-GpbMirrorPath -RepoPath $script:sub
+            git init --bare -q $script:subMirror
+            git -C $script:subMirror config gpb.workrepo $script:sub
+            git -C $script:repo push -q $script:subMirror 'refs/heads/*:refs/heads/*' 2>&1 | Out-Null
+            git -C $script:repo remote set-url proton $script:subMirror
+            Remove-Item -LiteralPath $script:repoMirror -Recurse -Force
+            $cfg = Read-GpbConfig; $cfg.Repos = @($cfg.Repos) + $script:sub; Write-GpbConfig -Config $cfg
+        }
+        function New-WiredBareRepo {
+            $b = Join-Path $TestDrive "bare-$([guid]::NewGuid().ToString('N').Substring(0,8)).git"
+            git clone -q --bare $script:repo $b
+            $script:bare = (Resolve-Path $b).Path
+            Install-ProtonBackup -RepoPath $script:bare 6>$null
+            $script:bareMirror = Get-GpbMirrorPath -RepoPath $script:bare
+        }
+        # A linked worktree of $Of shares its config — the 'proton' remote included (D5).
+        function New-LinkedWorktree([string]$Of = $script:repo) {
+            $leaf = "wt-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+            $w = Join-Path $TestDrive $leaf
+            git -C $Of worktree add -q $w -b $leaf 2>&1 | Out-Null
+            (Resolve-Path $w).Path
+        }
+    }
+    BeforeEach {
+        $script:drive = New-Sandbox
+        $script:repo = (Resolve-Path (New-TestRepo)).Path
+        Install-ProtonBackup -RepoPath $script:repo 6>$null
+        $script:repoMirror = Get-GpbMirrorPath -RepoPath $script:repo
+        $script:sub = Join-Path $script:repo 'repos\deliv'
+        New-Item -ItemType Directory $script:sub -Force | Out-Null
+    }
+    AfterEach { Clear-Sandbox }
+
+    It 'install refuses a work-tree subfolder, naming the top, and leaves that repository untouched' {
+        { Install-ProtonBackup -RepoPath $script:sub } |
+            Should -Throw "*'$script:sub' is inside the repository at '$script:repo', not its top folder. Pass '$script:repo', or run 'git init' in '$script:sub' first.*"
+        Assert-RepoWiringIntact
+        Test-Path -LiteralPath (Get-GpbMirrorPath -RepoPath $script:sub) | Should -BeFalse
+        (@((Read-GpbConfig).Repos) -join '|') | Should -Be $script:repo
+    }
+    It 'repair refuses a work-tree subfolder the same way' {
+        { Repair-ProtonBackup -RepoPath $script:sub } | Should -Throw "*'$script:sub' is inside the repository at '$script:repo', not its top folder.*"
+        Assert-RepoWiringIntact
+        (@((Read-GpbConfig).Repos) -join '|') | Should -Be $script:repo
+    }
+    It 'install refuses the repository''s .git folder and anything under it' {
+        $gitDir = Join-Path $script:repo '.git'
+        { Install-ProtonBackup -RepoPath $gitDir } |
+            Should -Throw "*'$gitDir' is inside a repository's git directory, not its work tree. Pass the repository's top folder.*"
+        $refs = Join-Path $gitDir 'refs'
+        { Install-ProtonBackup -RepoPath $refs } | Should -Throw "*'$refs' is inside a repository's git directory, not its work tree.*"
+        Assert-RepoWiringIntact
+        (@((Read-GpbConfig).Repos) -join '|') | Should -Be $script:repo
+    }
+    It 'install still accepts the top of a bare repository (GUARD)' {
+        New-WiredBareRepo
+        (git -C $script:bare remote get-url proton) | Should -Be $script:bareMirror
+        @((Read-GpbConfig).Repos) | Should -Contain $script:bare
+    }
+    It 'install refuses a subfolder of a bare repository, naming the bare repository' {
+        New-WiredBareRepo
+        $refs = Join-Path $script:bare 'refs'
+        { Install-ProtonBackup -RepoPath $refs } |
+            Should -Throw "*'$refs' is inside the bare repository at '$script:bare', not its top folder. Pass '$script:bare'.*"
+        (git -C $script:bare remote get-url proton) | Should -Be $script:bareMirror
+        Test-Path -LiteralPath (Join-Path $script:bareMirror 'HEAD') | Should -BeTrue
+        @((Read-GpbConfig).Repos) | Should -Not -Contain $refs
+    }
+    It 'install still accepts the top of a submodule (GUARD)' {
+        $src = New-TestRepo
+        git -C $script:repo -c protocol.file.allow=always submodule add -q ("file:///" + ($src -replace '\\', '/')) mods/sm 2>&1 | Out-Null
+        $sm = (Resolve-Path (Join-Path $script:repo 'mods\sm')).Path
+        Install-ProtonBackup -RepoPath $sm -WarningAction SilentlyContinue 6>$null
+        (git -C $sm remote get-url proton) | Should -Be (Get-GpbMirrorPath -RepoPath $sm)
+        Assert-RepoWiringIntact   # a submodule has its own config: the superproject is not rewired
+    }
+    It 'install refuses a linked worktree''s top, naming the main checkout, and leaves it wired' {
+        $wt = New-LinkedWorktree
+        { Install-ProtonBackup -RepoPath $wt } |
+            Should -Throw "*'$wt' is a linked worktree of the repository at '$script:repo'. Pass '$script:repo'; its bundles carry every worktree's branches and tags.*"
+        Assert-RepoWiringIntact
+        (@((Read-GpbConfig).Repos) -join '|') | Should -Be $script:repo
+    }
+    It 'install refuses a worktree of a bare repository, naming the bare repository' {
+        New-WiredBareRepo
+        $wt = New-LinkedWorktree -Of $script:bare
+        { Install-ProtonBackup -RepoPath $wt } |
+            Should -Throw "*'$wt' is a linked worktree of the repository at '$script:bare'. Pass '$script:bare';*"
+        (git -C $script:bare remote get-url proton) | Should -Be $script:bareMirror
+        Test-Path -LiteralPath (Join-Path $script:bareMirror 'HEAD') | Should -BeTrue
+    }
+    It 'install still accepts the main checkout of a repository that has a linked worktree (GUARD)' {
+        $main = (Resolve-Path (New-TestRepo)).Path
+        New-LinkedWorktree -Of $main | Out-Null
+        Install-ProtonBackup -RepoPath $main -WarningAction SilentlyContinue 6>$null
+        (git -C $main remote get-url proton) | Should -Be (Get-GpbMirrorPath -RepoPath $main)
+        @((Read-GpbConfig).Repos) | Should -Contain $main
+    }
+    It 'uninstall of an unregistered subfolder leaves the containing repository wired and says so' {
+        Uninstall-ProtonBackup -RepoPath $script:sub -WarningVariable wv -WarningAction SilentlyContinue 6>$null
+        Assert-RepoWiringIntact
+        (@((Read-GpbConfig).Repos) -join '|') | Should -Be $script:repo
+        (@($wv) -join "`n") | Should -BeLike "*'$script:sub' is inside the repository at '$script:repo', not its top folder*"
+    }
+    It 'uninstall of the repository''s .git folder leaves the repository wired' {
+        $gitDir = Join-Path $script:repo '.git'
+        Uninstall-ProtonBackup -RepoPath $gitDir -WarningVariable wv -WarningAction SilentlyContinue 6>$null
+        Assert-RepoWiringIntact
+        (@((Read-GpbConfig).Repos) -join '|') | Should -Be $script:repo
+        (@($wv) -join "`n") | Should -BeLike "*'$gitDir' is inside a repository's git directory, not its work tree*"
+    }
+    It 'uninstall of a bare repository''s subfolder leaves the bare repository wired' {
+        New-WiredBareRepo
+        $refs = Join-Path $script:bare 'refs'
+        Uninstall-ProtonBackup -RepoPath $refs -WarningVariable wv -WarningAction SilentlyContinue 6>$null
+        (git -C $script:bare remote get-url proton) | Should -Be $script:bareMirror
+        Test-Path -LiteralPath (Join-Path $script:bareMirror 'HEAD') | Should -BeTrue
+        @((Read-GpbConfig).Repos) | Should -Contain $script:bare
+        (@($wv) -join "`n") | Should -BeLike "*'$refs' is inside the bare repository at '$script:bare', not its top folder*"
+    }
+    It 'uninstall of a linked worktree''s top leaves the shared remote and the main checkout wired' {
+        $wt = New-LinkedWorktree
+        Uninstall-ProtonBackup -RepoPath $wt -WarningVariable wv -WarningAction SilentlyContinue 6>$null
+        Assert-RepoWiringIntact
+        (@((Read-GpbConfig).Repos) -join '|') | Should -Be $script:repo
+        (@($wv) -join "`n") | Should -BeLike "*'$wt' is a linked worktree of the repository at '$script:repo'*"
+    }
+    It 'recovery from the 0.8.0 leftover state: repair the repository, then uninstall the subfolder' {
+        New-Issue10LeftoverState
+        Repair-ProtonBackup -RepoPath $script:repo 6>$null
+        Uninstall-ProtonBackup -RepoPath $script:sub -WarningAction SilentlyContinue 6>$null
+        Assert-RepoWiringIntact
+        (@((Read-GpbConfig).Repos) -join '|') | Should -Be $script:repo
+        Test-Path -LiteralPath $script:subMirror | Should -BeFalse
+    }
+    It 'recovery from the 0.8.0 leftover state: uninstall the subfolder, then repair the repository' {
+        New-Issue10LeftoverState
+        Uninstall-ProtonBackup -RepoPath $script:sub -WarningAction SilentlyContinue 6>$null
+        # Uninstall removed the subfolder's own bookkeeping and nothing of the repository's: its
+        # remote still points at the (now deleted) subfolder mirror until the repair below.
+        (git -C $script:repo remote get-url proton) | Should -Be $script:subMirror
+        Test-Path -LiteralPath $script:subMirror | Should -BeFalse
+        (@((Read-GpbConfig).Repos) -join '|') | Should -Be $script:repo
+        Repair-ProtonBackup -RepoPath $script:repo 6>$null
+        Assert-RepoWiringIntact
+    }
+    It 'verify names a registered subfolder, points at Uninstall, and does not bundle it' {
+        New-Issue10LeftoverState
+        $r = Invoke-ProtonBackupVerify -SyncCheck { param($p) $true } -CliReadyRunner { $false } -WarningAction SilentlyContinue
+        $sr = @($r.Repos) | Where-Object { $_.RepoPath -eq $script:sub }
+        $sr.State | Should -Be 'attention'
+        (@($sr.Findings) -join "`n") |
+            Should -BeLike "*registered path '$script:sub' is inside the repository at '$script:repo', not its top folder — Uninstall-ProtonBackup '$script:sub' to deregister it*"
+        Test-Path -LiteralPath (Get-GpbBundleDir -Config (Read-GpbConfig) -RepoPath $script:sub) | Should -BeFalse
+    }
+    # Fail-closed (round-2 review): only a POSITIVE root answer may let a caller touch a remote. A
+    # first probe that fails while later git calls succeed must not read as "this is a root".
+    It 'install refuses, and rewires nothing, when git does not answer the first classification probe' {
+        Mock git { $global:LASTEXITCODE = 128 } -ModuleName GitProtonBackup -ParameterFilter {
+            $args -contains '--is-bare-repository' -and $args -contains $script:sub }
+        { Install-ProtonBackup -RepoPath $script:sub } | Should -Throw "*'$script:sub': git did not confirm*"
+        Assert-RepoWiringIntact
+        (@((Read-GpbConfig).Repos) -join '|') | Should -Be $script:repo
+    }
+    It 'uninstall leaves the repository around the path alone when git does not answer the first classification probe' {
+        Mock git { $global:LASTEXITCODE = 128 } -ModuleName GitProtonBackup -ParameterFilter {
+            $args -contains '--is-bare-repository' -and $args -contains $script:sub }
+        Uninstall-ProtonBackup -RepoPath $script:sub -WarningVariable wv -WarningAction SilentlyContinue 6>$null
+        Assert-RepoWiringIntact
+        (@((Read-GpbConfig).Repos) -join '|') | Should -Be $script:repo
+        # Visible, not silent: a real repository whose probe failed keeps its remote, and says so.
+        (@($wv) -join "`n") | Should -BeLike "*git found no repository at '$script:sub' (or did not answer)*no 'proton' remote was touched*"
+    }
+    It 'verify flags a registered linked worktree, names the move to the main checkout, and does not bundle it' {
+        $wt = New-LinkedWorktree
+        $cfg = Read-GpbConfig; $cfg.Repos = @($cfg.Repos) + $wt; Write-GpbConfig -Config $cfg
+        $r = Invoke-ProtonBackupVerify -SyncCheck { param($p) $true } -CliReadyRunner { $false } -WarningAction SilentlyContinue
+        $wr = @($r.Repos) | Where-Object { $_.RepoPath -eq $wt }
+        $wr.State | Should -Be 'attention'
+        (@($wr.Findings) -join "`n") |
+            Should -BeLike "*registered path '$wt' is a linked worktree of the repository at '$script:repo' — Uninstall-ProtonBackup '$wt' to deregister it, and Install-ProtonBackup '$script:repo' if that repository is not wired*"
+        Test-Path -LiteralPath (Get-GpbBundleDir -Config (Read-GpbConfig) -RepoPath $wt) | Should -BeFalse
+    }
+}

@@ -1,5 +1,43 @@
 # Changelog
 
+## [Unreleased]
+
+- **GitProtonBackup (PowerShell module): a folder inside a repository is no longer wired in that
+  repository's place.** ([#10]) `Install-ProtonBackup` — and `Repair-ProtonBackup`, which goes
+  through it — accepted any folder git could resolve to a repository: a subfolder of a work tree,
+  the `.git` folder, a subfolder of a bare repository. This deliberately refuses input 0.8.0
+  accepted; that input only ever produced a mis-keyed backup of a different repository. Every git call then acted on the repository
+  *around* that folder, while the registry entry, the mirror and the bundle folder were named after
+  the folder itself. On a repository that was already wired, its `proton` remote was repointed at a
+  new mirror and its own mirror was deleted. Install now refuses any path that is not a repository's
+  own top folder and names the right one, e.g. `'<path>' is inside the repository at '<top>', not
+  its top folder. Pass '<top>', or run 'git init' in '<path>' first.` The top of a repository, of a
+  submodule and of a bare repository are accepted as before.
+  - **A linked worktree is now refused in favour of its main checkout.** A linked worktree shares
+    its repository's config, `proton` remote included, so installing one while the main checkout
+    was wired had the same effect: the shared remote was repointed and the main checkout's mirror
+    deleted. The message names the main checkout; its bundles already carry every worktree's
+    branches and tags. **If you wired only a linked worktree** (that worked, since the refs are
+    shared), `Invoke-ProtonBackupVerify` now flags it: run `Install-ProtonBackup <main checkout>`,
+    then `Uninstall-ProtonBackup <worktree>`. (The other order works too, but leaves the shared
+    `proton` remote pointing at a deleted mirror until the Install.)
+  - `Uninstall-ProtonBackup` on such a path no longer touches the repository around it — before, it
+    removed that repository's `proton` remote. It removes only the path's own registration,
+    push-pending marker, digest stamp and mirror, and warns that the containing repository was left
+    alone. Uninstall of a path that no longer exists is unchanged.
+  - `Invoke-ProtonBackupVerify` reports a registered path of this kind as `registered path '<path>'
+    is inside the repository at '<top>', not its top folder — Uninstall-ProtonBackup '<path>' to
+    deregister it`, and no longer bundles it. Before, it bundled the containing repository's whole
+    history a second time under the folder's name and advised `Repair-ProtonBackup`, which re-ran
+    the bug.
+  - **If you were hit by this:** run `Repair-ProtonBackup <containing repository>`, then
+    `Uninstall-ProtonBackup <folder>`. Either order ends in the same state; repairing first means the
+    repository's `proton` remote never points at a deleted mirror in between. Bundles already cut
+    under the folder's name stay on Proton Drive, as Uninstall never deletes bundles; remove them by
+    hand if you want the space back.
+
+[#10]: https://github.com/craigstoller/git-proton-backup/issues/10
+
 ## 0.8.0 — 2026-09-05
 
 Module-only release: the per-repo digest stamp leaves the Proton Drive sync root. The
