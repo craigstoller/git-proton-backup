@@ -896,21 +896,33 @@ function Get-GpbRepoRole {
     # a rewire. (After a failure part-way through, the non-root kind may be the wrong one; that
     # misnames the case in a message, it never permits one.)
     [CmdletBinding()] param([Parameter(Mandatory)][string]$RepoPath)
+    # A linked worktree's private git dir differs from its repository's shared common dir; a
+    # repository's own git dir is that common dir. Compared as directories, not as git's spelling
+    # of them: git may print one relative and the other absolute, and a real root read as a
+    # worktree would be refused.
+    $dirOf = { param($p) if (-not $p) { return $null }
+        $abs = if ([System.IO.Path]::IsPathRooted($p)) { $p } else { Join-Path $RepoPath $p }
+        (Resolve-Path -LiteralPath $abs -ErrorAction SilentlyContinue)?.Path }
+    $sameDir = { param($a, $b) [bool]($a -and $b -and [string]::Equals($a.TrimEnd('\', '/'), $b.TrimEnd('\', '/'), [System.StringComparison]::OrdinalIgnoreCase)) }
     $bare = git -C $RepoPath rev-parse --is-bare-repository 2>$null
     if ($LASTEXITCODE -ne 0) { return [pscustomobject]@{ Kind = 'none'; Top = $null } }
     if ($bare -eq 'true') {
-        if ((git -C $RepoPath rev-parse --git-dir 2>$null) -eq '.') { return [pscustomobject]@{ Kind = 'root'; Top = $RepoPath } }
-        $kind = 'bare'; $top = git -C $RepoPath rev-parse --absolute-git-dir 2>$null
+        # The bare repository's own directory: git prints --git-dir as '.' there — but also inside
+        # the private git dir of one of its linked worktrees (<bare>\worktrees\<wt>), where git
+        # still says bare. Only the common dir tells them apart (verification round).
+        $rawGitDir = git -C $RepoPath rev-parse --git-dir 2>$null
+        $common = & $dirOf (git -C $RepoPath rev-parse --git-common-dir 2>$null)
+        if ($rawGitDir -eq '.' -and (& $sameDir (& $dirOf $rawGitDir) $common)) { return [pscustomobject]@{ Kind = 'root'; Top = $RepoPath } }
+        $kind = 'bare'; $top = $common   # the bare repository itself, from anywhere inside it
     } elseif ((git -C $RepoPath rev-parse --is-inside-work-tree 2>$null) -eq 'true') {
         $prefix = git -C $RepoPath rev-parse --show-prefix 2>$null
         if ($LASTEXITCODE -eq 0 -and -not $prefix) {
             # A linked worktree's top passes the prefix test but is not a root of its own (D5): it
             # shares its repository's config, 'proton' remote included, so wiring it rewires the
-            # main checkout. Its private git dir differs from the shared common dir; a main
-            # checkout's (and a submodule's) do not — git prints both the same way there.
-            $gitDir = git -C $RepoPath rev-parse --git-dir 2>$null
-            $common = git -C $RepoPath rev-parse --git-common-dir 2>$null
-            if ($gitDir -and $gitDir -eq $common) { return [pscustomobject]@{ Kind = 'root'; Top = $RepoPath } }
+            # main checkout. A main checkout's (and a submodule's) git dir is its common dir.
+            $gitDir = & $dirOf (git -C $RepoPath rev-parse --git-dir 2>$null)
+            $common = & $dirOf (git -C $RepoPath rev-parse --git-common-dir 2>$null)
+            if (& $sameDir $gitDir $common) { return [pscustomobject]@{ Kind = 'root'; Top = $RepoPath } }
             # The main checkout is the first `worktree list` entry — the bare directory itself
             # for a worktree of a bare repository.
             $kind = 'linked'
@@ -929,12 +941,14 @@ function Get-GpbRepoRole {
 
 function Format-GpbRepoRole {
     # The shared first clause of every issue-#10 refusal, warning and finding, so Install,
-    # Uninstall and Verify cannot drift apart in wording.
+    # Uninstall and Verify cannot drift apart in wording. A repository git did not name (a later
+    # probe failed) is described, never printed as ''.
     [CmdletBinding()] param([Parameter(Mandatory)][string]$RepoPath, [Parameter(Mandatory)][object]$Role)
+    $named = [bool]$Role.Top
     switch ($Role.Kind) {
-        'worktree' { "'$RepoPath' is inside the repository at '$($Role.Top)', not its top folder" }
-        'bare'     { "'$RepoPath' is inside the bare repository at '$($Role.Top)', not its top folder" }
-        'linked'   { "'$RepoPath' is a linked worktree of the repository at '$($Role.Top)'" }
+        'worktree' { if ($named) { "'$RepoPath' is inside the repository at '$($Role.Top)', not its top folder" } else { "'$RepoPath' is inside a repository, not its top folder" } }
+        'bare'     { if ($named) { "'$RepoPath' is inside the bare repository at '$($Role.Top)', not its top folder" } else { "'$RepoPath' is inside a bare repository, not its top folder" } }
+        'linked'   { if ($named) { "'$RepoPath' is a linked worktree of the repository at '$($Role.Top)'" } else { "'$RepoPath' is a linked worktree of another checkout" } }
         default    { "'$RepoPath' is inside a repository's git directory, not its work tree" }
     }
 }
@@ -953,10 +967,11 @@ function Install-ProtonBackup {
     $role = Get-GpbRepoRole -RepoPath $RepoPath
     if ($role.Kind -eq 'none') { throw "'$RepoPath': git did not confirm this is a repository's own top folder — nothing was changed; retry." }
     if ($role.Kind -ne 'root') {
+        $where = if ($role.Top) { "'$($role.Top)'" } else { "the repository's top folder" }
         $fix = switch ($role.Kind) {
-            'worktree' { "Pass '$($role.Top)', or run 'git init' in '$RepoPath' first." }
-            'bare'     { "Pass '$($role.Top)'." }
-            'linked'   { "Pass '$($role.Top)'; its bundles carry every worktree's branches and tags." }
+            'worktree' { "Pass $where, or run 'git init' in '$RepoPath' first." }
+            'bare'     { "Pass $where." }
+            'linked'   { "Pass $where; its bundles carry every worktree's branches and tags." }
             default    { "Pass the repository's top folder." }
         }
         throw "$(Format-GpbRepoRole -RepoPath $RepoPath -Role $role). $fix"
@@ -1362,22 +1377,25 @@ function Invoke-ProtonBackupVerify {
                 StallContradiction = $false  # CF says InSync, CLI says absent (phase B2 verdict)
             }
             try {
-                # A registered path that is not a repository's own root (issue #10) is neither
-                # wiring-checked nor bundled: both would act on the repository around it — a
-                # duplicate bundle of that repository's history under this path's slug, and
-                # "run Repair" advice that Install now refuses. 'none' (git found no repository, or
-                # did not answer) keeps the normal pass: its wiring check only reads, and a path
-                # with no repository fails the bundling preflight on its own. (A transient probe
-                # failure on a real subfolder therefore bundles the containing repository under
-                # this path's slug for that run — a duplicate, never a loss.)
+                # Only a registered path git positively confirms as a repository's own root
+                # (issue #10) is wiring-checked and bundled. Anything else would act on the
+                # repository around it — a duplicate bundle of that repository's history under
+                # this path's slug (permanent: Uninstall never deletes bundles), "run Repair"
+                # advice that Install now refuses, even a false ok — and a 'none' answer cannot
+                # rule that out, since git does not tell "no repository" from "did not answer".
+                # A transient failure on a healthy repository costs one run's bundle, flagged.
                 $exists = Test-Path -LiteralPath $repo
                 $role = if ($exists) { Get-GpbRepoRole -RepoPath $repo } else { $null }
                 if (-not $exists) { $rec.Findings.Add("registered repo missing on disk: $repo — Uninstall-ProtonBackup to deregister"); $rec.State = 'attention' }
-                elseif ($role.Kind -notin 'root', 'none') {
-                    # A worktree-only setup (it worked on 0.8.0, the refs being shared) must also be
-                    # told where the backup moves to, or deregistering it would end the backup.
-                    $then = if ($role.Kind -eq 'linked') { ", and Install-ProtonBackup '$($role.Top)' if that repository is not wired" } else { '' }
-                    $rec.Findings.Add("registered path $(Format-GpbRepoRole -RepoPath $repo -Role $role) — Uninstall-ProtonBackup '$repo' to deregister it$then"); $rec.State = 'attention'
+                elseif ($role.Kind -eq 'none') {
+                    $rec.Findings.Add("registered path '$repo': git found no repository there (or did not answer) — fix the path or run 'git init' there and Install-ProtonBackup '$repo', or Uninstall-ProtonBackup '$repo' to deregister it"); $rec.State = 'attention'
+                }
+                elseif ($role.Kind -ne 'root') {
+                    # The repository first, the deregistration second: Uninstall alone would end a
+                    # setup that only ever registered this path (a subfolder, or a linked worktree
+                    # — which worked on 0.8.0, the refs being shared).
+                    $first = if ($role.Top -and $role.Kind -ne 'gitdir') { "Install-ProtonBackup '$($role.Top)' (it also repairs existing wiring)" } else { "Repair-ProtonBackup the repository's top folder" }
+                    $rec.Findings.Add("registered path $(Format-GpbRepoRole -RepoPath $repo -Role $role) — $first, then Uninstall-ProtonBackup '$repo' to deregister it"); $rec.State = 'attention'
                 }
                 else {
                     $m = Test-GpbMirror -RepoPath $repo

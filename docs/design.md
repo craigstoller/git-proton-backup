@@ -98,8 +98,9 @@ one. A design that only ever cleared or reported on markers would let that failu
 completely unnoticed, possibly forever.
 
 `Invoke-ProtonBackupVerify` closes that gap by not trusting markers as its source of truth at all.
-Every run, for every registered repo, it independently recomputes the same canonical digest
-(heads + tags) the push flow uses and compares it against what's actually stamped and bundled on
+Every run, for every registered repo — present on disk, and confirmed by git as a repository's own
+top folder; any other entry gets a finding instead — it independently recomputes the same canonical
+digest (heads + tags) the push flow uses and compares it against what's actually stamped and bundled on
 disk. If they don't match — or the newest bundle file doesn't carry the current digest — Verify
 cuts and publishes a fresh bundle right there, with no marker required to trigger it. That's the
 real reason Verify re-cuts even when nothing is pending: a marker only tells you a push is *in

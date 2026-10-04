@@ -1328,6 +1328,17 @@ Describe 'Issue #10: a path inside a repository is never wired in its place' {
         (git -C $script:bare remote get-url proton) | Should -Be $script:bareMirror
         Test-Path -LiteralPath (Join-Path $script:bareMirror 'HEAD') | Should -BeTrue
     }
+    It 'install refuses the private git dir of a bare repository''s worktree, naming the bare repository' {
+        # Inside <bare>\worktrees\<wt> git says bare and prints --git-dir as '.', exactly as at the
+        # bare repository's own top; only the common dir tells them apart (verification round).
+        New-WiredBareRepo
+        $wt = New-LinkedWorktree -Of $script:bare
+        $private = Join-Path $script:bare "worktrees\$(Split-Path $wt -Leaf)"
+        { Install-ProtonBackup -RepoPath $private } |
+            Should -Throw "*'$private' is inside the bare repository at '$script:bare', not its top folder. Pass '$script:bare'.*"
+        (git -C $script:bare remote get-url proton) | Should -Be $script:bareMirror
+        Test-Path -LiteralPath (Join-Path $script:bareMirror 'HEAD') | Should -BeTrue
+    }
     It 'install still accepts the main checkout of a repository that has a linked worktree (GUARD)' {
         $main = (Resolve-Path (New-TestRepo)).Path
         New-LinkedWorktree -Of $main | Out-Null
@@ -1383,13 +1394,15 @@ Describe 'Issue #10: a path inside a repository is never wired in its place' {
         Repair-ProtonBackup -RepoPath $script:repo 6>$null
         Assert-RepoWiringIntact
     }
-    It 'verify names a registered subfolder, points at Uninstall, and does not bundle it' {
+    It 'verify names a registered subfolder, points at Install then Uninstall, and does not bundle it' {
         New-Issue10LeftoverState
         $r = Invoke-ProtonBackupVerify -SyncCheck { param($p) $true } -CliReadyRunner { $false } -WarningAction SilentlyContinue
         $sr = @($r.Repos) | Where-Object { $_.RepoPath -eq $script:sub }
         $sr.State | Should -Be 'attention'
+        # The repository first, the deregistration second: Uninstall alone would end a
+        # subfolder-only setup's backup (D3 as amended).
         (@($sr.Findings) -join "`n") |
-            Should -BeLike "*registered path '$script:sub' is inside the repository at '$script:repo', not its top folder — Uninstall-ProtonBackup '$script:sub' to deregister it*"
+            Should -BeLike "*registered path '$script:sub' is inside the repository at '$script:repo', not its top folder — Install-ProtonBackup '$script:repo' (it also repairs existing wiring), then Uninstall-ProtonBackup '$script:sub' to deregister it*"
         Test-Path -LiteralPath (Get-GpbBundleDir -Config (Read-GpbConfig) -RepoPath $script:sub) | Should -BeFalse
     }
     # Fail-closed (round-2 review): only a POSITIVE root answer may let a caller touch a remote. A
@@ -1417,7 +1430,47 @@ Describe 'Issue #10: a path inside a repository is never wired in its place' {
         $wr = @($r.Repos) | Where-Object { $_.RepoPath -eq $wt }
         $wr.State | Should -Be 'attention'
         (@($wr.Findings) -join "`n") |
-            Should -BeLike "*registered path '$wt' is a linked worktree of the repository at '$script:repo' — Uninstall-ProtonBackup '$wt' to deregister it, and Install-ProtonBackup '$script:repo' if that repository is not wired*"
+            Should -BeLike "*registered path '$wt' is a linked worktree of the repository at '$script:repo' — Install-ProtonBackup '$script:repo' (it also repairs existing wiring), then Uninstall-ProtonBackup '$wt' to deregister it*"
         Test-Path -LiteralPath (Get-GpbBundleDir -Config (Read-GpbConfig) -RepoPath $wt) | Should -BeFalse
+    }
+    It 'verify bundles nothing for a registered subfolder whose first classification probe fails (gated on a positive root)' {
+        New-Issue10LeftoverState
+        Mock git { $global:LASTEXITCODE = 128 } -ModuleName GitProtonBackup -ParameterFilter {
+            $args -contains '--is-bare-repository' -and $args -contains $script:sub }
+        $r = Invoke-ProtonBackupVerify -SyncCheck { param($p) $true } -CliReadyRunner { $false } -WarningAction SilentlyContinue
+        $sr = @($r.Repos) | Where-Object { $_.RepoPath -eq $script:sub }
+        $sr.State | Should -Be 'attention'
+        (@($sr.Findings) -join "`n") | Should -BeLike "*registered path '$script:sub': git found no repository there (or did not answer)*"
+        Test-Path -LiteralPath (Get-GpbBundleDir -Config (Read-GpbConfig) -RepoPath $script:sub) | Should -BeFalse
+    }
+    It 'verify tells a registered folder with no repository to fix or deregister it, not to Repair' {
+        $plain = Join-Path $TestDrive "plain-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        New-Item -ItemType Directory $plain -Force | Out-Null
+        $plain = (Resolve-Path $plain).Path
+        $cfg = Read-GpbConfig; $cfg.Repos = @($cfg.Repos) + $plain; Write-GpbConfig -Config $cfg
+        $r = Invoke-ProtonBackupVerify -SyncCheck { param($p) $true } -CliReadyRunner { $false } -WarningAction SilentlyContinue
+        $pr = @($r.Repos) | Where-Object { $_.RepoPath -eq $plain }
+        $pr.State | Should -Be 'attention'
+        (@($pr.Findings) -join "`n") |
+            Should -BeLike "*registered path '$plain': git found no repository there (or did not answer) — fix the path or run 'git init' there and Install-ProtonBackup '$plain', or Uninstall-ProtonBackup '$plain' to deregister it*"
+        (@($pr.Findings) -join "`n") | Should -Not -BeLike '*run Repair-ProtonBackup*'
+        Test-Path -LiteralPath (Get-GpbBundleDir -Config (Read-GpbConfig) -RepoPath $plain) | Should -BeFalse
+    }
+    It 'a main checkout stays a root when git prints its git dir and common dir in different forms' {
+        # The linked-worktree test must compare the two directories, not git's spelling of them:
+        # same directory, one absolute and one relative, is still a main checkout.
+        $main = (Resolve-Path (New-TestRepo)).Path
+        $absGitDir = (Join-Path $main '.git') -replace '\\', '/'
+        Mock git { $global:LASTEXITCODE = 0; $absGitDir } -ModuleName GitProtonBackup -ParameterFilter {
+            $args -contains '--git-dir' -and $args -contains $main }
+        Install-ProtonBackup -RepoPath $main -WarningAction SilentlyContinue 6>$null
+        @((Read-GpbConfig).Repos) | Should -Contain $main
+    }
+    It 'a refusal never names an empty path when git does not name the containing repository' {
+        Mock git { $global:LASTEXITCODE = 128 } -ModuleName GitProtonBackup -ParameterFilter {
+            $args -contains '--show-toplevel' -and $args -contains $script:sub }
+        { Install-ProtonBackup -RepoPath $script:sub } |
+            Should -Throw "*'$script:sub' is inside a repository, not its top folder. Pass the repository's top folder, or run 'git init' in '$script:sub' first.*"
+        Assert-RepoWiringIntact
     }
 }

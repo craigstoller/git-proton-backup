@@ -12,7 +12,9 @@
   new mirror and its own mirror was deleted. Install now refuses any path that is not a repository's
   own top folder and names the right one, e.g. `'<path>' is inside the repository at '<top>', not
   its top folder. Pass '<top>', or run 'git init' in '<path>' first.` The top of a repository, of a
-  submodule and of a bare repository are accepted as before.
+  submodule and of a bare repository are accepted as before. Install acts only when git positively
+  confirms the path is a repository's own top folder; if git does not answer, it refuses with
+  `git did not confirm this is a repository's own top folder — nothing was changed; retry.`
   - **A linked worktree is now refused in favour of its main checkout.** A linked worktree shares
     its repository's config, `proton` remote included, so installing one while the main checkout
     was wired had the same effect: the shared remote was repointed and the main checkout's mirror
@@ -26,10 +28,18 @@
     push-pending marker, digest stamp and mirror, and warns that the containing repository was left
     alone. Uninstall of a path that no longer exists is unchanged.
   - `Invoke-ProtonBackupVerify` reports a registered path of this kind as `registered path '<path>'
-    is inside the repository at '<top>', not its top folder — Uninstall-ProtonBackup '<path>' to
-    deregister it`, and no longer bundles it. Before, it bundled the containing repository's whole
-    history a second time under the folder's name and advised `Repair-ProtonBackup`, which re-ran
-    the bug.
+    is inside the repository at '<top>', not its top folder — Install-ProtonBackup '<top>' (it
+    also repairs existing wiring), then Uninstall-ProtonBackup '<path>' to deregister it`, and no
+    longer bundles it. Before, it bundled the containing repository's whole history a second time
+    under the folder's name and advised `Repair-ProtonBackup`, which re-ran the bug.
+  - Verify now wiring-checks and bundles a registered path only when git confirms it is a
+    repository's own top folder. A registered folder git finds no repository in (for example one
+    whose `.git` was deleted) gets `registered path '<path>': git found no repository there (or did
+    not answer) — fix the path or run 'git init' there and Install-ProtonBackup '<path>', or
+    Uninstall-ProtonBackup '<path>' to deregister it`, where it used to be told to run
+    `Repair-ProtonBackup`, which then reported "not a git repository". A momentary git failure on
+    a healthy repository now skips that repository's bundle for one run, with a finding; the next
+    run retries.
   - **If you were hit by this:** run `Repair-ProtonBackup <containing repository>`, then
     `Uninstall-ProtonBackup <folder>`. Either order ends in the same state; repairing first means the
     repository's `proton` remote never points at a deleted mirror in between. Bundles already cut

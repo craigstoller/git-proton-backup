@@ -7,13 +7,16 @@ instead of a separate plan file (the 2026-09-05 digest-stamp spec set the preced
 live in other repos or in Craig's hands are labelled *external*.
 
 **Status (2026-10-03):** Tasks 1–5 implemented on branch `claude/nice-mclean-3f37e0`, test-first.
-The Issue #10 Describe in `tests/Commands.Tests.ps1` holds 19 tests: 16 failed on the code they
-target before it changed, for the intended reasons, in three stages (10 against 0.8.0; the 4 D5
-tests against the round-1 code; the 2 first-probe tests against the round-2 code), and 3 are
-guards that passed throughout (bare top, submodule top, a main checkout with a linked worktree).
-The full Pester suite (all four files, 182 tests) and PSScriptAnalyzer with the repo settings ran
-clean on the committed tree. Task 6 is *external*. Two Verify questions from round 3 are open with
-Craig (see Revisions).
+The Issue #10 Describe in `tests/Commands.Tests.ps1` holds 24 tests. 21 of them failed on the
+code they target before it changed, for the intended reasons, in five stages: 10 against 0.8.0;
+4 (D5) against the round-1 code; 2 (first-probe) against the round-2 code; 3 (D3's amendment and
+gate, and the unnamed-repository wording) against the round-3 code; 2 (form-divergent git dirs,
+a bare repository's worktree git dir) during the verification round. 10 + 4 + 2 + 3 + 2 = 21 —
+counting tests, not failures: the 2 existing Verify tests whose expected wording D3's amendment
+changed failed a second time then, and are not counted again. The other 3 are guards that passed
+throughout (bare top, submodule top, a main checkout with a linked worktree). The full Pester suite (all four files) and
+PSScriptAnalyzer with the repo settings ran clean on each committed tree — counts in the commit
+messages. Task 6 is *external*.
 
 Basis marks: **[sandbox]** = run on 2026-10-03 against `aa067cf` (v0.8.0) in an isolated state root
 (`GPB_CONFIG_DIR`, `GPB_LOCK_PATH`, `GPB_HOOK_DISABLED=1`); **[code]** = read from
@@ -67,10 +70,14 @@ A path is a repository's own root when either:
 - it is inside a work tree and `git rev-parse --show-prefix` prints nothing (the top of a repo or
   a submodule; the top of a *linked* worktree passes this test but is excluded by D5); or
 - the repository is bare and the path is its git directory itself (`git rev-parse --git-dir`
-  prints `.`).
+  prints `.`, and that directory is the repository's common dir — see below).
 
 Any other path inside a repository is refused — a work-tree subfolder, a non-bare repository's
-`.git` folder (or anything under it), a subfolder of a bare repository. The `.git` case never
+`.git` folder (or anything under it), a subfolder of a bare repository, including the private
+git dir of one of its linked worktrees (`<bare>\worktrees\<wt>`). That last one passes the
+`--git-dir` test alone — git says bare there and prints `--git-dir` as `.` — and was accepted as
+a root until the verification round; only its common dir, the bare repository, tells them apart
+**[sandbox]**. The `.git` case never
 reaches the first bullet: inside `.git`, git answers `--is-inside-work-tree` with `false` (and
 `--is-bare-repository` with `false`) although `--show-prefix` is empty **[sandbox]** — so it is
 neither a work-tree root nor a bare root. A path inside no repository
@@ -125,12 +132,38 @@ Recommending Repair first avoids that window. The mirror itself is disposable bo
 
 ### D3 — `Invoke-ProtonBackupVerify` recognises a registered non-root entry
 
-For a registered path that exists but is not a repository's own root, Verify records the finding
-`registered path '<path>' is inside the repository at '<top>', not its top folder —
-Uninstall-ProtonBackup '<path>' to deregister it` (the `.git` and bare variants use the D1 wording
-for their first half), sets the entry to `attention`, and skips its wiring check and bundling step.
-Skipping the bundle step stops *Verify's* duplicate bundles; skipping the wiring check stops the
-"run Repair" advice that would now only meet D1's refusal.
+For a registered path that exists but is not a repository's own root, Verify records a finding,
+sets the entry to `attention`, and skips its wiring check and bundling step. Skipping the bundle
+step stops *Verify's* duplicate bundles; skipping the wiring check stops the "run Repair" advice
+that would now only meet D1's refusal.
+
+**Amended after round 3 — Craig's call, 2026-10-03** (took the recommended default, third brief).
+The finding prescribes the repository first and the deregistration second, the order the CHANGELOG
+recommends; as first ruled it said only "Uninstall-ProtonBackup '<path>' to deregister it", which
+for a subfolder-only setup (0.8.0 registered the subfolder, never its repository) ends the backup
+[Codex, DeepSeek]. Wordings, the first clause shared with D1/D5:
+
+- subfolder (bare and linked alike, with their own first clause): `registered path '<path>' is
+  inside the repository at '<top>', not its top folder — Install-ProtonBackup '<top>' (it also
+  repairs existing wiring), then Uninstall-ProtonBackup '<path>' to deregister it`
+- `.git`, or any kind whose repository git did not name: `… — Repair-ProtonBackup the
+  repository's top folder, then Uninstall-ProtonBackup '<path>' to deregister it`
+
+**Also gated on a positive `root` — Craig's call, 2026-10-03, same brief.** For a registered path
+that exists but for which git answers `none` (no repository there, or no answer), Verify records
+`registered path '<path>': git found no repository there (or did not answer) — fix the path or
+run 'git init' there and Install-ProtonBackup '<path>', or Uninstall-ProtonBackup '<path>' to
+deregister it`, sets `attention`, and skips the wiring check and bundling step too. As first built,
+`none` kept the normal pass, so a transient first-probe failure on a registered non-root path
+bundled the containing repository under that path's name — permanently, since Uninstall never
+deletes bundles — and in the 0.8.0 leftover state could even read `ok` [Codex, DeepSeek]. The cost,
+accepted with the ruling: a momentary git failure on a healthy repository skips that repository's
+bundle for one run, with an `attention` finding; the next run retries. This also closes the loop
+round 1 had named out of scope (a registered folder whose `.git` was deleted was told "run Repair",
+which then said "not a git repository").
+
+Not taken for the amendment: keep the first-ruled wording. Not taken for the gate: keep the normal
+pass on `none` — non-destructive, but a permanent duplicate bundle and a possible false `ok`.
 
 `Get-ProtonBackupStatus` and the push hook are unchanged. Status is a read-only display, and in the
 fresh-bug state it will keep showing the subfolder entry as wired until the user recovers (it shows
@@ -185,9 +218,10 @@ documented behaviour, not just observed: the `git worktree` manual says the main
 listed first **[git docs, git-worktree.html shipped with Git for Windows 2.55]**. Install's message:
 `'<path>' is a linked worktree of the repository at '<main>'. Pass '<main>'; its bundles carry
 every worktree's branches and tags.` Uninstall leaves the shared remote alone, as for every other
-non-root (D2). Verify's finding adds the step a worktree-only setup needs: `registered path
-'<path>' is a linked worktree of the repository at '<main>' — Uninstall-ProtonBackup '<path>' to
-deregister it, and Install-ProtonBackup '<main>' if that repository is not wired`. A *subfolder* of
+non-root (D2). Verify's finding names the step a worktree-only setup needs, in the order D3 (as
+amended) uses for every kind: `registered path '<path>' is a linked worktree of the repository at
+'<main>' — Install-ProtonBackup '<main>' (it also repairs existing wiring), then
+Uninstall-ProtonBackup '<path>' to deregister it`. A *subfolder* of
 a linked worktree keeps the `worktree` wording naming the worktree's top; installing that top then
 names the main checkout (two refusals, each true).
 
@@ -231,11 +265,15 @@ Repair relies on and needs its own design. **Deferred to the Stage 7 slate** rat
   not answer, and otherwise one of `worktree`, `linked`, `gitdir`, `bare` with the repository it
   belongs to
   (`--show-toplevel` for a work-tree subfolder, the first `git worktree list --porcelain` entry for
-  a linked worktree, `--absolute-git-dir` otherwise), normalised to a native path. The linked test
-  compares git's own `--git-dir` and `--git-common-dir` output, which git prints identically for a
-  main checkout (`.git`), a submodule and a bare repository and differently only in a linked
-  worktree **[sandbox, git 2.55]**; it needs no `--path-format`, so no minimum git version beyond
-  what the module already uses. (`--git-common-dir` dates from git 2.5 and `--absolute-git-dir`
+  a linked worktree, the common dir for a bare repository, `--absolute-git-dir` otherwise),
+  normalised to a native path. The linked test — and, since the verification round, the bare test
+  too — compares the directories git names for `--git-dir` and `--git-common-dir`, each resolved
+  to an absolute path, not git's spelling of them: they are the same directory for a main checkout,
+  a submodule and a bare repository's own top, and different only for a linked worktree's top or
+  private git dir **[sandbox, git 2.55]**. Comparing spellings worked on this git (both print
+  `.git` in a main checkout) but would refuse a real root wherever git printed one relative and
+  the other absolute; a test now forces that divergence. It needs no `--path-format`, so no
+  minimum git version beyond what the module already uses. (`--git-common-dir` dates from git 2.5 and `--absolute-git-dir`
   from 2.13; Install's existing `--is-shallow-repository` probe already needs 2.15.) A second helper formats the
   shared first sentence of every message ("`'<path>' is inside …`"), so Install, Uninstall and
   Verify cannot drift apart in wording. The test is made with git's own answers (`--show-prefix`,
@@ -249,13 +287,14 @@ Repair relies on and needs its own design. **Deferred to the Stage 7 slate** rat
   step; a probe that fails anywhere yields a non-root kind or `none`, never `root`. That is a
   safety guarantee, not a diagnostic one: after a failure part-way through, the non-root kind
   reported can be the wrong one (a subfolder whose work-tree probe failed reads as `gitdir`), so
-  the message may misname the case, but it can never permit a rewire. Every
-  destructive step is gated on `root` alone: Install proceeds only on `root` (`none`, after its
-  own "is a git repository" check passed, is a contradiction it refuses: "git did not confirm …
-  nothing was changed; retry"), and Uninstall probes and removes the `proton` remote only on
-  `root` (on `none` it skips the remote, which a path git found no repository for cannot own).
-  Verify keeps its normal pass on `none`: the wiring check only reads, and a path with no
-  repository fails the bundling preflight on its own. Messages carry the canonical path
+  the message may misname the case, but it can never permit a rewire. Every step that acts on a
+  repository is gated on `root` alone: Install proceeds only on `root` (`none`, after its own "is
+  a git repository" check passed, is a contradiction it refuses: "git did not confirm … nothing
+  was changed; retry"); Uninstall probes and removes the `proton` remote only on `root` (on
+  `none` it skips the remote, which a path git found no repository for cannot own, and says so);
+  and Verify wiring-checks and bundles only on `root` (D3 as amended). When a later probe fails
+  and git names no containing repository, messages describe it ("inside a repository", "Pass
+  the repository's top folder") rather than print `''`. Messages carry the canonical path
   (Install's `Resolve-Path` at entry), not the caller's spelling.
 - **Assumed, not changed:** the probes inherit the caller's environment, so a session with
   `GIT_DIR`/`GIT_WORK_TREE` set gets those repositories' answers — for these probes exactly as for
@@ -273,21 +312,24 @@ Repair relies on and needs its own design. **Deferred to the Stage 7 slate** rat
   `proton` remote and falls back to the slug mirror under its existing delete-safe rule — exactly
   what a deleted path already got, since its remote probe failed. It warns, naming the containing
   repository, for the non-root kinds; for an existing path git answered `none` for, it warns that
-  no `proton` remote was touched. That is the fail-closed side made visible: a real repository
-  whose probe failed transiently keeps a remote pointing at its now-removed mirror, which a
-  re-run of Install or `git remote remove proton` clears, rather than risk Uninstall stripping a
-  remote that belongs to the repository around the path. git does not tell "no repository here"
+  no `proton` remote was touched. That makes the fail-closed side visible once, as a console
+  warning, and no more: Uninstall still drops the registry entry, so afterwards nothing monitors
+  that repository, and a real repository whose probe failed transiently keeps a remote pointing at
+  its now-removed mirror until a re-run of Install or `git remote remove proton` — the only later
+  signal being a failed `git push proton`. Accepted, rather than risk Uninstall stripping a remote
+  that belongs to the repository around the path. git does not tell "no repository here"
   from "did not answer" except in localised error text, so the two are not told apart. The marker, stamp and registry steps after that are
   unchanged, and `didSomething` reflects only this path's own mirror and registry entry.
-- **Verify:** a new branch between "registered repo missing on disk" and the normal pass. Phases B,
+- **Verify:** two new branches between "registered repo missing on disk" and the normal pass —
+  one for `none`, one for the non-root kinds — so only a `root` reaches the normal pass. Phases B,
   B2 and C already skip records without a bundle result (as they do for a missing repo), so none of
   them changes. The marker pass is not one of those phases: it works from marker files, not from
   the per-repo records, which is why a marker the hook left for a non-root path is still reported
   (the D3 residual).
-- **Out of scope, named:** a registered path that exists but is inside *no* repository (its `.git`
-  removed, nothing around it) still gets "wiring broken — run Repair-ProtonBackup", and Repair
-  then says "not a git repository". That loop predates this fix and is not #10's mechanism (nothing
-  is rewired); `Uninstall-ProtonBackup <path>` already clears it.
+- **Closed by D3's gate (was named out of scope in round 1):** a registered path that exists but
+  is inside *no* repository (its `.git` removed, nothing around it) used to get "wiring broken —
+  run Repair-ProtonBackup", and Repair then said "not a git repository". It now gets the `none`
+  finding, which names the two ways out.
 
 ## Tests (TDD)
 
@@ -321,6 +363,16 @@ what must not change. All in `tests/Commands.Tests.ps1`.
 - RED (round 2): with only the first classification probe failing (a Pester mock of `git`
   scoped to that call), Install of a subfolder refuses with "git did not confirm" and rewires
   nothing, and Uninstall of it leaves the containing repository's remote in place.
+- RED (D3 as amended): the Verify tests' expected findings name the Install step before the
+  Uninstall (both failed against the first-ruled wording, then passed); Verify on a registered
+  subfolder whose first probe fails (scoped mock) reports the `none` finding and bundles nothing;
+  Verify on a registered folder with no repository at all reports the `none` finding, not "run
+  Repair", and bundles nothing; an Install refusal for a subfolder whose `--show-toplevel` fails
+  (scoped mock) describes the repository instead of printing `''`.
+- RED (verification round): Install of a main checkout whose `--git-dir` git prints absolute
+  while `--git-common-dir` stays relative (scoped mock) still accepts it as a root; Install of
+  `<bare>\worktrees\<wt>`, a bare repository's worktree's private git dir, refuses naming the bare
+  repository and leaves its wiring intact.
 - RED: Verify on the leftover state reports the D3 finding for the subfolder entry, marks it
   `attention`, and creates no bundle directory under the subfolder's slug. One Verify test, not
   one per kind: the branch does not depend on the kind, and the kind's wording comes from the
@@ -339,9 +391,11 @@ so the fixture stays valid if that function is ever guarded too.
   non-root path, Verify's new finding, and the two-command recovery (Repair first).
 - `README.md`: after the `Install-ProtonBackup C:\code\myrepo` example, the sentence as amended
   under "Smaller defaults".
-- No `docs/design.md` change: none of the mechanisms it describes changes (bundling, the push
-  hook's verification table, marker reconciliation, locking), and it does not enumerate Verify's
-  per-entry findings — the existing missing-on-disk skip is not there either.
+- `docs/design.md`: one qualifier in "Markers + the reconciliation backstop" — Verify's per-run
+  recompute applies to registered repos that are present and that git confirms as a repository's
+  own top folder; any other entry gets a finding instead. (Before D3's gate the unqualified
+  sentence was already loose about the missing-on-disk skip; the gate made it wrong [DeepSeek,
+  verification round].) The doc lists no Verify findings, and none of its mechanisms changes.
 
 ## Revisions
 
@@ -423,6 +477,36 @@ so the fixture stays valid if that function is ever guarded too.
   its normal pass on `none`, so a transient first-probe failure on a registered non-root path
   bundles the containing repository under that path's name — and in the 0.8.0 leftover state
   can even read `ok` — instead of gating on a positive `root` as Install and Uninstall do.
+- **After round 3 (2026-10-03).** Craig ruled both (recommended defaults): (A) D3's finding
+  amended to name the repository's Install (or, where git names none, a Repair of its top
+  folder) before the Uninstall, for every kind; (B) Verify gated on a positive `root`, with a
+  `none` finding of its own. Also folded in, as recommended in the same brief: a message whose
+  repository git did not name describes it instead of printing `''`. Implemented test-first:
+  three new tests and the two Verify tests whose expected wording changed failed against the
+  round-3 code, then passed. B closes the inside-no-repository loop that round 1 had named out
+  of scope. Each ruling's text and the options not taken are under D3.
+- **Verification round (2026-10-03, after the A/B rulings; panel: Codex and Gemini (agy)
+  reported, Codex "Blockers: none"; Kimi (repo-aware) reported, "Blockers: none"; DeepSeek
+  (repo-aware) INCOMPLETE — a whole review, `finish_reason=stop`, ending without the run's canary
+  token — its findings checked by hand).** Applied: a bare repository's worktree's private git
+  dir (`<bare>\worktrees\<wt>`) classified as a root and would have been wired — reproduced in
+  the sandbox, then fixed with the common-dir test and a red-first test [DeepSeek]; the linked
+  (and now bare) test compares directories, not git's spelling of them, after a test forcing
+  one absolute and one relative spelling refused a real main checkout [Kimi]; `docs/design.md`'s
+  per-run-recompute sentence qualified [DeepSeek]; the Uninstall fail-closed warning described as
+  the one-shot signal it is [DeepSeek]; the Status ledger made to add up [Kimi, DeepSeek]; the
+  CHANGELOG names Install's "git did not confirm" refusal [Kimi]. Rejected, with evidence: "a
+  junction or other alias spelling of a repository's top is now refused" — a junction to a top
+  classifies as `root` **[sandbox]** [DeepSeek]; "non-ASCII worktree paths come back C-quoted
+  from `worktree list --porcelain`" — printed unquoted, main checkout named correctly **[sandbox,
+  git 2.55]** [DeepSeek]; "Repair rejects an unregistered top folder, so the `.git` finding's
+  Repair step fails" — `Repair-ProtonBackup` is `Install-ProtonBackup`, which registers [code]
+  [Gemini]; "Status's `EMPTY` digest sentinel can collide with a stamp" — pre-existing and needs a
+  hand-made stamp [Kimi]. Noted, not changed: a submodule checked out inside a linked worktree
+  is a `root`; whether its git dir is shared with the main checkout's copy of that submodule is
+  unverified and outside #10 [DeepSeek, inference]. No further round: the loop's three rounds and
+  this verification round are spent; the two code changes it produced are each pinned by a test
+  that failed first.
 
 ## Tasks
 
