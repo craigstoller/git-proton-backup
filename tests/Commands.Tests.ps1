@@ -1227,6 +1227,11 @@ Describe 'Issue #10: a path inside a repository is never wired in its place' {
     # on the path itself — so a path that is not a repository's own root must never be wired,
     # and Uninstall of one must never reach the repository around it.
     BeforeAll {
+        # The fault-injection tests below mock `git` for one probe only. Pester 5 sends every
+        # other call through to the real command, but Pester 6 throws on a call no filter
+        # matches — so each of those tests also mocks an unfiltered pass-through to this path
+        # (a full path, so the pass-through itself is never intercepted).
+        $script:realGit = (Get-Command git -CommandType Application | Select-Object -First 1).Source
         function Assert-RepoWiringIntact {
             (git -C $script:repo remote get-url proton) | Should -Be $script:repoMirror
             Test-Path -LiteralPath (Join-Path $script:repoMirror 'HEAD') | Should -BeTrue
@@ -1408,6 +1413,7 @@ Describe 'Issue #10: a path inside a repository is never wired in its place' {
     # Fail-closed (round-2 review): only a POSITIVE root answer may let a caller touch a remote. A
     # first probe that fails while later git calls succeed must not read as "this is a root".
     It 'install refuses, and rewires nothing, when git does not answer the first classification probe' {
+        Mock git { & $script:realGit @args } -ModuleName GitProtonBackup   # pass-through default (Pester 6)
         Mock git { $global:LASTEXITCODE = 128 } -ModuleName GitProtonBackup -ParameterFilter {
             $args -contains '--is-bare-repository' -and $args -contains $script:sub }
         { Install-ProtonBackup -RepoPath $script:sub } | Should -Throw "*'$script:sub': git did not confirm*"
@@ -1415,6 +1421,7 @@ Describe 'Issue #10: a path inside a repository is never wired in its place' {
         (@((Read-GpbConfig).Repos) -join '|') | Should -Be $script:repo
     }
     It 'uninstall leaves the repository around the path alone when git does not answer the first classification probe' {
+        Mock git { & $script:realGit @args } -ModuleName GitProtonBackup   # pass-through default (Pester 6)
         Mock git { $global:LASTEXITCODE = 128 } -ModuleName GitProtonBackup -ParameterFilter {
             $args -contains '--is-bare-repository' -and $args -contains $script:sub }
         Uninstall-ProtonBackup -RepoPath $script:sub -WarningVariable wv -WarningAction SilentlyContinue 6>$null
@@ -1435,6 +1442,7 @@ Describe 'Issue #10: a path inside a repository is never wired in its place' {
     }
     It 'verify bundles nothing for a registered subfolder whose first classification probe fails (gated on a positive root)' {
         New-Issue10LeftoverState
+        Mock git { & $script:realGit @args } -ModuleName GitProtonBackup   # pass-through default (Pester 6)
         Mock git { $global:LASTEXITCODE = 128 } -ModuleName GitProtonBackup -ParameterFilter {
             $args -contains '--is-bare-repository' -and $args -contains $script:sub }
         $r = Invoke-ProtonBackupVerify -SyncCheck { param($p) $true } -CliReadyRunner { $false } -WarningAction SilentlyContinue
@@ -1461,12 +1469,14 @@ Describe 'Issue #10: a path inside a repository is never wired in its place' {
         # same directory, one absolute and one relative, is still a main checkout.
         $main = (Resolve-Path (New-TestRepo)).Path
         $absGitDir = (Join-Path $main '.git') -replace '\\', '/'
+        Mock git { & $script:realGit @args } -ModuleName GitProtonBackup   # pass-through default (Pester 6)
         Mock git { $global:LASTEXITCODE = 0; $absGitDir } -ModuleName GitProtonBackup -ParameterFilter {
             $args -contains '--git-dir' -and $args -contains $main }
         Install-ProtonBackup -RepoPath $main -WarningAction SilentlyContinue 6>$null
         @((Read-GpbConfig).Repos) | Should -Contain $main
     }
     It 'a refusal never names an empty path when git does not name the containing repository' {
+        Mock git { & $script:realGit @args } -ModuleName GitProtonBackup   # pass-through default (Pester 6)
         Mock git { $global:LASTEXITCODE = 128 } -ModuleName GitProtonBackup -ParameterFilter {
             $args -contains '--show-toplevel' -and $args -contains $script:sub }
         { Install-ProtonBackup -RepoPath $script:sub } |
