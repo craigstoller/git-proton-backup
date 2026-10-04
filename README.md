@@ -47,6 +47,9 @@ Then wire a repo:
 Install-ProtonBackup C:\code\myrepo
 ```
 
+Pass the repository's own top folder (a submodule's counts); a plain folder inside a repository is
+refused rather than wired, and a linked worktree is refused in favour of its main checkout.
+
 `Install-ProtonBackup` is idempotent — re-run it to repair a moved repo, a deleted mirror, or a
 module upgrade (that's also what `Repair-ProtonBackup` does under the hood). Two switches:
 `-SetUpstream` takes over the branch's upstream even if one is already set (by default, install
