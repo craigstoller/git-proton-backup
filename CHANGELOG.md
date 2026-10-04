@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+- **Module manifest:** `PrivateData.PSData.ReleaseNotes` no longer describes 0.2.3. It had not been
+  updated since that release and shipped unchanged through 0.8.1. It now carries only the
+  version-independent notes and points to this changelog for what changed in each version, so it
+  cannot go stale again.
+
 ## 0.8.1 — 2026-10-03
 
 Module-only patch release. The `git-remote-proton` helper is unchanged in behaviour (rebuilt only
