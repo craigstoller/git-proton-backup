@@ -3,8 +3,8 @@
 ## [Unreleased]
 
 - **GitProtonBackup (PowerShell module): a folder inside a repository is no longer wired in that
-  repository's place.** ([#10]) `Install-ProtonBackup` — and `Repair-ProtonBackup`, which goes
-  through it — accepted any folder git could resolve to a repository: a subfolder of a work tree,
+  repository's place.** ([#10]) `Install-ProtonBackup` (and `Repair-ProtonBackup`, which goes
+  through it) accepted any folder git could resolve to a repository: a subfolder of a work tree,
   the `.git` folder, a subfolder of a bare repository. This deliberately refuses input 0.8.0
   accepted; that input only ever produced a mis-keyed backup of a different repository. Every git call then acted on the repository
   *around* that folder, while the registry entry, the mirror and the bundle folder were named after
@@ -23,8 +23,8 @@
     shared), `Invoke-ProtonBackupVerify` now flags it: run `Install-ProtonBackup <main checkout>`,
     then `Uninstall-ProtonBackup <worktree>`. (The other order works too, but leaves the shared
     `proton` remote pointing at a deleted mirror until the Install.)
-  - `Uninstall-ProtonBackup` on such a path no longer touches the repository around it — before, it
-    removed that repository's `proton` remote. It removes only the path's own registration,
+  - `Uninstall-ProtonBackup` on such a path no longer touches the repository around it (before, it
+    removed that repository's `proton` remote). It removes only the path's own registration,
     push-pending marker, digest stamp and mirror, and warns that the containing repository was left
     alone. Uninstall of a path that no longer exists is unchanged.
   - `Invoke-ProtonBackupVerify` reports a registered path of this kind as `registered path '<path>'
