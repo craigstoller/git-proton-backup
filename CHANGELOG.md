@@ -1,6 +1,10 @@
 # Changelog
 
-## [Unreleased]
+## 0.8.1 — 2026-10-03
+
+Module-only patch release. The `git-remote-proton` helper is unchanged in behaviour (rebuilt only
+so its `--version` string moves with the tag), and the certified Proton Drive CLI remains
+`cli-drive@0.8.0+06e8c605`.
 
 - **GitProtonBackup (PowerShell module): a folder inside a repository is no longer wired in that
   repository's place.** ([#10]) `Install-ProtonBackup` (and `Repair-ProtonBackup`, which goes
