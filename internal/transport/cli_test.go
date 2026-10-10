@@ -39,7 +39,7 @@ const (
 	roleCLIClean = "cli-clean"
 	roleLinger   = "linger"
 
-	// The five EnforceCertified stand-ins, below runVersionRole. Each ignores
+	// The six EnforceCertified stand-ins, below runVersionRole. Each ignores
 	// its args entirely, exactly like runHelperRole above — run() always
 	// calls Version() with "--version", so there is nothing to branch on.
 	roleCertified      = "version-certified"
@@ -47,6 +47,7 @@ const (
 	roleNonzeroVersion = "version-nonzero"
 	roleNoToken        = "version-no-token"
 	roleLegacy070      = "version-legacy-070"
+	roleLegacy080      = "version-legacy-080"
 
 	// The two Stat classification stand-ins, below runStatRole (Task 4). Like
 	// the version roles, each ignores its args and just reports a fixed
@@ -94,7 +95,7 @@ func TestMain(m *testing.M) {
 		runHelperRole(os.Getenv(helperEnv))
 	case roleLinger:
 		runLingerRole()
-	case roleCertified, roleWrongVersion, roleNonzeroVersion, roleNoToken, roleLegacy070:
+	case roleCertified, roleWrongVersion, roleNonzeroVersion, roleNoToken, roleLegacy070, roleLegacy080:
 		runVersionRole(os.Getenv(helperEnv))
 	case roleStatNotFound, roleStatOtherError:
 		runStatRole(os.Getenv(helperEnv))
@@ -170,6 +171,14 @@ func runVersionRole(role string) {
 		// de-trap test against the KNOWN-incompatible 0.7.0 build.
 		fmt.Println("Proton Drive CLI cli-drive@0.7.0+5174900c")
 		fmt.Println("Proton Drive SDK js@0.20.0+5174900c")
+	case roleLegacy080:
+		// The build every install made between 2026-08-13 and 2026-10-05 has,
+		// printing the real post-0.9.0 update nag (captured 2026-10-10). Literal
+		// text, not CertifiedCLI, which now names 0.9.0.
+		fmt.Println("Proton Drive CLI cli-drive@0.8.0+06e8c605")
+		fmt.Println("Proton Drive SDK js@0.21.0+06e8c605")
+		fmt.Println("A newer version is available: 0.9.0 (you have 0.8.0).")
+		fmt.Println("Download at https://proton.me/download/drive/cli/index.html")
 	}
 	os.Exit(0)
 }
@@ -935,6 +944,12 @@ func legacy070RoleCLI(t *testing.T) *CLI {
 	return &CLI{Exe: os.Args[0]}
 }
 
+func legacy080RoleCLI(t *testing.T) *CLI {
+	t.Helper()
+	t.Setenv(helperEnv, roleLegacy080)
+	return &CLI{Exe: os.Args[0]}
+}
+
 // RED (Stage 4): EnforceCertified does not exist. The advisory warn in
 // cmd/main.go becomes this enforcing check; the design's "refuse to run"
 // rule finally matches the code.
@@ -1071,10 +1086,14 @@ func TestIsCertifiedIsExactTokenNotContainment(t *testing.T) {
 
 // TestIsCertifiedTolerantOfAnAppendedUpdateNagLine is GUARD (a) from the
 // 0.8.0 certification plan (Task 1 step 2, round-3): 0.8.0 added an
-// up-to-date/update-nag report line after the identity line ("You are
-// running the latest version." or, post-0.8.1, an update-available
-// counterpart) — hardening must tolerate EXTRA output lines without
-// becoming line-count- or position-sensitive.
+// up-to-date/update-nag report line after the identity line — hardening
+// must tolerate EXTRA output lines without becoming line-count- or
+// position-sensitive. The nag text below is SYNTHETIC: it was invented in
+// August 2026 before any real update nag existed, and is kept as a
+// synthetic-shape GUARD. The two real shapes the CLI prints — the one-line
+// "latest version" report and the two-line "newer version is available"
+// nag — are pinned by the ...TheRealLatestVersionLine and
+// ...TheRealUpdateNag tests below (0.9.0 certification).
 func TestIsCertifiedTolerantOfAnAppendedUpdateNagLine(t *testing.T) {
 	v := "Proton Drive CLI " + CertifiedCLI + "\n" +
 		"Proton Drive SDK js@0.21.0+06e8c605\n" +
@@ -1100,14 +1119,94 @@ func TestIsCertifiedRefusesATokenMerelyMentionedInANagSentence(t *testing.T) {
 	}
 }
 
-// TestIsCertifiedRefuses070AfterTheBump is the plan's explicit GUARD: the
-// exact-version philosophy (Craig-adjudicated, Stage 2) means the
-// PREVIOUSLY-certified build refuses once CertifiedCLI moves on — no floor,
+// TestIsCertifiedRefuses070AfterTheBump is the 0.8.0 plan's explicit GUARD:
+// the exact-version philosophy (Craig-adjudicated, Stage 2) means a
+// formerly certified build refuses once CertifiedCLI moves on — no floor,
 // no grace window. Uses the literal 0.7.0 token text, not the CertifiedCLI
-// constant, so this test cannot silently pass by tautology after the bump.
+// constant, so this test cannot silently pass by tautology after any bump
+// (CertifiedCLI has since moved on to 0.9.0; the 0.8.0 twin is below).
 func TestIsCertifiedRefuses070AfterTheBump(t *testing.T) {
 	if IsCertified("Proton Drive CLI cli-drive@0.7.0+5174900c") {
-		t.Error("the previously-certified 0.7.0 token must refuse now that CertifiedCLI has moved to 0.8.0")
+		t.Error("the formerly certified 0.7.0 token must refuse now that CertifiedCLI has moved on (0.8.0, then 0.9.0)")
+	}
+}
+
+// TestIsCertifiedRefuses080AfterTheBump is the 0.9.0 certification's explicit
+// GUARD, the twin of TestIsCertifiedRefuses070AfterTheBump: the previously-
+// certified build refuses once CertifiedCLI moves on — no floor, no grace
+// window. The fixture is the REAL four-line output every 0.8.0 install has
+// printed since 0.9.0 shipped (captured 2026-10-10), literal text so the test
+// cannot pass by tautology.
+func TestIsCertifiedRefuses080AfterTheBump(t *testing.T) {
+	v := "Proton Drive CLI cli-drive@0.8.0+06e8c605\n" +
+		"Proton Drive SDK js@0.21.0+06e8c605\n" +
+		"A newer version is available: 0.9.0 (you have 0.8.0).\n" +
+		"Download at https://proton.me/download/drive/cli/index.html"
+	if IsCertified(v) {
+		t.Error("the previously-certified 0.8.0 token must refuse now that CertifiedCLI has moved to 0.9.0")
+	}
+}
+
+// TestEnforceCertifiedOn080RefusesByNameAndOverrideStaysGeneric pins the
+// build every current user has: without the override it refuses, naming the
+// found token and the certified one; with the override it proceeds with the
+// generic warning and must NOT print the 0.7.0 vocabulary note — 0.9.0 kept
+// 0.8.0's conflict-strategy vocabulary (H1), so 0.8.0 is merely uncertified,
+// not known-incompatible. The refusal quotes bound(v, 200), which trims the
+// TAIL of the output; the token survives because the real CLI prints its
+// identity line FIRST (version.ts prints both identity lines before the
+// update check runs), so it sits in the first 41 bytes — a nag PREPENDED
+// before the identity line is a shape the CLI does not produce, and this
+// test does not claim to cover it.
+func TestEnforceCertifiedOn080RefusesByNameAndOverrideStaysGeneric(t *testing.T) {
+	err := EnforceCertified(legacy080RoleCLI(t), false, io.Discard)
+	if err == nil {
+		t.Fatal("0.8.0 must refuse without the override")
+	}
+	for _, want := range []string{"cli-drive@0.8.0+06e8c605", CertifiedCLI, "GPB_UNCERTIFIED_CLI"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal must name %q, got %q", want, err.Error())
+		}
+	}
+	var buf strings.Builder
+	if err := EnforceCertified(legacy080RoleCLI(t), true, &buf); err != nil {
+		t.Fatalf("override must proceed on 0.8.0: %v", err)
+	}
+	for _, want := range []string{"UNCERTIFIED", "cli-drive@0.8.0+06e8c605", CertifiedCLI} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("warning must name %q, got %q", want, buf.String())
+		}
+	}
+	if strings.Contains(buf.String(), "cli-drive@0.7.0+5174900c") {
+		t.Errorf("0.8.0 is not the known-incompatible 0.7.0 build; its override warning must not carry the 0.7.0 note, got %q", buf.String())
+	}
+}
+
+// TestIsCertifiedTolerantOfTheRealLatestVersionLine: the third line is the
+// literal report 0.8.0 printed while it was the latest (captured at the
+// 2026-08-13 gate; version.ts is unchanged 0.8.0→0.9.0). The SDK line is a
+// placeholder — never matched.
+func TestIsCertifiedTolerantOfTheRealLatestVersionLine(t *testing.T) {
+	v := "Proton Drive CLI " + CertifiedCLI + "\n" +
+		"Proton Drive SDK js@0.0.0+placeholder\n" +
+		"You are running the latest version."
+	if !IsCertified(v) {
+		t.Errorf("the real latest-version line must not break certification, got false for %q", v)
+	}
+}
+
+// TestIsCertifiedTolerantOfTheRealUpdateNag: the two-line nag in the shape
+// 0.8.0 printed on 2026-10-10 (version numbers substituted for the certified
+// build's own future) — two extra lines, one carrying two version numbers in
+// parentheses, one a URL, neither an identity line. The SDK line is a
+// placeholder — never matched.
+func TestIsCertifiedTolerantOfTheRealUpdateNag(t *testing.T) {
+	v := "Proton Drive CLI " + CertifiedCLI + "\n" +
+		"Proton Drive SDK js@0.0.0+placeholder\n" +
+		"A newer version is available: 0.10.0 (you have 0.9.0).\n" +
+		"Download at https://proton.me/download/drive/cli/index.html"
+	if !IsCertified(v) {
+		t.Errorf("the real two-line update nag must not break certification, got false for %q", v)
 	}
 }
 
