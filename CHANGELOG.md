@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## 0.9.0 — 2026-10-10
 
 Certified Proton Drive CLI moves from 0.8.0 to 0.9.0 — the exact allowlisted build is now
 `cli-drive@0.9.0+75612299` (Proton released it 2026-10-05; certified live 2026-10-10,
