@@ -46,6 +46,7 @@ try { $latest = $w | Sort-Object { [semver]$_.Version } -Descending | Select-Obj
 $installedSha = (Get-FileHash -LiteralPath $Cli -Algorithm SHA512).Hash.ToLower()
 
 try { $helperOut = (& $Helper --version 2>&1) -join ' ' } catch { Stop-Drift "could not run the helper '$Helper': $_" }
+if ($LASTEXITCODE -ne 0) { Stop-Drift "the helper '$Helper' --version exited $LASTEXITCODE" }
 if ($helperOut -notmatch 'certified CLI: (cli-drive@[0-9]+\.[0-9]+\.[0-9]+\+[0-9a-f]+)') { Stop-Drift "could not parse the helper's certified token from: $helperOut" }
 $certified = $Matches[1]
 $certifiedSemver = $certified -replace '^cli-drive@([0-9]+\.[0-9]+\.[0-9]+)\+.*$', '$1'
@@ -54,6 +55,10 @@ $certifiedSemver = $certified -replace '^cli-drive@([0-9]+\.[0-9]+\.[0-9]+)\+.*$
 # need not survive): the FIRST line of the shape "Proton Drive CLI <token>".
 $cliToken = $null
 try { $cliLines = @(& $Cli --version 2>&1) } catch { Stop-Drift "could not run the CLI '$Cli': $_" }
+# The helper's own gate is exit 0 AND identity token equal (Version() errors on a non-zero exit,
+# EnforceCertified then refuses); a CLI that prints its identity line and exits non-zero must
+# never read as MATCH here, because this script is the first triage step for that refusal.
+if ($LASTEXITCODE -ne 0) { Stop-Drift "the CLI '$Cli' --version exited $LASTEXITCODE" }
 foreach ($line in $cliLines) {
     if ([string]$line -match '^Proton Drive CLI (cli-drive@\S+)$') { $cliToken = $Matches[1]; break }
 }

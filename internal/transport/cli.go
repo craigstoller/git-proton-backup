@@ -695,10 +695,10 @@ func EnforceCertified(c *CLI, allowUncertified bool, w io.Writer) error {
 		// unrelated mismatched version gets only the generic warning above,
 		// never a false claim about 0.7.0's vocabulary.
 		if tok, ok := identityToken(v); ok && tok == legacyCertifiedCLI070 {
-			fmt.Fprintf(w, "git-remote-proton: NOTE: %s is the previously-certified build — "+
-				"its update path speaks the OLD conflict-strategy vocabulary, not %s's; "+
-				"pushes that update an existing ref will fail against it. The override does "+
-				"not make %s viable for pushes.\n", legacyCertifiedCLI070, CertifiedCLI, legacyCertifiedCLI070)
+			fmt.Fprintf(w, "git-remote-proton: NOTE: %s is a formerly certified build (0.7.0, "+
+				"certified through v0.6.0) — its update path speaks the OLD conflict-strategy "+
+				"vocabulary, not %s's; pushes that update an existing ref will fail against it. "+
+				"The override does not make %s viable for pushes.\n", legacyCertifiedCLI070, CertifiedCLI, legacyCertifiedCLI070)
 		}
 		return nil
 	}

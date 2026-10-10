@@ -23,9 +23,12 @@ forgotten for the v0.3.x releases. Follow it in order; do not skip or reorder st
 3. **Tag `vX.Y.Z` on the flipped commit.** The tag must point at the commit from step 2, not a
    later one. Push that commit to `main` first and wait for its CI to pass. Before pushing the
    tag, run the Proton CLI drift check (`scripts/Test-ProtonCliDrift.ps1`; see "Between
-   releases" below) with `-Helper` pointing at the frozen release candidate build — for a release
-   that moves the CLI pin, the installed helper still carries the old token and would fail by
-   construction — and require `DRIFT CHECK: MATCH`. Any MISMATCH is a STOP, and the default
+   releases" below) with `-Helper` pointing at a helper built from the step-2 commit
+   (`go build -o <scratch dir>\git-remote-proton.exe ./cmd/git-remote-proton`, outside the
+   tree); for a release that moves the CLI pin the installed helper still carries the old token
+   and would fail by construction, while for a release that does not move the pin the installed
+   helper carries the same token and may be used instead. Require `DRIFT CHECK: MATCH`. Any
+   MISMATCH is a STOP, and the default
    resolution is to re-certify against the current build: a release that certifies a build the
    download page no longer offers recreates the failure the 0.9.0 certification was written for.
    Shipping one behind needs an explicit Craig rationale. Only then push the tag, separately (not
@@ -50,9 +53,10 @@ forgotten for the v0.3.x releases. Follow it in order; do not skip or reorder st
    applies to it unchanged.
 
 6. **Craig publishes.** Once the gate passes, run the drift check again with `-Helper` set to the
-   installed draft helper (on PATH after the install step 5 names), and require `DRIFT CHECK:
-   MATCH` under the same STOP rule as step 3. Then Craig — not the gate runner — publishes the
-   draft release on GitHub.
+   draft's exe — the installed one when step 5 installed it (a pin-moving release), otherwise the
+   downloaded asset in the gate's staging directory — and require `DRIFT CHECK: MATCH` under the
+   same STOP rule as step 3. Then Craig — not the gate runner — publishes the draft release on
+   GitHub.
 
 7. **The publication digest closure re-downloads the published assets and compares per-asset
    SHA-256 against the gate's staged digests.** Only after this closure confirms the published

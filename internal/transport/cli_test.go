@@ -1227,6 +1227,13 @@ func TestEnforceCertifiedOverrideNamesTheKnown070Incompatibility(t *testing.T) {
 			t.Errorf("warning must name %q, got %q", want, buf.String())
 		}
 	}
+	// 0.9.0 certification, final-review fix: 0.7.0 has not been THE
+	// previously-certified build since 0.8.0 took over on 2026-08-13; the
+	// note must call it a formerly certified build, never "the
+	// previously-certified" one — an operator is told a false fact otherwise.
+	if strings.Contains(buf.String(), "previously-certified") {
+		t.Errorf("the 0.7.0 note must not call it the previously-certified build, got %q", buf.String())
+	}
 }
 
 // TestEnforceCertifiedOverrideOmitsThe070NoteForAnUnrelatedMismatch pins
