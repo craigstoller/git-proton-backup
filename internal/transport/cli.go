@@ -543,22 +543,37 @@ func dirOf(p string) string {
 	return "/"
 }
 
-// CertifiedCLI is the exact build this helper is certified against — moved
-// from 0.7.0 to 0.8.0 (Task 1, 0.8.0 certification: Proton stopped hosting
-// the 0.7.0 download the day 0.8.0 shipped, so every new install gets
-// 0.8.0). Support is an allowlist, not a floor: successive builds have
-// differed in the activeRevision payload shape, in whether a byte-identical
-// rewrite is skipped, and now in the upload conflict-strategy vocabulary
-// (the general strategy option split into -f/-d, C1's "merge" renamed to
-// "create-new-revision" for files — see UpdateRevision), so a floor would
-// admit a build that breaks verification silently. 0.7.0's own token now
-// REFUSES under this constant (exact-version philosophy, Craig-adjudicated
-// since Stage 2) — see legacyCertifiedCLI070 for the override path's
-// specific handling of that known-incompatible build.
-const CertifiedCLI = "cli-drive@0.8.0+06e8c605"
+// CertifiedCLI is the exact build this helper is certified against. It has
+// moved twice since Stage 4, each time under a fresh live certification
+// (gate records under docs/research/gates/):
+//
+//   - 0.7.0 → 0.8.0 on 2026-08-13: Proton stopped hosting the 0.7.0
+//     download the day 0.8.0 shipped, so every new install got 0.8.0; and
+//     0.8.0 split the general upload conflict-strategy option into -f/-d,
+//     renaming C1's "merge" to "create-new-revision" for files (see
+//     UpdateRevision).
+//   - 0.8.0 → 0.9.0 in October 2026: the download page advertises only
+//     0.9.0 (released 2026-10-05), so every new install meets a build the
+//     0.8.0-certified helper refused. NO vocabulary change this time — the
+//     0.9.0 audit confirmed the same four -f values — so the move is the
+//     token alone.
+//
+// Support is an allowlist, not a floor: successive builds have differed in
+// the activeRevision payload shape, in whether a byte-identical rewrite is
+// skipped, and in the upload conflict-strategy vocabulary, so a floor would
+// admit a build that breaks verification silently. Every formerly certified
+// token REFUSES under this constant (exact-version philosophy,
+// Craig-adjudicated since Stage 2); 0.8.0 gets the generic override
+// warning, while 0.7.0 — the one formerly certified build that speaks the
+// pre-split vocabulary — gets the specific note legacyCertifiedCLI070
+// drives.
+const CertifiedCLI = "cli-drive@0.9.0+75612299"
 
-// legacyCertifiedCLI070 is the PREVIOUSLY-certified build's exact token,
-// kept as its own named constant (never inferred from history) so
+// legacyCertifiedCLI070 is the exact token of the 0.7.0 build — certified
+// from Stage 1 through v0.6.0, and the only FORMERLY CERTIFIED build that
+// speaks the pre-split conflict-strategy vocabulary (every pre-0.8.0 build
+// does; only 0.7.0 was ever certified). It is kept as its own named
+// constant (never inferred from history) so
 // EnforceCertified's override path can name the SPECIFIC incompatibility
 // when it recognises this exact build, rather than only ever printing the
 // generic "UNCERTIFIED" warning every mismatched version gets (round-2
@@ -600,8 +615,8 @@ func identityToken(versionOutput string) (string, bool) {
 // build, via identityToken's structural identity-line parse (above).
 // Exact-token equality, never containment: identityToken's found field must
 // EQUAL CertifiedCLI. Containment was a prefix match by another name — it
-// accepted "cli-drive@0.8.0+06e8c605-extra" — and "exact versions, not a
-// floor or prefix" is the design's rule. Output with no qualifying identity
+// accepted the certified token with an "-extra" suffix — and "exact
+// versions, not a floor or prefix" is the design's rule. Output with no qualifying identity
 // line is simply not certified (the unparseable case).
 func IsCertified(versionOutput string) bool {
 	tok, ok := identityToken(versionOutput)
@@ -680,10 +695,10 @@ func EnforceCertified(c *CLI, allowUncertified bool, w io.Writer) error {
 		// unrelated mismatched version gets only the generic warning above,
 		// never a false claim about 0.7.0's vocabulary.
 		if tok, ok := identityToken(v); ok && tok == legacyCertifiedCLI070 {
-			fmt.Fprintf(w, "git-remote-proton: NOTE: %s is the previously-certified build — "+
-				"its update path speaks the OLD conflict-strategy vocabulary, not %s's; "+
-				"pushes that update an existing ref will fail against it. The override does "+
-				"not make %s viable for pushes.\n", legacyCertifiedCLI070, CertifiedCLI, legacyCertifiedCLI070)
+			fmt.Fprintf(w, "git-remote-proton: NOTE: %s is a formerly certified build (0.7.0, "+
+				"certified through v0.6.0) — its update path speaks the OLD conflict-strategy "+
+				"vocabulary, not %s's; pushes that update an existing ref will fail against it. "+
+				"The override does not make %s viable for pushes.\n", legacyCertifiedCLI070, CertifiedCLI, legacyCertifiedCLI070)
 		}
 		return nil
 	}

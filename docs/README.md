@@ -1,6 +1,6 @@
 # git-proton-backup Docs
 
-**Living reference. Last updated: 2026-08-13.** Update this index when a doc is added, renamed, retired, or superseded — not on a review calendar.
+**Living reference. Last updated: 2026-10-10.** Update this index when a doc is added, renamed, retired, or superseded — not on a review calendar.
 
 This repo ships two tools that share one version line; each has its own design doc.
 
@@ -12,6 +12,7 @@ This repo ships two tools that share one version line; each has its own design d
 ## Operating
 
 - [releasing.md](releasing.md) - The canonical release procedure for both tools. Follow it in order; its steps exist because skipping them has already gone wrong once.
+- [../scripts/Test-ProtonCliDrift.ps1](../scripts/Test-ProtonCliDrift.ps1) - The Proton CLI drift check `releasing.md` calls for before tagging, before publishing, and weekly between releases: the installed CLI against Proton's feed, its identity token against the helper's certified token, and the feed's version against the pin.
 
 ## Process And Provenance
 

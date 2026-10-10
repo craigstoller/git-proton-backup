@@ -1,7 +1,45 @@
 # Changelog
 
-## [Unreleased]
+## 0.9.0 — 2026-10-10
 
+Certified Proton Drive CLI moves from 0.8.0 to 0.9.0 — the exact allowlisted build is now
+`cli-drive@0.9.0+75612299` (Proton released it 2026-10-05; certified live 2026-10-10,
+`docs/research/gates/cli-0.9.0-certification.md`). **Two version series, said explicitly so it is
+never misread as a typo: git-proton-backup 0.9.0 (this release, tag + module) certifies Proton Drive
+CLI 0.9.0 — the two 0.9.0s coincide by accident, and this release refuses Proton Drive CLI 0.8.0.**
+
+- **git-remote-proton: existing installs — the helper and the Proton Drive CLI must move together,
+  in one sitting.** This release refuses CLI 0.8.0, and the previous release (0.8.1) refuses CLI
+  0.9.0, so `git push proton-v2` fails between the two steps whichever order you take; the window is
+  symmetric. Recommended order for a user: install this release, then swap the CLI (Proton's
+  [download page](https://proton.me/download/drive/cli/index.html) and its
+  [version.json](https://proton.me/download/drive/cli/version.json) feed advertise only the current
+  build), then `git ls-remote proton-v2` to confirm — minutes, done back to back. The certification
+  itself took the other order on the maintainer's machine (CLI first, because the CLI had to be
+  certified before a helper that accepts it could exist). `GPB_UNCERTIFIED_CLI=1` on a 0.8.0 CLI
+  proceeds with the generic warning — no incompatibility is known, 0.9.0 kept 0.8.0's upload
+  conflict-strategy vocabulary — and remains for troubleshooting only; the 0.7.0 note (its update
+  path cannot speak the post-0.8.0 vocabulary) is unchanged, now worded as "a formerly certified
+  build" rather than "the previously-certified build", which it stopped being in August.
+- **git-remote-proton: nothing else changed for 0.9.0.** The 17-row live contract table passed
+  against the new build with the three error-text signatures byte-identical to August; an update
+  push keeps the remote node's identity with exactly one new revision; 0.9.0 reads what 0.8.0 wrote
+  and the archived 0.8.0 reads what 0.9.0 wrote, so a rollback stays viable after new writes.
+- **Known limit (Proton CLI, not the helper):** Proton accepts two names differing only by case in
+  one folder; the 0.9.0 CLI's directory download of such a folder no longer hangs (0.8.0 did) but
+  silently writes one local file for the pair on a case-insensitive filesystem. The helper never
+  meets this: its ref survey downloads each ref individually and advertised both refs in the live
+  probe.
+- **Docs: the v2 design doc's CLI pin is current again (v6.7).** It still named 0.7.0 as the pinned
+  build (the 0.8.0 certification never updated it), described the pre-hardening matcher rule, and
+  said `UpdateRevision` passes `-f merge` (it has passed `create-new-revision` since 0.8.0); all
+  corrected, with the 0.8.0 move recorded retroactively.
+- **Release procedure: a Proton CLI drift check,** `scripts/Test-ProtonCliDrift.ps1`, run before
+  tagging, before publishing, and **weekly between releases (Craig-owned)** — the installed CLI's
+  bytes against Proton's feed, its identity token against the helper's certified token, and the
+  feed's version against the pin, with a named verdict and exit code. The 0.9.0 move went unnoticed
+  for five days because the check the 0.8.0 plan asked for was never written down; it is now
+  (`docs/releasing.md`, "Between releases"), with hermetic tests under `tests/`.
 - **Module manifest:** `PrivateData.PSData.ReleaseNotes` no longer describes 0.2.3. It had not been
   updated since that release and shipped unchanged through 0.8.1. It now carries only the
   version-independent notes and points to this changelog for what changed in each version, so it

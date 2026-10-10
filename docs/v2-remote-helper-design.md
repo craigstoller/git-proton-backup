@@ -1,10 +1,13 @@
 # git-remote-proton — v2 design
 
-**Status:** design v6.6, revised 2026-08-09 during Stage 6 implementation. v5 was settled after four rounds of Codex + Gemini peer review; v6, v6.1, v6.2 and v6.3 each change exactly one mechanism, and each only because implementation proved the original unimplementable, unenforceable, or worse than what shipped. v6.4 documented Stage 4's shipped additions — the CLI version allowlist and the `--set-head` operation. v6.5 was the largest revision since v5: it re-enabled full hierarchical refs and the other-namespace rule v6.1 had narrowed away, replaced the fetch residue rule with quarantine staging, folded in the gate-sourced UX items, and left one item open — a git-valid-named foreign file with unparseable contents still failed every read against the repo, in both directions, until deleted. v6.6 closes that open question: the fatal-content rule is now **per-operation** — tolerant (skip + note) on the push-direction survey, fatal-with-enumeration on the fetch-direction survey — adds occupancy-aware push refusals (kind-aware, pre-pack) for names the read boundary skipped, adds the create-heal race-window diagnosis for an occupant that appears after advertisement, and pins F1 (directory download) as a verified contract fact. See the revision history.
+**Status:** design v6.7, revised 2026-10-10 for the CLI 0.9.0 certification (v6.6 was revised 2026-08-09 during Stage 6 implementation). v5 was settled after four rounds of Codex + Gemini peer review; v6, v6.1, v6.2 and v6.3 each change exactly one mechanism, and each only because implementation proved the original unimplementable, unenforceable, or worse than what shipped. v6.4 documented Stage 4's shipped additions — the CLI version allowlist and the `--set-head` operation. v6.5 was the largest revision since v5: it re-enabled full hierarchical refs and the other-namespace rule v6.1 had narrowed away, replaced the fetch residue rule with quarantine staging, folded in the gate-sourced UX items, and left one item open — a git-valid-named foreign file with unparseable contents still failed every read against the repo, in both directions, until deleted. v6.6 closes that open question: the fatal-content rule is now **per-operation** — tolerant (skip + note) on the push-direction survey, fatal-with-enumeration on the fetch-direction survey — adds occupancy-aware push refusals (kind-aware, pre-pack) for names the read boundary skipped, adds the create-heal race-window diagnosis for an occupant that appears after advertisement, and pins F1 (directory download) as a verified contract fact. See the revision history.
 **Relates to:** [issue #3](https://github.com/craigstoller/git-proton-backup/issues/3).
 **Depends on:** [`docs/research/remote-helper-prior-art.md`](research/remote-helper-prior-art.md) — read first; assumed, not repeated.
-**Pinned to:** Proton Drive CLI **`cli-drive@0.7.0`** (SDK `js@0.20.0`) — Stage 1 was certified
-against this build; results in `docs/research/probes/stage1-results.json`. Support is an
+**Pinned to:** Proton Drive CLI **`cli-drive@0.9.0+75612299`** (SDK `js@0.22.2+75612299`), certified
+2026-10-10 (`docs/research/gates/cli-0.9.0-certification.md`). Previously `cli-drive@0.8.0+06e8c605`
+(certified 2026-08-13, `docs/research/gates/cli-0.8.0-certification.md`; this header was not updated
+then and is corrected in v6.7) and, from Stage 1 through v0.6.0, `cli-drive@0.7.0+5174900c` (Stage 1
+results in `docs/research/probes/stage1-results.json`). Support is an
 **exact-version allowlist**, not a minimum. That is not theoretical caution: 0.4.6 and 0.7.0
 differ in the `activeRevision` payload shape, in whether a byte-identical rewrite is skipped,
 and in concurrent-startup behaviour. A version floor would have admitted 0.7.0 and broken
@@ -450,7 +453,7 @@ type Transport interface {
 | Operation | CLI | Result shape | Notes |
 |---|---|---|---|
 | `CreateExclusive` | `upload -f skip --json` | transfer summary | `(1,0,0)`=Committed, `(0,1,0)`=Refused |
-| `UpdateRevision` | `upload -f merge --json` | transfer summary | **Verified revises in place** — node uid stable, revision uid changes |
+| `UpdateRevision` | `upload -f create-new-revision --json` | transfer summary | **Verified revises in place** — node uid stable, revision uid changes (probed as `-f merge` on 0.7.0; the file-side value is `create-new-revision` since the 0.8.0 certification, re-verified live on 0.9.0) |
 | `Trash` | `trash --json` | **`{uid, ok}` — NOT a transfer summary** | needs its own parser; the upload parser would silently read nulls |
 | `EnsureDir` | `create-folder parent name` | text | **fails on an existing folder** |
 | `List` | `list path --json` | JSON array | empty folder → exit 0, zero elements. Distinguishable from failure |
@@ -504,8 +507,8 @@ A missing count field is `Ambiguous`, never defaulted to zero — a renamed fiel
 **Mutable writes require post-write verification, because the CLI may skip silently.** **Version-specific, and previously misattributed here.** CLI **0.7.0** auto-skips when the
 existing node''s *claimed* SHA-1 matches the local file''s, **before** any conflict strategy is
 applied. CLI 0.4.6 - the build the probes ran on - does *not*; it resolves the strategy
-directly. An earlier revision of this document attributed the 0.7.0 behaviour to 0.4.6. Since
-0.7.0 is the current release, the hazard is real for the version users would install, which
+directly. An earlier revision of this document attributed the 0.7.0 behaviour to 0.4.6. The hazard
+was live on 0.7.0 and is re-verified by the contract table at each certification (0.8.0, 0.9.0), which
 makes read-back verification more important rather than less. So `UpdateRevision` is not guaranteed to create a revision, and the decision is made from a digest Proton itself flags `sha1Verified: false`. Every mutable write is therefore followed by `ReadTo` and a byte comparison; equality by claimed digest is never accepted as proof. This is the one place the design cannot trust its transport, and it is why `Ambiguous` exists as a first-class outcome.
 
 **Immutable objects** (packs, indexes) use `CreateExclusive`. `Refused` there means only that **the name is already taken** — it is not evidence about the bytes behind it, and it is never success on the strength of the refusal alone. It becomes success only after Push's reconciliation rule, which differs by member: a `.pack` is compared byte-for-byte against the candidate, because its name is its content checksum; a `.idx` is not, because its name is borrowed from its pack and more than one valid index can carry it. See Push for the full rule.
@@ -516,11 +519,16 @@ makes read-back verification more important rather than less. So `UpdateRevision
 on either the protocol path (`run()`) or `--set-head` (`runSetHead()`), the helper runs
 `proton-drive --version` once per process and matches the CLI's identity token against a
 compiled-in certified list — today exactly one build, `transport.CertifiedCLI =
-"cli-drive@0.7.0+5174900c"` (`internal/transport/cli.go`). Matching is exact-token, not
-containment or a prefix: `IsCertified` requires the first whitespace-delimited field starting
-`cli-drive@` to equal `CertifiedCLI` exactly, so `cli-drive@0.7.0+5174900c-extra` is **not**
-certified. The SDK line in `--version`'s output is recorded in diagnostics but never matched —
-only the CLI line's token gates anything.
+"cli-drive@0.9.0+75612299"` (`internal/transport/cli.go`). Matching is exact-token, not
+containment or a prefix: `IsCertified` accepts only a structural identity line — a line that is the
+bare token, or whose LAST whitespace field starts `cli-drive@` with `CLI` as the field before it —
+takes the first such line when more than one qualifies, and requires that token to equal
+`CertifiedCLI` exactly; a token elsewhere on a line, or followed by more fields, is not an identity
+line (the 0.8.0 round-3 hardening), so `cli-drive@0.9.0+75612299-extra` is **not** certified. The
+constant has moved twice since Stage 4 — to 0.8.0 (2026-08-13) and to 0.9.0 (2026-10-10) — each
+time under a fresh live certification (gate records under `docs/research/gates/`), never as a
+floor. The SDK line in `--version`'s output is recorded in diagnostics but never matched — only
+the CLI line's token gates anything.
 
 **Refuse by default, override loudly.** `transport.EnforceCertified` is the enforcement point:
 
@@ -1095,7 +1103,7 @@ existing v2 operation lives with, not a new exposure `--set-head` introduces.
 pinned contract (`TestWriteHEADNeverOverwritesExistingHEAD`) and never overwrites an existing
 symref. `UpdateHEAD` (`internal/repo/head.go`) is the new function that does, and it branches on
 whether `HEAD` currently exists: it `Stat`s the path first, then calls `UpdateRevision` (`upload
--f merge`, per probe C14) when `HEAD` is present — the ordinary overwrite case — or
+-f create-new-revision`, per probe C14 and the 0.8.0 certification) when `HEAD` is present — the ordinary overwrite case — or
 `CreateExclusive` when it is absent, which is the headless-repo rescue this document already
 defines elsewhere: a repo with no `HEAD` file at all, either because its first push was
 tags-only (the ref-transition table's own headless case) or because an operator deleted the
@@ -1208,6 +1216,42 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
 ---
 
 ## Revision history
+
+**v6.7, 2026-10-10 — CLI pin moved to 0.9.0; the 0.8.0 move of 2026-08-13 is recorded here retroactively.**
+
+- **What moved and why.** `transport.CertifiedCLI` is `cli-drive@0.9.0+75612299` (release 0.9.0),
+  certified live on 2026-10-10 (`docs/research/gates/cli-0.9.0-certification.md`): Proton's download
+  page and `version.json` feed advertise only the current build (0.9.0, released 2026-10-05), so
+  every new install met an allowlist refusal under the 0.8.0-certified helper. The same thing
+  happened on 2026-08-13, when the constant moved from `cli-drive@0.7.0+5174900c` to
+  `cli-drive@0.8.0+06e8c605` (`docs/research/gates/cli-0.8.0-certification.md`); that move was never
+  written into this document, which kept naming 0.7.0 as the pin — corrected now.
+- **What did NOT change in 0.9.0, as pinned.** Upload conflict-strategy vocabulary (audit-confirmed
+  from the binary's help; every helper upload in the live table and smoke ran); transfer-summary
+  JSON shape (live-pinned from raw `--json` captures of both outcomes); node JSON shapes and the
+  three error-text signatures (live-pinned by the 17-row table, byte-identical to August);
+  single-file and directory (F1) download semantics (live-pinned); the `version` command's offline
+  bound (0.31 s, two identity lines). Exec sites: unchanged. The one hypothesis that could not be
+  provoked — a storage-quota upsell on upload failure, suppressed under `--json` — is accepted on
+  the source reading and recorded as such.
+- **Currency claims corrected.** The header's pin; the mutable-writes paragraph's "since 0.7.0 is
+  the current release"; the allowlist section's example tokens.
+- **The matcher sentence corrected.** This section described the pre-hardening "first
+  whitespace-delimited field" rule; the shipped `identityToken` accepts only a structural identity
+  line (bare token, or `CLI <token>` as the last field), first such line wins — documented now as
+  implemented.
+- **Two normative `merge` statements corrected.** The "Verified CLI mappings" row for
+  `UpdateRevision` and the `--set-head`/`UpdateHEAD` flow prose said `upload -f merge`; the helper
+  has passed `create-new-revision` since the 0.8.0 certification (0.8.0 split the general
+  conflict-strategy option into `-f`/`-d`). The v6.4 entry's wording is history and carries a
+  bracketed note only.
+- **Observed limits recorded, not fixed.** Proton accepts two names differing only by case in one
+  folder; the 0.9.0 CLI's directory download of such a folder no longer hangs (0.8.0 did) but
+  silently collapses the pair onto one local file on a case-insensitive filesystem — a CLI-side
+  limit the helper never meets, because its ref survey downloads each ref individually and
+  advertised both refs correctly in the live probe. Two simultaneous CLI starts still reproduce
+  Stage 1's `database is locked` collision on the new runtime (one trial); the helper serialises
+  its own calls, and a startup retry remains a Stage 7 candidate.
 
 **v6.6, 2026-08-09 — Stage 6 ships: per-operation foreign-data policy (closing the v6.5 open question), occupancy-aware push, the heal-arm race diagnosis, and F1's directory-download contract pin. Documents shipped behaviour, verified against the merged code.**
 
@@ -1491,7 +1535,8 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   backup. The table cell was wrong, not the prose — fixed to "git only, from any machine... no
   account needed."
 - **`UpdateHEAD` was described as unconditionally using `upload -f merge`.** The shipped function
-  (`internal/repo/head.go:116-126`) `Stat`s `HEAD` first and branches: `UpdateRevision` (merge)
+  (`internal/repo/head.go:116-126`) `Stat`s `HEAD` first and branches: `UpdateRevision` (merge
+  [the 0.7.0 vocabulary; `create-new-revision` since the 0.8.0 certification])
   only when `HEAD` already exists, `CreateExclusive` when it is absent — the headless-repo rescue
   this document defines elsewhere. The original v6.4 text described only the merge branch, which
   is also not this document's own cross-check table's wording ("CAS via
