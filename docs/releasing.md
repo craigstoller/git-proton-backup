@@ -21,9 +21,16 @@ forgotten for the v0.3.x releases. Follow it in order; do not skip or reorder st
    CHANGELOG still says `[Unreleased]` or whose manifest still carries the previous version.
 
 3. **Tag `vX.Y.Z` on the flipped commit.** The tag must point at the commit from step 2, not a
-   later one. Push that commit to `main` first and wait for its CI to pass; only then push the tag,
-   separately (not with `--follow-tags`). Push the tag only on Craig's word — do not push a
-   release tag unilaterally.
+   later one. Push that commit to `main` first and wait for its CI to pass. Before pushing the
+   tag, run the Proton CLI drift check (`scripts/Test-ProtonCliDrift.ps1`; see "Between
+   releases" below) with `-Helper` pointing at the frozen release candidate build — for a release
+   that moves the CLI pin, the installed helper still carries the old token and would fail by
+   construction — and require `DRIFT CHECK: MATCH`. Any MISMATCH is a STOP, and the default
+   resolution is to re-certify against the current build: a release that certifies a build the
+   download page no longer offers recreates the failure the 0.9.0 certification was written for.
+   Shipping one behind needs an explicit Craig rationale. Only then push the tag, separately (not
+   with `--follow-tags`). Push the tag only on Craig's word — do not push a release tag
+   unilaterally.
 
 4. **The Release workflow builds a draft with exactly three assets.** Pushing the tag triggers
    the `Release` GitHub Actions workflow (`.github/workflows/release.yml`), which builds and
@@ -33,20 +40,50 @@ forgotten for the v0.3.x releases. Follow it in order; do not skip or reorder st
 5. **The live gate runs against the draft's bytes.** The gate downloads the draft's assets and
    exercises them against the real Proton account per the current gate brief (see
    `docs/research/gates/brief-checklist.md` for the standing rules every gate brief incorporates).
+   A release that moves the CLI pin installs the draft helper before the gate smoke, as v0.7.0's
+   gate did (the certification plan's Task 3 step 4), so that the helper under test and the helper
+   on PATH are the same bytes.
    Tags are never moved after any artifact has been built from them — if the gate finds a defect,
    the fix ships as a new tag, not a retag. The one alternative is a stand-in, for a release that
    qualifies under "When adoption may stand in for the live gate" below and only on Craig's
    ruling for that release; for such a release the stand-in is this step, and the no-retag rule
    applies to it unchanged.
 
-6. **Craig publishes.** Once the gate passes, Craig — not the gate runner — publishes the draft
-   release on GitHub.
+6. **Craig publishes.** Once the gate passes, run the drift check again with `-Helper` set to the
+   installed draft helper (on PATH after the install step 5 names), and require `DRIFT CHECK:
+   MATCH` under the same STOP rule as step 3. Then Craig — not the gate runner — publishes the
+   draft release on GitHub.
 
 7. **The publication digest closure re-downloads the published assets and compares per-asset
    SHA-256 against the gate's staged digests.** Only after this closure confirms the published
    bytes are byte-identical to the bytes the gate tested is the release final. If any digest
    differs, or the published assets are not exactly the three staged ones, the published bytes are
    not the gated bytes: return the release to draft, investigate, and ship the fix under a new tag.
+
+## Between releases: the Proton CLI drift check
+
+Proton's download page and its `version.json` feed advertise only the current CLI build, and the
+helper certifies exactly one build, so a CLI release Proton ships between our releases means every
+new install meets an allowlist refusal until we re-certify. Nothing detects that at release time
+alone: the 0.9.0 move of 2026-10-05 went unnoticed for five days because the check the 0.8.0
+certification plan asked for was never written down. It is written down here.
+
+**Weekly, Craig-owned:** run `scripts/Test-ProtonCliDrift.ps1` with no arguments (the installed
+helper and the `proton-drive` first on PATH). It compares three things and names which failed: the
+installed CLI's bytes against the feed, the installed CLI's own identity token against the helper's
+certified token, and the feed's version against the certified token's semver. `DRIFT CHECK: MATCH`
+means nothing has moved. A MISMATCH between releases means Proton has moved: open a certification
+task in the shape of `docs/superpowers/plans/2026-10-10-cli-0.9.0-certification.md`. The same
+command is the **first triage step** whenever verify or a user reports an uncertified-CLI refusal.
+
+**One expected shape, not drift:** while a certification is in flight and the machine's CLI has
+already been swapped to the new build but the release that certifies it is not yet installed, the
+check reports `installed CLI == helper's certified token: False`. That is the known window the
+certification plan describes (its Task 2 step 5 swap, closed by its Task 3 step 4 install); check
+whether a certification task is open before acting on it.
+
+Stage 7's `--verify` command is where the scheduled form of this check belongs; until it exists,
+this section is the control.
 
 ## When adoption may stand in for the live gate
 
