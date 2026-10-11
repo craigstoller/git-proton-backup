@@ -52,3 +52,13 @@ the rules from scratch.
    clean failure. Established by Stage 5's S1 (`docs/research/gates/stage5-gate.md`): a
    2-minute harness timeout killed the bootstrap push mid-flight and orphaned the `.lock`,
    which then had to be diagnosed and cleared by hand before the push could be re-issued.
+
+10. **A hermetic audit of a staged CLI binary may run its `--version` and help output
+    unauthenticated without asking, under the account's existing telemetry setting.** The
+    exposure is the CLI's own version check against Proton's feed and whatever its telemetry
+    reports under that setting — which the installed CLI already does on every scheduled run —
+    and no account data is touched. Established by the 0.9.0 certification
+    (`docs/research/gates/cli-0.9.0-certification.md`), whose Task 1 ran under the plan's
+    "proceed" default; Craig confirmed it retroactively as a standing ruling
+    (`v0.9.0-release-gate.md`, post-release rulings, 2026-10-11). Certification plans need not
+    put the telemetry question to Craig again.

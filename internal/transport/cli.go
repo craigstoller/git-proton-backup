@@ -552,11 +552,12 @@ func dirOf(p string) string {
 //     0.8.0 split the general upload conflict-strategy option into -f/-d,
 //     renaming C1's "merge" to "create-new-revision" for files (see
 //     UpdateRevision).
-//   - 0.8.0 → 0.9.0 in October 2026: the download page advertises only
-//     0.9.0 (released 2026-10-05), so every new install meets a build the
-//     0.8.0-certified helper refused. NO vocabulary change this time — the
-//     0.9.0 audit confirmed the same four -f values — so the move is the
-//     token alone.
+//   - 0.8.0 → 0.9.0 on 2026-10-10 (cli-0.9.0-certification.md and
+//     v0.9.0-release-gate.md): Proton shipped 0.9.0 on 2026-10-05 and the
+//     download page advertised only it, so every new install met a build
+//     the 0.8.0-certified helper refused. NO vocabulary change this time —
+//     the 0.9.0 audit confirmed the same four -f values — so the move is
+//     the token alone.
 //
 // Support is an allowlist, not a floor: successive builds have differed in
 // the activeRevision payload shape, in whether a byte-identical rewrite is

@@ -18,7 +18,10 @@ forgotten for the v0.3.x releases. Follow it in order; do not skip or reorder st
    0.6.0 policy ("the tag and `ModuleVersion` move together") and had been practice without being
    written here (e.g. `07e7d84` for 0.7.0); it is what lets an installed module be told apart from
    the one before it. Do this commit first, and tag it in the next step — never tag a commit whose
-   CHANGELOG still says `[Unreleased]` or whose manifest still carries the previous version.
+   CHANGELOG still says `[Unreleased]` or whose manifest still carries the previous version. The
+   date in the heading is the flip's and the tag's, not the day Craig publishes: a release
+   published the next morning keeps the tag's date (v0.9.0, flipped 2026-10-10 and published
+   2026-10-11; Craig's ruling of 2026-10-11).
 
 3. **Tag `vX.Y.Z` on the flipped commit.** The tag must point at the commit from step 2, not a
    later one. Push that commit to `main` first and wait for its CI to pass. Before pushing the
@@ -44,8 +47,9 @@ forgotten for the v0.3.x releases. Follow it in order; do not skip or reorder st
    exercises them against the real Proton account per the current gate brief (see
    `docs/research/gates/brief-checklist.md` for the standing rules every gate brief incorporates).
    A release that moves the CLI pin installs the draft helper before the gate smoke, as v0.7.0's
-   gate did (the certification plan's Task 3 step 4), so that the helper under test and the helper
-   on PATH are the same bytes.
+   gate did (Task 3 step 4 of the certification plan, today
+   `docs/superpowers/plans/2026-10-10-cli-0.9.0-certification.md`), so that the helper under test
+   and the helper on PATH are the same bytes.
    Tags are never moved after any artifact has been built from them — if the gate finds a defect,
    the fix ships as a new tag, not a retag. The one alternative is a stand-in, for a release that
    qualifies under "When adoption may stand in for the live gate" below and only on Craig's
@@ -79,12 +83,22 @@ certified token, and the feed's version against the certified token's semver. `D
 means nothing has moved. A MISMATCH between releases means Proton has moved: open a certification
 task in the shape of `docs/superpowers/plans/2026-10-10-cli-0.9.0-certification.md`. The same
 command is the **first triage step** whenever verify or a user reports an uncertified-CLI refusal.
+On Craig's machine a weekly Windows scheduled task runs the script (Craig's ruling of 2026-10-11;
+agents cannot create scheduled tasks there), appending its output to
+`%LOCALAPPDATA%\GitProtonBackup\drift-check.log` with the script's exit code as the task's last
+result. The task is only as good as someone reading that log, which is why the check stays
+Craig-owned; the script bounds its one network call (30 s) so an unreachable feed cannot hang the
+task, and reports STOP, not MISMATCH, when the feed is reachable but unusable.
 
 **One expected shape, not drift:** while a certification is in flight and the machine's CLI has
 already been swapped to the new build but the release that certifies it is not yet installed, the
-check reports `installed CLI == helper's certified token: False`. That is the known window the
-certification plan describes (its Task 2 step 5 swap, closed by its Task 3 step 4 install); check
-whether a certification task is open before acting on it.
+check reports the triple `installed CLI == feed: True; installed CLI == helper's certified token:
+False; feed version == certified semver: False`. That is the known window the certification plan
+describes (its Task 2 step 5 swap, closed by its Task 3 step 4 install); check whether a
+certification task is open before acting on it. The full triple is what tells it apart from the two
+shapes that ARE drift: `False; True; False` is the not-yet-swapped machine after Proton has moved
+(only the feed changed), and `False; True; True` is a re-cut of the same version number (same
+token on the machine, different bytes in the feed).
 
 Stage 7's `--verify` command is where the scheduled form of this check belongs; until it exists,
 this section is the control.

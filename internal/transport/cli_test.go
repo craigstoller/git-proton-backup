@@ -165,8 +165,9 @@ func runVersionRole(role string) {
 	case roleNoToken:
 		fmt.Println("unexpected output with no cli-drive@ token")
 	case roleLegacy070:
-		// The exact previously-certified build's identity line, literal text
-		// (not a symbolic reference to CertifiedCLI, which now names 0.8.0) —
+		// The exact identity line of the 0.7.0 build (certified through
+		// v0.6.0), as literal text rather than a symbolic reference to
+		// CertifiedCLI, which has moved twice since (0.8.0, then 0.9.0) —
 		// this role exists specifically to drive EnforceCertified's override
 		// de-trap test against the KNOWN-incompatible 0.7.0 build.
 		fmt.Println("Proton Drive CLI cli-drive@0.7.0+5174900c")
