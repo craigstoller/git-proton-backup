@@ -14,7 +14,10 @@
 #   between releases and after this release is installed.
 # -Cli: defaults to the proton-drive first on PATH, which is the one the helper spawns.
 #
-# Exit codes: 0 MATCH, 1 MISMATCH, 2 STOP (the check itself could not run: feed, parse, PATH).
+# Exit codes: 0 MATCH, 1 MISMATCH, 2 STOP (the check itself could not run: the feed was not
+# reachable within 30 s or carries no usable windows/x64 SHA-512, a parse failed, PATH).
+# The one network call is bounded because this script also runs unattended from a weekly
+# scheduled task (docs/releasing.md, "Between releases").
 param(
     [string]$Helper = 'git-remote-proton',
     [string]$Cli = ''
@@ -23,14 +26,16 @@ $ErrorActionPreference = 'Stop'
 
 function Stop-Drift([string]$why) { "DRIFT CHECK: STOP ($why)"; exit 2 }
 
+$cliLabel = 'cli (-Cli)         '
 if (-not $Cli) {
+    $cliLabel = 'cli (first on PATH)'
     $c = Get-Command proton-drive -ErrorAction SilentlyContinue
     if (-not $c) { Stop-Drift 'no proton-drive on PATH' }
     $Cli = $c.Source
 }
 if (-not (Test-Path -LiteralPath $Cli)) { Stop-Drift "CLI not found: $Cli" }
 
-try { $m = Invoke-RestMethod 'https://proton.me/download/drive/cli/version.json' } catch { Stop-Drift "feed unreachable: $_" }
+try { $m = Invoke-RestMethod 'https://proton.me/download/drive/cli/version.json' -TimeoutSec 30 } catch { Stop-Drift "feed unreachable: $_" }
 $w = @($m.Releases | ForEach-Object {
     $r = $_
     $r.Files | Where-Object { $_.Platform -in @('windows/x64', 'windows-x64') } | ForEach-Object {
@@ -42,6 +47,9 @@ $w | Format-Table -AutoSize | Out-String | ForEach-Object { $_.TrimEnd() }
 
 # [semver], not [version]: a prerelease tag such as 0.10.0-beta must sort, not throw.
 try { $latest = $w | Sort-Object { [semver]$_.Version } -Descending | Select-Object -First 1 } catch { Stop-Drift "unparseable feed version: $_" }
+# An entry without a usable hash is a feed the check cannot use, not a build that differs:
+# STOP, never a MISMATCH verdict built on an empty comparison.
+if ($latest.Sha512 -notmatch '^[0-9a-f]{128}$') { Stop-Drift "feed windows/x64 entry for $($latest.Version) has no usable SHA-512 (fail closed)" }
 
 $installedSha = (Get-FileHash -LiteralPath $Cli -Algorithm SHA512).Hash.ToLower()
 
@@ -64,14 +72,16 @@ foreach ($line in $cliLines) {
 }
 if (-not $cliToken) { Stop-Drift "could not parse the installed CLI's identity line from: $($cliLines -join ' | ')" }
 
-"cli on PATH        : $Cli"
+"${cliLabel}: $Cli"
 "feed latest        : $($latest.Version) $($latest.Date)"
 "installed CLI      : $cliToken  sha512 $installedSha"
 "helper certifies   : $certified  (semver $certifiedSemver; helper $Helper)"
 
-$hashOk  = $latest.Sha512 -eq $installedSha
-$tokenOk = $cliToken -eq $certified
-$verOk   = $latest.Version -eq $certifiedSemver
+# Case-sensitive, as the helper's own Go == compare is: a token differing only in case is a
+# different token to the helper, so it must be a MISMATCH here too.
+$hashOk  = $latest.Sha512 -ceq $installedSha
+$tokenOk = $cliToken -ceq $certified
+$verOk   = $latest.Version -ceq $certifiedSemver
 if ($hashOk -and $tokenOk -and $verOk) { 'DRIFT CHECK: MATCH'; exit 0 }
 "DRIFT CHECK: MISMATCH (installed CLI == feed: $hashOk; installed CLI == helper's certified token: $tokenOk; feed version == certified semver: $verOk) -- STOP"
 exit 1

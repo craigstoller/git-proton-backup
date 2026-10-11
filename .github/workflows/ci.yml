@@ -11,9 +11,10 @@ jobs:
         shell: pwsh
         run: |
           Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
-          # Shipped code only: installer, module, tests. Research probes under
+          # Shipped and operator-run code only: installer, module, tests, and the
+          # scripts/ operator tools (the drift check). Research probes under
           # docs/research/ are frozen evidence, deliberately not linted.
-          $paths = 'install.ps1', 'GitProtonBackup', 'tests'
+          $paths = 'install.ps1', 'GitProtonBackup', 'tests', 'scripts'
           $findings = foreach ($p in $paths) { Invoke-ScriptAnalyzer -Path $p -Recurse -Settings .\PSScriptAnalyzerSettings.psd1 }
           if ($findings) {
             $findings | Format-Table RuleName, Severity, ScriptName, Line, Message -AutoSize | Out-String | Write-Host
