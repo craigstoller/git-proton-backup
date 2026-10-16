@@ -566,7 +566,7 @@ func IndexPackVerify(packPath string) error {
 // empty means discovery is complete.
 //
 // Requires a git whose `rev-list --missing=print` reports missing tips and
-// parents as ?-lines (the Stage 3b minimum-git floor; probed on 2.53, pinned
+// parents as ?-lines (git 2.45.0 or newer, the Stage 3b floor, measured 2026-10-16 and recorded in design v6.8, pinned
 // by this package's tests). On an older git the traversal dies at the first
 // missing tip; the error wrap below names the floor so the failure is a
 // diagnosed refusal rather than git's bare fatal.
@@ -577,9 +577,9 @@ func RevListMissing(gitDir, altObjects string, wants []string) ([]string, error)
 	out, _, err := revListWithAlt(gitDir, altObjects, wants,
 		"--objects", "--missing=print", "--stdin", "--not", "--all")
 	if err != nil {
-		return nil, fmt.Errorf("%w (note: selective fetch requires a git whose rev-list "+
-			"--missing=print reports absent objects as ?-lines; a git older than that floor "+
-			"dies here with its own 'bad object' error instead)", err)
+		return nil, fmt.Errorf("%w (note: selective fetch requires git 2.45.0 or newer: "+
+			"rev-list --missing=print must report absent objects as ?-lines, and an older "+
+			"git dies here with its own 'bad object' error instead)", err)
 	}
 	return parseMissingOIDs(out)
 }

@@ -950,6 +950,9 @@ func TestRevListMissingWrapsUnderlyingErrorWithFloorText(t *testing.T) {
 		t.Errorf("wrapped error must name --missing=print (the floor-naming text "+
 			"from RevListMissing's wrap): %v", err)
 	}
+	if !strings.Contains(err.Error(), "git 2.45.0 or newer") {
+		t.Errorf("wrapped error must name git 2.45.0 or newer (the D5(a) floor): %v", err)
+	}
 }
 
 // RED: the parser is normative — first whitespace-delimited token after '?',
