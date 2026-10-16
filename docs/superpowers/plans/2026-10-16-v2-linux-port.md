@@ -30,7 +30,7 @@ WSL2 Ubuntu-24.04 for Linux verification.
 **Spec:** `docs/superpowers/specs/2026-10-15-v2-linux-port-design.md` (approved 2026-10-16; rulings
 D1–D8 recorded there). Executors read the spec's §1–§9 and its Rulings table before starting.
 
-**Spec amendment A1: pending Craig's OK; Tasks 6–7 assume it.** Plan review found that spec §5's
+**Spec amendment A1: approved by Craig on 2026-10-16 and folded into spec §5. Tasks 6–7 implement it.** Plan review found that spec §5's
 round-3 definition of a create lets a refused recreate destroy the ref it replaced, when a sibling
 delete fails in phase 4 [Codex, Kimi]. Its definition was "a destination that does not exist on the
 remote when it is written".
@@ -43,7 +43,6 @@ A1 changes two things:
 2. **A case-changing rename is refused whole.** When phase 2 refuses a create, every valid
    same-batch delete of a ref whose full name folds equal to it is refused too.
 
-If Craig declines A1, Tasks 6–7 must be revised before execution.
 
 **Branch:** work on a worktree branch, as Stages 5 and 6 did (`git log --first-parent`). Commit per
 task. Pushing the branch and opening a **draft** pull request are gated actions, taken together at
@@ -577,7 +576,7 @@ out, err := envEchoRoleCLI(t).Version()
     - the D2 rule (create-only per A1, prefixes, Unicode folding, rename refused whole, phase 2 and phase 5, the skipped-name exception, the residual);
     - the D4 and D5 message changes;
     - the rulings D1–D8, each with its options not taken, copied from the spec's Rulings table;
-    - A1, with Craig's ruling on it.
+    - A1 (approved by Craig on 2026-10-16), copied from the spec.
 - [ ] **Step 5: `brief-checklist.md` rule 11.** Hermetic **test runs** (`go test`, Pester) in WSL keep interop off, and either have no `proton-drive` on PATH except a test shim, or run in a network namespace with no route out. A rule-10 audit of a staged CLI binary's `--version` or help is not a hermetic test run, and stays governed by rule 10. Cite the 2026-10-15 F14 probe.
 - [ ] **Step 6: CHANGELOG `[Unreleased]`.** One bullet each:
   - the Linux asset;
@@ -667,81 +666,6 @@ out, err := envEchoRoleCLI(t).Version()
   - all live behaviour (the gates).
 
   Spec "Still untested" lists the rest.
-
-## Revisions
-
-Scaffolding for the review loop; delete before execution dispatch.
-
-**Round 1 (2026-10-16; all four reported).**
-
-- **Applied:**
-  - paired deletes (superseded in round 2);
-  - the README placeholder removed, with a pin guard;
-  - the probe's typed results, timeout, one bounded line, placement and stub;
-  - the message names prefixes and says "mishandle";
-  - new guards: repair, cross-namespace, invalid bytes, non-empty order test;
-  - Task 7's invariant;
-  - CI under `pipefail`;
-  - Task 9's `chmod`, prefix and `-count=1`;
-  - the drift feed builder's defaults, same-release selection and both spellings;
-  - rule 11's carve-out;
-  - the install split, tested-environment statement and drift wording;
-  - a wider stale sweep;
-  - the message check;
-  - merge on Craig's word;
-  - Task 2's mutation;
-  - both "four" comments;
-  - the inline WSL procedure.
-
-  [Codex, Gemini, DeepSeek, Kimi]
-- **Rejected:**
-  - a D2 override (Craig's ruling);
-  - a Linux smoke job in `release.yml` (draft-until-gated covers it);
-  - citing v6.9 in Task 3 (v6.8 records the floor);
-  - phase 5 as "dead code" (the spec requires it).
-
-**Round 2 (2026-10-16; all four reported; Gemini and DeepSeek said Blockers: none, DeepSeek listing
-majors).**
-
-- **A defect in round 1's paired-delete fix.** A phase-5 refusal could still destroy a replaced ref
-  when a sibling delete failed [Codex, Kimi, with independent counterexamples]. The fix is spec
-  amendment A1, pending Craig:
-  - a create means absent from the pre-batch set, so replacements are never refused;
-  - phase 5 gates on `!preExists`;
-  - a counterexample GUARD with a mutation check.
-- **Case-changing renames** are refused whole in phase 2, with the transport-fault residual
-  documented [DeepSeek].
-- **Task 7's fixture** needs a new commit, or the pack count is wrong [DeepSeek].
-- **The certified-SHA STOP rule** against a re-cut [DeepSeek].
-- **The probe's own 2 s `WaitDelay`,** giving a real bound of about 12 s [DeepSeek].
-- **`ProbeOK` keyed on the child's exit,** whatever the error type [DeepSeek].
-- **A wiring test through the real probe** [DeepSeek].
-- **Two message fragments added** to the check [DeepSeek].
-- **The artifact-glob claim narrowed,** with the exe sidecar checked too [DeepSeek].
-- **The ReadmePins regex reads named** [DeepSeek].
-- **Env-var scope** narrowed to production [DeepSeek].
-- **The message gives each ref its own pair** [Kimi].
-- **The probe-OID collision note** [Kimi].
-- **Placement wording** [Kimi].
-
-**Round 3 (2026-10-16; all four reported; Gemini and DeepSeek said Blockers: none; the loop's last
-round, so these fixes have not been re-reviewed).**
-
-- **Applied:**
-  - **Phase 2 repeats to a fixed point.** A refused rename's kept ref could expose a new conflict for
-    a create the same pass approved, losing a ref with healthy transport. Codex's counterexample is
-    now a RED test [Codex].
-  - The delete-refusal text says "the rename was not applied" [DeepSeek].
-  - `probeDetailLine` is named, and output capture is specified so the protocol stream is safe
-    [DeepSeek].
-  - `-LinuxPlatform` for the drift-test builder [DeepSeek].
-  - The sweep covers `docs/README.md`'s drift description [DeepSeek].
-  - The CI probe's collision clause [DeepSeek].
-  - The push and draft PR, gated together at Task 9 Step 4, so Task 8's CI actually runs [Kimi].
-- **Rejected:**
-  - **Kimi's argument that one pass is sound by transitivity.** Codex's counterexample defeats it.
-    `Foo/a` folds equal to `FOO/A` as a whole name, but their directory prefixes are spelled
-    differently, so the kept ref conflicts with `FOO/B` where the refused create did not.
 
 ## Execution
 

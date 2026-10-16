@@ -217,13 +217,16 @@ If D2 adopts the refusal, the rule is as follows.
 
 **Only creates are refused.**
 
-- A create is a destination that does not exist on the remote when it is written. That is the
-  batch-aware existence phase 5 already computes, `preExists && !deletedThisBatch` [code
-  `push.go:508-509`]. So a same-batch delete-then-recreate of one name counts as a create.
+- A create is a destination absent from the pre-batch advertised set. A same-batch
+  delete-then-recreate of a name that already existed is a replacement: it adds no spelling the
+  remote didn't already have, and this rule never refuses it. *(Amendment A1, 2026-10-16.)*
 - A create is refused when any of its prefixes conflicts with a prefix of another ref in the set it is
   checked against. The refusal names every conflicting ref, sorted.
-- Updates and deletes are never refused by this rule. A remote that already holds a pair still takes
-  pushes to its other refs, and a user can repair it by deleting one of the pair.
+- Updates, replacements and ordinary deletes are never refused by this rule. The one exception is a
+  case-changing rename: when phase 2 refuses a create, every same-batch delete of a ref whose full
+  name folds equal to it is refused too, so the rename isn't half-applied. Phase 2 repeats this
+  until nothing changes. A remote that already holds a pair still takes pushes to its other refs,
+  and a user can repair it by deleting one of the pair. *(Amendment A1, 2026-10-16.)*
 - The rule is strict where a pair already exists. Under a pre-existing directory pair such as
   `Feat/a` beside `feat/b`, a new ref under either spelling is refused until the pair is repaired.
 
@@ -236,11 +239,14 @@ header]:
 - Conflicts are computed as groups over that set, with no dependence on iteration order. Every
   create in a conflicting group is refused, so two same-batch creates `main` and `Main` are **both**
   refused.
+- The check repeats until a pass refuses nothing, because refusing a rename's delete keeps that
+  ref, and the kept ref can expose a new conflict (A1).
 
 **Phase 5 (creates and updates).**
 
-- Before each create, the rule is checked again against the live set: the pre-batch advertised refs,
-  minus the deletes that **committed** in phase 4, plus the creates already committed in this phase.
+- Before each create (a name absent from the pre-batch set; replacements are never re-checked),
+  the rule is checked again against the live set: the pre-batch advertised refs, minus the deletes
+  that **committed** in phase 4, plus the creates already committed in this phase.
 - So a create cleared in phase 2 by a same-batch delete is refused if any of the deletes it relied on
   failed.
 - **Nothing in phase 5 does this today.** `deletedThisBatch` only chooses create against update for
@@ -479,6 +485,20 @@ unopposed default.
 | D6 | (a) cross-compile in the existing Windows job; README install commands; no `install.sh` | (b) separate Linux release job plus `install.sh` |
 | D7 | venue (a) the WSL distro with the pre-tag sign-in probe; afterwards (a) log out and delete keyring and cache | venue (b) a separate Linux machine, kept only as the fallback if the sign-in probe fails; venue (c) a CI runner; afterwards (b) keep the WSL session |
 | D8 | (a) Linux contract table at every future certification, plus the drift script's linux/x64 comparison | (b) Windows table plus a Linux smoke only |
+
+**Amendment A1, 2026-10-16. Craig's call, approving it as shown.** Plan review (Codex, Kimi) found
+that §5's round-3 definition of a create let a phase-5 refusal destroy the very ref a batch was
+replacing, whenever a sibling delete failed in phase 4. Codex then found that refusing a rename's
+delete in one pass could expose a new conflict, losing a ref with no transport fault at all.
+
+A1 makes three changes:
+1. A create is a name absent from the pre-batch set, so replacements are never refused.
+2. A case-changing rename is refused whole.
+3. Phase 2 repeats until stable.
+
+Not taken: keeping the round-3 definition, and refusing a replacement's paired delete in a single
+pass (the round-1 plan fix). One residual is documented, not fixed: a rename can still lose the old
+name if a sibling delete hits a transport fault between phases 4 and 5.
 
 **D1 — Platform scope of the first Linux release.**
 - (a) linux/amd64 glibc only. *Recommended:* it is the only Linux build F5 ran and the only one a
