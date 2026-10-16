@@ -65,6 +65,11 @@ const (
 	roleEnsureDirContraFolder     = "ensuredir-contra-folder"
 	roleEnsureDirContraFile       = "ensuredir-contra-file"
 	roleEnsureDirContraUnresolved = "ensuredir-contra-unresolved"
+
+	// The environment pass-through stand-in, below runEnvEchoRole (Linux port,
+	// Task 2). It echoes two inherited variables back so a test can see what
+	// CLI.run actually handed the child.
+	roleEnvEcho = "env-echo"
 )
 
 // helperVersionLine is what the stand-in prints, shaped like the real CLI's
@@ -101,6 +106,8 @@ func TestMain(m *testing.M) {
 		runStatRole(os.Getenv(helperEnv))
 	case roleEnsureDirFile, roleEnsureDirContraFolder, roleEnsureDirContraFile, roleEnsureDirContraUnresolved:
 		runEnsureDirRole(os.Getenv(helperEnv))
+	case roleEnvEcho:
+		runEnvEchoRole()
 	}
 	if err := setupHelper(); err != nil {
 		fmt.Fprintln(os.Stderr, "helper setup:", err)
@@ -204,6 +211,19 @@ func runStatRole(role string) {
 		fmt.Fprintln(os.Stderr, "something exploded: quota exceeded")
 	}
 	os.Exit(1)
+}
+
+// runEnvEchoRole is the stand-in proton-drive for the environment pass-through
+// test. Like runVersionRole it ignores its args (Version() always passes
+// "--version") and spawns no grandchild. It prints the version line, so
+// Version() succeeds on it, then one line per variable it echoes back: the
+// CLI's real credentials-store variable, and an arbitrary one no filter would
+// have a reason to name. It never returns.
+func runEnvEchoRole() {
+	fmt.Println(helperVersionLine)
+	fmt.Println("PDCS=" + os.Getenv("PROTON_DRIVE_CREDENTIALS_STORE"))
+	fmt.Println("ARB=" + os.Getenv("GPB_TEST_ARBITRARY_PASSTHROUGH"))
+	os.Exit(0)
 }
 
 // ensureDirStep is one scripted response: raw combined output plus exit code.
@@ -949,6 +969,37 @@ func legacy080RoleCLI(t *testing.T) *CLI {
 	t.Helper()
 	t.Setenv(helperEnv, roleLegacy080)
 	return &CLI{Exe: os.Args[0]}
+}
+
+// envEchoRoleCLI sets the env-echo role and hands back a *CLI pointed at this
+// test binary, like the version-role constructors above. The caller sets the
+// variables it wants echoed before calling.
+func envEchoRoleCLI(t *testing.T) *CLI {
+	t.Helper()
+	t.Setenv(helperEnv, roleEnvEcho)
+	return &CLI{Exe: os.Args[0]}
+}
+
+// GUARD (Linux port, spec F8). CLI.run starts the CLI with no cmd.Env, so the
+// child inherits the helper's whole environment. The Linux setup relies on
+// PROTON_DRIVE_CREDENTIALS_STORE=pass reaching the CLI, and that only works
+// while the helper passes it through. This pins that: it fails if run()
+// clears the environment or filters out either pinned variable (the real one,
+// or an arbitrary one, which catches a filter built around the known name). It
+// cannot catch other filters: one that drops some third variable, or rewrites
+// a value other than these two, passes this test.
+func TestCLIPassesItsEnvironmentThroughUnfiltered(t *testing.T) {
+	t.Setenv("PROTON_DRIVE_CREDENTIALS_STORE", "pass")
+	t.Setenv("GPB_TEST_ARBITRARY_PASSTHROUGH", "x-7f3a")
+	out, err := envEchoRoleCLI(t).Version()
+	if err != nil {
+		t.Fatalf("Version() through the env-echo role: %v", err)
+	}
+	for _, want := range []string{"PDCS=pass", "ARB=x-7f3a"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the CLI's environment lost a variable: output lacks %q, got %q", want, out)
+		}
+	}
 }
 
 // RED (Stage 4): EnforceCertified does not exist. The advisory warn in
