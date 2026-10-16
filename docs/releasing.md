@@ -81,28 +81,53 @@ alone: the 0.9.0 move of 2026-10-05 went unnoticed for five days because the che
 certification plan asked for was never written down. It is written down here.
 
 **Weekly, Craig-owned:** run `scripts/Test-ProtonCliDrift.ps1` with no arguments (the installed
-helper and the `proton-drive` first on PATH). It compares three things and names which failed: the
+helper and the `proton-drive` first on PATH). It compares four things and names which failed: the
 installed CLI's bytes against the feed, the installed CLI's own identity token against the helper's
-certified token, and the feed's version against the certified token's semver. `DRIFT CHECK: MATCH`
-means nothing has moved. A MISMATCH between releases means Proton has moved: open a certification
-task in the shape of `docs/superpowers/plans/2026-10-10-cli-0.9.0-certification.md`. The same
-command is the **first triage step** whenever verify or a user reports an uncertified-CLI refusal.
+certified token, the feed's version against the certified token's semver, and the feed's
+`linux/x64` SHA-512 for that same release against the value the script records
+(`$CertifiedLinuxX64Sha512`). The fourth leg compares the feed with a recorded value: it cannot
+see an installed Linux CLI, because nothing on Windows hashes one, so it says nothing about the CLI
+on any Linux machine. A release with no `linux/x64` entry fails that leg (Proton dropping or
+delaying Linux is drift worth a certification look). `DRIFT CHECK: MATCH` means nothing has moved.
+A MISMATCH between releases means Proton has moved: open a certification task in the shape of
+`docs/superpowers/plans/2026-10-10-cli-0.9.0-certification.md`. The same command is the **first
+triage step** whenever verify or a user reports an uncertified-CLI refusal.
 On Craig's machine a weekly Windows scheduled task runs the script (Craig's ruling of 2026-10-11;
 agents cannot create scheduled tasks there), appending its output to
 `%LOCALAPPDATA%\GitProtonBackup\drift-check.log` with the script's exit code as the task's last
 result. The task is only as good as someone reading that log, which is why the check stays
 Craig-owned; the script bounds its one network call (30 s) so an unreachable feed cannot hang the
-task, and reports STOP, not MISMATCH, when the feed is reachable but unusable.
+task, and reports STOP, not MISMATCH, when the feed is reachable but unusable (a `windows/x64` or
+`linux/x64` entry whose SHA-512 is not 128 hex characters).
 
 **One expected shape, not drift:** while a certification is in flight and the machine's CLI has
 already been swapped to the new build but the release that certifies it is not yet installed, the
-check reports the triple `installed CLI == feed: True; installed CLI == helper's certified token:
-False; feed version == certified semver: False`. That is the known window the certification plan
+check reports the four fields `installed CLI == feed: True; installed CLI == helper's certified
+token: False; feed version == certified semver: False; feed linux/x64 == certified linux/x64:
+False`. The fourth is False because the feed's `linux/x64` entry moves with the version, until the
+certification updates `$CertifiedLinuxX64Sha512`. That is the known window the certification plan
 describes (its Task 2 step 5 swap, closed by its Task 3 step 4 install); check whether a
-certification task is open before acting on it. The full triple is what tells it apart from the two
-shapes that ARE drift: `False; True; False` is the not-yet-swapped machine after Proton has moved
-(only the feed changed), and `False; True; True` is a re-cut of the same version number (same
-token on the machine, different bytes in the feed).
+certification task is open before acting on it. The full set of four is what tells it apart from
+the shapes that ARE drift, read in the same order:
+
+- `False; True; False; False` is the not-yet-swapped machine after Proton has moved (only the feed
+  changed, and its `linux/x64` entry moved with it).
+- `False; True; True; *` is a re-cut of the same version number (same token on the machine,
+  different bytes in the feed); the fourth field says whether the Linux build was re-cut too.
+- `True; True; True; False` is a `linux/x64` entry that differs from the recorded value while
+  everything on the Windows side matches: a re-cut of the Linux build under the same version
+  number, or a release with no `linux/x64` entry. A same-token re-cut is response-worthy:
+  re-certify. The helper's token check alone would accept it, so this leg is the only thing that
+  can show it.
+
+**Certification touch points.** Every certification updates `$CertifiedLinuxX64Sha512` in
+`scripts/Test-ProtonCliDrift.ps1`, **and** the README's Linux CLI URL version and the SHA-512 beside
+it. All are certification touch points, and the README-pin Pester guard
+(`tests/ReadmePins.Tests.ps1`) checks that the README follows the helper's certified version and the
+script's value. Record the new value the way the first was: copy it from Proton's live feed, then
+require `sha512sum` of the Linux binary the Linux gate ran to equal it; if they differ, stop, because
+Proton has re-cut the build since it was tested and recording either value would bless bytes nothing
+tested.
 
 Stage 7's `--verify` command is where the scheduled form of this check belongs; until it exists,
 this section is the control.

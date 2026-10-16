@@ -28,17 +28,33 @@ BeforeAll {
         return $Path
     }
 
+    # The certified linux/x64 SHA-512 the script records, read from the script itself so the
+    # tests follow the constant (a certification changes it; the tests need no edit).
+    $script:certLinux = [regex]::Match((Get-Content -LiteralPath $script:driftScript -Raw), '\$CertifiedLinuxX64Sha512\s*=\s*''([0-9a-f]{128})''').Groups[1].Value
+
     # Runs the drift script in a child pwsh with Invoke-RestMethod shadowed by a function that
-    # returns a feed whose windows/x64 entry carries $Sha512 (or no windows/x64 entry at all
-    # when $Sha512 is $null). Returns the output lines and the child's exit code.
+    # returns a feed whose windows/x64 entry carries $Sha512 (or no windows/x64 entry AND no
+    # linux entry at all when $Sha512 is $null). The same release also carries a linux entry
+    # whose platform spelling is $LinuxPlatform and whose SHA-512 is $LinuxSha512 (default: the
+    # script's certified value), or none with -NoLinux. -OlderLinux adds an older 0.8.0 release
+    # that has a linux/x64 entry carrying $LinuxSha512, to show that the leg reads the entry of
+    # the LATEST release only. Returns the output lines and the child's exit code.
     function Invoke-Drift {
-        param([string]$Helper, [string]$Cli, $Sha512)
+        param([string]$Helper, [string]$Cli, $Sha512, $LinuxSha512 = $script:certLinux, [string]$LinuxPlatform = 'linux/x64', [switch]$NoLinux, [switch]$OlderLinux)
+        $win = "[pscustomobject]@{ Platform = 'windows/x64'; Sha512CheckSum = '$Sha512' }"
+        $lin = "[pscustomobject]@{ Platform = '$LinuxPlatform'; Sha512CheckSum = '$LinuxSha512' }"
         if ($null -eq $Sha512) {
-            $files = "@([pscustomobject]@{ Platform = 'linux/x64'; Sha512CheckSum = 'ab' })"
+            $files = '@()'
+        } elseif ($NoLinux) {
+            $files = "@($win)"
         } else {
-            $files = "@([pscustomobject]@{ Platform = 'windows/x64'; Sha512CheckSum = '$Sha512' })"
+            $files = "@($win, $lin)"
         }
-        $feed = "[pscustomobject]@{ Releases = @([pscustomobject]@{ Version = '0.9.0'; ReleaseDate = '2026-10-05'; Files = $files }) }"
+        $releases = "[pscustomobject]@{ Version = '0.9.0'; ReleaseDate = '2026-10-05'; Files = $files }"
+        if ($OlderLinux) {
+            $releases += ", [pscustomobject]@{ Version = '0.8.0'; ReleaseDate = '2026-09-01'; Files = @($win, [pscustomobject]@{ Platform = 'linux/x64'; Sha512CheckSum = '$LinuxSha512' }) }"
+        }
+        $feed = "[pscustomobject]@{ Releases = @($releases) }"
         # `exit $LASTEXITCODE` at the end is load-bearing: pwsh -Command converts any script exit
         # code other than 0 or 1 to 1 unless the command string re-exits with it explicitly.
         # The shadow also reports the -TimeoutSec it was given, on stderr (merged into Output), so
@@ -118,5 +134,59 @@ Describe 'Test-ProtonCliDrift.ps1' {
         $r = Invoke-Drift -Helper $script:helperOk -Cli $script:cliOk -Sha512 $script:cliOkSha
         ($r.Output -join "`n") | Should -Match '(?m)^cli \(-Cli\)\s+: '
         ($r.Output -join "`n") | Should -Not -Match 'cli on PATH'
+    }
+
+    # The linux/x64 leg (D8(a)): the feed's linux/x64 SHA-512 for the SAME release as the
+    # windows/x64 entry it picked, against the value the script records. It cannot see an
+    # installed Linux CLI; nothing on Windows hashes one.
+    It 'records the certified linux/x64 SHA-512 as 128 lowercase hex characters' {
+        $script:certLinux | Should -Match '^[0-9a-f]{128}$'
+    }
+
+    It 'reports MISMATCH (exit 1) naming the linux leg when the feed''s linux/x64 SHA-512 differs from the certified value' {
+        $r = Invoke-Drift -Helper $script:helperOk -Cli $script:cliOk -Sha512 $script:cliOkSha -LinuxSha512 ('0' * 128)
+        $r.ExitCode | Should -Be 1
+        ($r.Output -join "`n") | Should -Match 'DRIFT CHECK: MISMATCH \(installed CLI == feed: True; installed CLI == helper''s certified token: True; feed version == certified semver: True; feed linux/x64 == certified linux/x64: False\) -- STOP'
+    }
+
+    It 'reports MISMATCH (exit 1) naming the linux leg when the latest release has no linux/x64 entry' {
+        $r = Invoke-Drift -Helper $script:helperOk -Cli $script:cliOk -Sha512 $script:cliOkSha -NoLinux
+        $r.ExitCode | Should -Be 1
+        ($r.Output -join "`n") | Should -Match 'feed linux/x64 == certified linux/x64: False'
+    }
+
+    It 'STOPs (exit 2) when the feed''s linux/x64 entry carries a non-128-hex SHA-512 (fail closed)' {
+        $r = Invoke-Drift -Helper $script:helperOk -Cli $script:cliOk -Sha512 $script:cliOkSha -LinuxSha512 'abc123'
+        $r.ExitCode | Should -Be 2
+        ($r.Output -join "`n") | Should -Match 'DRIFT CHECK: STOP \(.*linux/x64.*SHA-512'
+    }
+
+    It 'accepts the linux-x64 platform spelling as well as linux/x64' {
+        # Read as the linux entry, a matching hash is MATCH ...
+        $r = Invoke-Drift -Helper $script:helperOk -Cli $script:cliOk -Sha512 $script:cliOkSha -LinuxPlatform 'linux-x64'
+        $r.ExitCode | Should -Be 0
+        $r.Output | Should -Contain 'DRIFT CHECK: MATCH'
+        # ... and a malformed hash is a STOP; were the entry ignored it would be a missing-entry MISMATCH.
+        $r = Invoke-Drift -Helper $script:helperOk -Cli $script:cliOk -Sha512 $script:cliOkSha -LinuxPlatform 'linux-x64' -LinuxSha512 'abc123'
+        $r.ExitCode | Should -Be 2
+    }
+
+    # Guards on the leg's other rules: each fails before the leg exists (the check then says MATCH).
+    It 'compares the linux/x64 SHA-512 case-sensitively' {
+        $r = Invoke-Drift -Helper $script:helperOk -Cli $script:cliOk -Sha512 $script:cliOkSha -LinuxSha512 $script:certLinux.ToUpper()
+        $r.ExitCode | Should -Be 1
+        ($r.Output -join "`n") | Should -Match 'feed linux/x64 == certified linux/x64: False'
+    }
+
+    It 'reads the linux/x64 entry of the latest release only, not of an older one' {
+        $r = Invoke-Drift -Helper $script:helperOk -Cli $script:cliOk -Sha512 $script:cliOkSha -NoLinux -OlderLinux
+        $r.ExitCode | Should -Be 1
+        ($r.Output -join "`n") | Should -Match 'feed linux/x64 == certified linux/x64: False'
+    }
+
+    It 'does not take another linux build (linux/x64-musl) for linux/x64' {
+        $r = Invoke-Drift -Helper $script:helperOk -Cli $script:cliOk -Sha512 $script:cliOkSha -LinuxPlatform 'linux/x64-musl'
+        $r.ExitCode | Should -Be 1
+        ($r.Output -join "`n") | Should -Match 'feed linux/x64 == certified linux/x64: False'
     }
 }
