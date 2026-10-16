@@ -49,6 +49,11 @@ const (
 	roleLegacy070      = "version-legacy-070"
 	roleLegacy080      = "version-legacy-080"
 
+	// A seventh EnforceCertified stand-in (Linux port, Task 5): a distro's
+	// repackaged build, whose identity token reads cli-drive-debian@... rather
+	// than cli-drive@.... Handled by runVersionRole like the six above.
+	roleDistroToken = "distro-token"
+
 	// The two Stat classification stand-ins, below runStatRole (Task 4). Like
 	// the version roles, each ignores its args and just reports a fixed
 	// `filesystem info` failure shape on stderr with exit 1 — the roleNonzero-
@@ -100,7 +105,7 @@ func TestMain(m *testing.M) {
 		runHelperRole(os.Getenv(helperEnv))
 	case roleLinger:
 		runLingerRole()
-	case roleCertified, roleWrongVersion, roleNonzeroVersion, roleNoToken, roleLegacy070, roleLegacy080:
+	case roleCertified, roleWrongVersion, roleNonzeroVersion, roleNoToken, roleLegacy070, roleLegacy080, roleDistroToken:
 		runVersionRole(os.Getenv(helperEnv))
 	case roleStatNotFound, roleStatOtherError:
 		runStatRole(os.Getenv(helperEnv))
@@ -187,6 +192,12 @@ func runVersionRole(role string) {
 		fmt.Println("Proton Drive SDK js@0.21.0+06e8c605")
 		fmt.Println("A newer version is available: 0.9.0 (you have 0.8.0).")
 		fmt.Println("Download at https://proton.me/download/drive/cli/index.html")
+	case roleDistroToken:
+		// A Debian-style repackage: the same build number as the certified CLI
+		// (+75612299), but a distribution-suffixed product token. Literal text,
+		// so the role does not move when CertifiedCLI does.
+		fmt.Println("Proton Drive CLI cli-drive-debian@0.9.0+75612299")
+		fmt.Println("Proton Drive SDK js@0.22.2+75612299")
 	}
 	os.Exit(0)
 }
@@ -971,6 +982,12 @@ func legacy080RoleCLI(t *testing.T) *CLI {
 	return &CLI{Exe: os.Args[0]}
 }
 
+func distroTokenRoleCLI(t *testing.T) *CLI {
+	t.Helper()
+	t.Setenv(helperEnv, roleDistroToken)
+	return &CLI{Exe: os.Args[0]}
+}
+
 // envEchoRoleCLI sets the env-echo role and hands back a *CLI pointed at this
 // test binary, like the version-role constructors above. The caller sets the
 // variables it wants echoed before calling.
@@ -1025,6 +1042,98 @@ func TestEnforceCertifiedRefusesAMismatchNamingBothSides(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("refusal must name %q, got %q", want, err.Error())
 		}
+	}
+}
+
+// RED (Linux port, spec D4(a)). A distribution's repackage prints a
+// distro-suffixed product token (cli-drive-debian@...). The generic refusal
+// names the token but not why it is wrong; the refusal gains one sentence that
+// says "repackaged build" and where Proton's own download lives. The GUARD
+// assertions already hold: the generic refusal text is kept in front of it.
+func TestEnforceCertifiedRefusesADistroRepackageWithASpecificNote(t *testing.T) {
+	err := EnforceCertified(distroTokenRoleCLI(t), false, io.Discard)
+	if err == nil {
+		t.Fatal("a distro-repackaged build must refuse")
+	}
+	// RED
+	for _, want := range []string{"repackaged build", "https://proton.me/download/drive/cli/"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal must say %q, got %q", want, err.Error())
+		}
+	}
+	// GUARD
+	for _, want := range []string{CertifiedCLI, "GPB_UNCERTIFIED_CLI"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal must still carry %q, got %q", want, err.Error())
+		}
+	}
+}
+
+// GUARD (spec D4(a)): the note is text only. A distro token never certifies,
+// the genuine token still does, and the override path is the generic warning,
+// not the repackage note.
+func TestDistroTokenNeverCertifies(t *testing.T) {
+	const distroOutput = "Proton Drive CLI cli-drive-debian@0.9.0+75612299\nProton Drive SDK js@0.22.2+75612299"
+	if IsCertified(distroOutput) {
+		t.Errorf("IsCertified(%q) = true; a repackaged build must never certify", distroOutput)
+	}
+	if !IsCertified("Proton Drive CLI cli-drive@0.9.0+75612299") {
+		t.Error("the genuine certified line must still certify")
+	}
+	var buf strings.Builder
+	if err := EnforceCertified(distroTokenRoleCLI(t), true, &buf); err != nil {
+		t.Fatalf("override must proceed on a repackaged build: %v", err)
+	}
+	for _, want := range []string{"UNCERTIFIED", "cli-drive-debian@0.9.0+75612299"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("override warning must name %q, got %q", want, buf.String())
+		}
+	}
+}
+
+// GUARD (spec D4(a)): an ordinary version mismatch is not called a repackage.
+func TestEnforceCertifiedOmitsTheDistroNoteForAnOrdinaryMismatch(t *testing.T) {
+	err := EnforceCertified(wrongVersionRoleCLI(t), false, io.Discard)
+	if err == nil {
+		t.Fatal("an uncertified version must refuse")
+	}
+	if strings.Contains(err.Error(), "repackaged") {
+		t.Errorf("an ordinary mismatch must not mention a repackage, got %q", err.Error())
+	}
+}
+
+// RED (compile failure: distroToken does not exist yet). distroToken accepts
+// exactly the two line shapes identityToken does (a bare token, or the field
+// after "CLI") and, like identityToken, never a token buried in a longer line.
+func TestDistroTokenAcceptsOnlyTheTwoIdentityLineShapes(t *testing.T) {
+	for _, tc := range []struct {
+		name, in string
+		wantTok  string
+		wantOK   bool
+	}{
+		{"CLI line", "Proton Drive CLI cli-drive-debian@0.9.0+75612299", "cli-drive-debian@0.9.0+75612299", true},
+		{"bare line", "cli-drive-debian@0.9.0+75612299", "cli-drive-debian@0.9.0+75612299", true},
+		{"dotted distro name", "Proton Drive CLI cli-drive-ubuntu.2@1.0", "cli-drive-ubuntu.2@1.0", true},
+		{"after an SDK line", "Proton Drive SDK js@0.22.2+75612299\nProton Drive CLI cli-drive-debian@0.9.0+75612299", "cli-drive-debian@0.9.0+75612299", true},
+		{"the genuine token", "Proton Drive CLI cli-drive@0.9.0+75612299", "", false},
+		{"buried in a longer line", "Update available for cli-drive-debian@0.9.0+75612299", "", false},
+		{"not preceded by CLI", "Proton Drive SDK cli-drive-debian@0.9.0+75612299", "", false},
+		{"empty distro name", "Proton Drive CLI cli-drive-@0.9.0", "", false},
+		{"uppercase distro name", "Proton Drive CLI cli-drive-Debian@0.9.0", "", false},
+		{"nothing after the at sign", "Proton Drive CLI cli-drive-debian@", "", false},
+		{"no output", "", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tok, ok := distroToken(tc.in)
+			if ok != tc.wantOK || tok != tc.wantTok {
+				t.Errorf("distroToken(%q) = (%q, %v), want (%q, %v)", tc.in, tok, ok, tc.wantTok, tc.wantOK)
+			}
+		})
+	}
+	// The token comes back through bound(tok, 80).
+	long := "cli-drive-debian@" + strings.Repeat("9", 200)
+	if tok, ok := distroToken("Proton Drive CLI " + long); !ok || tok != bound(long, 80) {
+		t.Errorf("a long token must come back bounded: got (%q, %v)", tok, ok)
 	}
 }
 
