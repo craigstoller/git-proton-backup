@@ -4,9 +4,9 @@
 `GitProtonBackup` module stays Windows-only: its transport is the Proton Drive Windows sync app and
 the Windows Cloud Files API (README, "Why PowerShell?"). **Shape:** a stage spec; a dated plan
 follows once Craig rules on the decisions below. **Status:** Draft. Decisions D1–D8 await Craig.
-Nothing in this document is built yet. **Depends on:** PR #13, which fixes the Linux shim-test
-bug, adds the git 2.45.0 floor to the README, and takes design revision v6.8. It lands first, and
-this stage's README edits build on it.
+Nothing in this document is built yet. **Builds on:** PR #13, merged 2026-10-16 as `7b858ee`. It
+fixed the Linux shim-test bug, added the git 2.45.0 floor to the README, and took design revision
+v6.8. This stage's README edits build on it.
 
 **Why now.** The README roadmap already says Linux support "means porting v2's build, not a new
 mechanism", and the Reddit introduction asked for Linux testers. On 2026-10-15 and 16 a WSL2 distro

@@ -1233,7 +1233,12 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
 - **Basis, measured.** 2026-10-15, WSL2 Ubuntu-24.04, full hermetic suite: on the distro's git
   2.43.0, 23 fetch-path tests failed closed with `RevListMissing`'s wrapped `bad object` error; on
   git 2.55.0 built from source, all 23 passed with no new failures. No 2.44 or 2.45 binary was
-  run, so the exact boundary rests on the docs and source above.
+  run, so the exact boundary rests on the docs and source above. *Update 2026-10-16: the boundary
+  is now measured. Built from source on the same distro, git 2.44.4 (the newest 2.44.x) fails the
+  same 23 tests and git 2.45.0 passes them. A single `rev-list --objects --missing=print --stdin`
+  call fed one absent object ID shows the same split: exit 128 (`bad object`) on 2.43.0 and
+  2.44.4, exit 0 printing `?<oid>` on 2.45.0 and 2.55.0. See F3 of
+  `docs/superpowers/specs/2026-10-15-v2-linux-port-design.md`.*
 - **What did not change.** No code, and no version check: the floor stays behavioural, and an
   older git still fails closed on the first round with the wrapped error, as Stage 3b designed.
   That error describes the requirement without naming the version; naming it would be a code
