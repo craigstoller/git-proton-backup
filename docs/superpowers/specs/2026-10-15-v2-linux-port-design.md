@@ -2,9 +2,9 @@
 
 **Date:** 2026-10-15. **Scope:** the v2 remote helper (`git-remote-proton`) only. The v1
 `GitProtonBackup` module stays Windows-only: its transport is the Proton Drive Windows sync app and
-the Windows Cloud Files API (README, "Why PowerShell?"). **Shape:** a stage spec; a dated plan
-follows once Craig rules on the decisions below. **Status:** Draft. Decisions D1–D8 await Craig.
-Nothing in this document is built yet. **Builds on:** PR #13, merged 2026-10-16 as `7b858ee`. It
+the Windows Cloud Files API (README, "Why PowerShell?"). **Shape:** a stage spec; its plan is
+`docs/superpowers/plans/2026-10-16-v2-linux-port.md`. **Status:** Approved 2026-10-16: Craig ruled on
+D1–D8, taking every recommendation ("Rulings", under Decisions). Nothing in this document is built yet. **Builds on:** PR #13, merged 2026-10-16 as `7b858ee`. It
 fixed the Linux shim-test bug, added the git 2.45.0 floor to the README, and took design revision
 v6.8. This stage's README edits build on it.
 
@@ -463,8 +463,22 @@ case-variant creates. It changes no existing ref and refuses no update or delete
 
 ## Decisions for Craig
 
-Ordered so the ones the others follow from come first. Every default is my recommendation, not a
-ruling. Rulings go into design v6.9's revision history when this ships, with the options not taken.
+Ordered so the ones the others follow from come first. The options below are kept as written for
+the record; the rulings come first. When this ships, design v6.9's revision history carries them.
+
+**Rulings, 2026-10-16.** Each is Craig's call, accepting my recommended default; none is an
+unopposed default.
+
+| | Ruled | Not taken |
+|---|---|---|
+| D1 | (a) linux/amd64 glibc only | (b) arm64 built but ungated; (c) musl |
+| D2 | (a) refuse case-variant **creates** on every platform (§5), no override | (b) allow and document |
+| D3 | (a) attended use gated and supported; `pass` and keyring unlock documented as "not gated" | (b) gate the `pass` store live; (c) say nothing |
+| D4 | (a) keep the exact token; add a refusal-only sentence for `cli-drive-<distro>@` | (b) accept distro tokens as certified; (c) no change |
+| D5 | (a) name git 2.45.0 in the fetch error **and** (d) warn on push when this git cannot restore | (b) refuse to start below 2.45.0; (c) docs only; (e) download-everything fallback |
+| D6 | (a) cross-compile in the existing Windows job; README install commands; no `install.sh` | (b) separate Linux release job plus `install.sh` |
+| D7 | venue (a) the WSL distro with the pre-tag sign-in probe; afterwards (a) log out and delete keyring and cache | venue (b) a separate Linux machine, kept only as the fallback if the sign-in probe fails; venue (c) a CI runner; afterwards (b) keep the WSL session |
+| D8 | (a) Linux contract table at every future certification, plus the drift script's linux/x64 comparison | (b) Windows table plus a Linux smoke only |
 
 **D1 — Platform scope of the first Linux release.**
 - (a) linux/amd64 glibc only. *Recommended:* it is the only Linux build F5 ran and the only one a
@@ -575,98 +589,6 @@ These are my calls; a plan may change them with a reason.
 - The exact README wording.
 - The hermetic env pass-through test's shape.
 - Where D5(d)'s probe sits within `list for-push`, provided it runs before the lock.
-
-## Revisions
-
-Scaffolding for the review loop; delete before the plan is written.
-
-**Round 1 (2026-10-16; Codex, Gemini via agy, and the repo-aware Fireworks.ai roster: DeepSeek and
-Kimi; all four reported).**
-
-- Case-variant mechanism rebuilt [Codex+Gemini+DeepSeek+Kimi].
-- F13 and the git floor probed.
-- CI moved to a behavioural check [Gemini+Kimi+DeepSeek].
-- D5(d) added [Gemini+DeepSeek].
-- Gate step 5's lock writes made explicit [Kimi+DeepSeek].
-- Gate step 2 gets `GPB_LIVE_ACCOUNT` [DeepSeek].
-- Isolation preconditions [DeepSeek+Codex].
-- Sign-in probe before tagging [Gemini+DeepSeek].
-- Session checks and the task pause [DeepSeek+Gemini].
-- Cleanup and existing-clone fetches [Codex+Gemini].
-- `release.yml` touch points [Gemini+DeepSeek].
-- Install commands [All].
-- The certified SHA-512 [Codex+Gemini].
-- AVX2 [All].
-- F11/D4 corrected [Kimi+DeepSeek].
-- D3 and D8 wording [Codex+DeepSeek+Gemini].
-- v6.9, the manifest bump, the F8 test, the anti-goal scope.
-- Rejected: including skipped names in the fold check [Kimi+Gemini].
-
-**Round 2 (2026-10-16; all four reported; DeepSeek said Blockers: none but listed majors).**
-
-Defects in round-1 fixes, applied:
-
-- **Phase 5.** §5 claimed phase 5 already re-checks via `deletedThisBatch`. It doesn't
-  [Gemini, confirmed `push.go:470-515`]. §5 now specifies a new live-set re-check, and order-free
-  group conflicts in phase 2 so same-batch pairs are both refused [Gemini].
-- **Pre-existing directory pairs** blocking new children is now stated [Gemini].
-- **Gate step 5** separates a single-create push (no ref or pack write) from a mixed push (one pack)
-  [Kimi].
-- **Gate cleanup** trashes the gate subtrees and checks the row set **before** logout [Gemini].
-- **The task pause** now starts before the first sign-in; the task is unpaused only on a passing
-  Windows check, with a STOP path [Codex].
-- **The CI check** was a test whose failure would stop the job before its fallback could run. It is
-  now an explicit branching shell step, with `-count=1` on the suite [Kimi+DeepSeek+Gemini].
-- **D5(d)** said both "temp repo" and "one call". It is now F3's measured single-call probe, placed
-  before the lock [Gemini+DeepSeek+Kimi].
-- **`releasing.md`'s list** now includes step 5 and the stand-in's asset-count and digest lines
-  [Gemini+DeepSeek].
-- **The certified SHA-512's home** is the Linux gate record, and the drift constant is a
-  certification touch point [DeepSeek+Gemini+Kimi].
-
-New, applied:
-
-- AVX2 re-based on Proton's README text [Kimi+DeepSeek].
-- Windows-side preconditions [Kimi].
-- `contract_test.go`'s stale untouchable list (no `Archive`, no `Tax Documents`) [Gemini, confirmed].
-- The confinement sentence covers trash [Kimi].
-- `PROTON_DRIVE_CACHE_DIR` verified in the probe [Kimi].
-- The F8 test pins an unrelated variable too [Kimi].
-- The CLI install commands [DeepSeek].
-- D4(a)'s refusal-only constraint [DeepSeek].
-- The skipped-ref rationale made exact, with the repaired-skip path [DeepSeek].
-- The macOS roadmap wording [Kimi].
-
-**Round 3 (2026-10-16; all four reported; Gemini and DeepSeek said Blockers: none, DeepSeek
-listing majors; this is the loop's last round, and its fixes have not been re-reviewed).**
-
-Defects in round-2 fixes, applied:
-
-- **Gate step 0** no longer accepts a Windows helper by its CLI token. It must match the draft's
-  bytes, with its resolved path and hash recorded [Codex+DeepSeek].
-- **The README's CLI hash line** now has a gate step that runs §6's commands as written
-  [DeepSeek].
-- **The skipped-ref wording** was too strong. The one way a push can lay down half of a pair is now
-  stated as an exception, and round 1's rejection stands [DeepSeek].
-
-New, applied:
-
-- **The phase-5 re-check** sits before `ensureRefParents` and gets a hermetic test with a failing
-  `Trash`; "Still untested" records that no gate step reaches it [DeepSeek].
-- **The check set** uses `finalSet`'s algebra, and "create" means batch-aware non-existence
-  [Gemini].
-- **The rejection a user sees after phase 2 passed** is described [Kimi].
-- **The ways a pair can appear without the user pushing one** are listed [Kimi].
-- **A Windows check** runs after the contract table [Kimi].
-- **The mixed push** is fetched and checked with `fsck` [Kimi].
-- **D5(d)'s failure handling, cost and limits** are spelled out [Kimi+DeepSeek].
-- **CI's git** floats on purpose [Kimi].
-- **AVX2** is described as the CLI's requirement, with the honest-limit line [Kimi].
-- **The install checks** run in a new login shell [Kimi].
-- **D4(a)** gets a hermetic test [Kimi].
-- **D2's cost** now covers tags and the absence of an override [DeepSeek].
-- **The asset count** follows D1 [DeepSeek].
-- **Sidecar defects** ship as a new tag [Kimi].
 
 ## Still untested, and how it gets tested
 
