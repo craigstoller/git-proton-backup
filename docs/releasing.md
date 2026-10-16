@@ -38,34 +38,38 @@ forgotten for the v0.3.x releases. Follow it in order; do not skip or reorder st
    with `--follow-tags`). Push the tag only on Craig's word — do not push a release tag
    unilaterally.
 
-4. **The Release workflow builds a draft with exactly three assets.** Pushing the tag triggers
+4. **The Release workflow builds a draft with exactly five assets.** Pushing the tag triggers
    the `Release` GitHub Actions workflow (`.github/workflows/release.yml`), which builds and
-   publishes a **draft** release containing exactly three assets: `git-remote-proton.exe`,
-   `git-remote-proton.exe.sha256`, and `install.ps1`. No more, no fewer.
+   publishes a **draft** release containing exactly five assets: `git-remote-proton.exe`,
+   `git-remote-proton.exe.sha256`, `install.ps1`, `git-remote-proton-linux-amd64` and
+   `git-remote-proton-linux-amd64.sha256`. No more, no fewer. The Linux binary is a static
+   linux/amd64 build (`CGO_ENABLED=0`) cross-built on the same Windows runner.
 
-5. **The live gate runs against the draft's bytes.** The gate downloads the draft's assets and
-   exercises them against the real Proton account per the current gate brief (see
+5. **Two live gates run against the draft's bytes: the Windows live gate and the Linux live
+   gate.** Each downloads the draft's assets and exercises its own binary
+   (`git-remote-proton.exe` for Windows, `git-remote-proton-linux-amd64` for Linux) against the
+   real Proton account per its own current gate brief (see
    `docs/research/gates/brief-checklist.md` for the standing rules every gate brief incorporates).
-   A release that moves the CLI pin installs the draft helper before the gate smoke, as v0.7.0's
-   gate did (Task 3 step 4 of the certification plan, today
+   A release that moves the CLI pin installs the draft helper before the Windows gate smoke, as
+   v0.7.0's gate did (Task 3 step 4 of the certification plan, today
    `docs/superpowers/plans/2026-10-10-cli-0.9.0-certification.md`), so that the helper under test
    and the helper on PATH are the same bytes.
-   Tags are never moved after any artifact has been built from them — if the gate finds a defect,
-   the fix ships as a new tag, not a retag. The one alternative is a stand-in, for a release that
-   qualifies under "When adoption may stand in for the live gate" below and only on Craig's
-   ruling for that release; for such a release the stand-in is this step, and the no-retag rule
-   applies to it unchanged.
+   Tags are never moved after any artifact has been built from them — if either gate finds a
+   defect, the fix ships as a new tag, not a retag. The one alternative is a stand-in, for a
+   release that qualifies under "When adoption may stand in for the live gate" below and only on
+   Craig's ruling for that release; for such a release the stand-in is this step, and the
+   no-retag rule applies to it unchanged.
 
-6. **Craig publishes.** Once the gate passes, run the drift check again with `-Helper` set to the
+6. **Craig publishes.** Once the gates pass, run the drift check again with `-Helper` set to the
    draft's exe — the installed one when step 5 installed it (a pin-moving release), otherwise the
-   downloaded asset in the gate's staging directory — and require `DRIFT CHECK: MATCH` under the
-   same STOP rule as step 3. Then Craig — not the gate runner — publishes the draft release on
-   GitHub.
+   downloaded asset in the Windows gate's staging directory — and require `DRIFT CHECK: MATCH`
+   under the same STOP rule as step 3. Then Craig — not the gate runner — publishes the draft
+   release on GitHub.
 
 7. **The publication digest closure re-downloads the published assets and compares per-asset
-   SHA-256 against the gate's staged digests.** Only after this closure confirms the published
-   bytes are byte-identical to the bytes the gate tested is the release final. If any digest
-   differs, or the published assets are not exactly the three staged ones, the published bytes are
+   SHA-256 against the gates' staged digests.** Only after this closure confirms the published
+   bytes are byte-identical to the bytes the gates tested is the release final. If any digest
+   differs, or the published assets are not exactly the five staged ones, the published bytes are
    not the gated bytes: return the release to draft, investigate, and ship the fix under a new tag.
 
 ## Between releases: the Proton CLI drift check
@@ -105,53 +109,61 @@ this section is the control.
 
 ## When adoption may stand in for the live gate
 
-A stand-in replaces step 5's live gate with installing the release on Craig's machine and checking
-it there. It is Craig's ruling, made per release and recorded in that release's gate
-record; this section says when he may make it and what the stand-in must then do. The 0.8.1 record
+A stand-in replaces step 5's live gates with installing the release on Craig's machine and checking
+it there (the Linux binary gets the offline checks of stand-in step 1 only). It is Craig's ruling,
+made per release and recorded in that release's gate record; this section says when he may make it
+and what the stand-in must then do. The 0.8.1 record
 (`docs/research/gates/v0.8.1-release-gate.md`) is the worked example.
 
 **Eligible only when nothing that builds or ships the helper has changed since the anchor,** the
-most recent release whose own bytes passed a formal live gate (for 0.8.1, the anchor was v0.7.0).
+most recent release whose own bytes passed the formal live gates (for 0.8.1, the anchor was v0.7.0,
+which had one gate; once releases carry a Linux binary, the anchor must have passed both gates).
 All four must hold:
 
 - `git diff <anchor-tag> <new-tag> -- '*.go' '*.s' '*.c' '*.h' go.mod go.sum go.work` is empty.
   That is every file the Go toolchain compiles, wherever it sits; add any file the helper embeds
   with `go:embed` (none today).
 - `git diff <anchor-tag> <new-tag> -- .github/workflows/release.yml` is empty. The whole workflow,
-  not chosen steps: its checkout, `setup-go`, Version, Build and Checksum steps all reach the exe,
-  and its Create DRAFT release step sets `--draft` and the three-asset list. (A Dependabot bump to
-  this file therefore means the next release takes the formal gate.)
-- `go version -m` on the draft exe and on the anchor's published exe reports the same Go version
-  and the same build settings; on the draft, `vcs.revision` is the tagged commit and
-  `vcs.modified=false`. `go.mod` declares a language floor, not a patch release, so the toolchain
-  can move between builds; this check shows whether it did, and if it did, the release is not
-  eligible.
+  not chosen steps: its checkout, `setup-go`, Version, Build and Checksum steps all reach the
+  shipped binaries, and its Create DRAFT release step sets `--draft` and the five-asset list. (A
+  Dependabot bump to this file therefore means the next release takes the formal gates.)
+- `go version -m` on each draft binary (the exe and the Linux binary) and on the anchor's published
+  binary for the same platform reports the same Go version and the same build settings; on each
+  draft binary, `vcs.revision` is the tagged commit and `vcs.modified=false`. `go.mod` declares a
+  language floor, not a patch release, so the toolchain can move between builds; this check shows
+  whether it did, and if it did, the release is not eligible.
 - The installed Proton Drive CLI reports the certified build (`--version`), the one the anchor's
   live gate ran against.
 
-The two exes then differ by the embedded version string and VCS stamps, and their behaviour is
-expected to be the same: an inference from identical source, recipe and toolchain, not a byte
-comparison. Anything else takes the formal live gate. The anchor never advances through a stand-in:
-it stays the last formally gated release, so a run of stand-ins cannot drift away from live
-evidence.
+The anchor's and the draft's binaries, per platform, then differ by the embedded version string and
+VCS stamps, and their behaviour is expected to be the same: an inference from identical source,
+recipe and toolchain, not a byte comparison. Anything else takes the formal live gates. The anchor
+never advances through a stand-in: it stays the last formally gated release, so a run of stand-ins
+cannot drift away from live evidence.
+
+**The first Linux release cannot take a stand-in.** It changes `release.yml` (the second bullet
+above) and has no Linux anchor: no earlier release's Linux bytes passed a Linux live gate.
 
 **What the stand-in covers live, and what it does not.** The module reaches Proton only through the
 sync folder and the Proton Drive CLI, never through the helper, and the fleet verify (stand-in
-step 6) exercises both against the real account. No push or fetch goes through the draft helper;
-that evidence comes from the anchor, and the gate record says so. The stand-in's only writes to the
-account are the fleet verify's own: the bundles it cuts and the old bundles its retention prunes,
-exactly as the daily run makes them; it adds no test writes of its own. Of `brief-checklist.md`'s
-rules, rule 4 binds it (stop and report BLOCKED with verbatim output, never patch), and rule 5
-(`-count=1`) binds any `go test` it runs; the rest concern a live gate's own test writes, listings
-and pushes, which a stand-in does not make.
+step 6) exercises both against the real account. No push or fetch goes through the draft helper,
+and the Linux binary is never run against the account at all (step 1's offline checks are all it
+gets); that evidence comes from the anchor, and the gate record says so. The stand-in's only
+writes to the account are the fleet verify's own: the bundles it cuts and the old bundles its
+retention prunes, exactly as the daily run makes them; it adds no test writes of its own. Of
+`brief-checklist.md`'s rules, rule 4 binds it (stop and report BLOCKED with verbatim output, never
+patch), and rule 5 (`-count=1`) binds any `go test` it runs; the rest concern a live gate's own
+test writes, listings and pushes, which a stand-in does not make.
 
 **The stand-in, in order:**
 
-1. **Offline checks on the draft's bytes.** Exactly three assets; the exe's SHA-256 equals its
-   `.sha256` sidecar; `git-remote-proton.exe --version` prints the new tag and the certified CLI
-   token; `install.ps1` equals the tagged blob apart from line endings; the `go version -m`
-   comparison above. Stage all three digests for release step 7. The module ships through the
-   repository, not as an asset, so also record its tree and file blobs at the tag.
+1. **Offline checks on the draft's bytes.** Exactly five assets; each binary's SHA-256 equals its
+   `.sha256` sidecar (both sidecars); `git-remote-proton.exe --version` prints the new tag and the
+   certified CLI token; the Linux binary does the same when run in WSL (interop off, from an ext4
+   copy, after `chmod 0755`); `install.ps1` equals the tagged blob apart from line endings; the
+   `go version -m` comparison above, on both binaries. Stage all five digests for release step 7.
+   The module ships through the repository, not as an asset, so also record its tree and file
+   blobs at the tag.
 2. **Prepare.** Record the installed module and helper versions and keep a copy of their files and
    of each consumer pin's value, so the rollback restores what was actually installed. Confirm no
    backup or verify is running, and that the next scheduled run leaves time for the whole stand-in
