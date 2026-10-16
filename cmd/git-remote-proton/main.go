@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/craigstoller/git-proton-backup/internal/gitcmd"
 	"github.com/craigstoller/git-proton-backup/internal/protocol"
 	"github.com/craigstoller/git-proton-backup/internal/repo"
 	"github.com/craigstoller/git-proton-backup/internal/transport"
@@ -61,6 +62,32 @@ func main() {
 // reassign it — production always calls through the real runSetHead via
 // this variable's initializer.
 var runSetHeadFn = runSetHead
+
+// probeRestoreFloor is the restore-floor probe (spec D5(d)): whether this
+// host's git is new enough to RESTORE from a git-remote-proton remote. It is a
+// test seam only, there so the package's tests spawn no git for it (TestMain
+// stubs it for the whole package) and can pin both warnings. Nothing else may
+// reassign it; production always runs the real probe via this initializer.
+var probeRestoreFloor = gitcmd.ProbeMissingTips
+
+// warnRestoreFloor runs the restore-floor probe and writes at most one WARNING
+// line to stderr. It never fails and never blocks: pushing needs no particular
+// git, restoring needs git 2.45.0 or newer, and the point is to say so while the
+// operator can still do something about it. stderr only, because stdout is the
+// git-remote-helper protocol stream.
+func warnRestoreFloor(gitDir string) {
+	res, detail := probeRestoreFloor(gitDir)
+	switch res {
+	case gitcmd.ProbeTooOld:
+		fmt.Fprintf(os.Stderr, "git-remote-proton: WARNING: this git cannot restore from a "+
+			"git-remote-proton remote: fetch and clone need git 2.45.0 or newer (%s). "+
+			"This check does not block the push.\n", detail)
+	case gitcmd.ProbeUnknown:
+		fmt.Fprintf(os.Stderr, "git-remote-proton: WARNING: could not check whether this git can "+
+			"restore from a git-remote-proton remote (fetch and clone need git 2.45.0 or newer): %s. "+
+			"This check does not block the push.\n", detail)
+	}
+}
 
 // dispatchUtility handles the CLOSED set of direct-invocation modes. Only
 // exact matches dispatch: a prefix match would misroute a remote whose
@@ -438,6 +465,12 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 				warn(err)
 				return 1
 			}
+			// D5(d): say so if this git could not RESTORE from what it is
+			// about to back up. After Bootstrap, so a push that is refused for
+			// any earlier reason says nothing of the kind, and BEFORE the lock,
+			// so the probe's few seconds (bounded near 12 s) are never spent
+			// holding the single-writer lock. It only ever warns.
+			warnRestoreFloor(gitDir)
 			l, err := repo.AcquireLock(t, root) // BEFORE advertising
 			if err != nil {
 				warn(err)
