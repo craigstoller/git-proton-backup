@@ -24,6 +24,9 @@ Your branch is up to date with 'proton/main'.
 
 ## Install & first run
 
+**On Linux, only v2 applies** (v1's transport is the Windows sync app): go to
+[Install on Linux (v2)](#install-on-linux-v2). The rest of this section is Windows and v1.
+
 **Requirements:** Windows, PowerShell 7.4+, git, the Proton Drive desktop app, and the
 [Proton Drive CLI](https://proton.me/drive) — optional but recommended. Without the CLI,
 verification degrades to Windows Cloud Files sync-state only (see
@@ -88,23 +91,29 @@ are not equivalent, and the restore story is where that matters most.
 
 | | v1 — bundles | v2 — `git-remote-proton` |
 |---|---|---|
+| Platforms | Windows (PowerShell 7.4+) | Windows (amd64) and Linux (amd64) |
 | Transport | Proton Drive's Windows sync app; a single bundle file lands in the synced folder | The Proton Drive CLI, invoked directly by the helper as a real git remote |
 | Remote name | `proton` | `proton-v2` |
-| Restore needs | git only, from any machine — the bundle itself is the backup, no account needed | git, `git-remote-proton` on PATH, and the certified Proton Drive CLI (0.9.0) signed in |
+| Restore needs | git only, from any machine — the bundle itself is the backup, no account needed | git 2.45.0 or newer, `git-remote-proton` on PATH, and the certified Proton Drive CLI (0.9.0) signed in; on Linux, also a credential store the CLI can use ([Linux prerequisites](#install-on-linux-v2)) |
 
-**Install v2 first — `git-remote-proton` doesn't land on PATH by default.** Download the release
-assets (`git-remote-proton.exe`, `git-remote-proton.exe.sha256`, `install.ps1`) from a [GitHub
-Release](https://github.com/craigstoller/git-proton-backup/releases) into one folder and run
-`install.ps1` there: it verifies the exe against the `.sha256`, copies it to
-`%LOCALAPPDATA%\Programs\git-proton-backup`, and adds that folder to your user PATH — open a
-**new** terminal afterward, since the script can't change its caller's own session. Building from
-source works too: `go build ./cmd/git-remote-proton` and put the resulting exe on PATH yourself.
+**Install v2 first — `git-remote-proton` doesn't land on PATH by default.** A [GitHub
+Release](https://github.com/craigstoller/git-proton-backup/releases) carries five assets:
+`git-remote-proton.exe`, `git-remote-proton.exe.sha256` and `install.ps1` for Windows, and
+`git-remote-proton-linux-amd64` and `git-remote-proton-linux-amd64.sha256` for Linux. On Windows,
+download the first three into one folder and run `install.ps1` there: it verifies the exe against
+the `.sha256`, copies it to `%LOCALAPPDATA%\Programs\git-proton-backup`, and adds that folder to
+your user PATH — open a **new** terminal afterward, since the script can't change its caller's own
+session. On Linux, follow [Install on Linux (v2)](#install-on-linux-v2) below. Building from
+source works too: `go build ./cmd/git-remote-proton` and put the resulting binary on PATH yourself.
 
 **v2 fetch and clone need git 2.45.0 or newer.** The helper downloads only the packs a fetch
 needs, and finds them by asking `git rev-list --missing=print` which objects are still absent.
 Git reports the objects a fetch starts from that way only from 2.45.0 on; an older git stops the
-fetch or clone with a `bad object` error. Check with `git --version`: Ubuntu 24.04, for one,
-ships 2.43.0.
+fetch or clone with a `bad object` error that names the 2.45.0 requirement. Check with
+`git --version`: Ubuntu 24.04, for one, ships 2.43.0. A push needs no particular git, but on an
+older one it prints a single warning that this git cannot restore (it never blocks the push). That
+warning only helps whoever reads push output: an unattended push on an old git succeeds with it
+unread, so check `git --version` on any machine you may one day restore to.
 
 ```
 git clone -o proton-v2 proton::/my-files/GitRemotes/myrepo
@@ -145,8 +154,9 @@ adopted as a v2 repo, so don't create one there even as a placeholder.
 
 **Restore contracts, stated honestly.** A v1 bundle restores with nothing but git —
 `git clone <bundle-path>` — from any machine, any OS, no account needed at the moment of
-restore. A v2 restore needs three things to be true at once: git, `git-remote-proton` installed
-and on PATH, and the certified Proton Drive CLI — currently 0.9.0 — signed in. That is a real dependency v1 doesn't
+restore. A v2 restore needs three things to be true at once: git 2.45.0 or newer, `git-remote-proton`
+installed and on PATH, and the certified Proton Drive CLI — currently 0.9.0 — signed in (on Linux,
+into a credential store the CLI can use). That is a real dependency v1 doesn't
 have, not a footnote — plan around it if a v2 remote is ever your only copy of something.
 
 **If a v2 push fails with "already exists" out of nowhere:** this has been observed once,
@@ -159,6 +169,77 @@ that capture is what turns a one-off into something reproducible. Only then remo
 trash, items whose names collide with the repo's remote path, and retry. The advice is scoped to
 those homonyms — never "empty your trash" wholesale, which would take unrelated recoverable
 files with it.
+
+### Install on Linux (v2)
+
+v2 runs on Linux; v1 does not, because its transport is the Windows sync app. Only `linux/amd64`
+on glibc is built and gated: no arm64 helper is built, and Proton's arm64 and musl CLI builds were
+not run.
+
+**What is tested.** The helper is a static Go binary; the Proton Drive CLI it drives is Proton's
+glibc `linux/x64` build. Each release's Linux binary is gated live on Ubuntu 24.04 under WSL2
+(see [docs/releasing.md](docs/releasing.md)). Other distributions are expected to work and are not
+gated.
+
+**Prerequisites.**
+
+- **git 2.45.0 or newer** for fetch and clone (above). Ubuntu 24.04's own git, 2.43.0, is below
+  it. One upgrade route is the Ubuntu Git Maintainers PPA: `sudo add-apt-repository
+  ppa:git-core/ppa`, then `sudo apt update && sudo apt install git`. The PPA carries whatever
+  version it carries at the time, so confirm with `git --version`.
+- **An AVX2 CPU.** This is the Proton CLI's requirement, not the helper's: Proton's README says
+  its default `linux/x64` build crashes at startup with `Illegal instruction` on a CPU without
+  AVX2 (see [Honest limits](#honest-limits)).
+- **The certified Proton Drive CLI**, version 0.9.0 (`cli-drive@0.9.0+75612299`), installed with
+  the commands below and checked against its SHA-512.
+- **A credential store the CLI can use.** On Linux the CLI keeps its sign-in session in a Secret
+  Service (GNOME Keyring, KWallet, anything that speaks `org.freedesktop.secrets`), and it has to be
+  unlocked in the session that runs git. That is the tested store. With no session bus the CLI
+  fails before any network attempt, and the helper passes its message through unchanged
+  (`Failed to load session from secrets … Cannot autolaunch D-Bus`). The CLI's other store,
+  `pass` (`PROTON_DRIVE_CREDENTIALS_STORE=pass`), reaches the CLI untouched because the helper
+  sets no environment of its own; it is **not gated**. [Proton's CLI
+  README](https://github.com/ProtonDriveApps/sdk/blob/main/cli/README.md) describes both stores.
+
+**Install.** Download the release's two Linux assets into one folder and run this there:
+
+```bash
+# The helper:
+mkdir -p ~/.local/bin
+sha256sum -c git-remote-proton-linux-amd64.sha256
+install -m 0755 git-remote-proton-linux-amd64 ~/.local/bin/git-remote-proton
+
+# Proton's CLI, certified version 0.9.0 (SHA-512 recorded 2026-10-16):
+curl -fLo proton-drive https://proton.me/download/drive/cli/0.9.0/linux-x64/proton-drive
+echo "3533025ba69ae112b64e3e01fbcc1ad0688136a4043f6cf6a72886967d85fdcd9ec235479c2e113171614be5225bfba93427509a05ca5aa6071d924fa7e91ca8  proton-drive" | sha512sum -c
+install -m 0755 proton-drive ~/.local/bin/proton-drive
+```
+
+The SHA-512 is the value Proton's feed listed for this build on 2026-10-16, and it equals the
+binary the project's Linux probes ran. A passing check means you hold the bytes that were tested;
+a failing one means they are not (Proton may have re-cut the build, or the download is damaged),
+so do not install it. Proton's download page advertises only the current release, so this
+versioned URL may stop serving once Proton moves on (see [Install & first run](#install--first-run)).
+
+On Ubuntu, a freshly created `~/.local/bin` joins your PATH at your next login. Until then,
+`~/.local/bin/git-remote-proton --version` confirms the install directly (it prints the tag and
+the certified CLI token). In a **new login shell**, check that each name resolves to exactly one
+path, the one you just installed:
+
+```bash
+type -a git-remote-proton
+type -a proton-drive
+```
+
+That is the Linux form of `install.ps1`'s shadow check, which exists because a stale helper
+earlier on PATH once passed for the new one. Then sign in with `proton-drive auth login` and use
+v2 as above.
+
+A Proton CLI from your distribution's package manager is a different build and is refused. Proton's
+README says a CLI repackaged for a distribution may identify itself as `cli-drive-<distro>`; the
+helper accepts only the exact certified token, and for such a build the refusal says it looks like
+a distribution repackage and points back to this section. Whether any distribution ships one today
+is untested.
 
 ### Environment variables
 
@@ -226,8 +307,9 @@ Because the domain is Windows, and PowerShell is what Windows already speaks.
   exactly what a shell is for. A compiled language would add build weight to a tool whose honest
   job is coordination, not computation.
 
-The Windows-specific part is the transport, not the language — see the [Roadmap](#roadmap) for
-what macOS/Linux support would actually take.
+The Windows-specific part is the transport, not the language. v1 stays Windows-only; Linux has the
+v2 remote helper instead ([Install on Linux](#install-on-linux-v2)), and the [Roadmap](#roadmap)
+says what macOS would take.
 
 ## Monitoring
 
@@ -297,6 +379,59 @@ download them; you don't need this tool, or even a Windows machine, to get your 
   working-tree state of any secondary `git worktree` attached to the repo. History is complete;
   restoring a linked worktree's own working copy afterward is a manual `git worktree add` from that
   history, not something the bundle reproduces automatically.
+- **v2: refs that differ only by letter case (`main` and `Main`).** Proton stores both, and a
+  case-sensitive client such as Linux can push both. A Windows clone of such a remote succeeds, and
+  local use then goes wrong in one of three ways (measured by cloning bundles onto NTFS, not
+  through the helper):
+  - `main` beside `Main` (two branches): `git switch Main` puts you on `Main` at `main`'s commit
+    and files, silently, while `main` is still a loose ref file. Once the refs are packed, the same
+    command works.
+  - `feat` beside `Feat/x` (a branch against a folder of the same name): the second local branch is
+    refused, loudly (`cannot lock ref`).
+  - `grp/a` beside `Grp/b` (two folders): the second local branch is silently re-cased to `grp/b`.
+
+  So, on every platform, a push **refuses to create** a ref whose name differs only by letter case
+  from another ref's (any component of the path counts, so all three shapes above are covered). The
+  refusal names every conflicting ref, and git reports that ref rejected. A create is a name the
+  remote does not hold yet: replacing an existing ref is not refused, and updates and ordinary
+  deletes never are. A case-changing rename beside a surviving variant (delete `Main`, create
+  `MAIN`, with `main` present) is refused whole, its delete included, so `Main` survives. There is
+  no override. Case is folded the way Go's `strings.EqualFold` does, Unicode simple folding. NTFS
+  folds with its own table, which probably differs for a handful of characters, and Unicode
+  normalisation (NFC against NFD, as on macOS) is out of scope; neither is checked.
+  - **One loss remains.** If a rename passes the check because the variant it conflicts with is
+    deleted in the same push, and that delete then fails (a race or a transport fault) between the
+    push's delete step and its create step, the create is refused after the rename's own delete
+    has removed the old name. That old name is then gone from the remote. Only a hermetic test with
+    a faked delete failure reaches the refusal; no live gate can reach it deterministically.
+  - **A pair can still appear without you pushing one:** from pushes made before this check
+    existed; from a Proton CLI or web-UI upload, as the 0.9.0 certification made one; and from a
+    skipped foreign file (the v2 section above describes them) that is later repaired. A ref whose
+    case variant sits in a skipped file is not checked, because skipped names never reach a clone,
+    so a push can create the other half of a pair there; the pair becomes visible to clones once
+    the file is repaired.
+  - **Repair a pair** by deleting one member (`git push proton-v2 --delete Main`). A remote that
+    already holds a pair keeps taking pushes to its other refs, but under a directory pair
+    (`Feat/a` beside `feat/b`) a new ref under either spelling is refused until the pair is
+    repaired.
+- **v2 on Linux: unattended use is not gated.** Only attended use is tested and supported: a
+  session with an unlocked Secret Service. Cron or systemd-timer runs are not covered. The helper
+  takes no part in credentials, and the CLI needs an unlocked Secret Service (or `pass`), which a
+  headless session does not have unless you arrange it. Without one, the push fails with the
+  CLI's own message (`Failed to load session from secrets …`). Unlocking headless always means
+  storing a password, or decrypting without a prompt, somewhere; that trade-off is yours, not a
+  default shipped here.
+- **v2 on Linux: Proton CLI drift.** The helper accepts one exact CLI build. A newer Proton CLI
+  reaches you as a refusal (`GPB_UNCERTIFIED_CLI=1` overrides it, see [Environment
+  variables](#environment-variables)). A re-cut of the same version number passes the helper's
+  check, which matches the identity token only; catching it is the maintainer's drift check
+  (`scripts/Test-ProtonCliDrift.ps1`, which compares Proton's feed with the recorded Linux
+  SHA-512). The `sha512sum -c` line in the install commands is your own check of the download.
+- **v2 on Linux: no certified CLI for CPUs without AVX2.** The certified `linux/x64` build needs
+  AVX2. Proton's README names a `linux/x64-baseline` build for older CPUs, but Proton's 0.9.0 feed
+  lists no such build, so there is nothing to certify. On such a CPU the CLI crashes at startup
+  (`Illegal instruction`) before the helper can report anything. Only Proton's README says so; the
+  gate's x64 venue cannot test it.
 
 > **What this tool does and doesn't encrypt:** git-proton-backup performs no encryption itself.
 > Bundles are ordinary git bundles; anyone with access to your Windows account or your Proton
@@ -316,11 +451,14 @@ promised.
 
 ## Roadmap
 
-- **macOS** — if there's demonstrated interest.
-- **Linux** — `git-remote-proton` (v2) already does exactly this: CLI-direct upload, bypassing
-  the sync-folder transport entirely. It's windows/amd64 only for now — the only platform its
-  gate has run on — so Linux support means porting v2's build, not a new mechanism. For v1
-  specifically, the alternative is waiting for Proton to ship a Linux sync client.
+- **macOS** — an aspiration only, if there's demonstrated interest. Nothing is built, gated or
+  documented for it.
+- **Linux** — `git-remote-proton` (v2) supports Linux in this release: CLI-direct upload,
+  bypassing the sync-folder transport entirely, as a linux/amd64 helper driving Proton's glibc
+  CLI, gated on Ubuntu 24.04 under WSL2. Still open, and not gated: other architectures and musl,
+  unattended use, and other credential stores (see [Install on Linux](#install-on-linux-v2) and
+  [Honest limits](#honest-limits)). For v1 specifically, the alternative is waiting for Proton to
+  ship a Linux sync client.
 - **PowerShell Gallery** — the manifest is Gallery-ready; publishing is a fast-follow, not a v1
   blocker.
 

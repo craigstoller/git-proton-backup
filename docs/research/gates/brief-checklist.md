@@ -62,3 +62,14 @@ the rules from scratch.
     "proceed" default; Craig confirmed it retroactively as a standing ruling
     (`v0.9.0-release-gate.md`, post-release rulings, 2026-10-11). Certification plans need not
     put the telemetry question to Craig again.
+
+11. **Hermetic test runs in WSL keep Windows interop off, and cannot reach a real `proton-drive`.**
+    A hermetic test run (`go test`, Pester) in WSL sets `/etc/wsl.conf` `[interop] enabled=false`
+    and `appendWindowsPath=false`, and then either has no `proton-drive` on PATH except a test
+    shim, or runs in a network namespace with no route out. With WSL's default interop on, the
+    real, signed-in Windows `proton-drive.exe` is on the Linux PATH and executes, so a hermetic
+    test could reach the account. Established by the 2026-10-15 F14 probe (finding F14 of
+    `docs/superpowers/specs/2026-10-15-v2-linux-port-design.md`): with interop off, the Windows
+    exe exits 126. A rule-10 audit of a staged CLI binary's `--version` or help output is not a
+    hermetic test run, and stays governed by rule 10. (A live gate in WSL asserts the same
+    interop-off precondition: spec §7, step 0.)

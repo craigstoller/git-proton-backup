@@ -1,5 +1,57 @@
 # Changelog
 
+## [Unreleased]
+
+The v2 remote helper (`git-remote-proton`) now runs on Linux. The certified Proton Drive CLI is
+unchanged (`cli-drive@0.9.0+75612299`).
+
+- **git-remote-proton: a Linux build.** The release now carries a static `linux/amd64` helper,
+  `git-remote-proton-linux-amd64`, with its `.sha256`, beside the Windows files: five assets in all.
+  The README has install commands for it and for Proton's certified Linux CLI, with the CLI's
+  SHA-512 to check the download against, and lists the prerequisites: git 2.45.0 or newer, an AVX2
+  CPU, and a credential store the CLI can use. Each release's Linux binary is gated live on
+  Ubuntu 24.04 under WSL2. Unattended use (cron, systemd timers), the `pass` credential store,
+  other distributions, arm64 and musl are not gated.
+- **git-remote-proton: a push now refuses to create a ref that differs from another only by letter
+  case (`Main` beside `main`), on every platform.** Proton stores both, but a Windows clone of such
+  a remote silently checks out the wrong commit or silently re-cases a branch. The refusal names
+  every conflicting ref. Replacing a ref that already exists is never refused, nor are updates and
+  deletes; a case-changing rename beside a surviving variant is refused whole, so neither half is
+  applied. There is no override. A remote that already holds a pair takes pushes to its other refs,
+  and you repair the pair by deleting one member. Known limits: a ref whose variant sits in a
+  skipped foreign file is not checked, and a rename can lose its old name if the delete of the
+  variant it replaces fails partway through a push (a race or a transport fault); both are in the
+  README's honest limits.
+- **git-remote-proton: the git requirement is now stated where it bites.** A fetch or clone on a
+  git older than 2.45.0 fails with the same error as before, now naming "git 2.45.0 or newer". A
+  push warns once, without refusing, when the git running it could not restore the backup (stock
+  Ubuntu 24.04 ships 2.43.0): backups succeed on such a host but a restore there would not. The
+  check is one extra, time-bounded git process per push, on every platform.
+- **git-remote-proton: a distribution-repackaged Proton CLI is refused with a pointer.** A CLI
+  that identifies itself as `cli-drive-<distro>@…` was already refused (only the exact certified
+  build passes); the refusal now says it looks like a distribution repackage and points to the
+  README's install section and Proton's download URL. The matcher itself is unchanged, and
+  `GPB_UNCERTIFIED_CLI=1` behaves as before.
+- **CI: the Go suite now runs on Linux too,** at the latest Go and at the toolchain in `go.mod`
+  (the one releases are built with), beside the existing Windows run. A Linux step first checks the
+  runner's git against the 2.45.0 floor and falls back to the git-core PPA.
+- **Release procedure: the Proton CLI drift check has a fourth leg.** `scripts/Test-ProtonCliDrift.ps1`
+  now also compares the `linux/x64` SHA-512 in Proton's feed with the certified Linux value it
+  records, so a Linux re-cut under the same version number is caught. A release with no `linux/x64`
+  entry is a MISMATCH. `docs/releasing.md` now covers five assets and two live gates (Windows and
+  Linux).
+- **Tests: the live contract test's list of untouchable account folders now has all six**
+  (`Tax Documents` and `Archive` were missing), and a hermetic test pins that the helper passes
+  its environment, including the CLI's `PROTON_DRIVE_*` credential variables, through unchanged.
+- **Tests: the README's Linux CLI download URL and SHA-512 are guarded.** A Pester test fails if
+  they stop matching the certified version in the code and the drift script's recorded value, so a
+  CLI certification cannot leave the README pointing at the wrong build.
+- **Docs: the README, the v2 design (now v6.9) and the gate checklist describe the Linux port.**
+  The README gains the Linux install and prerequisites and honest limits for case variants,
+  unattended use, CLI drift and CPUs without AVX2; the design records the rulings behind it; the
+  gate checklist gains rule 11 (hermetic WSL test runs keep Windows interop off, so they cannot
+  reach a real signed-in `proton-drive`). The docs index links the Linux port's spec and plan.
+
 ## 0.9.0 — 2026-10-10
 
 Certified Proton Drive CLI moves from 0.8.0 to 0.9.0 — the exact allowlisted build is now
