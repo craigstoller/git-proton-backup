@@ -52,7 +52,9 @@ type Result struct {
 //     object-independent and must not be held hostage by an unrelated pack
 //     failure.
 //  4. Execute deletions (Stage 4's HEAD-protection logic, verbatim).
-//  5. Execute creates/updates: ensureRefParents, then WriteRef.
+//  5. Execute creates/updates: re-check each create against the live set for
+//     case variants (spec §5; see the loop itself), then ensureRefParents,
+//     then WriteRef.
 //
 // ensureHEAD runs last, after all five phases, unchanged from the per-ref
 // version.
@@ -539,9 +541,52 @@ func Push(t transport.Transport, root, gitDir string,
 	}
 
 	// ======================= Phase 5: creates/updates ========================
+
+	// live is the ref namespace as it actually stands while phase 5 runs
+	// (spec §5): the pre-batch advertised refs, minus the deletes that
+	// COMMITTED in phase 4 (deletedThisBatch, not phase-2 validity), plus each
+	// create or update this loop has committed so far (added after okResult
+	// below). The case-variant re-check reads it.
+	live := make(map[string]bool, len(remote))
+	for ref := range remote {
+		if !deletedThisBatch[ref] {
+			live[ref] = true
+		}
+	}
+
 	for i, u := range ups {
 		if !valid[i] || isDelete[i] {
 			continue
+		}
+		// Case-variant re-check (spec §5, D2(a), Amendment A1), for a CREATE
+		// only: a name absent from the pre-batch advertised set.
+		//
+		// Phase 2 checked every create against a set that assumes every valid
+		// delete commits, and repeated until stable, so its final set already
+		// reflects every delete it refused. Phase 5 can therefore find a NEW
+		// conflict for a create only when some phase-2-valid delete failed in
+		// phase 4: the ref it was to remove is still in live.
+		//
+		// Replacements of pre-existing names (a same-batch delete and
+		// recreate) are never re-checked: they add no spelling the remote
+		// lacked, and refusing one after its own delete committed would
+		// destroy the ref it replaces. One residual needs a transport fault: a
+		// case-changing rename that passed phase 2, because its conflicting
+		// variant was also being deleted, can still lose the renamed-away ref
+		// if that variant's delete fails. The README's honest limits say so.
+		//
+		// This must run before ensureRefParents, which creates remote parent
+		// folders; any later would leave folders behind for a refused create.
+		// The pack phase 3 uploaded for a create refused here stays
+		// unreferenced, as with any phase-5 create failure. No gate step can
+		// reach this path deterministically (spec §5); the hermetic test
+		// TestPushPhase5RefusesACreateWhoseVariantDeleteFailed is its evidence.
+		_, preExists := remote[u.Dst]
+		if !preExists {
+			if cs := caseConflicts(live, []string{u.Dst})[u.Dst]; len(cs) > 0 {
+				fail(i, caseConflictMessage(u.Dst, cs))
+				continue
+			}
 		}
 		// exists is BATCH-AWARE (fix round M4, corrected in fix round 2), not
 		// a bare read of the pre-batch remote map: when a same-batch delete
@@ -555,7 +600,6 @@ func Push(t transport.Transport, root, gitDir string,
 		// not contain the dst, exists falls back to the pre-batch read, and
 		// WriteRef correctly takes UpdateRevision against the node that is
 		// still actually there.
-		_, preExists := remote[u.Dst]
 		exists := preExists && !deletedThisBatch[u.Dst]
 		if err := ensureRefParents(t, root, u.Dst); err != nil {
 			fail(i, err.Error())
@@ -599,6 +643,7 @@ func Push(t transport.Transport, root, gitDir string,
 			continue
 		}
 		okResult(i)
+		live[u.Dst] = true
 	}
 
 	// Complete a missing HEAD. This is the same rule Bootstrap applies to a

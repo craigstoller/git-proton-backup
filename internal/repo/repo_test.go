@@ -313,6 +313,22 @@ func (a ambiguousTrashTransport) Trash(p string) (transport.Outcome, error) {
 	return transport.Ambiguous, nil
 }
 
+// trashFailsForTransport wraps a Fake but makes Trash report Ambiguous, with a
+// nil error, for one exact path only, and calls through to the Fake for every
+// other path. It drives a phase-4 delete failure of one ref while the rest of
+// the batch, a sibling delete included, runs normally (spec §5, phase 5).
+type trashFailsForTransport struct {
+	*transport.Fake
+	path string
+}
+
+func (tr trashFailsForTransport) Trash(p string) (transport.Outcome, error) {
+	if p == tr.path {
+		return transport.Ambiguous, nil
+	}
+	return tr.Fake.Trash(p)
+}
+
 // TestReleaseFailsClosedOnAmbiguousTrash covers the requirement that Release
 // must not discard Trash's Outcome. Committed from CreateExclusive does not
 // prove a write landed, and symmetrically a non-Committed Trash outcome does
@@ -2591,6 +2607,89 @@ func TestPushCaseRuleIgnoresSkippedNames(t *testing.T) {
 		t.Fatalf("a create beside a skipped case variant must be accepted, got %+v", res)
 	}
 	assertCaseRemote(t, f, map[string]string{"refs/heads/main": c1})
+}
+
+// TestPushPhase5RefusesACreateWhoseVariantDeleteFailed is RED (spec §5,
+// phase 5): phase 2 clears the create Feat/x only because the same batch
+// deletes feat, and that delete then fails in phase 4. Phase 5 re-checks the
+// create against the live set, which still holds feat, and refuses it before
+// ensureRefParents, so no Feat folder is left behind. The pack phase 3
+// uploaded for the create stays, unreferenced, as spec §5 documents.
+func TestPushPhase5RefusesACreateWhoseVariantDeleteFailed(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{"refs/heads/main": c1, "refs/heads/feat": c1}
+	f, remote := seedCaseRemote(t, seeded)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/feat"},
+		{Src: c2, Dst: "refs/heads/Feat/x"},
+	}
+	tr := trashFailsForTransport{Fake: f, path: "/r/refs/heads/feat"}
+	res := Push(tr, "/r", gitDir, ups, remote, nil)
+	if len(res) != 2 {
+		t.Fatalf("want 2 results, got %+v", res)
+	}
+	if res[0].OK {
+		t.Errorf("the delete of refs/heads/feat must fail in phase 4, got %+v", res[0])
+	}
+	const wantCreate = "refs/heads/Feat/x conflicts by letter case with refs/heads/feat " +
+		"(heads/Feat vs heads/feat): "
+	if res[1].OK || !strings.HasPrefix(res[1].Err, wantCreate) {
+		t.Errorf("the create must be refused in phase 5, naming refs/heads/feat:\n got %+v\nwant Err beginning %q",
+			res[1], wantCreate)
+	}
+	if f.Dirs["/r/refs/heads/Feat"] {
+		t.Error("a create refused in phase 5 must leave no parent folder: the re-check runs before ensureRefParents")
+	}
+	if _, ok := f.Files["/r/refs/heads/Feat/x"]; ok {
+		t.Error("the refused create must not be written")
+	}
+	assertCaseRemote(t, f, seeded)
+	if packs, idxs := countPackFiles(f, "/r"); packs != 1 || idxs != 1 {
+		t.Errorf("phase 3 uploads the create's pack before phase 5 refuses it, so exactly one "+
+			"unreferenced pack must remain, got pack=%d idx=%d", packs, idxs)
+	}
+}
+
+// TestPushPhase5NeverRefusesAReplacement is a GUARD (A1; the Codex and Kimi
+// counterexample): phase 5 re-checks creates only, never a replacement. The
+// remote holds feat beside Feat; the batch deletes both and recreates Feat,
+// and the feat delete fails in phase 4. Recreating Feat adds no spelling the
+// remote lacked before the batch, so it must land. Re-checking it against a
+// live set that still holds feat would refuse it after its own delete had
+// committed, and lose Feat.
+func TestPushPhase5NeverRefusesAReplacement(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	f, remote := seedCaseRemote(t, map[string]string{
+		"refs/heads/main": c1, "refs/heads/feat": c1, "refs/heads/Feat": c1,
+	})
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/feat"},
+		{Src: "", Dst: "refs/heads/Feat"},
+		{Src: c2, Dst: "refs/heads/Feat"},
+	}
+	tr := trashFailsForTransport{Fake: f, path: "/r/refs/heads/feat"}
+	res := Push(tr, "/r", gitDir, ups, remote, nil)
+	if len(res) != 3 {
+		t.Fatalf("want 3 results, got %+v", res)
+	}
+	if res[0].OK {
+		t.Errorf("the delete of refs/heads/feat must fail in phase 4, got %+v", res[0])
+	}
+	if !res[1].OK {
+		t.Errorf("the delete of refs/heads/Feat must commit, got %+v", res[1])
+	}
+	if !res[2].OK {
+		t.Errorf("the replacement of refs/heads/Feat must land, got %+v", res[2])
+	}
+	assertCaseRemote(t, f, map[string]string{
+		"refs/heads/main": c1, "refs/heads/feat": c1, "refs/heads/Feat": c2,
+	})
 }
 
 // TestPushOtherNamespaceRequiresForce covers the design's conservative
