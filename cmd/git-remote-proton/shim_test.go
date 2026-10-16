@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/craigstoller/git-proton-backup/internal/testcli"
@@ -43,7 +44,7 @@ func TestMain(m *testing.M) {
 }
 
 // buildShimOnPath copies this test binary into a private temp directory
-// under the literal name "proton-drive"(+the host's exe extension), points
+// under the literal name "proton-drive"(.exe on Windows only), points
 // GPB_TESTCLI_TREE at a second, empty temp directory (the shim's local
 // tree — every Proton Drive remote path the test seeds, or the real code
 // under test writes, maps onto a file under it via testcli.LocalPath), and
@@ -56,7 +57,12 @@ func TestMain(m *testing.M) {
 // ("proton-drive"), and os.Executable() here is this package's own test
 // binary, named nothing like that. On Windows the copy additionally needs
 // the ".exe" suffix — LookPath's PATHEXT-driven search only finds it under
-// that literal name.
+// that literal name. Everywhere else it must carry no suffix at all, since
+// LookPath there matches the bare name exactly. The suffix is therefore
+// keyed on runtime.GOOS, never borrowed from os.Executable(): on Linux this
+// test binary is git-remote-proton.test, whose ".test" extension would name
+// the copy "proton-drive.test" and leave it unfindable (the first Linux run,
+// 2026-10-15, failed all three shim tests exactly that way).
 func buildShimOnPath(t *testing.T) (treeDir string) {
 	t.Helper()
 	self, err := os.Executable()
@@ -64,7 +70,11 @@ func buildShimOnPath(t *testing.T) (treeDir string) {
 		t.Fatalf("os.Executable: %v", err)
 	}
 	shimDir := t.TempDir()
-	shimExe := filepath.Join(shimDir, "proton-drive"+filepath.Ext(self))
+	shimName := "proton-drive"
+	if runtime.GOOS == "windows" {
+		shimName += ".exe"
+	}
+	shimExe := filepath.Join(shimDir, shimName)
 	in, err := os.Open(self)
 	if err != nil {
 		t.Fatalf("open self: %v", err)

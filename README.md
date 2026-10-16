@@ -100,6 +100,12 @@ Release](https://github.com/craigstoller/git-proton-backup/releases) into one fo
 **new** terminal afterward, since the script can't change its caller's own session. Building from
 source works too: `go build ./cmd/git-remote-proton` and put the resulting exe on PATH yourself.
 
+**v2 fetch and clone need git 2.45.0 or newer.** The helper downloads only the packs a fetch
+needs, and finds them by asking `git rev-list --missing=print` which objects are still absent.
+Git reports the objects a fetch starts from that way only from 2.45.0 on; an older git stops the
+fetch or clone with a `bad object` error. Check with `git --version`: Ubuntu 24.04, for one,
+ships 2.43.0.
+
 ```
 git clone -o proton-v2 proton::/my-files/GitRemotes/myrepo
 git push proton-v2 main

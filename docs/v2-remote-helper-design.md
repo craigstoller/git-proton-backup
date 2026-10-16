@@ -1,6 +1,6 @@
 # git-remote-proton — v2 design
 
-**Status:** design v6.7, revised 2026-10-10 for the CLI 0.9.0 certification (v6.6 was revised 2026-08-09 during Stage 6 implementation). v5 was settled after four rounds of Codex + Gemini peer review; v6, v6.1, v6.2 and v6.3 each change exactly one mechanism, and each only because implementation proved the original unimplementable, unenforceable, or worse than what shipped. v6.4 documented Stage 4's shipped additions — the CLI version allowlist and the `--set-head` operation. v6.5 was the largest revision since v5: it re-enabled full hierarchical refs and the other-namespace rule v6.1 had narrowed away, replaced the fetch residue rule with quarantine staging, folded in the gate-sourced UX items, and left one item open — a git-valid-named foreign file with unparseable contents still failed every read against the repo, in both directions, until deleted. v6.6 closes that open question: the fatal-content rule is now **per-operation** — tolerant (skip + note) on the push-direction survey, fatal-with-enumeration on the fetch-direction survey — adds occupancy-aware push refusals (kind-aware, pre-pack) for names the read boundary skipped, adds the create-heal race-window diagnosis for an occupant that appears after advertisement, and pins F1 (directory download) as a verified contract fact. See the revision history.
+**Status:** design v6.8, revised 2026-10-15 to record selective fetch's minimum git, 2.45.0 (v6.7 was revised 2026-10-10 for the CLI 0.9.0 certification, v6.6 on 2026-08-09 during Stage 6 implementation). v5 was settled after four rounds of Codex + Gemini peer review; v6, v6.1, v6.2 and v6.3 each change exactly one mechanism, and each only because implementation proved the original unimplementable, unenforceable, or worse than what shipped. v6.4 documented Stage 4's shipped additions — the CLI version allowlist and the `--set-head` operation. v6.5 was the largest revision since v5: it re-enabled full hierarchical refs and the other-namespace rule v6.1 had narrowed away, replaced the fetch residue rule with quarantine staging, folded in the gate-sourced UX items, and left one item open — a git-valid-named foreign file with unparseable contents still failed every read against the repo, in both directions, until deleted. v6.6 closes that open question: the fatal-content rule is now **per-operation** — tolerant (skip + note) on the push-direction survey, fatal-with-enumeration on the fetch-direction survey — adds occupancy-aware push refusals (kind-aware, pre-pack) for names the read boundary skipped, adds the create-heal race-window diagnosis for an occupant that appears after advertisement, and pins F1 (directory download) as a verified contract fact. See the revision history.
 **Relates to:** [issue #3](https://github.com/craigstoller/git-proton-backup/issues/3).
 **Depends on:** [`docs/research/remote-helper-prior-art.md`](research/remote-helper-prior-art.md) — read first; assumed, not repeated.
 **Pinned to:** Proton Drive CLI **`cli-drive@0.9.0+75612299`** (SDK `js@0.22.2+75612299`), certified
@@ -956,6 +956,8 @@ The helper owns the closure. Git's `fetch` capability is defined as transferring
    **The temp directory must have git's own object layout, not a flat one.** An alternate is an *objects* directory, so packs are only found at `<tmp-objects>/pack/pack-<hash>.{pack,idx}`. Dropped flat into `<tmp-objects>/`, git silently does not see them — `rev-list` then reports every object missing, the loop downloads packs it already holds, and the no-progress rule below fires on what looks like a corrupt index mapping. The failure is loud but the cause is not, so the layout is normative rather than an implementation detail.
 
    **The walk uses git plumbing, not a hand-written parser.** `git cat-file --batch` decompresses and identifies objects but does *not* enumerate commit parents, tag targets, or tree entries — an earlier draft claimed it removed the need for a parser, which was wrong. Instead run `git rev-list --objects --missing=print <wants>` against the temp directory: git performs the traversal and reports missing OIDs prefixed with `?`. Feed those back through the object-to-pack map, download, repeat. This also handles gitlinks and malformed objects with git's own semantics rather than reimplemented ones.
+
+   **This traversal sets fetch's minimum git at 2.45.0.** Every want the client still lacks is a missing tip of the walk, and git reports a missing tip as a `?` line only from v2.45.0 on: `Documentation/rev-list-options.txt` gains the sentence at that tag, and `revision.c`'s `get_reference` gains the matching branch, which `--stdin` tips also go through. An older git dies with `bad object <oid>` on the first round, which `gitcmd.RevListMissing` wraps with a note describing the requirement (the note does not name the version). Only fetch, and so clone, runs this traversal. See the v6.8 entry.
 5. **Consolidate the closure into ONE pack, install it, and emit git's single `lock`.** Git's `transport-helper.c` retains only the **first** `lock <path>` response, so a multi-pack install cannot be protected by multiple protocol locks.
 
    **This decision reversed twice and is now settled on the merits.** v2 used consolidation; v3 replaced it with helper-managed `.keep` files swept at the start of the next fetch; v4 restores consolidation. The helper-managed variant is **not crash-safe**: if a fetch dies after installing a pack but before git updates refs, the next fetch removes that pack's protection *before* refs exist, and a concurrent `git gc` can delete it between connectivity verification and git's ref write — leaving refs pointing at missing objects. It also leaks permanently if the user never fetches from that remote again. Git's protocol lock exists precisely to cover the install-to-ref-update interval and is released only after both complete. Corruption beats a repacking pipeline as a thing to avoid.
@@ -1216,6 +1218,26 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
 ---
 
 ## Revision history
+
+**v6.8, 2026-10-15 — selective fetch's minimum git recorded: 2.45.0.**
+
+- **What this records.** Stage 3b (spec of 2026-08-03) made "`rev-list --missing=print` reports
+  missing tips and parents as `?` lines" a documented behavioural floor for fetch, probed on git
+  2.53, but named no version. The version is 2.45.0. Fetch step 4 now says so, and the README
+  states it for users.
+- **Basis, from the source.** git's `Documentation/rev-list-options.txt` gains "If some tips
+  passed to the traversal are missing, they will be considered as missing too" at v2.45.0. It is
+  absent at v2.43.0, v2.44.0 and every v2.44.x tag through v2.44.4. `revision.c`'s
+  `get_reference` gains the matching `do_not_die_on_missing_objects` branch at v2.45.0. Both read
+  2026-10-15 from git's GitHub mirror.
+- **Basis, measured.** 2026-10-15, WSL2 Ubuntu-24.04, full hermetic suite: on the distro's git
+  2.43.0, 23 fetch-path tests failed closed with `RevListMissing`'s wrapped `bad object` error; on
+  git 2.55.0 built from source, all 23 passed with no new failures. No 2.44 or 2.45 binary was
+  run, so the exact boundary rests on the docs and source above.
+- **What did not change.** No code, and no version check: the floor stays behavioural, and an
+  older git still fails closed on the first round with the wrapped error, as Stage 3b designed.
+  That error describes the requirement without naming the version; naming it would be a code
+  change outside this revision.
 
 **v6.7, 2026-10-10 — CLI pin moved to 0.9.0; the 0.8.0 move of 2026-08-13 is recorded here retroactively.**
 
