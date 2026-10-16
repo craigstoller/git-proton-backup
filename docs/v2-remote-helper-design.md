@@ -1202,7 +1202,7 @@ Executable, not prose. Produces a committed results file that becomes normative.
 
 **Stage 3 — a real `git clone` and `git fetch`.** Idx cache, iterative discovery with termination, single-pack consolidation, `.keep`, connectivity verification. Ends when `git clone -o proton-v2 proton::…` produces a working checkout.
 
-**Stage 4 — productionisation.** Shipped: a windows/amd64 release build (the only platform its gate has run on; other platforms build from source and are unsupported — *the "windows/amd64 only" sentence is superseded by v6.9, which adds linux/amd64 as a second supported, gated platform*), published as a draft until the live gate passes against those exact bytes, the CLI version allowlist, `--set-head`, and v1 coexistence documentation. Recovery documentation and its test, and broader protocol conformance, remain open.
+**Stage 4 — productionisation.** Shipped: a windows/amd64 release build (the only platform its gate has run on; other platforms build from source and are unsupported — *the "windows/amd64 only" sentence is superseded by v6.9, which adds linux/amd64 as a second supported platform, to be gated per `docs/releasing.md`*), published as a draft until the live gate passes against those exact bytes, the CLI version allowlist, `--set-head`, and v1 coexistence documentation. Recovery documentation and its test, and broader protocol conformance, remain open.
 
 Compaction and retention remain a separately approved milestone. v2 reserves nothing for them beyond the marker's `version` field, which is the seam a future layout change goes through.
 
@@ -1229,7 +1229,8 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   `docs/superpowers/specs/2026-10-15-v2-linux-port-design.md` (approved 2026-10-16) and planned in
   `docs/superpowers/plans/2026-10-16-v2-linux-port.md`. Craig ruled on D1–D8 on 2026-10-16, taking
   every recommendation, and approved Amendment A1 the same day (both copied below). The evidence is
-  the spec's findings F1–F14, measured in WSL2 `Ubuntu-24.04` and on Windows on 2026-10-15 and 16.
+  the spec's findings F1–F14 (most measured in WSL2 `Ubuntu-24.04` and on Windows on 2026-10-15 and
+  16; the spec marks each one's basis: wsl, win, doc, code, record, inference or untested).
 - **Supported platforms.** windows/amd64 and linux/amd64 (D1(a)): a static helper binary on each,
   and Proton's glibc linux/x64 CLI on Linux. The release now holds five assets
   (`git-remote-proton.exe`, its `.sha256`, `install.ps1`, `git-remote-proton-linux-amd64` and its
@@ -1336,7 +1337,8 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   (3) phase 2 repeats until stable. Not taken: keeping the round-3 definition, and refusing a
   replacement's paired delete in a single pass (the round-1 plan fix). One residual is documented,
   not fixed: a rename can still lose the old name if a sibling delete hits a transport fault
-  between phases 4 and 5.
+  between phases 4 and 5. *[v6.9 note: the trigger is a phase-4 delete failure from a race or a
+  transport fault; see the D2 bullet above.]*
 
 **v6.8, 2026-10-15 — selective fetch's minimum git recorded: 2.45.0.**
 
@@ -1487,7 +1489,9 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   the hardcoded default, validated segment-wise (absolute, strictly below `/my-files/`, no `.`/`..`
   segment, not one of the four untouchable top-level folders) before any live call runs. It lives
   in the contract test's own comment and the gate brief checklist, not in user-facing docs — it
-  governs how this repository's own tests are run, not how `git-remote-proton` behaves.
+  governs how this repository's own tests are run, not how `git-remote-proton` behaves. *Update
+  2026-10-16 (v6.9): the account now has six untouchable top-level folders, not four (`Tax
+  Documents` and `Archive` were added), and the contract test's list names all six.*
 
 **v6.5, 2026-08-06 — Stage 5 ships: hierarchical refs, quarantine fetch staging, and the gate-sourced UX items. Documents shipped behaviour, verified against the merged code.**
 

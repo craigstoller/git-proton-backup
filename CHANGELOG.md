@@ -9,9 +9,10 @@ unchanged (`cli-drive@0.9.0+75612299`).
   `git-remote-proton-linux-amd64`, with its `.sha256`, beside the Windows files: five assets in all.
   The README has install commands for it and for Proton's certified Linux CLI, with the CLI's
   SHA-512 to check the download against, and lists the prerequisites: git 2.45.0 or newer, an AVX2
-  CPU, and a credential store the CLI can use. Each release's Linux binary is gated live on
-  Ubuntu 24.04 under WSL2. Unattended use (cron, systemd timers), the `pass` credential store,
-  other distributions, arm64 and musl are not gated.
+  CPU, and a credential store the CLI can use. The first release carrying it takes a Linux live
+  gate, planned on Ubuntu 24.04 under WSL2 (`docs/releasing.md` sets the procedure for this and
+  later releases). Unattended use (cron, systemd timers), the `pass` credential store, other
+  distributions, arm64 and musl are not gated.
 - **git-remote-proton: a push now refuses to create a ref that differs from another only by letter
   case (`Main` beside `main`), on every platform.** Proton stores both, but a Windows clone of such
   a remote silently checks out the wrong commit or silently re-cases a branch. The refusal names
@@ -20,10 +21,11 @@ unchanged (`cli-drive@0.9.0+75612299`).
   applied. There is no override. A remote that already holds a pair takes pushes to its other refs,
   and you repair the pair by deleting one member. Known limits: a ref whose variant sits in a
   skipped foreign file is not checked, and a rename can lose its old name if the delete of the
-  variant it replaces fails partway through a push (a race or a transport fault); both are in the
-  README's honest limits.
-- **git-remote-proton: the git requirement is now stated where it bites.** A fetch or clone on a
-  git older than 2.45.0 fails with the same error as before, now naming "git 2.45.0 or newer". A
+  variant it conflicts with, made in the same push, fails partway through that push (a race or a
+  transport fault); both are in the README's honest limits.
+- **git-remote-proton: the git requirement is now stated where it bites.** A fetch or clone on an
+  older git fails with the same error as before, now with a note that selective fetch requires
+  git 2.45.0 or newer. A
   push warns once, without refusing, when the git running it could not restore the backup (stock
   Ubuntu 24.04 ships 2.43.0): backups succeed on such a host but a restore there would not. The
   check is one extra, time-bounded git process per push, on every platform.
@@ -34,7 +36,7 @@ unchanged (`cli-drive@0.9.0+75612299`).
   `GPB_UNCERTIFIED_CLI=1` behaves as before.
 - **CI: the Go suite now runs on Linux too,** at the latest Go and at the toolchain in `go.mod`
   (the one releases are built with), beside the existing Windows run. A Linux step first checks the
-  runner's git against the 2.45.0 floor and falls back to the git-core PPA.
+  runner's git against the floor (git 2.45.0 or newer) and falls back to the git-core PPA.
 - **Release procedure: the Proton CLI drift check has a fourth leg.** `scripts/Test-ProtonCliDrift.ps1`
   now also compares the `linux/x64` SHA-512 in Proton's feed with the certified Linux value it
   records, so a Linux re-cut under the same version number is caught. A release with no `linux/x64`

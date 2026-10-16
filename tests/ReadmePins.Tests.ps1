@@ -31,6 +31,8 @@ BeforeAll {
 }
 
 Describe 'README Linux CLI pins' {
+    # RED: both tests below were written before the README had a Linux install block, and failed
+    # on their Should -BeTrue assertions until it did (Task 11 report). They now guard the pins.
     It 'pins the README''s Linux CLI download to the certified version' {
         $url = "https://proton.me/download/drive/cli/$($script:certifiedSemver)/linux-x64/proton-drive"
         $script:readme.Contains($url) | Should -BeTrue -Because "README.md must contain $url (the semver of transport.CertifiedCLI)"

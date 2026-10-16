@@ -109,7 +109,8 @@ source works too: `go build ./cmd/git-remote-proton` and put the resulting binar
 **v2 fetch and clone need git 2.45.0 or newer.** The helper downloads only the packs a fetch
 needs, and finds them by asking `git rev-list --missing=print` which objects are still absent.
 Git reports the objects a fetch starts from that way only from 2.45.0 on; an older git stops the
-fetch or clone with a `bad object` error that names the 2.45.0 requirement. Check with
+fetch or clone with a `bad object` error, now followed by a note that selective fetch requires
+git 2.45.0 or newer. Check with
 `git --version`: Ubuntu 24.04, for one, ships 2.43.0. A push needs no particular git, but on an
 older one it prints a single warning that this git cannot restore (it never blocks the push). That
 warning only helps whoever reads push output: an unattended push on an old git succeeds with it
@@ -173,13 +174,16 @@ files with it.
 ### Install on Linux (v2)
 
 v2 runs on Linux; v1 does not, because its transport is the Windows sync app. Only `linux/amd64`
-on glibc is built and gated: no arm64 helper is built, and Proton's arm64 and musl CLI builds were
-not run.
+on glibc is built, and it is the only Linux build the release procedure covers: no arm64 helper is
+built, and Proton's arm64 and musl CLI builds were not run.
 
 **What is tested.** The helper is a static Go binary; the Proton Drive CLI it drives is Proton's
-glibc `linux/x64` build. Each release's Linux binary is gated live on Ubuntu 24.04 under WSL2
-(see [docs/releasing.md](docs/releasing.md)). Other distributions are expected to work and are not
-gated.
+glibc `linux/x64` build. The Linux live gate is still to run: the first Linux release takes one
+against the draft's exact bytes, on Ubuntu 24.04 under WSL2 (the design's venue,
+[spec D7](docs/superpowers/specs/2026-10-15-v2-linux-port-design.md), with a separate Linux machine
+as the fallback if the sign-in probe fails). Later releases follow
+[docs/releasing.md](docs/releasing.md): a live gate, or, when eligible, a stand-in that gives the
+Linux binary offline checks only. Other distributions are expected to work and are not gated.
 
 **Prerequisites.**
 
@@ -194,7 +198,7 @@ gated.
   the commands below and checked against its SHA-512.
 - **A credential store the CLI can use.** On Linux the CLI keeps its sign-in session in a Secret
   Service (GNOME Keyring, KWallet, anything that speaks `org.freedesktop.secrets`), and it has to be
-  unlocked in the session that runs git. That is the tested store. With no session bus the CLI
+  unlocked in the session that runs git. That is the store the Linux gate is to cover. With no session bus the CLI
   fails before any network attempt, and the helper passes its message through unchanged
   (`Failed to load session from secrets … Cannot autolaunch D-Bus`). The CLI's other store,
   `pass` (`PROTON_DRIVE_CREDENTIALS_STORE=pass`), reaches the CLI untouched because the helper
@@ -206,19 +210,18 @@ gated.
 ```bash
 # The helper:
 mkdir -p ~/.local/bin
-sha256sum -c git-remote-proton-linux-amd64.sha256
-install -m 0755 git-remote-proton-linux-amd64 ~/.local/bin/git-remote-proton
+sha256sum -c git-remote-proton-linux-amd64.sha256 && install -m 0755 git-remote-proton-linux-amd64 ~/.local/bin/git-remote-proton
 
 # Proton's CLI, certified version 0.9.0 (SHA-512 recorded 2026-10-16):
 curl -fLo proton-drive https://proton.me/download/drive/cli/0.9.0/linux-x64/proton-drive
-echo "3533025ba69ae112b64e3e01fbcc1ad0688136a4043f6cf6a72886967d85fdcd9ec235479c2e113171614be5225bfba93427509a05ca5aa6071d924fa7e91ca8  proton-drive" | sha512sum -c
-install -m 0755 proton-drive ~/.local/bin/proton-drive
+echo "3533025ba69ae112b64e3e01fbcc1ad0688136a4043f6cf6a72886967d85fdcd9ec235479c2e113171614be5225bfba93427509a05ca5aa6071d924fa7e91ca8  proton-drive" | sha512sum -c && install -m 0755 proton-drive ~/.local/bin/proton-drive
 ```
 
 The SHA-512 is the value Proton's feed listed for this build on 2026-10-16, and it equals the
-binary the project's Linux probes ran. A passing check means you hold the bytes that were tested;
-a failing one means they are not (Proton may have re-cut the build, or the download is damaged),
-so do not install it. Proton's download page advertises only the current release, so this
+binary the project's Linux probes ran. Each `install` is chained to its check with `&&`, so a
+failed check stops the install. A passing check means you hold the bytes that were tested; a
+failing one means they are not (Proton may have re-cut the build, or the download is damaged), so
+do not install it. Proton's download page advertises only the current release, so this
 versioned URL may stop serving once Proton moves on (see [Install & first run](#install--first-run)).
 
 On Ubuntu, a freshly created `~/.local/bin` joins your PATH at your next login. Until then,
@@ -238,7 +241,7 @@ v2 as above.
 A Proton CLI from your distribution's package manager is a different build and is refused. Proton's
 README says a CLI repackaged for a distribution may identify itself as `cli-drive-<distro>`; the
 helper accepts only the exact certified token, and for such a build the refusal says it looks like
-a distribution repackage and points back to this section. Whether any distribution ships one today
+a distribution repackage and points to the README's install section. Whether any distribution ships one today
 is untested.
 
 ### Environment variables
@@ -414,8 +417,9 @@ download them; you don't need this tool, or even a Windows machine, to get your 
     already holds a pair keeps taking pushes to its other refs, but under a directory pair
     (`Feat/a` beside `feat/b`) a new ref under either spelling is refused until the pair is
     repaired.
-- **v2 on Linux: unattended use is not gated.** Only attended use is tested and supported: a
-  session with an unlocked Secret Service. Cron or systemd-timer runs are not covered. The helper
+- **v2 on Linux: unattended use is not gated.** Only attended use is in scope for the Linux gate
+  and supported: a session with an unlocked Secret Service. Cron or systemd-timer runs are not
+  covered. The helper
   takes no part in credentials, and the CLI needs an unlocked Secret Service (or `pass`), which a
   headless session does not have unless you arrange it. Without one, the push fails with the
   CLI's own message (`Failed to load session from secrets …`). Unlocking headless always means
@@ -453,11 +457,11 @@ promised.
 
 - **macOS** — an aspiration only, if there's demonstrated interest. Nothing is built, gated or
   documented for it.
-- **Linux** — `git-remote-proton` (v2) supports Linux in this release: CLI-direct upload,
-  bypassing the sync-folder transport entirely, as a linux/amd64 helper driving Proton's glibc
-  CLI, gated on Ubuntu 24.04 under WSL2. Still open, and not gated: other architectures and musl,
-  unattended use, and other credential stores (see [Install on Linux](#install-on-linux-v2) and
-  [Honest limits](#honest-limits)). For v1 specifically, the alternative is waiting for Proton to
+- **Linux** — `git-remote-proton` (v2) gains Linux support in the next release: CLI-direct
+  upload, bypassing the sync-folder transport entirely, as a linux/amd64 helper driving Proton's
+  glibc CLI. Its live gate is still to run (planned on Ubuntu 24.04 under WSL2; see [Install on
+  Linux](#install-on-linux-v2)). Still open, and not gated: other architectures and musl,
+  unattended use, and other credential stores (see [Honest limits](#honest-limits)). For v1 specifically, the alternative is waiting for Proton to
   ship a Linux sync client.
 - **PowerShell Gallery** — the manifest is Gallery-ready; publishing is a fast-follow, not a v1
   blocker.

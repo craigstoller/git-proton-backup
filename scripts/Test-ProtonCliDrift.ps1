@@ -33,7 +33,7 @@ $ErrorActionPreference = 'Stop'
 
 # The linux/x64 SHA-512 of the certified Linux CLI (0.9.0, the semver of the helper's CertifiedCLI).
 # Recorded 2026-10-16: copied from Proton's live feed for 0.9.0 linux/x64, and equal to
-# `sha512sum` of the binary the Linux probes and gate ran (~/opt/proton-drive-cli/0.9.0/proton-drive).
+# `sha512sum` of the binary the Linux probes ran (~/opt/proton-drive-cli/0.9.0/proton-drive).
 # Every certification updates this AND the README's Linux CLI URL version and SHA-512
 # (docs/releasing.md, "Between releases"). Keep it on one line in single quotes: the Pester
 # tests read it with a regex.
