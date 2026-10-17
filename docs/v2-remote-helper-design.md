@@ -1272,8 +1272,8 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
     against the live set: the pre-batch advertised refs, minus the deletes that committed in
     phase 4, plus the creates already committed in this phase. Replacements are never re-checked.
     A create cleared in phase 2 by a same-batch delete is therefore refused if that delete failed;
-    git's per-ref output reports that ref rejected, which makes it the one case where a ref passes
-    validation and is still rejected. The pack phase 3 uploaded for it stays unreferenced, as with
+    git's per-ref output reports that ref rejected, naming the delete that did not commit, which
+    makes it the one case where a ref passes validation and is still rejected. The pack phase 3 uploaded for it stays unreferenced, as with
     any phase-5 create failure [inference]. The evidence is a hermetic test
     (`TestPushPhase5RefusesACreateWhoseVariantDeleteFailed`); no gate step reaches it
     deterministically, because a phase-2-valid delete fails in phase 4 only through a race or a
