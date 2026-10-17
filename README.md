@@ -400,16 +400,16 @@ download them; you don't need this tool, or even a Windows machine, to get your 
   So, on every platform, a push **refuses to create** a ref whose name differs only by letter case
   from another ref's (any component of the path counts, so all three shapes above are covered). The
   refusal names every conflicting ref, and git reports that ref rejected. A create is a name the
-  remote does not hold yet: a name it already holds is never refused by this rule, whether the
-  push updates it (forced or not) or deletes it. When this check refuses the create of a
-  case-changing rename beside a surviving variant (delete `Main`, create `MAIN`, with `main`
-  present), it refuses the rename's delete too, so `Main` survives. A create refused for
-  another reason (for example a ref and a folder of refs under the same name, or a name a
-  skipped foreign file occupies) gets git's ordinary per-ref treatment: its paired delete still
-  goes through, and the refused create's commit stays in your local repo. There is no override.
-  Case is folded the way Go's `strings.EqualFold` does, Unicode simple folding. NTFS folds with its
-  own table, which probably differs for a handful of characters, and Unicode normalisation (NFC
-  against NFD, as on macOS) is out of scope; neither is checked.
+  remote does not hold yet: a name it already holds is never refused by this rule when the push
+  updates it (forced or not) or makes an ordinary delete of it. The one delete this check refuses
+  is the delete half of a case-changing rename beside a surviving variant (delete `Main`, create
+  `MAIN`, with `main` present): when it refuses the create, it refuses the delete too, so `Main`
+  survives. A create refused for another reason (for example a ref and a folder of refs under the
+  same name, or a name a skipped foreign file occupies) gets git's ordinary per-ref treatment: its
+  paired delete still goes through, and the refused create's commit stays in your local repo.
+  There is no override. Case is folded the way Go's `strings.EqualFold` does, Unicode simple
+  folding. NTFS folds with its own table, which probably differs for a handful of characters, and
+  Unicode normalisation (NFC against NFD, as on macOS) is out of scope; neither is checked.
   - **One loss remains.** If a rename passes the check because the variant it conflicts with is
     deleted in the same push, and that delete then fails (a race or a transport fault) between the
     push's delete step and its create step, the create is refused after the rename's own delete
