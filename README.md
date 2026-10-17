@@ -91,15 +91,16 @@ are not equivalent, and the restore story is where that matters most.
 
 | | v1 — bundles | v2 — `git-remote-proton` |
 |---|---|---|
-| Platforms | Windows (PowerShell 7.4+) | Windows (amd64) and Linux (amd64) |
+| Platforms | Windows (PowerShell 7.4+) | Windows (amd64) and, from v0.10.0, Linux (amd64) |
 | Transport | Proton Drive's Windows sync app; a single bundle file lands in the synced folder | The Proton Drive CLI, invoked directly by the helper as a real git remote |
 | Remote name | `proton` | `proton-v2` |
 | Restore needs | git only, from any machine — the bundle itself is the backup, no account needed | git 2.45.0 or newer, `git-remote-proton` on PATH, and the certified Proton Drive CLI (0.9.0) signed in; on Linux, also a credential store the CLI can use ([Linux prerequisites](#install-on-linux-v2)) |
 
-**Install v2 first — `git-remote-proton` doesn't land on PATH by default.** A [GitHub
+**Install v2 first — `git-remote-proton` doesn't land on PATH by default.** From v0.10.0, a [GitHub
 Release](https://github.com/craigstoller/git-proton-backup/releases) carries five assets:
 `git-remote-proton.exe`, `git-remote-proton.exe.sha256` and `install.ps1` for Windows, and
-`git-remote-proton-linux-amd64` and `git-remote-proton-linux-amd64.sha256` for Linux. On Windows,
+`git-remote-proton-linux-amd64` and `git-remote-proton-linux-amd64.sha256` for Linux (v0.9.0 and
+earlier carry only the three Windows assets). On Windows,
 download the first three into one folder and run `install.ps1` there: it verifies the exe against
 the `.sha256`, copies it to `%LOCALAPPDATA%\Programs\git-proton-backup`, and adds that folder to
 your user PATH — open a **new** terminal afterward, since the script can't change its caller's own
@@ -173,9 +174,9 @@ files with it.
 
 ### Install on Linux (v2)
 
-v2 runs on Linux; v1 does not, because its transport is the Windows sync app. Only `linux/amd64`
-on glibc is built, and it is the only Linux build the release procedure covers: no arm64 helper is
-built, and Proton's arm64 and musl CLI builds were not run.
+From v0.10.0, v2 runs on Linux; v1 does not, because its transport is the Windows sync app. Only
+`linux/amd64` on glibc is built, and it is the only Linux build the release procedure covers: no
+arm64 helper is built, and Proton's arm64 and musl CLI builds were not run.
 
 **What is tested.** The helper is a static Go binary; the Proton Drive CLI it drives is Proton's
 glibc `linux/x64` build. The Linux live gate is still to run: the first Linux release takes one
@@ -201,11 +202,14 @@ Linux binary offline checks only. Other distributions are expected to work and a
   unlocked in the session that runs git. That is the store the Linux gate is to cover. With no session bus the CLI
   fails before any network attempt, and the helper passes its message through unchanged
   (`Failed to load session from secrets … Cannot autolaunch D-Bus`). The CLI's other store,
-  `pass` (`PROTON_DRIVE_CREDENTIALS_STORE=pass`), reaches the CLI untouched because the helper
-  sets no environment of its own; it is **not gated**. [Proton's CLI
+  `pass` (`PROTON_DRIVE_CREDENTIALS_STORE=pass`), reaches the CLI untouched: the helper sets no
+  `PROTON_DRIVE_*` variable and passes the CLI no environment of its own, so the CLI inherits the
+  helper's (the helper changes only git's own variables: it unsets `GIT_DIR` and makes relative
+  `GIT_COMMON_DIR` and `GIT_OBJECT_DIRECTORY` paths absolute). It is **not gated**. [Proton's CLI
   README](https://github.com/ProtonDriveApps/sdk/blob/main/cli/README.md) describes both stores.
 
-**Install.** Download the release's two Linux assets into one folder and run this there:
+**Install.** Download the two Linux assets of a v0.10.0 or later release into one folder and run
+this there:
 
 ```bash
 # The helper:
@@ -396,12 +400,16 @@ download them; you don't need this tool, or even a Windows machine, to get your 
   So, on every platform, a push **refuses to create** a ref whose name differs only by letter case
   from another ref's (any component of the path counts, so all three shapes above are covered). The
   refusal names every conflicting ref, and git reports that ref rejected. A create is a name the
-  remote does not hold yet: replacing an existing ref is not refused, and updates and ordinary
-  deletes never are. A case-changing rename beside a surviving variant (delete `Main`, create
-  `MAIN`, with `main` present) is refused whole, its delete included, so `Main` survives. There is
-  no override. Case is folded the way Go's `strings.EqualFold` does, Unicode simple folding. NTFS
-  folds with its own table, which probably differs for a handful of characters, and Unicode
-  normalisation (NFC against NFD, as on macOS) is out of scope; neither is checked.
+  remote does not hold yet: replacing an existing ref in one push (deleting it and pushing it
+  again) is never refused, either half, and updates and ordinary deletes never are. When this
+  check refuses the create of a case-changing rename beside a surviving variant (delete `Main`,
+  create `MAIN`, with `main` present), it refuses the rename's delete too, so `Main` survives. A
+  create refused for another reason (a ref and a folder of refs under the same name, or a name a
+  skipped foreign file occupies) gets git's ordinary per-ref treatment: its paired delete still
+  goes through, and the refused create's commit stays in your local repo. There is no override.
+  Case is folded the way Go's `strings.EqualFold` does, Unicode simple folding. NTFS folds with its
+  own table, which probably differs for a handful of characters, and Unicode normalisation (NFC
+  against NFD, as on macOS) is out of scope; neither is checked.
   - **One loss remains.** If a rename passes the check because the variant it conflicts with is
     deleted in the same push, and that delete then fails (a race or a transport fault) between the
     push's delete step and its create step, the create is refused after the rename's own delete
@@ -434,8 +442,11 @@ download them; you don't need this tool, or even a Windows machine, to get your 
 - **v2 on Linux: no certified CLI for CPUs without AVX2.** The certified `linux/x64` build needs
   AVX2. Proton's README names a `linux/x64-baseline` build for older CPUs, but Proton's 0.9.0 feed
   lists no such build, so there is nothing to certify. On such a CPU the CLI crashes at startup
-  (`Illegal instruction`) before the helper can report anything. Only Proton's README says so; the
-  gate's x64 venue cannot test it.
+  (`Illegal instruction`). The helper's first CLI call is its version check, so the message you
+  most likely see is that check's refusal, `Proton CLI version could not be determined (… signal:
+  illegal instruction) …`, ending `or install the certified CLI`. That is the AVX2 tell, not a
+  wrong CLI version [inference, untested]. Only Proton's README says the CLI needs AVX2; the gate's
+  x64 venue cannot test it.
 
 > **What this tool does and doesn't encrypt:** git-proton-backup performs no encryption itself.
 > Bundles are ordinary git bundles; anyone with access to your Windows account or your Proton

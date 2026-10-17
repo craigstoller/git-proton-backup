@@ -102,15 +102,17 @@ Craig-owned; the script bounds its one network call (30 s) so an unreachable fee
 task, and reports STOP, not MISMATCH, when the feed is reachable but unusable (a `windows/x64` or
 `linux/x64` entry whose SHA-512 is not 128 hex characters).
 
-**One expected shape, not drift:** while a certification is in flight and the machine's CLI has
+**Two expected shapes, not drift:** while a certification is in flight and the machine's CLI has
 already been swapped to the new build but the release that certifies it is not yet installed, the
 check reports the four fields `installed CLI == feed: True; installed CLI == helper's certified
 token: False; feed version == certified semver: False; feed linux/x64 == certified linux/x64:
 False`. The fourth is False because the feed's `linux/x64` entry moves with the version, until the
-certification updates `$CertifiedLinuxX64Sha512`. That is the known window the certification plan
-describes (its Task 2 step 5 swap, closed by its Task 3 step 4 install); check whether a
-certification task is open before acting on it. The full set of four is what tells it apart from
-the shapes that ARE drift, read in the same order:
+certification updates `$CertifiedLinuxX64Sha512`. Once the certification commit has updated that
+constant, and while the helper that certifies the new build is still not installed, a run of the
+script carrying that commit reports `True; False; False; True`. Both are the known window the
+certification plan describes (its Task 2 step 5 swap, closed by its Task 3 step 4 install); check
+whether a certification task is open before acting on either. The full set of four is what tells
+them apart from the shapes that ARE drift, read in the same order:
 
 - `False; True; False; False` is the not-yet-swapped machine after Proton has moved (only the feed
   changed, and its `linux/x64` entry moved with it).
@@ -122,7 +124,11 @@ the shapes that ARE drift, read in the same order:
   re-certify. The helper's token check alone would accept it, so this leg is the only thing that
   can show it.
 
-**Certification touch points.** Every certification updates `$CertifiedLinuxX64Sha512` in
+**Certification touch points.** Every CLI certification also runs the 17-row live contract table
+on linux/x64, in WSL with Windows interop off (`docs/research/gates/brief-checklist.md` rule 11),
+as well as on Windows, and records the Linux SHA-512 from that run (D8(a) of
+`docs/superpowers/specs/2026-10-15-v2-linux-port-design.md`). Every certification updates
+`$CertifiedLinuxX64Sha512` in
 `scripts/Test-ProtonCliDrift.ps1`, **and** the README's Linux CLI URL version and the SHA-512 beside
 it. All are certification touch points, and the README-pin Pester guard
 (`tests/ReadmePins.Tests.ps1`) checks that the README follows the helper's certified version and the
@@ -137,14 +143,12 @@ this section is the control.
 ## When adoption may stand in for the live gate
 
 A stand-in replaces step 5's live gates with installing the release on Craig's machine and checking
-it there (the Linux binary gets the offline checks of stand-in step 1 only). It is Craig's ruling,
-made per release and recorded in that release's gate record; this section says when he may make it
-and what the stand-in must then do. The 0.8.1 record
+it there. It is Craig's ruling, made per release and recorded in that release's gate record; this
+section says when he may make it and what the stand-in must then do. The 0.8.1 record
 (`docs/research/gates/v0.8.1-release-gate.md`) is the worked example.
 
 **Eligible only when nothing that builds or ships the helper has changed since the anchor,** the
-most recent release whose own bytes passed the formal live gates (for 0.8.1, the anchor was v0.7.0,
-which had one gate; once releases carry a Linux binary, the anchor must have passed both gates).
+most recent release whose own bytes passed the formal live gates (for 0.8.1, the anchor was v0.7.0).
 All four must hold:
 
 - `git diff <anchor-tag> <new-tag> -- '*.go' '*.s' '*.c' '*.h' go.mod go.sum go.work` is empty.
@@ -160,7 +164,7 @@ All four must hold:
   language floor, not a patch release, so the toolchain can move between builds; this check shows
   whether it did, and if it did, the release is not eligible.
 - The installed Proton Drive CLI reports the certified build (`--version`), the one the anchor's
-  live gate ran against.
+  Windows live gate ran against.
 
 The anchor's and the draft's binaries, per platform, then differ by the embedded version string and
 VCS stamps, and their behaviour is expected to be the same: an inference from identical source,
@@ -168,8 +172,9 @@ recipe and toolchain, not a byte comparison. Anything else takes the formal live
 never advances through a stand-in: it stays the last formally gated release, so a run of stand-ins
 cannot drift away from live evidence.
 
-**The first Linux release cannot take a stand-in.** It changes `release.yml` (the second bullet
-above) and has no Linux anchor: no earlier release's Linux bytes passed a Linux live gate.
+**The first Linux release cannot take a stand-in.** It changes `release.yml` (the `release.yml`
+diff bullet above) and has no Linux anchor: no earlier release's Linux bytes passed a Linux live
+gate.
 
 **What the stand-in covers live, and what it does not.** The module reaches Proton only through the
 sync folder and the Proton Drive CLI, never through the helper, and the fleet verify (stand-in

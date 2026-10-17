@@ -2,7 +2,7 @@
 
 **Status:** design v6.9, revised 2026-10-16 for the Linux port (linux/amd64 becomes a supported platform, pushes refuse new case-variant refs, and the git-floor and distro-CLI messages change; v6.8 was revised 2026-10-15 to record selective fetch's minimum git, 2.45.0; v6.7 on 2026-10-10 for the CLI 0.9.0 certification, v6.6 on 2026-08-09 during Stage 6 implementation). v5 was settled after four rounds of Codex + Gemini peer review; v6, v6.1, v6.2 and v6.3 each change exactly one mechanism, and each only because implementation proved the original unimplementable, unenforceable, or worse than what shipped. v6.4 documented Stage 4's shipped additions — the CLI version allowlist and the `--set-head` operation. v6.5 was the largest revision since v5: it re-enabled full hierarchical refs and the other-namespace rule v6.1 had narrowed away, replaced the fetch residue rule with quarantine staging, folded in the gate-sourced UX items, and left one item open — a git-valid-named foreign file with unparseable contents still failed every read against the repo, in both directions, until deleted. v6.6 closes that open question: the fatal-content rule is now **per-operation** — tolerant (skip + note) on the push-direction survey, fatal-with-enumeration on the fetch-direction survey — adds occupancy-aware push refusals (kind-aware, pre-pack) for names the read boundary skipped, adds the create-heal race-window diagnosis for an occupant that appears after advertisement, and pins F1 (directory download) as a verified contract fact. See the revision history.
 **Relates to:** [issue #3](https://github.com/craigstoller/git-proton-backup/issues/3).
-**Supported platforms (v6.9):** windows/amd64 and linux/amd64 — a static helper binary on each, driving Proton's glibc linux/x64 CLI on Linux. Other platforms build from source and are unsupported. Linux design and evidence: [`docs/superpowers/specs/2026-10-15-v2-linux-port-design.md`](superpowers/specs/2026-10-15-v2-linux-port-design.md).
+**Supported platforms (v6.9):** windows/amd64 and linux/amd64 — a static helper binary on each, driving Proton's glibc linux/x64 CLI on Linux. The Linux gate is still to run: linux/amd64 is gated per `docs/releasing.md` with the first release that ships it. Other platforms build from source and are unsupported. Linux design and evidence: [`docs/superpowers/specs/2026-10-15-v2-linux-port-design.md`](superpowers/specs/2026-10-15-v2-linux-port-design.md).
 **Depends on:** [`docs/research/remote-helper-prior-art.md`](research/remote-helper-prior-art.md) — read first; assumed, not repeated.
 **Pinned to:** Proton Drive CLI **`cli-drive@0.9.0+75612299`** (SDK `js@0.22.2+75612299`), certified
 2026-10-10 (`docs/research/gates/cli-0.9.0-certification.md`). Previously `cli-drive@0.8.0+06e8c605`
@@ -1235,7 +1235,8 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   and Proton's glibc linux/x64 CLI on Linux. The release now holds five assets
   (`git-remote-proton.exe`, its `.sha256`, `install.ps1`, `git-remote-proton-linux-amd64` and its
   `.sha256`); the Linux binary is cross-compiled in the existing Windows job with `CGO_ENABLED=0`
-  (D6(a)); `docs/releasing.md` runs two live gates against the draft's bytes, Windows and Linux.
+  (D6(a)); `docs/releasing.md` runs two live gates against the draft's bytes, Windows and Linux (or
+  an eligible stand-in).
   Stage 4's "windows/amd64 only" line is superseded. The CLI pin is unchanged: the Linux build
   prints the same identity token, so the exact pin needs no per-platform token (F5).
 - **The D2 rule: a push refuses to create a case variant, on every platform.** F13 (measured with
@@ -1243,8 +1244,8 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   `main` and `Main` silently checks out the wrong commit, or silently re-cases a branch. The
   helper already refuses Windows device names on every platform for the same reason (`marker.go`).
   - *Create-only, per A1.* A create is a destination absent from the pre-batch advertised set.
-    Replacements of existing names (a same-batch delete and recreate), updates and ordinary
-    deletes are never refused by this rule. There is no override variable.
+    Replacements of existing names (a same-batch delete and recreate; neither half is refused),
+    updates and ordinary deletes are never refused by this rule. There is no override variable.
   - *Prefixes and folding.* A ref's prefixes are its component chains from the namespace
     component down (`heads`, `heads/grp`, `heads/grp/a` for `refs/heads/grp/a`). Two spellings
     conflict when they differ but fold equal under Unicode simple case folding, the equivalence
@@ -1259,10 +1260,13 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
     existing `finalSet` algebra). Conflicts are computed as groups over that set, with no
     dependence on iteration order, and every create in a conflicting group is refused, so two
     same-batch creates `main` and `Main` are both refused. The refusal names every conflicting
-    ref, sorted. A case-changing rename is refused whole: when phase 2 refuses a create, every
-    same-batch delete of a ref whose full name folds equal to it is refused too. Because a refused
-    delete keeps its ref, and the kept ref can expose a new conflict, phase 2 repeats until a pass
-    refuses nothing (A1).
+    ref, sorted. A case-changing rename is refused whole: when this rule refuses a create, every
+    same-batch delete of an existing ref whose full name folds equal to it is refused too, except
+    the delete half of a replacement (the batch also writes that name). A create that phase 2
+    refuses for another reason (the D/F preflight, or a name a skipped file occupies) keeps git's
+    ordinary per-ref behaviour, so its paired delete still commits; the A1 implementation note
+    below records this narrowing. Because a refused delete keeps its ref, and the kept ref can
+    expose a new conflict, phase 2 repeats until a pass refuses nothing (A1).
   - *Phase 5 (creates and updates).* Before each create, as the first statement of the create arm
     and before `ensureRefParents` (which creates remote folders), the rule is checked again
     against the live set: the pre-batch advertised refs, minus the deletes that committed in
@@ -1339,6 +1343,10 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   not fixed: a rename can still lose the old name if a sibling delete hits a transport fault
   between phases 4 and 5. *[v6.9 note: the trigger is a phase-4 delete failure from a race or a
   transport fault; see the D2 bullet above.]*
+  *[v6.9 implementation note, 2026-10-16: the code applies the rename-whole refusal only when the
+  case rule refuses the create; widening it to other phase-2 refusals needs the D/F preflight
+  inside the fixed-point loop. This narrowing is the controller's ruling, pending Craig's
+  confirmation.]*
 
 **v6.8, 2026-10-15 — selective fetch's minimum git recorded: 2.45.0.**
 

@@ -124,7 +124,9 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         # Hermetic, as on Windows. The probe above has already proved the
-        # runner has git 2.45.0 or newer, which the fetch tests need.
+        # runner's git reports a missing tip as a `?`-line under
+        # `rev-list --missing=print`, the behaviour git 2.45.0 introduced and
+        # the fetch tests need.
         run: go test -count=1 ./...
       - name: gofmt (Linux)
         if: runner.os == 'Linux'
