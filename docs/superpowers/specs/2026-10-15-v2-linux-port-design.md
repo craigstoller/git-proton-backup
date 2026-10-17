@@ -223,10 +223,13 @@ If D2 adopts the refusal, the rule is as follows.
 - A create is refused when any of its prefixes conflicts with a prefix of another ref in the set it is
   checked against. The refusal names every conflicting ref, sorted.
 - Updates, replacements and ordinary deletes are never refused by this rule. The one exception is a
-  case-changing rename: when phase 2 refuses a create, every same-batch delete of a ref whose full
-  name folds equal to it is refused too, so the rename isn't half-applied. Phase 2 repeats this
-  until nothing changes. A remote that already holds a pair still takes pushes to its other refs,
-  and a user can repair it by deleting one of the pair. *(Amendment A1, 2026-10-16.)*
+  case-changing rename: when this rule refuses a create, every same-batch delete of a ref the remote
+  holds, that the batch does not also rewrite, and whose full name folds equal to the create, is
+  refused too, so the rename isn't half-applied. A create that another phase-2 check refuses (a ref
+  and a folder of refs under the same name, or a name a skipped file occupies) keeps git's ordinary
+  per-ref behaviour: its paired delete still commits. Phase 2 repeats this until nothing changes. A
+  remote that already holds a pair still takes pushes to its other refs, and a user can repair it by
+  deleting one of the pair. *(Amendments A1 and A2, 2026-10-16.)*
 - The rule is strict where a pair already exists. Under a pre-existing directory pair such as
   `Feat/a` beside `feat/b`, a new ref under either spelling is refused until the pair is repaired.
 
@@ -298,8 +301,7 @@ The helper, from the release's two linux assets:
 
 ```
 mkdir -p ~/.local/bin
-sha256sum -c git-remote-proton-linux-amd64.sha256
-install -m 0755 git-remote-proton-linux-amd64 ~/.local/bin/git-remote-proton
+sha256sum -c git-remote-proton-linux-amd64.sha256 && install -m 0755 git-remote-proton-linux-amd64 ~/.local/bin/git-remote-proton
 type -a git-remote-proton   # exactly one, the one just installed
 ```
 
@@ -307,10 +309,12 @@ The CLI, from Proton's download URL for the certified version:
 
 ```
 curl -fLo proton-drive https://proton.me/download/drive/cli/0.9.0/linux-x64/proton-drive
-echo "<certified SHA-512>  proton-drive" | sha512sum -c
-install -m 0755 proton-drive ~/.local/bin/proton-drive
+echo "<certified SHA-512>  proton-drive" | sha512sum -c && install -m 0755 proton-drive ~/.local/bin/proton-drive
 type -a proton-drive
 ```
+
+Each `install` is chained to its check with `&&`, so a failed check stops the install. *(Amendment
+A3, 2026-10-16.)*
 
 The `<certified SHA-512>` is the value the Linux gate record holds (§8), labelled with its
 certification date.
@@ -499,6 +503,16 @@ A1 makes three changes:
 Not taken: keeping the round-3 definition, and refusing a replacement's paired delete in a single
 pass (the round-1 plan fix). One residual is documented, not fixed: a rename can still lose the old
 name if a sibling delete hits a transport fault between phases 4 and 5.
+
+**Amendment A2, 2026-10-16. Craig's call, taking the recommended default.** Execution showed the
+rename-whole refusal is safe only where the case rule refused the create; widening it to every
+phase-2 refusal needs the D/F preflight inside the fixed-point loop (the final review ran the
+counterexample). A2 narrows the exception to case-rule refusals, and to deletes of names the remote
+holds that the batch does not also rewrite. Not taken: widening it to every phase-2 refusal.
+
+**Amendment A3, 2026-10-16. Craig's call, taking the recommended default.** §6's install commands
+chain each checksum to its `install` with `&&`, as the README does, so a failed check stops the
+install. Not taken: §6's unchained lines.
 
 **D1 — Platform scope of the first Linux release.**
 - (a) linux/amd64 glibc only. *Recommended:* it is the only Linux build F5 ran and the only one a

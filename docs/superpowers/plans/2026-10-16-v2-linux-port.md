@@ -42,6 +42,9 @@ A1 changes two things:
    the case rule never refuses it.
 2. **A case-changing rename is refused whole.** When phase 2 refuses a create, every valid
    same-batch delete of a ref whose full name folds equal to it is refused too.
+   *Superseded in part by spec Amendment A2 (2026-10-16): the refusal fires only when the case rule
+   refuses the create, and only for deletes of names the remote holds that the batch does not also
+   rewrite.*
 
 
 **Branch:** work on a worktree branch, as Stages 5 and 6 did (`git log --first-parent`). Commit per
