@@ -1348,8 +1348,21 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   transport fault; see the D2 bullet above.]*
   *[v6.9 implementation note, 2026-10-16: the code applies the rename-whole refusal only when the
   case rule refuses the create; widening it to other phase-2 refusals needs the D/F preflight
-  inside the fixed-point loop. This narrowing is the controller's ruling, pending Craig's
-  confirmation.]*
+  inside the fixed-point loop. Craig confirmed this narrowing on 2026-10-16 (spec Amendment A2;
+  see the post-execution rulings below).]*
+- **Post-execution rulings (2026-10-16, Craig's calls, each taking the controller's recommended
+  default).** Made after the port was executed and its draft PR's CI and release dry run had
+  passed. The options not taken are on the right.
+
+  | | Ruled | Not taken |
+  |---|---|---|
+  | Rename-whole scope | The rename-whole refusal applies only when the case rule refuses the create, and only to deletes of names the remote holds that the batch does not also rewrite; a create refused by another phase-2 check keeps git's per-ref behaviour, so its paired delete commits (spec Amendment A2) | Widen it to every phase-2 refusal, which needs the D/F preflight inside the fixed-point loop |
+  | Linux install checks | Each `install` in the README's Linux install is chained to its checksum with `&&`, so a failed check stops it (spec Amendment A3) | Spec §6's unchained lines |
+  | Draft Windows helper for the Linux gate | The Linux gate brief installs it (B.3) and keeps a rollback copy; if a later gate fails or the release is abandoned, restoring that copy is part of abandoning the release (`docs/releasing.md` step 5) | A Windows gate brief installs it, and the Linux gate runs second |
+  | Gate-brief behaviour calls 27, 31/36, 33, 37 and 47/52, and the BLOCKs on an incomplete listing row and on a `GitRemotes` that is not a folder | Accepted as the brief writes them | §7's literal wording: the scheduled tasks re-enabled on the last Windows check alone, the trash emptied under checklist rule 6, the first "could not check" warning BLOCKED, a still-listed trashed row BLOCKED, and keyring deletion not waiting on a successful logout |
+  | Cross-platform push-back | Not in the v0.10.0 gate: step 4 covers two one-way handoffs | Steps 4.9-4.11 (recoverable from a2ec7f6) |
+  | Length of the conflict list in a case refusal | Uncapped, as spec §5 says ("names every conflicting ref") | Cap it at 5, like `maxDescribedBlockers` |
+  | Pre-existing case pairs before adoption | Before 0.10.0 is adopted for scheduled pushes, `git ls-remote` each v2 remote those pushes reach and fold-compare each namespace (gate brief, "After the gate") | Adopt without checking |
 
 **v6.8, 2026-10-15 — selective fetch's minimum git recorded: 2.45.0.**
 
