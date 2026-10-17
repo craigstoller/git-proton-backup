@@ -17,17 +17,17 @@ unchanged (`cli-drive@0.9.0+75612299`).
 - **git-remote-proton: a push now refuses to create a ref that differs from another only by letter
   case (`Main` beside `main`), on every platform.** Proton stores both, but a Windows clone of such
   a remote silently checks out the wrong commit or silently re-cases a branch. The refusal names
-  every conflicting ref. Replacing a ref that already exists is never refused, either half, and
-  neither are updates and ordinary deletes. When this check refuses the create of a case-changing
-  rename beside a surviving variant, it refuses the rename's delete too, so neither half is
-  applied; a create refused for another reason (a ref and a folder of refs under the same name, or
-  a name a skipped foreign file occupies) keeps git's ordinary per-ref behaviour, and its delete
-  still goes through. There is no override. A remote that already holds a pair takes pushes to its
-  other refs, and you repair the pair by deleting one member; under a directory pair (`Feat/a`
-  beside `feat/b`), a new ref under either spelling is refused until the pair is repaired. Known
-  limits: a ref whose variant sits in a skipped foreign file is not checked, and a rename can lose
-  its old name if the delete of the variant it conflicts with, made in the same push, fails partway
-  through that push (a race or a transport fault); both are in the README's honest limits.
+  every conflicting ref. A name the remote already holds is never refused by this rule, whether the
+  push updates it or deletes it. When this check refuses the create of a case-changing rename beside
+  a surviving variant, it refuses the rename's delete too, so neither half is applied; a create
+  refused for another reason (for example a ref and a folder of refs under the same name, or a name
+  a skipped foreign file occupies) keeps git's ordinary per-ref behaviour, and its delete still goes
+  through. There is no override. A remote that already holds a pair takes pushes to its other refs,
+  and you repair the pair by deleting one member; under a directory pair (`Feat/a` beside `feat/b`),
+  a new ref under either spelling is refused until the pair is repaired. Known limits: a ref whose
+  variant sits in a skipped foreign file is not checked, and a rename can lose its old name if the
+  delete of the variant it conflicts with, made in the same push, fails partway through that push (a
+  race or a transport fault); both are in the README's honest limits.
 - **git-remote-proton: the git requirement is now stated where it bites.** A fetch or clone on an
   older git fails with the same error as before, now with a note that selective fetch requires
   git 2.45.0 or newer. A

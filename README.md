@@ -99,8 +99,8 @@ are not equivalent, and the restore story is where that matters most.
 **Install v2 first — `git-remote-proton` doesn't land on PATH by default.** From v0.10.0, a [GitHub
 Release](https://github.com/craigstoller/git-proton-backup/releases) carries five assets:
 `git-remote-proton.exe`, `git-remote-proton.exe.sha256` and `install.ps1` for Windows, and
-`git-remote-proton-linux-amd64` and `git-remote-proton-linux-amd64.sha256` for Linux (v0.9.0 and
-earlier carry only the three Windows assets). On Windows,
+`git-remote-proton-linux-amd64` and `git-remote-proton-linux-amd64.sha256` for Linux (v0.9.0
+carries only the three Windows assets). On Windows,
 download the first three into one folder and run `install.ps1` there: it verifies the exe against
 the `.sha256`, copies it to `%LOCALAPPDATA%\Programs\git-proton-backup`, and adds that folder to
 your user PATH — open a **new** terminal afterward, since the script can't change its caller's own
@@ -400,11 +400,11 @@ download them; you don't need this tool, or even a Windows machine, to get your 
   So, on every platform, a push **refuses to create** a ref whose name differs only by letter case
   from another ref's (any component of the path counts, so all three shapes above are covered). The
   refusal names every conflicting ref, and git reports that ref rejected. A create is a name the
-  remote does not hold yet: replacing an existing ref in one push (deleting it and pushing it
-  again) is never refused, either half, and updates and ordinary deletes never are. When this
-  check refuses the create of a case-changing rename beside a surviving variant (delete `Main`,
-  create `MAIN`, with `main` present), it refuses the rename's delete too, so `Main` survives. A
-  create refused for another reason (a ref and a folder of refs under the same name, or a name a
+  remote does not hold yet: a name it already holds is never refused by this rule, whether the
+  push updates it (forced or not) or deletes it. When this check refuses the create of a
+  case-changing rename beside a surviving variant (delete `Main`, create `MAIN`, with `main`
+  present), it refuses the rename's delete too, so `Main` survives. A create refused for
+  another reason (for example a ref and a folder of refs under the same name, or a name a
   skipped foreign file occupies) gets git's ordinary per-ref treatment: its paired delete still
   goes through, and the refused create's commit stays in your local repo. There is no override.
   Case is folded the way Go's `strings.EqualFold` does, Unicode simple folding. NTFS folds with its

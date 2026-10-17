@@ -1244,8 +1244,11 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   `main` and `Main` silently checks out the wrong commit, or silently re-cases a branch. The
   helper already refuses Windows device names on every platform for the same reason (`marker.go`).
   - *Create-only, per A1.* A create is a destination absent from the pre-batch advertised set.
-    Replacements of existing names (a same-batch delete and recreate; neither half is refused),
-    updates and ordinary deletes are never refused by this rule. There is no override variable.
+    Names the remote already holds are never refused by this rule: updates, ordinary deletes, and
+    replacements (a same-batch delete and recreate of one name; neither half is refused). Git
+    itself rejects that pairing at push time with "dst ref ... receives from more than one src"
+    (measured 2026-10-16, git 2.55.0.windows.3), so the helper's handling of it is defensive
+    [inference]. There is no override variable.
   - *Prefixes and folding.* A ref's prefixes are its component chains from the namespace
     component down (`heads`, `heads/grp`, `heads/grp/a` for `refs/heads/grp/a`). Two spellings
     conflict when they differ but fold equal under Unicode simple case folding, the equivalence
@@ -1263,21 +1266,21 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
     ref, sorted. A case-changing rename is refused whole: when this rule refuses a create, every
     same-batch delete of an existing ref whose full name folds equal to it is refused too, except
     the delete half of a replacement (the batch also writes that name). A create that phase 2
-    refuses for another reason (the D/F preflight, or a name a skipped file occupies) keeps git's
-    ordinary per-ref behaviour, so its paired delete still commits; the A1 implementation note
-    below records this narrowing. Because a refused delete keeps its ref, and the kept ref can
-    expose a new conflict, phase 2 repeats until a pass refuses nothing (A1).
+    refuses for another reason (for example the D/F preflight, or a name a skipped file occupies)
+    keeps git's ordinary per-ref behaviour, so its paired delete still commits; the A1
+    implementation note below records this narrowing. Because a refused delete keeps its ref, and
+    the kept ref can expose a new conflict, phase 2 repeats until a pass refuses nothing (A1).
   - *Phase 5 (creates and updates).* Before each create, as the first statement of the create arm
     and before `ensureRefParents` (which creates remote folders), the rule is checked again
     against the live set: the pre-batch advertised refs, minus the deletes that committed in
     phase 4, plus the creates already committed in this phase. Replacements are never re-checked.
     A create cleared in phase 2 by a same-batch delete is therefore refused if that delete failed;
     git's per-ref output reports that ref rejected, naming the delete that did not commit, which
-    makes it the one case where a ref passes validation and is still rejected. The pack phase 3 uploaded for it stays unreferenced, as with
-    any phase-5 create failure [inference]. The evidence is a hermetic test
-    (`TestPushPhase5RefusesACreateWhoseVariantDeleteFailed`); no gate step reaches it
-    deterministically, because a phase-2-valid delete fails in phase 4 only through a race or a
-    transport fault.
+    makes it the one case where a ref passes validation and is still rejected. The pack phase 3
+    uploaded for it stays unreferenced, as with any phase-5 create failure [inference]. The evidence
+    is a hermetic test (`TestPushPhase5RefusesACreateWhoseVariantDeleteFailed`); no gate step
+    reaches it deterministically, because a phase-2-valid delete fails in phase 4 only through a
+    race or a transport fault.
   - *Where it runs.* Under the repo lock, which `main.go` acquires before advertising, so two
     clients cannot each validate one half of a pair.
   - *Skipped refs are not in the set.* Name-skipped refs are never advertised, and a content skip
