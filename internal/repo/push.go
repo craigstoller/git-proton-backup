@@ -340,8 +340,9 @@ func Push(t transport.Transport, root, gitDir string,
 	// (windowsReserved, marker.go): a repo stays usable from every machine,
 	// whichever one pushed first. Updates and replacements (a same-batch
 	// delete and recreate of a name already on the remote) are never refused,
-	// since they add no spelling the remote did not already have; nor is
-	// anything checked against skipped names, which never reach a clone.
+	// neither half of a replacement, since they add no spelling the remote did
+	// not already have; nor is anything checked against skipped names, which
+	// never reach a clone.
 	//
 	// It runs after the D/F preflight, against batchFinalSet over the CURRENT
 	// valid flags (so a create the D/F loop refused is not in the set), and
@@ -349,16 +350,28 @@ func Push(t transport.Transport, root, gitDir string,
 	//
 	// A case-changing rename (delete Main, create MAIN) is refused WHOLE (A1):
 	// when this rule refuses a create X, every still-valid same-batch delete
-	// whose full name folds equal to X is refused too, so the rename is not
-	// half-applied. A refused delete keeps its ref, and the kept ref can
-	// expose a conflict for a create an earlier pass approved, so the check
-	// repeats until a pass refuses nothing. Each pass that continues refuses
-	// at least one create, so there are at most (creates + 1) passes, and
-	// each pass is set algebra, so neither outcome nor text depends on batch
-	// order (Review Focus 5). The D/F preflight needs no re-run for a kept
-	// ref: a create above or beneath it either shares its spelling where it
-	// differs from X, and so conflicts with X here in the same pass, or lies
-	// above or beneath X too, and already met X in the D/F preflight.
+	// of a ref the pre-batch remote holds whose full name folds equal to X is
+	// refused too, so the rename is not half-applied. Two deletes are spared:
+	// one of a name the remote does not hold, which is a no-op, not half of a
+	// rename; and the delete half of a replacement (the batch also writes that
+	// name), which A1 never refuses. Only this rule's refusals trigger the
+	// step: a create the D/F preflight or the occupancy check refused keeps
+	// git's per-ref behaviour, so a delete paired with it still commits
+	// (design v6.9's implementation note on A1; widening it needs the D/F
+	// preflight inside this loop).
+	//
+	// A refused delete keeps its ref, and the kept ref can expose a conflict
+	// for a create an earlier pass approved, so the check repeats until a pass
+	// refuses nothing. Each pass that continues refuses at least one create,
+	// so there are at most (creates + 1) passes, and each pass is set algebra,
+	// so neither outcome nor text depends on batch order (Review Focus 5).
+	// Sparing the two deletes above changes no pass's set: subtracting an
+	// absent name is a no-op, and a replaced name is added back by its
+	// recreate, which is no create, so this loop never changes its validity.
+	// The D/F preflight needs no re-run for a kept ref: a create above or
+	// beneath it either shares its spelling where it differs from X, and so
+	// conflicts with X here in the same pass, or lies above or beneath X too,
+	// and already met X in the D/F preflight.
 	for {
 		caseSet := batchFinalSet(remote, ups, valid, isDelete)
 		var candidates []string
@@ -391,8 +404,19 @@ func Push(t transport.Transport, root, gitDir string,
 				renameTo[caseKey(x)] = x
 			}
 		}
+		// rewritten: every name a still-valid non-delete writes, so a delete
+		// of one of them is half of a replacement.
+		rewritten := map[string]bool{}
+		for i, u := range ups {
+			if valid[i] && !isDelete[i] {
+				rewritten[u.Dst] = true
+			}
+		}
 		for j, u := range ups {
 			if !valid[j] || !isDelete[j] {
+				continue
+			}
+			if _, held := remote[u.Dst]; !held || rewritten[u.Dst] {
 				continue
 			}
 			if x, ok := renameTo[caseKey(u.Dst)]; ok {
@@ -553,6 +577,14 @@ func Push(t transport.Transport, root, gitDir string,
 			live[ref] = true
 		}
 	}
+	// batchDeletes: every name this batch asked to delete, so a phase-5
+	// refusal can name the deletes it depended on.
+	batchDeletes := map[string]bool{}
+	for i, u := range ups {
+		if isDelete[i] {
+			batchDeletes[u.Dst] = true
+		}
+	}
 
 	for i, u := range ups {
 		if !valid[i] || isDelete[i] {
@@ -570,10 +602,15 @@ func Push(t transport.Transport, root, gitDir string,
 		// Replacements of pre-existing names (a same-batch delete and
 		// recreate) are never re-checked: they add no spelling the remote
 		// lacked, and refusing one after its own delete committed would
-		// destroy the ref it replaces. One residual needs a transport fault: a
-		// case-changing rename that passed phase 2, because its conflicting
-		// variant was also being deleted, can still lose the renamed-away ref
-		// if that variant's delete fails. The README's honest limits say so.
+		// destroy the ref it replaces. One residual needs a race or a
+		// transport fault: a case-changing rename that passed phase 2, because
+		// its conflicting variant was also being deleted, can still lose the
+		// renamed-away ref if that variant's delete fails. The README's honest
+		// limits say so.
+		//
+		// The refusal names the delete it depended on (spec §5): the message
+		// is caseConflictMessage's, with failedDeleteClause appended for each
+		// conflicting ref this batch tried to delete and did not.
 		//
 		// This must run before ensureRefParents, which creates remote parent
 		// folders; any later would leave folders behind for a refused create.
@@ -584,7 +621,13 @@ func Push(t transport.Transport, root, gitDir string,
 		_, preExists := remote[u.Dst]
 		if !preExists {
 			if cs := caseConflicts(live, []string{u.Dst})[u.Dst]; len(cs) > 0 {
-				fail(i, caseConflictMessage(u.Dst, cs))
+				var undeleted []string
+				for _, c := range cs {
+					if batchDeletes[c.Ref] && !deletedThisBatch[c.Ref] {
+						undeleted = append(undeleted, c.Ref)
+					}
+				}
+				fail(i, caseConflictMessage(u.Dst, cs)+failedDeleteClause(undeleted))
 				continue
 			}
 		}

@@ -144,3 +144,22 @@ func caseConflictMessage(dst string, cs []caseConflict) string {
 		"the pair (README, Honest limits), so this create is refused on every platform",
 		dst, strings.Join(parts, ", "))
 }
+
+// failedDeleteClause is what phase 5 appends to caseConflictMessage when a
+// create it refuses depended on same-batch deletes that did not commit (spec
+// §5: the refusal names the delete it depended on). refs are sorted, so the
+// text does not depend on batch order: " (the same-batch delete of A did not
+// commit)" for one, " (the same-batch deletes of A, B and C did not commit)"
+// for several, and "" for none.
+func failedDeleteClause(refs []string) string {
+	if len(refs) == 0 {
+		return ""
+	}
+	s := append([]string(nil), refs...)
+	sort.Strings(s)
+	if len(s) == 1 {
+		return " (the same-batch delete of " + s[0] + " did not commit)"
+	}
+	return " (the same-batch deletes of " + strings.Join(s[:len(s)-1], ", ") + " and " +
+		s[len(s)-1] + " did not commit)"
+}
