@@ -78,11 +78,16 @@ var probeRestoreFloor = gitcmd.ProbeMissingTips
 func warnRestoreFloor(gitDir string) {
 	res, detail := probeRestoreFloor(gitDir)
 	switch res {
+	case gitcmd.ProbeOK:
+		// This git can restore: nothing to say.
 	case gitcmd.ProbeTooOld:
 		fmt.Fprintf(os.Stderr, "git-remote-proton: WARNING: this git cannot restore from a "+
 			"git-remote-proton remote: fetch and clone need git 2.45.0 or newer (%s). "+
 			"This check does not block the push.\n", detail)
-	case gitcmd.ProbeUnknown:
+	default:
+		// gitcmd.ProbeUnknown, and any result this switch does not know: an
+		// unexpected answer is not proof this git can restore, so it reads as
+		// "could not check", never as a silent pass.
 		fmt.Fprintf(os.Stderr, "git-remote-proton: WARNING: could not check whether this git can "+
 			"restore from a git-remote-proton remote (fetch and clone need git 2.45.0 or newer): %s. "+
 			"This check does not block the push.\n", detail)

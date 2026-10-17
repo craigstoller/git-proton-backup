@@ -594,7 +594,8 @@ const (
 	// ProbeOK: this git reports a missing tip as a ?-line, so it can restore.
 	ProbeOK ProbeResult = iota
 	// ProbeTooOld: this git died on the missing tip with its own 'bad object'
-	// error, which is how a git older than 2.45.0 behaves.
+	// error, which is how git behaves below the restore floor (restoring
+	// needs git 2.45.0 or newer).
 	ProbeTooOld
 	// ProbeUnknown: the probe could not tell (timeout, git missing, not a
 	// repository, any other git error). It is not evidence the git is too old.
@@ -663,12 +664,19 @@ func ProbeMissingTips(gitDir string) (ProbeResult, string) {
 	if strings.Contains(output, "bad object "+probeMissingTipOID) {
 		return ProbeTooOld, probeDetailLine(output, err)
 	}
-	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+	timedOut := err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded)
+	if timedOut {
 		// A killed child reports "signal: killed" (or a bare exit status on
 		// Windows); the deadline is the reason the operator needs.
 		err = fmt.Errorf("timed out after %s", probeTimeout)
 	}
-	return ProbeUnknown, probeDetailLine(output, err)
+	detail := probeDetailLine(output, err)
+	if timedOut && strings.TrimSpace(output) != "" {
+		// probeDetailLine quotes the output when there is any, and err only
+		// when there is none; partial output alone would hide the timeout.
+		detail += fmt.Sprintf(" (timed out after %s)", probeTimeout)
+	}
+	return ProbeUnknown, detail
 }
 
 // probeDetailLine renders what a probe saw as one line for a stderr warning:

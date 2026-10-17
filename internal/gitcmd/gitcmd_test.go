@@ -933,12 +933,14 @@ func TestRevListMissingFrontierDeepensThroughATree(t *testing.T) {
 	}
 }
 
-// GUARD: pins RevListMissing's error-translation wrap — the unconditional
-// %w-wrap that names "--missing=print" and the minimum-git floor whenever the
+// GUARD, with one RED assertion: pins RevListMissing's error-translation wrap,
+// the unconditional %w-wrap that names the minimum-git floor whenever the
 // underlying rev-list call itself errors (as opposed to succeeding and
 // reporting ?-lines, which every other RevListMissing test above exercises).
 // A gitDir that is not a git repository at all makes revListWithAlt fail
 // immediately, forcing the wrap branch the rest of this suite never takes.
+// The test was a GUARD until D5(a) (Task 3) added the "git 2.45.0 or newer"
+// assertion, which is RED: it failed until the wrap named the floor.
 func TestRevListMissingWrapsUnderlyingErrorWithFloorText(t *testing.T) {
 	notARepo := t.TempDir() // deliberately never `git init`-ed
 	altObjects := t.TempDir()
@@ -948,9 +950,11 @@ func TestRevListMissingWrapsUnderlyingErrorWithFloorText(t *testing.T) {
 	if err == nil {
 		t.Fatal("RevListMissing against a non-repo gitDir must return an error")
 	}
+	// This only shows the error came from the --missing=print rev-list call: the
+	// underlying error already echoes the call's arguments, so it holds with or
+	// without the wrap. The floor assertion below is what pins the wrap itself.
 	if !strings.Contains(err.Error(), "--missing=print") {
-		t.Errorf("wrapped error must name --missing=print (the floor-naming text "+
-			"from RevListMissing's wrap): %v", err)
+		t.Errorf("error must come from the --missing=print rev-list call: %v", err)
 	}
 	if !strings.Contains(err.Error(), "git 2.45.0 or newer") {
 		t.Errorf("wrapped error must name git 2.45.0 or newer (the D5(a) floor): %v", err)
@@ -1185,8 +1189,13 @@ func TestProbeMissingTipsUnknownWhenGitExitsZeroWithoutTheMissingLine(t *testing
 // ?-line and exits 0, but leaves a grandchild holding the output pipe, so Wait
 // returns exec.ErrWaitDelay after the probe's own 2 s bound. That is still a
 // pass: the answer was already in hand.
+//
+// The grandchild sleeps 20 s, well past the 8 s bound, so the bound holds only
+// while probeWaitDelay does: with no WaitDelay, or the package's 30 s one, Wait
+// would block until the sleep ends and the test fails (final-review fix C6;
+// with `sleep 5` a lost WaitDelay still passed, and ErrWaitDelay never fired).
 func TestProbeMissingTipsOKEvenWhenAGrandchildHoldsThePipe(t *testing.T) {
-	fakeGitOnPath(t, "cat >/dev/null\necho '?"+probeMissingTipOID+"'\nsleep 5 &\nexit 0")
+	fakeGitOnPath(t, "cat >/dev/null\necho '?"+probeMissingTipOID+"'\nsleep 20 &\nexit 0")
 	start := time.Now()
 	res, detail := ProbeMissingTips(t.TempDir())
 	if res != ProbeOK {
@@ -1200,11 +1209,15 @@ func TestProbeMissingTipsOKEvenWhenAGrandchildHoldsThePipe(t *testing.T) {
 // RED. A hung git (and the sleep it leaves holding the pipe) only makes the
 // probe Unknown, within its deadline plus its own short WaitDelay: it must
 // never hold up a push for the package's 30 s waitDelay.
+//
+// The sleep is 20 s, well past the 8 s bound, for the same reason as the
+// grandchild test above (final-review fix C6): a shorter sleep would let a
+// lost probeWaitDelay pass.
 func TestProbeMissingTipsUnknownWhenGitHangs(t *testing.T) {
 	old := probeTimeout
 	probeTimeout = 500 * time.Millisecond
 	t.Cleanup(func() { probeTimeout = old })
-	fakeGitOnPath(t, "sleep 5")
+	fakeGitOnPath(t, "sleep 20")
 	start := time.Now()
 	res, detail := ProbeMissingTips(t.TempDir())
 	if res != ProbeUnknown {
@@ -1215,6 +1228,26 @@ func TestProbeMissingTipsUnknownWhenGitHangs(t *testing.T) {
 	}
 	if took := time.Since(start); took > 8*time.Second {
 		t.Errorf("probe took %s, want it bounded near the deadline plus the 2 s WaitDelay", took)
+	}
+}
+
+// RED (final-review fix C7(a)). A git that printed something before hanging
+// still timed out, and the detail must say so: the partial output alone reads
+// like an answer, not like a probe that ran out of time.
+func TestProbeMissingTipsTimeoutIsNamedEvenWithPartialOutput(t *testing.T) {
+	old := probeTimeout
+	probeTimeout = 500 * time.Millisecond
+	t.Cleanup(func() { probeTimeout = old })
+	fakeGitOnPath(t, "echo partial-output\nsleep 20")
+	res, detail := ProbeMissingTips(t.TempDir())
+	if res != ProbeUnknown {
+		t.Fatalf("ProbeMissingTips = (%d, %q), want ProbeUnknown", res, detail)
+	}
+	if !strings.Contains(detail, "partial-output") {
+		t.Errorf("detail = %q, want the partial output quoted", detail)
+	}
+	if !strings.HasSuffix(detail, " (timed out after 500ms)") {
+		t.Errorf("detail = %q, want it to end %q", detail, " (timed out after 500ms)")
 	}
 }
 
