@@ -52,6 +52,8 @@ forgotten for the v0.3.x releases. Follow it in order; do not skip or reorder st
    `docs/research/gates/brief-checklist.md` for the standing rules every gate brief incorporates).
    For v0.10.0, the first release with a Linux binary, the Linux gate's brief is
    `docs/research/gates/v0.10.0-linux-gate-brief.md`.
+   Its Windows gate's brief is `docs/research/gates/v0.10.0-windows-gate-brief.md`; that gate runs
+   after the Linux gate has passed, and asserts the draft helper's install rather than making it.
    A release that moves the CLI pin installs the draft helper before the Windows gate smoke, as
    v0.7.0's gate did (Task 3 step 4 of the certification plan, today
    `docs/superpowers/plans/2026-10-10-cli-0.9.0-certification.md`), so that the helper under test
