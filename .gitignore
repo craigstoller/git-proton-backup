@@ -12,3 +12,8 @@ testResults.xml
 # git-remote-proton build output
 /git-remote-proton
 /git-remote-proton.exe
+
+# Agent working files: certification captures, SDD ledgers and review packages.
+# They are scratch, never source of truth (AGENTS.md), and some hold raw account
+# listings, so they stay out of this public repository.
+.superpowers/
