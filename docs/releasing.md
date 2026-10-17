@@ -58,7 +58,8 @@ forgotten for the v0.3.x releases. Follow it in order; do not skip or reorder st
    and the helper on PATH are the same bytes.
    For v0.10.0 the Linux gate's brief installs the draft Windows helper itself and keeps a rollback
    copy (Craig's ruling, 2026-10-16). If a later gate fails or the release is abandoned after that,
-   restoring the rollback copy is part of abandoning the release, before scheduled backups resume.
+   restoring the rollback copy is part of abandoning the release: pause the scheduled tasks,
+   restore and verify the copy, then re-enable them.
    Tags are never moved after any artifact has been built from them — if either gate finds a
    defect, the fix ships as a new tag, not a retag. The one alternative is a stand-in, for a
    release that qualifies under "When adoption may stand in for the live gate" below and only on
