@@ -24,7 +24,7 @@ const liveRoot = "/my-files/_cas-probe/contract"
 // every call (see contractLiveRoot) — never cached in package state.
 const contractLiveRootEnv = "GPB_CONTRACT_LIVE_ROOT"
 
-// untouchableTopLevelFolders are the six pre-existing top-level folders in
+// untouchableTopLevelFolders are the six protected top-level folders in
 // the live Proton account that no gate or contract run may ever write to or
 // trash. These are account facts, not inventions — verified verbatim
 // against docs/research/gates/stage5-gate.md:669-670 ("Untouchable folders
@@ -33,7 +33,7 @@ const contractLiveRootEnv = "GPB_CONTRACT_LIVE_ROOT"
 // `filesystem list /my-files` output.") and cross-checked against the same
 // four names in docs/research/gates/stage4-gate.md:271-272,830-831 and
 // docs/research/gates/stage5-gate-brief.md:60,487. The last two were added
-// later: `Tax Documents` (new since August, treated as a fifth untouchable,
+// later: `Tax Documents` (created 2026-09-19, treated as a fifth untouchable,
 // D3) is in docs/research/gates/cli-0.9.0-certification.md, and `Archive` (the
 // folder the 0.9.0 CLI archive was uploaded to, treated as foreign data by
 // later gate briefs) is post-release ruling 5 in

@@ -1089,6 +1089,9 @@ func TestDistroTokenNeverCertifies(t *testing.T) {
 			t.Errorf("override warning must name %q, got %q", want, buf.String())
 		}
 	}
+	if strings.Contains(buf.String(), "repackaged") {
+		t.Errorf("the override warning must be the generic one, without the repackage note, got %q", buf.String())
+	}
 }
 
 // GUARD (spec D4(a)): an ordinary version mismatch is not called a repackage.
