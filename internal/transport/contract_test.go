@@ -24,7 +24,7 @@ const liveRoot = "/my-files/_cas-probe/contract"
 // every call (see contractLiveRoot) — never cached in package state.
 const contractLiveRootEnv = "GPB_CONTRACT_LIVE_ROOT"
 
-// untouchableTopLevelFolders are the four pre-existing top-level folders in
+// untouchableTopLevelFolders are the six protected top-level folders in
 // the live Proton account that no gate or contract run may ever write to or
 // trash. These are account facts, not inventions — verified verbatim
 // against docs/research/gates/stage5-gate.md:669-670 ("Untouchable folders
@@ -32,12 +32,19 @@ const contractLiveRootEnv = "GPB_CONTRACT_LIVE_ROOT"
 // Bundles`, `ChatGPT Export Text Backup` appeared only as rows in
 // `filesystem list /my-files` output.") and cross-checked against the same
 // four names in docs/research/gates/stage4-gate.md:271-272,830-831 and
-// docs/research/gates/stage5-gate-brief.md:60,487.
+// docs/research/gates/stage5-gate-brief.md:60,487. The last two were added
+// later: `Tax Documents` (created 2026-09-19, treated as a fifth untouchable,
+// D3) is in docs/research/gates/cli-0.9.0-certification.md, and `Archive` (the
+// folder the 0.9.0 CLI archive was uploaded to, treated as foreign data by
+// later gate briefs) is post-release ruling 5 in
+// docs/research/gates/v0.9.0-release-gate.md.
 var untouchableTopLevelFolders = map[string]bool{
 	"GitBackups":                 true,
 	"Sensitive Project Sources":  true,
 	"Project Repo Bundles":       true,
 	"ChatGPT Export Text Backup": true,
+	"Tax Documents":              true,
+	"Archive":                    true,
 }
 
 // validateContractLiveRoot is the PURE, fail-closed gate on the contract
@@ -49,7 +56,7 @@ var untouchableTopLevelFolders = map[string]bool{
 //     v (not a cleaned path): a prefix check alone would still admit
 //     /my-files/x/../../outside-style traversal if the CLI resolves dot
 //     segments (round-3 Codex, spec Component 3);
-//   - the first path segment under /my-files/ is not one of the four
+//   - the first path segment under /my-files/ is not one of the six
 //     untouchable top-level folders above.
 //
 // Every rejection's error names the offending value v.
@@ -103,6 +110,8 @@ func TestValidateContractLiveRoot(t *testing.T) {
 		{"Sensitive Project Sources prefix", "/my-files/Sensitive Project Sources/x"},
 		{"Project Repo Bundles prefix", "/my-files/Project Repo Bundles/x"},
 		{"ChatGPT Export Text Backup prefix", "/my-files/ChatGPT Export Text Backup/x"},
+		{"Tax Documents prefix", "/my-files/Tax Documents/x"},
+		{"Archive prefix", "/my-files/Archive/x"},
 		{"outside /my-files", "/other/x"},
 		{"dot-dot segments climbing out", "/my-files/x/../../etc"},
 		{"dot-dot segment reaching an untouchable", "/my-files/x/../GitBackups"},

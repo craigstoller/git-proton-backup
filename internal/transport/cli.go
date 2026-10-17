@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -703,9 +704,52 @@ func EnforceCertified(c *CLI, allowUncertified bool, w io.Writer) error {
 		}
 		return nil
 	}
-	return fmt.Errorf("Proton CLI version %s, but this build is certified only "+
+	msg := fmt.Sprintf("Proton CLI version %s, but this build is certified only "+
 		"against %s; refusing to run. Set GPB_UNCERTIFIED_CLI=1 to proceed anyway "+
 		"(unvalidated), or install the certified CLI", found, CertifiedCLI)
+	// A distribution's repackage (cli-drive-debian@...) is refused like any
+	// other mismatch; it only gets one more sentence saying so (spec D4(a)).
+	// The "." closes the generic text above, which has no final stop of its own
+	// and must stay byte-identical for an ordinary mismatch.
+	if tok, ok := distroToken(v); ok {
+		msg += fmt.Sprintf(". This looks like a distribution's repackaged build (%q); "+
+			"install Proton's official build of the certified version instead "+
+			"(see the README's install section; Proton's downloads are at "+
+			"https://proton.me/download/drive/cli/).", tok)
+	}
+	return errors.New(msg)
+}
+
+// distroTokenRE matches a distribution-repackaged identity token: the real
+// product token with a distro name spliced after "cli-drive" (Debian-style
+// packaging prints cli-drive-debian@...). Lowercase letters, digits, dots and
+// hyphens only, starting with a letter or digit, then "@" and a version.
+var distroTokenRE = regexp.MustCompile(`^cli-drive-[a-z0-9][a-z0-9.-]*@\S+$`)
+
+// distroToken reports a distribution-repackaged identity token in --version
+// output, for ONE purpose: letting EnforceCertified's refusal say so. It
+// accepts exactly the two line shapes identityToken does (the line is nothing
+// but the token, or the token is the field right after "CLI"), so a token
+// merely mentioned inside a longer line never qualifies. It confers nothing:
+// identityToken and IsCertified do not call it, and a repackaged build is
+// uncertified like any other mismatch (spec D4(a)). The token is bounded
+// because it is remote-tool output headed for an error message.
+func distroToken(versionOutput string) (string, bool) {
+	for _, line := range strings.Split(versionOutput, "\n") {
+		f := strings.Fields(line)
+		n := len(f)
+		if n == 0 {
+			continue
+		}
+		last := f[n-1]
+		if !distroTokenRE.MatchString(last) {
+			continue
+		}
+		if n == 1 || f[n-2] == "CLI" {
+			return bound(last, 80), true
+		}
+	}
+	return "", false
 }
 
 // bound truncates s for quoting in diagnostics.

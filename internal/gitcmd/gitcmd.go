@@ -7,6 +7,8 @@
 package gitcmd
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -16,6 +18,7 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // oidRe validates a full SHA-1 object name. gitcmd is self-contained (it
@@ -566,7 +569,7 @@ func IndexPackVerify(packPath string) error {
 // empty means discovery is complete.
 //
 // Requires a git whose `rev-list --missing=print` reports missing tips and
-// parents as ?-lines (the Stage 3b minimum-git floor; probed on 2.53, pinned
+// parents as ?-lines (git 2.45.0 or newer, the Stage 3b floor, measured 2026-10-16 and recorded in design v6.8, pinned
 // by this package's tests). On an older git the traversal dies at the first
 // missing tip; the error wrap below names the floor so the failure is a
 // diagnosed refusal rather than git's bare fatal.
@@ -577,11 +580,127 @@ func RevListMissing(gitDir, altObjects string, wants []string) ([]string, error)
 	out, _, err := revListWithAlt(gitDir, altObjects, wants,
 		"--objects", "--missing=print", "--stdin", "--not", "--all")
 	if err != nil {
-		return nil, fmt.Errorf("%w (note: selective fetch requires a git whose rev-list "+
-			"--missing=print reports absent objects as ?-lines; a git older than that floor "+
-			"dies here with its own 'bad object' error instead)", err)
+		return nil, fmt.Errorf("%w (note: selective fetch requires git 2.45.0 or newer: "+
+			"rev-list --missing=print must report absent objects as ?-lines, and an older "+
+			"git dies here with its own 'bad object' error instead)", err)
 	}
 	return parseMissingOIDs(out)
+}
+
+// ProbeResult is the outcome of ProbeMissingTips.
+type ProbeResult int
+
+const (
+	// ProbeOK: this git reports a missing tip as a ?-line, so it can restore.
+	ProbeOK ProbeResult = iota
+	// ProbeTooOld: this git died on the missing tip with its own 'bad object'
+	// error, which is how git behaves below the restore floor (restoring
+	// needs git 2.45.0 or newer).
+	ProbeTooOld
+	// ProbeUnknown: the probe could not tell (timeout, git missing, not a
+	// repository, any other git error). It is not evidence the git is too old.
+	ProbeUnknown
+)
+
+// probeMissingTipOID is the object ID the restore probe asks rev-list about. No
+// repository holds it, which is the point: spec F3 measured that git 2.45.0 or
+// newer answers `?<oid>` for a missing tip given on stdin and exits 0, while an
+// older git dies with `fatal: bad object <oid>`. A repository that genuinely
+// held this object would not print the ?-line and would read as ProbeUnknown, a
+// negligible case that only produces a warning.
+const probeMissingTipOID = "0123456789abcdef0123456789abcdef01234567"
+
+// probeTimeout bounds the probe's git process. A var, unexported, so a test can
+// shorten it; nothing in production writes to it.
+var probeTimeout = 10 * time.Second
+
+// probeWaitDelay is the probe's OWN post-exit pipe-drain bound, deliberately not
+// the package's 30 s waitDelay: with probeTimeout the whole probe is bounded
+// near 12 s, because it runs on the push path and must never hold it up.
+const probeWaitDelay = 2 * time.Second
+
+// probeDetailMax bounds the git output quoted in a probe's detail line.
+const probeDetailMax = 300
+
+// ProbeMissingTips reports whether this host's git can restore (fetch or clone)
+// from a git-remote-proton remote, which needs `rev-list --missing=print` to
+// report a missing tip as a ?-line (git 2.45.0 or newer). Pushing needs no such
+// git, so on an older one a push succeeds on a host that cannot restore; this
+// lets the helper say so at push time.
+//
+// It makes one cheap call: `git -C gitDir rev-list --objects --missing=print
+// --stdin`, fed a single OID no repository holds. There is no `--not --all`, so
+// it walks nothing. The second return value is a one-line detail for the
+// operator, empty on ProbeOK.
+//
+// Classification keys on what the child did, never on the error's type alone:
+// a child that exited 0 and printed the ?-line is ProbeOK even if Wait also
+// returned exec.ErrWaitDelay or a context error (the answer was already in
+// hand). Output carrying git's `bad object <oid>` is ProbeTooOld. Everything
+// else, a timeout or a start failure included, is ProbeUnknown.
+//
+// All output goes into one buffer. The helper's stdout is the git-remote-helper
+// protocol stream, so the child must never inherit it: a stray `?<oid>` line
+// there would desynchronise the session.
+func ProbeMissingTips(gitDir string) (ProbeResult, string) {
+	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "-C", gitDir, "rev-list", "--objects", "--missing=print", "--stdin")
+	cmd.Stdin = strings.NewReader(probeMissingTipOID + "\n")
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	cmd.WaitDelay = probeWaitDelay
+	err := cmd.Run()
+	output := buf.String()
+
+	if cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == 0 {
+		for _, line := range strings.Split(output, "\n") {
+			if strings.TrimSuffix(line, "\r") == "?"+probeMissingTipOID {
+				return ProbeOK, ""
+			}
+		}
+	}
+	if strings.Contains(output, "bad object "+probeMissingTipOID) {
+		return ProbeTooOld, probeDetailLine(output, err)
+	}
+	timedOut := err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded)
+	if timedOut {
+		// A killed child reports "signal: killed" (or a bare exit status on
+		// Windows); the deadline is the reason the operator needs.
+		err = fmt.Errorf("timed out after %s", probeTimeout)
+	}
+	detail := probeDetailLine(output, err)
+	if timedOut && strings.TrimSpace(output) != "" {
+		// probeDetailLine quotes the output when there is any, and err only
+		// when there is none; partial output alone would hide the timeout.
+		detail += fmt.Sprintf(" (timed out after %s)", probeTimeout)
+	}
+	return ProbeUnknown, detail
+}
+
+// probeDetailLine renders what a probe saw as one line for a stderr warning:
+// "git rev-list: " followed by the output with its line breaks flattened to
+// " | " and bounded to probeDetailMax bytes (cut on a rune boundary). When the
+// output is empty it quotes err instead, or "no output" if there is no err.
+func probeDetailLine(output string, err error) string {
+	s := strings.TrimSpace(output)
+	if s == "" {
+		if err != nil {
+			s = err.Error()
+		} else {
+			s = "no output"
+		}
+	}
+	s = strings.NewReplacer("\r\n", " | ", "\n", " | ", "\r", " | ").Replace(strings.TrimSpace(s))
+	if len(s) > probeDetailMax {
+		cut := probeDetailMax
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		s = strings.TrimRight(s[:cut], " ")
+	}
+	return "git rev-list: " + s
 }
 
 // parseMissingOIDs extracts ?-prefixed OIDs from rev-list --missing=print

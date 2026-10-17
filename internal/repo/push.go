@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/craigstoller/git-proton-backup/internal/gitcmd"
@@ -38,9 +39,10 @@ type Result struct {
 //     non-mutating ReadHEAD for the whole batch), namespace-specific
 //     force/ancestry rules, occupancy against every path ScanRefs skipped
 //     (component 2: a create/update/delete landing on, above, or beneath a
-//     skipped path is refused, kind-aware, naming the occupant), and a
+//     skipped path is refused, kind-aware, naming the occupant), a
 //     final-state directory/file preflight over the refs that will exist
-//     once the batch lands. Failures here cost nothing: no pack has been
+//     once the batch lands, and the case-variant rule on creates (spec §5;
+//     see the block itself). Failures here cost nothing: no pack has been
 //     built yet.
 //  3. Build, upload, and confirm ONE pack for every valid create/update —
 //     the design's normative "Object transfer per batch", which Stage 2's
@@ -50,7 +52,9 @@ type Result struct {
 //     object-independent and must not be held hostage by an unrelated pack
 //     failure.
 //  4. Execute deletions (Stage 4's HEAD-protection logic, verbatim).
-//  5. Execute creates/updates: ensureRefParents, then WriteRef.
+//  5. Execute creates/updates: re-check each create against the live set for
+//     case variants (spec §5; see the loop itself), then ensureRefParents,
+//     then WriteRef.
 //
 // ensureHEAD runs last, after all five phases, unchanged from the per-ref
 // version.
@@ -305,35 +309,9 @@ func Push(t transport.Transport, root, gitDir string,
 	// minus every VALID delete in this batch (a REFUSED delete is NOT
 	// subtracted — the ref genuinely still exists on the remote, so a
 	// dependent create must still be checked against it), plus every valid
-	// create/update's destination.
-	finalSet := make(map[string]bool, len(remote)+len(ups))
-	for ref := range remote {
-		finalSet[ref] = true
-	}
-	// TWO PASSES, deliberately, not one interleaved pass keyed on ups' own
-	// order (fix round I1): finalSet is SET ALGEBRA — remote minus every
-	// valid delete, plus every valid non-delete — and must be independent of
-	// which order ups happens to list them in. A single pass that applies
-	// each entry in input order gets this wrong whenever a delete and a
-	// non-delete target the SAME name in one batch: "update X, delete X"
-	// (update listed first) folds correctly under set algebra (X survives,
-	// carrying the update's new value — the delete does not "win" merely by
-	// being processed second), but a naive single in-order pass would apply
-	// the update then the delete and lose X, when the batch's actual EXECUTION
-	// order (phase 4 deletes, then phase 5 creates/updates) means X survives
-	// either way. Subtracting every delete FIRST, then adding every
-	// non-delete, makes the non-delete always win a same-name collision,
-	// matching execution order and being independent of ups' own order.
-	for i, u := range ups {
-		if valid[i] && isDelete[i] {
-			delete(finalSet, u.Dst)
-		}
-	}
-	for i, u := range ups {
-		if valid[i] && !isDelete[i] {
-			finalSet[u.Dst] = true
-		}
-	}
+	// create/update's destination. batchFinalSet's doc comment says why it is
+	// built in two passes.
+	finalSet := batchFinalSet(remote, ups, valid, isDelete)
 	for i, u := range ups {
 		if !valid[i] || isDelete[i] || !isCreate[i] {
 			continue
@@ -347,6 +325,104 @@ func Push(t transport.Transport, root, gitDir string,
 					"folder containing other refs", u.Dst, other))
 				valid[i] = false
 				break
+			}
+		}
+	}
+
+	// Case-variant creates (spec §5, D2(a), Amendment A1). Proton keeps
+	// refs/heads/main and refs/heads/Main side by side, but a Windows clone of
+	// such a remote mishandles the pair silently (spec F13). So a CREATE, a
+	// valid non-delete whose dst is absent from the PRE-BATCH advertised set
+	// (isCreate), is refused when a prefix of it is spelled differently from,
+	// but folds equal to, a prefix of another ref in the set it would join
+	// (caseConflicts; Unicode simple folding, as strings.EqualFold). This
+	// applies on every platform, by the precedent of the Windows device names
+	// (windowsReserved, marker.go): a repo stays usable from every machine,
+	// whichever one pushed first. Updates and replacements (a same-batch
+	// delete and recreate of a name already on the remote) are never refused,
+	// neither half of a replacement, since they add no spelling the remote did
+	// not already have; nor is anything checked against skipped names, which
+	// never reach a clone.
+	//
+	// It runs after the D/F preflight, against batchFinalSet over the CURRENT
+	// valid flags (so a create the D/F loop refused is not in the set), and
+	// before phase 3, so a refused create costs no pack.
+	//
+	// A case-changing rename (delete Main, create MAIN) is refused WHOLE (A1):
+	// when this rule refuses a create X, every still-valid same-batch delete
+	// of a ref the pre-batch remote holds whose full name folds equal to X is
+	// refused too, so the rename is not half-applied. Two deletes are spared:
+	// one of a name the remote does not hold, which is a no-op, not half of a
+	// rename; and the delete half of a replacement (the batch also writes that
+	// name), which A1 never refuses. Only this rule's refusals trigger the
+	// step: a create the D/F preflight or the occupancy check refused keeps
+	// git's per-ref behaviour, so a delete paired with it still commits
+	// (design v6.9's implementation note on A1; widening it needs the D/F
+	// preflight inside this loop).
+	//
+	// A refused delete keeps its ref, and the kept ref can expose a conflict
+	// for a create an earlier pass approved, so the check repeats until a pass
+	// refuses nothing. Each pass that continues refuses at least one create,
+	// so there are at most (creates + 1) passes, and each pass is set algebra,
+	// so neither outcome nor text depends on batch order (Review Focus 5).
+	// Sparing the two deletes above changes no pass's set: subtracting an
+	// absent name is a no-op, and a replaced name is added back by its
+	// recreate, which is no create, so this loop never changes its validity.
+	// The D/F preflight needs no re-run for a kept ref: a create above or
+	// beneath it either shares its spelling where it differs from X, and so
+	// conflicts with X here in the same pass, or lies above or beneath X too,
+	// and already met X in the D/F preflight.
+	for {
+		caseSet := batchFinalSet(remote, ups, valid, isDelete)
+		var candidates []string
+		for i, u := range ups {
+			if valid[i] && !isDelete[i] && isCreate[i] {
+				candidates = append(candidates, u.Dst)
+			}
+		}
+		conflicts := caseConflicts(caseSet, candidates)
+		if len(conflicts) == 0 {
+			break
+		}
+		var refused []string
+		for i, u := range ups {
+			if !valid[i] || isDelete[i] || !isCreate[i] {
+				continue
+			}
+			if cs, ok := conflicts[u.Dst]; ok {
+				fail(i, caseConflictMessage(u.Dst, cs))
+				valid[i] = false
+				refused = append(refused, u.Dst)
+			}
+		}
+		// A delete that folds equal to several refused creates names the
+		// smallest, so its text does not depend on batch order either.
+		sort.Strings(refused)
+		renameTo := map[string]string{}
+		for _, x := range refused {
+			if _, ok := renameTo[caseKey(x)]; !ok {
+				renameTo[caseKey(x)] = x
+			}
+		}
+		// rewritten: every name a still-valid non-delete writes, so a delete
+		// of one of them is half of a replacement.
+		rewritten := map[string]bool{}
+		for i, u := range ups {
+			if valid[i] && !isDelete[i] {
+				rewritten[u.Dst] = true
+			}
+		}
+		for j, u := range ups {
+			if !valid[j] || !isDelete[j] {
+				continue
+			}
+			if _, held := remote[u.Dst]; !held || rewritten[u.Dst] {
+				continue
+			}
+			if x, ok := renameTo[caseKey(u.Dst)]; ok {
+				fail(j, fmt.Sprintf("%s: delete refused because it pairs with the refused "+
+					"case-changing rename to %s; the rename was not applied", u.Dst, x))
+				valid[j] = false
 			}
 		}
 	}
@@ -489,9 +565,71 @@ func Push(t transport.Transport, root, gitDir string,
 	}
 
 	// ======================= Phase 5: creates/updates ========================
+
+	// live is the ref namespace as it actually stands while phase 5 runs
+	// (spec §5): the pre-batch advertised refs, minus the deletes that
+	// COMMITTED in phase 4 (deletedThisBatch, not phase-2 validity), plus each
+	// create or update this loop has committed so far (added after okResult
+	// below). The case-variant re-check reads it.
+	live := make(map[string]bool, len(remote))
+	for ref := range remote {
+		if !deletedThisBatch[ref] {
+			live[ref] = true
+		}
+	}
+	// batchDeletes: every name this batch asked to delete, so a phase-5
+	// refusal can name the deletes it depended on.
+	batchDeletes := map[string]bool{}
+	for i, u := range ups {
+		if isDelete[i] {
+			batchDeletes[u.Dst] = true
+		}
+	}
+
 	for i, u := range ups {
 		if !valid[i] || isDelete[i] {
 			continue
+		}
+		// Case-variant re-check (spec §5, D2(a), Amendment A1), for a CREATE
+		// only: a name absent from the pre-batch advertised set.
+		//
+		// Phase 2 checked every create against a set that assumes every valid
+		// delete commits, and repeated until stable, so its final set already
+		// reflects every delete it refused. Phase 5 can therefore find a NEW
+		// conflict for a create only when some phase-2-valid delete failed in
+		// phase 4: the ref it was to remove is still in live.
+		//
+		// Replacements of pre-existing names (a same-batch delete and
+		// recreate) are never re-checked: they add no spelling the remote
+		// lacked, and refusing one after its own delete committed would
+		// destroy the ref it replaces. One residual needs a race or a
+		// transport fault: a case-changing rename that passed phase 2, because
+		// its conflicting variant was also being deleted, can still lose the
+		// renamed-away ref if that variant's delete fails. The README's honest
+		// limits say so.
+		//
+		// The refusal names the delete it depended on (spec §5): the message
+		// is caseConflictMessage's, with failedDeleteClause appended for each
+		// conflicting ref this batch tried to delete and did not.
+		//
+		// This must run before ensureRefParents, which creates remote parent
+		// folders; any later would leave folders behind for a refused create.
+		// The pack phase 3 uploaded for a create refused here stays
+		// unreferenced, as with any phase-5 create failure. No gate step can
+		// reach this path deterministically (spec §5); the hermetic test
+		// TestPushPhase5RefusesACreateWhoseVariantDeleteFailed is its evidence.
+		_, preExists := remote[u.Dst]
+		if !preExists {
+			if cs := caseConflicts(live, []string{u.Dst})[u.Dst]; len(cs) > 0 {
+				var undeleted []string
+				for _, c := range cs {
+					if batchDeletes[c.Ref] && !deletedThisBatch[c.Ref] {
+						undeleted = append(undeleted, c.Ref)
+					}
+				}
+				fail(i, caseConflictMessage(u.Dst, cs)+failedDeleteClause(undeleted))
+				continue
+			}
 		}
 		// exists is BATCH-AWARE (fix round M4, corrected in fix round 2), not
 		// a bare read of the pre-batch remote map: when a same-batch delete
@@ -505,7 +643,6 @@ func Push(t transport.Transport, root, gitDir string,
 		// not contain the dst, exists falls back to the pre-batch read, and
 		// WriteRef correctly takes UpdateRevision against the node that is
 		// still actually there.
-		_, preExists := remote[u.Dst]
 		exists := preExists && !deletedThisBatch[u.Dst]
 		if err := ensureRefParents(t, root, u.Dst); err != nil {
 			fail(i, err.Error())
@@ -549,6 +686,7 @@ func Push(t transport.Transport, root, gitDir string,
 			continue
 		}
 		okResult(i)
+		live[u.Dst] = true
 	}
 
 	// Complete a missing HEAD. This is the same rule Bootstrap applies to a
@@ -558,6 +696,43 @@ func Push(t transport.Transport, root, gitDir string,
 	// branch stays an explicit operation, out of scope for v2.
 	ensureHEAD(t, root, gitDir, ups, remote, results)
 	return results
+}
+
+// batchFinalSet is the ref namespace as phase 2 expects it to read once the
+// batch lands: every pre-batch advertised ref, minus every VALID delete, plus
+// every VALID non-delete. The D/F preflight and the case-variant rule both
+// check against it.
+//
+// TWO PASSES, deliberately, not one interleaved pass keyed on ups' own
+// order (fix round I1): this is SET ALGEBRA — remote minus every valid
+// delete, plus every valid non-delete — and must be independent of which
+// order ups happens to list them in. A single pass that applies each entry
+// in input order gets this wrong whenever a delete and a non-delete target
+// the SAME name in one batch: "update X, delete X" (update listed first)
+// folds correctly under set algebra (X survives, carrying the update's new
+// value — the delete does not "win" merely by being processed second), but a
+// naive single in-order pass would apply the update then the delete and lose
+// X, when the batch's actual EXECUTION order (phase 4 deletes, then phase 5
+// creates/updates) means X survives either way. Subtracting every delete
+// FIRST, then adding every non-delete, makes the non-delete always win a
+// same-name collision, matching execution order and being independent of
+// ups' own order.
+func batchFinalSet(remote map[string]string, ups []protocol.RefUpdate, valid, isDelete []bool) map[string]bool {
+	set := make(map[string]bool, len(remote)+len(ups))
+	for ref := range remote {
+		set[ref] = true
+	}
+	for i, u := range ups {
+		if valid[i] && isDelete[i] {
+			delete(set, u.Dst)
+		}
+	}
+	for i, u := range ups {
+		if valid[i] && !isDelete[i] {
+			set[u.Dst] = true
+		}
+	}
+	return set
 }
 
 // parentOf returns ref's parent in "/"-joined REF-NAME space (not a remote

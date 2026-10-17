@@ -1,6 +1,6 @@
 # git-proton-backup Docs
 
-**Living reference. Last updated: 2026-10-10.** Update this index when a doc is added, renamed, retired, or superseded — not on a review calendar.
+**Living reference. Last updated: 2026-10-16.** Update this index when a doc is added, renamed, retired, or superseded — not on a review calendar.
 
 This repo ships two tools that share one version line; each has its own design doc.
 
@@ -12,7 +12,7 @@ This repo ships two tools that share one version line; each has its own design d
 ## Operating
 
 - [releasing.md](releasing.md) - The canonical release procedure for both tools. Follow it in order; its steps exist because skipping them has already gone wrong once.
-- [../scripts/Test-ProtonCliDrift.ps1](../scripts/Test-ProtonCliDrift.ps1) - The Proton CLI drift check `releasing.md` calls for before tagging, before publishing, and weekly between releases: the installed CLI against Proton's feed, its identity token against the helper's certified token, and the feed's version against the pin.
+- [../scripts/Test-ProtonCliDrift.ps1](../scripts/Test-ProtonCliDrift.ps1) - The Proton CLI drift check `releasing.md` calls for before tagging, before publishing, and weekly between releases: the installed CLI against Proton's feed, its identity token against the helper's certified token, the feed's version against the pin, and the feed's `linux/x64` SHA-512 against the certified Linux value the script records.
 
 ## Process And Provenance
 
@@ -27,6 +27,9 @@ This repo ships two tools that share one version line; each has its own design d
 ## Specs And Plans
 
 Feature work is specified and planned in dated pairs under [superpowers/](superpowers/): `YYYY-MM-DD-<slug>-design.md` (spec) in `specs/`, `YYYY-MM-DD-<slug>.md` (plan) in `plans/`; the plan links its spec. Superseded planning docs stay in place with a `Status: Superseded` line naming their successor — see [v2-stage2-plan.md](v2-stage2-plan.md).
+
+- [superpowers/specs/2026-10-15-v2-linux-port-design.md](superpowers/specs/2026-10-15-v2-linux-port-design.md) - The Linux port of `git-remote-proton`: the findings behind it (F1–F14), the case-variant ref rule, the install and gate design, and Craig's rulings D1–D8. Approved 2026-10-16; its design record is v6.9 of the v2 design doc.
+- [superpowers/plans/2026-10-16-v2-linux-port.md](superpowers/plans/2026-10-16-v2-linux-port.md) - The 12-task implementation plan for that spec.
 
 ## Conventions
 

@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"testing"
 
+	"github.com/craigstoller/git-proton-backup/internal/gitcmd"
 	"github.com/craigstoller/git-proton-backup/internal/testcli"
 	"github.com/craigstoller/git-proton-backup/internal/transport"
 )
@@ -40,8 +41,19 @@ func TestMain(m *testing.M) {
 	if os.Getenv(testcliRoleEnv) == testcliRoleShim {
 		os.Exit(testcli.Run(os.Args[1:], os.Stdout, os.Stderr))
 	}
+	// Every TestLoop_* test that reaches "list for-push" would otherwise spawn
+	// a real git for the restore-floor probe (D5(d)). Stub the seam for the whole
+	// package; the tests that care about the probe set it themselves and restore
+	// it, and TestLoop_ListForPush_RealProbeIsSilentOnTheSuitesGit puts the real
+	// function back through realProbeRestoreFloor.
+	realProbeRestoreFloor = probeRestoreFloor
+	probeRestoreFloor = func(string) (gitcmd.ProbeResult, string) { return gitcmd.ProbeOK, "" }
 	os.Exit(m.Run())
 }
+
+// realProbeRestoreFloor holds the production probe, saved by TestMain before
+// it stubs the seam, so a test can wire the real thing back in.
+var realProbeRestoreFloor func(string) (gitcmd.ProbeResult, string)
 
 // buildShimOnPath copies this test binary into a private temp directory
 // under the literal name "proton-drive"(.exe on Windows only), points

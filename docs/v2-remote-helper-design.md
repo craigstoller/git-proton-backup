@@ -1,7 +1,8 @@
 # git-remote-proton — v2 design
 
-**Status:** design v6.8, revised 2026-10-15 to record selective fetch's minimum git, 2.45.0 (v6.7 was revised 2026-10-10 for the CLI 0.9.0 certification, v6.6 on 2026-08-09 during Stage 6 implementation). v5 was settled after four rounds of Codex + Gemini peer review; v6, v6.1, v6.2 and v6.3 each change exactly one mechanism, and each only because implementation proved the original unimplementable, unenforceable, or worse than what shipped. v6.4 documented Stage 4's shipped additions — the CLI version allowlist and the `--set-head` operation. v6.5 was the largest revision since v5: it re-enabled full hierarchical refs and the other-namespace rule v6.1 had narrowed away, replaced the fetch residue rule with quarantine staging, folded in the gate-sourced UX items, and left one item open — a git-valid-named foreign file with unparseable contents still failed every read against the repo, in both directions, until deleted. v6.6 closes that open question: the fatal-content rule is now **per-operation** — tolerant (skip + note) on the push-direction survey, fatal-with-enumeration on the fetch-direction survey — adds occupancy-aware push refusals (kind-aware, pre-pack) for names the read boundary skipped, adds the create-heal race-window diagnosis for an occupant that appears after advertisement, and pins F1 (directory download) as a verified contract fact. See the revision history.
+**Status:** design v6.9, revised 2026-10-16 for the Linux port (linux/amd64 becomes a supported platform, pushes refuse new case-variant refs, and the git-floor and distro-CLI messages change; v6.8 was revised 2026-10-15 to record selective fetch's minimum git, 2.45.0; v6.7 on 2026-10-10 for the CLI 0.9.0 certification, v6.6 on 2026-08-09 during Stage 6 implementation). v5 was settled after four rounds of Codex + Gemini peer review; v6, v6.1, v6.2 and v6.3 each change exactly one mechanism, and each only because implementation proved the original unimplementable, unenforceable, or worse than what shipped. v6.4 documented Stage 4's shipped additions — the CLI version allowlist and the `--set-head` operation. v6.5 was the largest revision since v5: it re-enabled full hierarchical refs and the other-namespace rule v6.1 had narrowed away, replaced the fetch residue rule with quarantine staging, folded in the gate-sourced UX items, and left one item open — a git-valid-named foreign file with unparseable contents still failed every read against the repo, in both directions, until deleted. v6.6 closes that open question: the fatal-content rule is now **per-operation** — tolerant (skip + note) on the push-direction survey, fatal-with-enumeration on the fetch-direction survey — adds occupancy-aware push refusals (kind-aware, pre-pack) for names the read boundary skipped, adds the create-heal race-window diagnosis for an occupant that appears after advertisement, and pins F1 (directory download) as a verified contract fact. See the revision history.
 **Relates to:** [issue #3](https://github.com/craigstoller/git-proton-backup/issues/3).
+**Supported platforms (v6.9):** windows/amd64 and linux/amd64 — a static helper binary on each, driving Proton's glibc linux/x64 CLI on Linux. The Linux gate is still to run: linux/amd64 is gated per `docs/releasing.md` with the first release that ships it. Other platforms build from source and are unsupported. Linux design and evidence: [`docs/superpowers/specs/2026-10-15-v2-linux-port-design.md`](superpowers/specs/2026-10-15-v2-linux-port-design.md).
 **Depends on:** [`docs/research/remote-helper-prior-art.md`](research/remote-helper-prior-art.md) — read first; assumed, not repeated.
 **Pinned to:** Proton Drive CLI **`cli-drive@0.9.0+75612299`** (SDK `js@0.22.2+75612299`), certified
 2026-10-10 (`docs/research/gates/cli-0.9.0-certification.md`). Previously `cli-drive@0.8.0+06e8c605`
@@ -37,7 +38,7 @@ git fetch proton-v2
 
 **Non-goals:** multi-machine concurrent pushes; eliminating the CLI dependency; implementing Proton auth; shallow/partial clone.
 
-**Deployment surface, honestly:** `git-remote-proton` **and** `proton-drive` on PATH, an authenticated CLI session, and on Linux a working OS secret store. One prerequisite, installed once — not literally one file.
+**Deployment surface, honestly:** `git-remote-proton` **and** `proton-drive` on PATH, an authenticated CLI session, and on Linux a working OS secret store. One prerequisite, installed once — not literally one file. The Linux secret store is a measured requirement, not a guess (v6.9, spec F6 and F8): the CLI hard-requires a D-Bus Secret Service by default and, with no session bus, exits before any network attempt with `Failed to load session from secrets … Cannot autolaunch D-Bus without X11 $DISPLAY` (F6, measured in WSL2), a message the helper passes through intact (F7); the CLI offers a second store, `pass` (`PROTON_DRIVE_CREDENTIALS_STORE=pass`, F8, from Proton's README and changelog; the README also lists `unsafe_file`, "do not use, for testing only"), which reaches the CLI unchanged because the helper sets no `cmd.Env` (pinned by a hermetic test since v6.9). Both are the user's to provide; the helper takes no part in credentials. Unattended Linux use and the `pass` store are not gated.
 
 ## Substrate decision
 
@@ -534,7 +535,10 @@ the CLI line's token gates anything.
 
 - **Mismatch, unparseable `--version` output, or a nonzero `--version` exit → refuse**, before
   any filesystem command, naming what was found (or that it could not be determined) and what is
-  certified.
+  certified. A distribution's repackage (`cli-drive-<distro>@…`, spec F11) is refused like any
+  other mismatch, with one added sentence naming it, pointing to the README's install section and
+  Proton's download URL (v6.9, D4(a)). That sentence is text on a path that has already refused,
+  never an acceptance path: the exact-token matcher is unchanged.
 - **`GPB_UNCERTIFIED_CLI=1` → proceed**, printing a loud stderr warning naming the untested (or
   undetermined) version on every helper invocation. The override is never remembered or cached
   across processes — it is read fresh from the environment each run.
@@ -957,7 +961,7 @@ The helper owns the closure. Git's `fetch` capability is defined as transferring
 
    **The walk uses git plumbing, not a hand-written parser.** `git cat-file --batch` decompresses and identifies objects but does *not* enumerate commit parents, tag targets, or tree entries — an earlier draft claimed it removed the need for a parser, which was wrong. Instead run `git rev-list --objects --missing=print <wants>` against the temp directory: git performs the traversal and reports missing OIDs prefixed with `?`. Feed those back through the object-to-pack map, download, repeat. This also handles gitlinks and malformed objects with git's own semantics rather than reimplemented ones.
 
-   **This traversal sets fetch's minimum git at 2.45.0.** Every want the client still lacks is a missing tip of the walk, and git reports a missing tip as a `?` line only from v2.45.0 on: `Documentation/rev-list-options.txt` gains the sentence at that tag, and `revision.c`'s `get_reference` gains the matching branch, which `--stdin` tips also go through. An older git dies with `bad object <oid>` on the first round, which `gitcmd.RevListMissing` wraps with a note describing the requirement (the note does not name the version). Only fetch, and so clone, runs this traversal. See the v6.8 entry.
+   **This traversal sets fetch's minimum git at 2.45.0.** Every want the client still lacks is a missing tip of the walk, and git reports a missing tip as a `?` line only from v2.45.0 on: `Documentation/rev-list-options.txt` gains the sentence at that tag, and `revision.c`'s `get_reference` gains the matching branch, which `--stdin` tips also go through. An older git dies with `bad object <oid>` on the first round, which `gitcmd.RevListMissing` wraps with a note naming the requirement, "git 2.45.0 or newer" (v6.9; v6.8 wrote that the note did not name the version). Only fetch, and so clone, runs this traversal. A push needs no floor, but warns once when this git cannot restore (v6.9, D5(d)). See the v6.8 and v6.9 entries.
 5. **Consolidate the closure into ONE pack, install it, and emit git's single `lock`.** Git's `transport-helper.c` retains only the **first** `lock <path>` response, so a multi-pack install cannot be protected by multiple protocol locks.
 
    **This decision reversed twice and is now settled on the merits.** v2 used consolidation; v3 replaced it with helper-managed `.keep` files swept at the start of the next fetch; v4 restores consolidation. The helper-managed variant is **not crash-safe**: if a fetch dies after installing a pack but before git updates refs, the next fetch removes that pack's protection *before* refs exist, and a concurrent `git gc` can delete it between connectivity verification and git's ref write — leaving refs pointing at missing objects. It also leaks permanently if the user never fetches from that remote again. Git's protocol lock exists precisely to cover the install-to-ref-update interval and is released only after both complete. Corruption beats a repacking pipeline as a thing to avoid.
@@ -1198,7 +1202,7 @@ Executable, not prose. Produces a committed results file that becomes normative.
 
 **Stage 3 — a real `git clone` and `git fetch`.** Idx cache, iterative discovery with termination, single-pack consolidation, `.keep`, connectivity verification. Ends when `git clone -o proton-v2 proton::…` produces a working checkout.
 
-**Stage 4 — productionisation.** Shipped: a windows/amd64 release build (the only platform its gate has run on; other platforms build from source and are unsupported), published as a draft until the live gate passes against those exact bytes, the CLI version allowlist, `--set-head`, and v1 coexistence documentation. Recovery documentation and its test, and broader protocol conformance, remain open.
+**Stage 4 — productionisation.** Shipped: a windows/amd64 release build (the only platform its gate has run on; other platforms build from source and are unsupported — *the "windows/amd64 only" sentence is superseded by v6.9, which adds linux/amd64 as a second supported platform, to be gated per `docs/releasing.md`*), published as a draft until the live gate passes against those exact bytes, the CLI version allowlist, `--set-head`, and v1 coexistence documentation. Recovery documentation and its test, and broader protocol conformance, remain open.
 
 Compaction and retention remain a separately approved milestone. v2 reserves nothing for them beyond the marker's `version` field, which is the seam a future layout change goes through.
 
@@ -1218,6 +1222,147 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
 ---
 
 ## Revision history
+
+**v6.9, 2026-10-16 — Linux port: linux/amd64 becomes a supported platform, pushes refuse new case-variant refs, and the git-floor and distro-CLI messages change.**
+
+- **What this records.** The Linux port, specified in
+  `docs/superpowers/specs/2026-10-15-v2-linux-port-design.md` (approved 2026-10-16) and planned in
+  `docs/superpowers/plans/2026-10-16-v2-linux-port.md`. Craig ruled on D1–D8 on 2026-10-16, taking
+  every recommendation, and approved Amendment A1 the same day (both copied below). The evidence is
+  the spec's findings F1–F14 (most measured in WSL2 `Ubuntu-24.04` and on Windows on 2026-10-15 and
+  16; the spec marks each one's basis: wsl, win, doc, code, record, inference or untested).
+- **Supported platforms.** windows/amd64 and linux/amd64 (D1(a)): a static helper binary on each,
+  and Proton's glibc linux/x64 CLI on Linux. The release now holds five assets
+  (`git-remote-proton.exe`, its `.sha256`, `install.ps1`, `git-remote-proton-linux-amd64` and its
+  `.sha256`); the Linux binary is cross-compiled in the existing Windows job with `CGO_ENABLED=0`
+  (D6(a)); `docs/releasing.md` runs two live gates against the draft's bytes, Windows and Linux (or
+  an eligible stand-in).
+  Stage 4's "windows/amd64 only" line is superseded. The CLI pin is unchanged: the Linux build
+  prints the same identity token, so the exact pin needs no per-platform token (F5).
+- **The D2 rule: a push refuses to create a case variant, on every platform.** F13 (measured with
+  bundles cloned onto NTFS, not through the helper) shows that a Windows clone of a remote holding
+  `main` and `Main` silently checks out the wrong commit, or silently re-cases a branch. The
+  helper already refuses Windows device names on every platform for the same reason (`marker.go`).
+  - *Create-only, per A1.* A create is a destination absent from the pre-batch advertised set.
+    Names the remote already holds are never refused by this rule: updates, ordinary deletes, and
+    replacements (a same-batch delete and recreate of one name; neither half is refused). Git
+    itself rejects that pairing at push time with "dst ref ... receives from more than one src"
+    (measured 2026-10-16, git 2.55.0.windows.3), so the helper's handling of it is defensive
+    [inference]. There is no override variable.
+  - *Prefixes and folding.* A ref's prefixes are its component chains from the namespace
+    component down (`heads`, `heads/grp`, `heads/grp/a` for `refs/heads/grp/a`). Two spellings
+    conflict when they differ but fold equal under Unicode simple case folding, the equivalence
+    `strings.EqualFold` implements; invalid UTF-8 bytes are copied through unfolded, so distinct
+    invalid bytes never compare equal. This covers all three F13 shapes: `main`/`Main` (two
+    leaves), `feat`/`Feat/x` (a leaf against a directory prefix) and `grp/a`/`Grp/b` (two
+    directory prefixes). NTFS's own `$UpCase` table differs from Unicode simple folding for a
+    handful of characters [inference] and NFC against NFD normalisation (macOS) is out of scope;
+    both are documented limits, not code.
+  - *Phase 2 (whole-batch validation).* The check set is the pre-batch advertised refs, minus the
+    batch's valid deletes, plus every non-delete still valid after phase 2's other checks (the
+    existing `finalSet` algebra). Conflicts are computed as groups over that set, with no
+    dependence on iteration order, and every create in a conflicting group is refused, so two
+    same-batch creates `main` and `Main` are both refused. The refusal names every conflicting
+    ref, sorted. A case-changing rename is refused whole: when this rule refuses a create, every
+    same-batch delete of an existing ref whose full name folds equal to it is refused too, except
+    the delete half of a replacement (the batch also writes that name). A create that phase 2
+    refuses for another reason (for example the D/F preflight, or a name a skipped file occupies)
+    keeps git's ordinary per-ref behaviour, so its paired delete still commits; the A1
+    implementation note below records this narrowing. Because a refused delete keeps its ref, and
+    the kept ref can expose a new conflict, phase 2 repeats until a pass refuses nothing (A1).
+  - *Phase 5 (creates and updates).* Before each create, as the first statement of the create arm
+    and before `ensureRefParents` (which creates remote folders), the rule is checked again
+    against the live set: the pre-batch advertised refs, minus the deletes that committed in
+    phase 4, plus the creates already committed in this phase. Replacements are never re-checked.
+    A create cleared in phase 2 by a same-batch delete is therefore refused if that delete failed;
+    git's per-ref output reports that ref rejected, naming the delete that did not commit, which
+    makes it the one case where a ref passes validation and is still rejected. The pack phase 3
+    uploaded for it stays unreferenced, as with any phase-5 create failure [inference]. The evidence
+    is a hermetic test (`TestPushPhase5RefusesACreateWhoseVariantDeleteFailed`); no gate step
+    reaches it deterministically, because a phase-2-valid delete fails in phase 4 only through a
+    race or a transport fault.
+  - *Where it runs.* Under the repo lock, which `main.go` acquires before advertising, so two
+    clients cannot each validate one half of a pair.
+  - *Skipped refs are not in the set.* Name-skipped refs are never advertised, and a content skip
+    makes `list` and fetch fail closed, so neither reaches a clone. A push can therefore create a
+    ref whose case variant sits in a skipped file; the pair becomes visible to clones only when
+    someone repairs the skipped file. This is the one way a push can lay down half of a pair,
+    stated in the README's honest limits rather than closed by putting skipped names in the set.
+  - *The residual (documented, not fixed).* A case-changing rename that passed phase 2 because its
+    conflicting variant was also being deleted can still lose the renamed-away ref if that
+    variant's delete fails in phase 4 (a race or a transport fault, for example a non-v2 rewrite
+    of HEAD between phases): phase 5 then refuses the create after the rename's own delete has
+    committed.
+  - *Existing pairs stay as they are.* A pair can be on a remote from earlier pushes, from a CLI or
+    web-UI upload (the 0.9.0 certification made one), or from a repaired skipped file. A remote
+    that already holds a pair still takes pushes to its other refs, and a user repairs it by
+    deleting one of the pair; under a pre-existing directory pair such as `Feat/a` beside `feat/b`,
+    a new ref under either spelling is refused until the pair is repaired.
+- **D5: the git floor is stated.** (a) The fetch error names the requirement, "git 2.45.0 or newer"
+  (`gitcmd.RevListMissing`); the behaviour-based detection is unchanged. (d) A push warns, without
+  refusing, when this git cannot restore: one `git rev-list` process in the repo being pushed,
+  run at `list for-push` after the marker is in place and before the repo lock is taken, fed one
+  absent object ID (F3's single call). Exit 0 with a `?`-line means this git can restore; a
+  too-old answer and a failed probe each warn, once, and a failed probe is never treated as proof.
+  The probe never blocks a push and is bounded near 12 s. Its cost is one short git process per
+  push on every platform, Windows included, short because the probed object is absent
+  [inference].
+- **D4: the CLI-version refusal names a distro repackage.** When the `--version` output carries a
+  `cli-drive-<distro>@…` identity token (F11), the existing refusal gains one sentence naming it,
+  pointing to the README's install section and to https://proton.me/download/drive/cli/. The
+  addition is text on a path that has already refused: `identityToken`'s exact-token hardening is
+  untouched, `GPB_UNCERTIFIED_CLI=1` applies unchanged, and a hermetic test feeds a fabricated
+  output because no real build of that shape is known.
+- **Companions.** CI runs the hermetic Go suite on Windows and on Linux at `stable` and at
+  go.mod's toolchain, with a git-floor probe. `scripts/Test-ProtonCliDrift.ps1` has a fourth leg,
+  the feed's linux/x64 SHA-512 against the certified value (D8(a)); that value, the README's Linux
+  CLI URL version and the README's `sha512sum -c` line are certification touch points, and
+  `tests/ReadmePins.Tests.ps1` fails when the README stops following the code. The contract test's
+  untouchable list gains `Tax Documents` and `Archive` (six folders). A hermetic test pins that the
+  CLI's environment passes through unchanged (F8). `docs/research/gates/brief-checklist.md` gains
+  rule 11 (hermetic WSL runs keep interop off, F14).
+- **Rulings D1–D8 (2026-10-16, copied from the spec).** Each is Craig's call, accepting the
+  recommended default; none is an unopposed default.
+
+  | | Ruled | Not taken |
+  |---|---|---|
+  | D1 | (a) linux/amd64 glibc only | (b) arm64 built but ungated; (c) musl |
+  | D2 | (a) refuse case-variant **creates** on every platform (§5), no override | (b) allow and document |
+  | D3 | (a) attended use gated and supported; `pass` and keyring unlock documented as "not gated" | (b) gate the `pass` store live; (c) say nothing |
+  | D4 | (a) keep the exact token; add a refusal-only sentence for `cli-drive-<distro>@` | (b) accept distro tokens as certified; (c) no change |
+  | D5 | (a) name git 2.45.0 in the fetch error **and** (d) warn on push when this git cannot restore | (b) refuse to start below 2.45.0; (c) docs only; (e) download-everything fallback |
+  | D6 | (a) cross-compile in the existing Windows job; README install commands; no `install.sh` | (b) separate Linux release job plus `install.sh` |
+  | D7 | venue (a) the WSL distro with the pre-tag sign-in probe; afterwards (a) log out and delete keyring and cache | venue (b) a separate Linux machine, kept only as the fallback if the sign-in probe fails; venue (c) a CI runner; afterwards (b) keep the WSL session |
+  | D8 | (a) Linux contract table at every future certification, plus the drift script's linux/x64 comparison | (b) Windows table plus a Linux smoke only |
+
+- **Amendment A1 (2026-10-16, Craig's call, approving it as shown; copied from the spec).** Plan
+  review (Codex, Kimi) found that the spec's round-3 definition of a create let a phase-5 refusal
+  destroy the very ref a batch was replacing, whenever a sibling delete failed in phase 4. Codex
+  then found that refusing a rename's delete in one pass could expose a new conflict, losing a ref
+  with no transport fault at all. A1 makes three changes: (1) a create is a name absent from the
+  pre-batch set, so replacements are never refused; (2) a case-changing rename is refused whole;
+  (3) phase 2 repeats until stable. Not taken: keeping the round-3 definition, and refusing a
+  replacement's paired delete in a single pass (the round-1 plan fix). One residual is documented,
+  not fixed: a rename can still lose the old name if a sibling delete hits a transport fault
+  between phases 4 and 5. *[v6.9 note: the trigger is a phase-4 delete failure from a race or a
+  transport fault; see the D2 bullet above.]*
+  *[v6.9 implementation note, 2026-10-16: the code applies the rename-whole refusal only when the
+  case rule refuses the create; widening it to other phase-2 refusals needs the D/F preflight
+  inside the fixed-point loop. Craig confirmed this narrowing on 2026-10-16 (spec Amendment A2;
+  see the post-execution rulings below).]*
+- **Post-execution rulings (2026-10-16, Craig's calls, each taking the controller's recommended
+  default).** Made after the port was executed and its draft PR's CI and release dry run had
+  passed. The options not taken are on the right.
+
+  | | Ruled | Not taken |
+  |---|---|---|
+  | Rename-whole scope | The rename-whole refusal applies only when the case rule refuses the create, and only to deletes of names the remote holds that the batch does not also rewrite; a create refused by another phase-2 check keeps git's per-ref behaviour, so its paired delete commits (spec Amendment A2) | Widen it to every phase-2 refusal, which needs the D/F preflight inside the fixed-point loop |
+  | Linux install checks | Each `install` in the README's Linux install is chained to its checksum with `&&`, so a failed check stops it (spec Amendment A3) | Spec §6's unchained lines |
+  | Draft Windows helper for the Linux gate | The Linux gate brief installs it (B.3) and keeps a rollback copy; if a later gate fails or the release is abandoned, restoring that copy is part of abandoning the release (`docs/releasing.md` step 5) | A Windows gate brief installs it, and the Linux gate runs second |
+  | Gate-brief behaviour calls 27, 31/36, 33, 37 and 47/52, and the BLOCKs on an incomplete listing row and on a `GitRemotes` that is not a folder | Accepted as the brief writes them | §7's literal wording: the scheduled tasks re-enabled on the last Windows check alone, the trash emptied under checklist rule 6, the first "could not check" warning BLOCKED, a still-listed trashed row BLOCKED, and keyring deletion not waiting on a successful logout |
+  | Cross-platform push-back | Not in the v0.10.0 gate: step 4 covers two one-way handoffs | Steps 4.9-4.11 (recoverable from a2ec7f6) |
+  | Length of the conflict list in a case refusal | Uncapped, as spec §5 says ("names every conflicting ref") | Cap it at 5, like `maxDescribedBlockers` |
+  | Pre-existing case pairs before adoption | Before 0.10.0 is adopted for scheduled pushes, `git ls-remote` each v2 remote those pushes reach and fold-compare each namespace (gate brief, "After the gate") | Adopt without checking |
 
 **v6.8, 2026-10-15 — selective fetch's minimum git recorded: 2.45.0.**
 
@@ -1242,7 +1387,8 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
 - **What did not change.** No code, and no version check: the floor stays behavioural, and an
   older git still fails closed on the first round with the wrapped error, as Stage 3b designed.
   That error describes the requirement without naming the version; naming it would be a code
-  change outside this revision.
+  change outside this revision. *Superseded by v6.9 (2026-10-16): the fetch error now names "git
+  2.45.0 or newer", and a push warns once when this git cannot restore.*
 
 **v6.7, 2026-10-10 — CLI pin moved to 0.9.0; the 0.8.0 move of 2026-08-13 is recorded here retroactively.**
 
@@ -1367,7 +1513,9 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   the hardcoded default, validated segment-wise (absolute, strictly below `/my-files/`, no `.`/`..`
   segment, not one of the four untouchable top-level folders) before any live call runs. It lives
   in the contract test's own comment and the gate brief checklist, not in user-facing docs — it
-  governs how this repository's own tests are run, not how `git-remote-proton` behaves.
+  governs how this repository's own tests are run, not how `git-remote-proton` behaves. *Update
+  2026-10-16 (v6.9): the account now has six untouchable top-level folders, not four (`Tax
+  Documents` and `Archive` were added), and the contract test's list names all six.*
 
 **v6.5, 2026-08-06 — Stage 5 ships: hierarchical refs, quarantine fetch staging, and the gate-sourced UX items. Documents shipped behaviour, verified against the merged code.**
 

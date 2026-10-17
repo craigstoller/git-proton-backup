@@ -19,7 +19,7 @@ jobs:
           go-version-file: go.mod
       - name: Test (hermetic; the live half loudly skips in CI)
         shell: pwsh
-        run: go vet ./... && go test ./...
+        run: go vet ./... && go test -count=1 ./...
       - name: Lint installer (it ships as a release asset)
         shell: pwsh
         run: |
@@ -53,21 +53,33 @@ jobs:
         shell: pwsh
         env:
           VERSION: ${{ steps.ver.outputs.version }}
-        run: go build -trimpath -ldflags "-X main.version=$env:VERSION" -o git-remote-proton.exe ./cmd/git-remote-proton
+        run: |
+          go build -trimpath -ldflags "-X main.version=$env:VERSION" -o git-remote-proton.exe ./cmd/git-remote-proton
+          # Only the last native command's exit code ends the step, so stop here
+          # if the Windows build failed rather than letting the Linux build mask it.
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # The Linux helper is a static linux/amd64 binary cross-built on this
+          # runner. This run: block is its own pwsh process, so these variables
+          # cannot leak into any later step.
+          $env:GOOS='linux'; $env:GOARCH='amd64'; $env:CGO_ENABLED='0'; go build -trimpath -ldflags "-X main.version=$env:VERSION" -o git-remote-proton-linux-amd64 ./cmd/git-remote-proton
       - name: Checksum
         shell: pwsh
         run: |
-          $hash = (Get-FileHash git-remote-proton.exe -Algorithm SHA256).Hash.ToLower()
-          Set-Content git-remote-proton.exe.sha256 -Value "$hash  git-remote-proton.exe" -NoNewline
+          # Both sidecars are written the same way: lowercase SHA-256, two spaces,
+          # the file name, no trailing newline.
+          foreach ($name in 'git-remote-proton.exe', 'git-remote-proton-linux-amd64') {
+            $hash = (Get-FileHash $name -Algorithm SHA256).Hash.ToLower()
+            Set-Content "$name.sha256" -Value "$hash  $name" -NoNewline
+          }
       - name: Upload build artifact (dispatch dry run only — never a release)
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v7
         with:
           name: git-remote-proton-dev
-          path: git-remote-proton.exe*
+          path: git-remote-proton*
       - name: Create DRAFT release (tag runs only)
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create $env:GITHUB_REF_NAME --draft --title $env:GITHUB_REF_NAME --notes "See CHANGELOG.md. Draft until the Stage 4 live gate passes against these exact bytes." git-remote-proton.exe git-remote-proton.exe.sha256 install.ps1
+        run: gh release create $env:GITHUB_REF_NAME --draft --title $env:GITHUB_REF_NAME --notes "See CHANGELOG.md. Draft until the Windows and Linux live gates pass against these exact bytes." git-remote-proton.exe git-remote-proton.exe.sha256 install.ps1 git-remote-proton-linux-amd64 git-remote-proton-linux-amd64.sha256

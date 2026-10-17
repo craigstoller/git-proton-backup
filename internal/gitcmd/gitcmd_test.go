@@ -3,6 +3,7 @@ package gitcmd
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // newRepo builds a real, throwaway git repo under t.TempDir() with one
@@ -931,12 +933,14 @@ func TestRevListMissingFrontierDeepensThroughATree(t *testing.T) {
 	}
 }
 
-// GUARD: pins RevListMissing's error-translation wrap — the unconditional
-// %w-wrap that names "--missing=print" and the minimum-git floor whenever the
+// GUARD, with one RED assertion: pins RevListMissing's error-translation wrap,
+// the unconditional %w-wrap that names the minimum-git floor whenever the
 // underlying rev-list call itself errors (as opposed to succeeding and
 // reporting ?-lines, which every other RevListMissing test above exercises).
 // A gitDir that is not a git repository at all makes revListWithAlt fail
 // immediately, forcing the wrap branch the rest of this suite never takes.
+// The test was a GUARD until D5(a) (Task 3) added the "git 2.45.0 or newer"
+// assertion, which is RED: it failed until the wrap named the floor.
 func TestRevListMissingWrapsUnderlyingErrorWithFloorText(t *testing.T) {
 	notARepo := t.TempDir() // deliberately never `git init`-ed
 	altObjects := t.TempDir()
@@ -946,9 +950,14 @@ func TestRevListMissingWrapsUnderlyingErrorWithFloorText(t *testing.T) {
 	if err == nil {
 		t.Fatal("RevListMissing against a non-repo gitDir must return an error")
 	}
+	// This only shows the error came from the --missing=print rev-list call: the
+	// underlying error already echoes the call's arguments, so it holds with or
+	// without the wrap. The floor assertion below is what pins the wrap itself.
 	if !strings.Contains(err.Error(), "--missing=print") {
-		t.Errorf("wrapped error must name --missing=print (the floor-naming text "+
-			"from RevListMissing's wrap): %v", err)
+		t.Errorf("error must come from the --missing=print rev-list call: %v", err)
+	}
+	if !strings.Contains(err.Error(), "git 2.45.0 or newer") {
+		t.Errorf("wrapped error must name git 2.45.0 or newer (the D5(a) floor): %v", err)
 	}
 }
 
@@ -1055,5 +1064,245 @@ func TestWritePackRevListFailureCarriesLongPathHint(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "core.longpaths") {
 		t.Errorf("want the MAX_PATH hint appended to the error, got %v", err)
+	}
+}
+
+// RED (ProbeMissingTips does not exist yet; fails to compile). The suite
+// itself needs git 2.45.0 or newer, so on the suite's git a probe of a fresh
+// repo must classify as OK, with no detail to report. On a git older than the
+// floor this same test is the one that fails (Task 4 Step 7 measures that in
+// WSL against a real 2.44.4).
+func TestProbeMissingTipsOKOnTheSuitesGit(t *testing.T) {
+	res, detail := ProbeMissingTips(newRepo(t))
+	if res != ProbeOK {
+		t.Fatalf("ProbeMissingTips on a fresh repo = (%d, %q), want ProbeOK: the suite's own git must be at the floor", res, detail)
+	}
+	if detail != "" {
+		t.Errorf("detail = %q, want empty on ProbeOK", detail)
+	}
+}
+
+// RED. main.go hands the probe an ABSOLUTE git dir, and for a linked worktree
+// that is the per-worktree dir under the main repo's .git/worktrees/, not a
+// work tree. Every other gitcmd call already runs with -C on that path; the
+// probe must too.
+func TestProbeMissingTipsOKInALinkedWorktree(t *testing.T) {
+	main := newRepo(t)
+	wt := filepath.Join(t.TempDir(), "wt")
+	if out, err := exec.Command("git", "-C", main, "worktree", "add", "-q", wt, "-b", "probe-wt").CombinedOutput(); err != nil {
+		t.Fatalf("git worktree add: %v: %s", err, out)
+	}
+	out, err := exec.Command("git", "-C", wt, "rev-parse", "--absolute-git-dir").Output()
+	if err != nil {
+		t.Fatalf("rev-parse --absolute-git-dir: %v", err)
+	}
+	gitDir := strings.TrimSpace(string(out))
+	if !strings.Contains(filepath.ToSlash(gitDir), "/worktrees/") {
+		t.Fatalf("absolute git dir %q is not a linked worktree's: the fixture is wrong", gitDir)
+	}
+
+	res, detail := ProbeMissingTips(gitDir)
+	if res != ProbeOK {
+		t.Fatalf("ProbeMissingTips(%q) = (%d, %q), want ProbeOK", gitDir, res, detail)
+	}
+}
+
+// RED. A directory that is not a repository is "could not check", never "too
+// old": git runs fine, it just has nothing to probe. The detail must carry git's
+// own words so the operator can see why, on one line.
+func TestProbeMissingTipsUnknownOutsideARepo(t *testing.T) {
+	res, detail := ProbeMissingTips(t.TempDir())
+	if res != ProbeUnknown {
+		t.Fatalf("ProbeMissingTips outside a repo = (%d, %q), want ProbeUnknown", res, detail)
+	}
+	if !strings.HasPrefix(detail, "git rev-list: ") {
+		t.Errorf("detail = %q, want the prefix %q", detail, "git rev-list: ")
+	}
+	if !strings.Contains(detail, "not a git repository") {
+		t.Errorf("detail = %q, want git's own 'not a git repository' text", detail)
+	}
+}
+
+// RED. A probe that cannot finish in time is Unknown, never OK and never
+// TooOld, and it still says why. A nanosecond deadline is already past by the
+// time the command starts, so this does not depend on how fast git is.
+func TestProbeMissingTipsUnknownOnTimeout(t *testing.T) {
+	old := probeTimeout
+	probeTimeout = time.Nanosecond
+	t.Cleanup(func() { probeTimeout = old })
+
+	res, detail := ProbeMissingTips(newRepo(t))
+	if res != ProbeUnknown {
+		t.Fatalf("ProbeMissingTips with an expired deadline = (%d, %q), want ProbeUnknown", res, detail)
+	}
+	if strings.TrimPrefix(detail, "git rev-list: ") == "" {
+		t.Errorf("detail = %q, want a non-empty reason after the prefix", detail)
+	}
+}
+
+// fakeGitOnPath puts a POSIX shell script named "git" first on PATH for the
+// rest of the test, so the probe can be shown what a slow, hung, old or odd git
+// does without needing one. exec.CommandContext resolves "git" when the command
+// is built, so setting PATH before the probe runs is enough. Skipped on Windows,
+// where a shell script is not an executable; the Linux CI leg and the WSL runs
+// exercise these.
+func fakeGitOnPath(t *testing.T, script string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("needs a POSIX shell script standing in for git")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "git"), []byte("#!/bin/sh\n"+script+"\n"), 0o755); err != nil {
+		t.Fatalf("write fake git: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// RED. A git older than the floor dies on the missing tip with its own 'bad
+// object' error; that exact text is what separates "too old" from "could not
+// check". The fake prints what the real 2.44.4 printed (spec F3).
+func TestProbeMissingTipsTooOldWhenGitDiesOnTheBadObject(t *testing.T) {
+	fakeGitOnPath(t, "cat >/dev/null\necho 'fatal: bad object "+probeMissingTipOID+"' >&2\nexit 128")
+	res, detail := ProbeMissingTips(t.TempDir())
+	if res != ProbeTooOld {
+		t.Fatalf("ProbeMissingTips = (%d, %q), want ProbeTooOld", res, detail)
+	}
+	if !strings.Contains(detail, "bad object") || strings.ContainsAny(detail, "\r\n") {
+		t.Errorf("detail = %q, want git's one-line 'bad object' text", detail)
+	}
+}
+
+// RED. A git that exits 0 without the ?-line has not shown it can restore, and
+// has not shown it cannot: Unknown, with the "no output" stand-in.
+func TestProbeMissingTipsUnknownWhenGitExitsZeroWithoutTheMissingLine(t *testing.T) {
+	fakeGitOnPath(t, "cat >/dev/null\nexit 0")
+	res, detail := ProbeMissingTips(t.TempDir())
+	if res != ProbeUnknown {
+		t.Fatalf("ProbeMissingTips = (%d, %q), want ProbeUnknown", res, detail)
+	}
+	if !strings.HasSuffix(detail, "no output") {
+		t.Errorf("detail = %q, want the 'no output' stand-in", detail)
+	}
+}
+
+// RED. The classification keys on what the child DID. This git prints the
+// ?-line and exits 0, but leaves a grandchild holding the output pipe, so Wait
+// returns exec.ErrWaitDelay after the probe's own 2 s bound. That is still a
+// pass: the answer was already in hand.
+//
+// The grandchild sleeps 20 s, well past the 8 s bound, so the bound holds only
+// while probeWaitDelay does: with no WaitDelay, or the package's 30 s one, Wait
+// would block until the sleep ends and the test fails (final-review fix C6;
+// with `sleep 5` a lost WaitDelay still passed, and ErrWaitDelay never fired).
+func TestProbeMissingTipsOKEvenWhenAGrandchildHoldsThePipe(t *testing.T) {
+	fakeGitOnPath(t, "cat >/dev/null\necho '?"+probeMissingTipOID+"'\nsleep 20 &\nexit 0")
+	start := time.Now()
+	res, detail := ProbeMissingTips(t.TempDir())
+	if res != ProbeOK {
+		t.Fatalf("ProbeMissingTips = (%d, %q), want ProbeOK despite the abandoned pipe", res, detail)
+	}
+	if took := time.Since(start); took > 8*time.Second {
+		t.Errorf("probe took %s, want it bounded near the 2 s WaitDelay, not the package's 30 s", took)
+	}
+}
+
+// RED. A hung git (and the sleep it leaves holding the pipe) only makes the
+// probe Unknown, within its deadline plus its own short WaitDelay: it must
+// never hold up a push for the package's 30 s waitDelay.
+//
+// The sleep is 20 s, well past the 8 s bound, for the same reason as the
+// grandchild test above (final-review fix C6): a shorter sleep would let a
+// lost probeWaitDelay pass.
+func TestProbeMissingTipsUnknownWhenGitHangs(t *testing.T) {
+	old := probeTimeout
+	probeTimeout = 500 * time.Millisecond
+	t.Cleanup(func() { probeTimeout = old })
+	fakeGitOnPath(t, "sleep 20")
+	start := time.Now()
+	res, detail := ProbeMissingTips(t.TempDir())
+	if res != ProbeUnknown {
+		t.Fatalf("ProbeMissingTips = (%d, %q), want ProbeUnknown", res, detail)
+	}
+	if !strings.Contains(detail, "timed out") {
+		t.Errorf("detail = %q, want it to say the probe timed out", detail)
+	}
+	if took := time.Since(start); took > 8*time.Second {
+		t.Errorf("probe took %s, want it bounded near the deadline plus the 2 s WaitDelay", took)
+	}
+}
+
+// RED (final-review fix C7(a)). A git that printed something before hanging
+// still timed out, and the detail must say so: the partial output alone reads
+// like an answer, not like a probe that ran out of time.
+func TestProbeMissingTipsTimeoutIsNamedEvenWithPartialOutput(t *testing.T) {
+	old := probeTimeout
+	probeTimeout = 500 * time.Millisecond
+	t.Cleanup(func() { probeTimeout = old })
+	fakeGitOnPath(t, "echo partial-output\nsleep 20")
+	res, detail := ProbeMissingTips(t.TempDir())
+	if res != ProbeUnknown {
+		t.Fatalf("ProbeMissingTips = (%d, %q), want ProbeUnknown", res, detail)
+	}
+	if !strings.Contains(detail, "partial-output") {
+		t.Errorf("detail = %q, want the partial output quoted", detail)
+	}
+	if !strings.HasSuffix(detail, " (timed out after 500ms)") {
+		t.Errorf("detail = %q, want it to end %q", detail, " (timed out after 500ms)")
+	}
+}
+
+// RED. A missing git is "could not check", not a crash: the child never starts,
+// so there is no ProcessState to read.
+func TestProbeMissingTipsUnknownWhenGitIsMissing(t *testing.T) {
+	d := newRepo(t)
+	t.Setenv("PATH", t.TempDir()) // nothing on it
+	res, detail := ProbeMissingTips(d)
+	if res != ProbeUnknown {
+		t.Fatalf("ProbeMissingTips with no git on PATH = (%d, %q), want ProbeUnknown", res, detail)
+	}
+	if !strings.HasPrefix(detail, "git rev-list: ") || strings.TrimPrefix(detail, "git rev-list: ") == "" {
+		t.Errorf("detail = %q, want the prefix and a reason", detail)
+	}
+}
+
+// RED. The detail is spliced into a single-line warning, so it must itself be
+// one line, bounded however much git said.
+func TestProbeMissingTipsDetailIsOneBoundedLine(t *testing.T) {
+	const prefix = "git rev-list: "
+	long := strings.Repeat("fatal: line of git chatter\r\nmore\n", 40) // well over 1,000 bytes
+	if len(long) < 1000 {
+		t.Fatalf("fixture is %d bytes, want at least 1,000", len(long))
+	}
+	got := probeDetailLine(long, nil)
+	if strings.ContainsAny(got, "\r\n") {
+		t.Errorf("detail contains a line break: %q", got)
+	}
+	if !strings.HasPrefix(got, prefix) {
+		t.Errorf("detail = %q, want the prefix %q", got, prefix)
+	}
+	if len(got) > len(prefix)+300 {
+		t.Errorf("detail is %d bytes, want at most %d (300 plus the prefix)", len(got), len(prefix)+300)
+	}
+	if !strings.Contains(got, " | ") {
+		t.Errorf("detail = %q, want newlines flattened to ' | '", got)
+	}
+
+	// A cut must land on a rune boundary: the leading byte shifts every two-byte
+	// rune by one, so a naive 300-byte cut would split the 150th rune.
+	multi := probeDetailLine("x"+strings.Repeat("é", 200), nil)
+	if body := strings.TrimPrefix(multi, prefix); !strings.HasSuffix(body, "é") || len(body) > 300 {
+		t.Errorf("multi-byte detail body = %q (%d bytes), want whole runes within 300 bytes", body, len(body))
+	}
+
+	// With no output to report, the error's text stands in for it.
+	if got := probeDetailLine("", errors.New("boom")); !strings.Contains(got, "boom") {
+		t.Errorf("probeDetailLine(\"\", boom) = %q, want it to carry the error text", got)
+	}
+	// Whitespace-only output is no output.
+	if got := probeDetailLine("\n  \n", errors.New("boom")); !strings.Contains(got, "boom") {
+		t.Errorf("probeDetailLine(whitespace, boom) = %q, want it to carry the error text", got)
+	}
+	if got := probeDetailLine("", nil); !strings.HasSuffix(got, "no output") {
+		t.Errorf("probeDetailLine(\"\", nil) = %q, want a 'no output' stand-in", got)
 	}
 }

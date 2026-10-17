@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/craigstoller/git-proton-backup/internal/gitcmd"
 	"github.com/craigstoller/git-proton-backup/internal/repo"
 	"github.com/craigstoller/git-proton-backup/internal/transport"
 )
@@ -223,6 +224,201 @@ func TestLoop_ListForPush_MissingParentWithoutEnvGivesActionableMessageNotRawErr
 	}
 	if _, ok := ft.Files[root+"/"+repo.MarkerName]; ok {
 		t.Error("a refused push must never reach Bootstrap")
+	}
+}
+
+// stubProbe points the restore-floor seam (D5(d)) at fn for one test and puts
+// the previous value back afterwards. TestMain has already stubbed the seam to
+// an OK no-op for the whole package, so a test only needs this when it cares
+// what the probe says.
+func stubProbe(t *testing.T, fn func(gitDir string) (gitcmd.ProbeResult, string)) {
+	t.Helper()
+	old := probeRestoreFloor
+	probeRestoreFloor = fn
+	t.Cleanup(func() { probeRestoreFloor = old })
+}
+
+// warningLines returns the lines of stderr that carry the WARNING marker.
+func warningLines(stderr string) []string {
+	var got []string
+	for _, l := range strings.Split(stderr, "\n") {
+		if strings.Contains(l, "WARNING") {
+			got = append(got, l)
+		}
+	}
+	return got
+}
+
+// TestLoop_ListForPush_WarnsWhenThisGitIsTooOld is RED (Task 4, D5(d)): git
+// 2.45.0 or newer is needed to RESTORE from this remote but not to push to it,
+// so on an older git a push succeeds on a host that could never get the data
+// back. "list for-push" must say so, once, on stderr, and must not turn the
+// warning into a failed push: the advertisement completes and loop returns 0.
+//
+// The seam closure also pins WHERE the probe runs: after Bootstrap has created
+// the remote layout and BEFORE the lock is taken, so a slow probe never holds
+// the single-writer lock open.
+func TestLoop_ListForPush_WarnsWhenThisGitIsTooOld(t *testing.T) {
+	ft := transport.NewFake()
+	root := "/my-files/r"
+	const detail = "git rev-list: fatal: bad object 0123456789abcdef0123456789abcdef01234567"
+	var calls int
+	var gotGitDir string
+	var markerThere, lockThere bool
+	stubProbe(t, func(gitDir string) (gitcmd.ProbeResult, string) {
+		calls++
+		gotGitDir = gitDir
+		_, markerThere = ft.Files[root+"/"+repo.MarkerName]
+		_, lockThere = ft.Files[root+"/"+repo.LockName]
+		return gitcmd.ProbeTooOld, detail
+	})
+
+	in := bufio.NewScanner(strings.NewReader("list for-push\n\n"))
+	var outBuf bytes.Buffer
+	out := bufio.NewWriter(&outBuf)
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(ft, root, "/the/git/dir", in, out) })
+	out.Flush()
+
+	if got != 0 {
+		t.Fatalf("loop() = %d, want 0: the warning must never block the push; stderr=%q", got, stderr)
+	}
+	if outBuf.String() != "\n" {
+		t.Errorf("stdout = %q, want the empty advertisement %q: the protocol stream must be unaffected", outBuf.String(), "\n")
+	}
+	if calls != 1 {
+		t.Fatalf("probe ran %d times, want exactly once", calls)
+	}
+	if gotGitDir != "/the/git/dir" {
+		t.Errorf("probe got gitDir %q, want the one loop was given", gotGitDir)
+	}
+	if !markerThere {
+		t.Error("the probe ran before Bootstrap wrote the remote layout; it belongs after")
+	}
+	if lockThere {
+		t.Error("the probe ran with the lock already held; it belongs before AcquireLock")
+	}
+	warns := warningLines(stderr)
+	if len(warns) != 1 {
+		t.Fatalf("stderr has %d WARNING lines, want exactly one: %q", len(warns), stderr)
+	}
+	// GUARD assertion (final-review fix C7(c)): the warning is the ONLY stderr
+	// line, so nothing else this path prints can split or bury it.
+	if n := strings.Count(stderr, "\n"); n != 1 {
+		t.Errorf("stderr has %d lines, want exactly one (the warning): %q", n, stderr)
+	}
+	for _, want := range []string{
+		"cannot restore", "git 2.45.0 or newer", "does not block the push", detail,
+	} {
+		if !strings.Contains(warns[0], want) {
+			t.Errorf("warning %q does not contain %q", warns[0], want)
+		}
+	}
+	if strings.Contains(outBuf.String(), "WARNING") {
+		t.Errorf("stdout carried the warning: %q", outBuf.String())
+	}
+}
+
+// TestLoop_ListForPush_WarnsWhenTheCheckCannotRun is RED (Task 4): a probe that
+// could not tell (timeout, git missing, an erroring git) is a different message
+// from "too old", and it too never fails the push.
+func TestLoop_ListForPush_WarnsWhenTheCheckCannotRun(t *testing.T) {
+	stubProbe(t, func(string) (gitcmd.ProbeResult, string) {
+		return gitcmd.ProbeUnknown, "git rev-list: context deadline exceeded"
+	})
+	in := bufio.NewScanner(strings.NewReader("list for-push\n\n"))
+	out := bufio.NewWriter(&bytes.Buffer{})
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(transport.NewFake(), "/my-files/r", ".", in, out) })
+
+	if got != 0 {
+		t.Fatalf("loop() = %d, want 0: an inconclusive probe must never block the push; stderr=%q", got, stderr)
+	}
+	warns := warningLines(stderr)
+	if len(warns) != 1 {
+		t.Fatalf("stderr has %d WARNING lines, want exactly one: %q", len(warns), stderr)
+	}
+	for _, want := range []string{
+		"could not check", "git 2.45.0 or newer", "does not block the push", "context deadline exceeded",
+	} {
+		if !strings.Contains(warns[0], want) {
+			t.Errorf("warning %q does not contain %q", warns[0], want)
+		}
+	}
+	if strings.Contains(warns[0], "cannot restore") {
+		t.Errorf("warning %q claims this git cannot restore, which the probe did not establish", warns[0])
+	}
+}
+
+// TestLoop_ListForPush_UnexpectedProbeResultWarnsLikeUnknown is RED
+// (final-review fix C7(b)): a ProbeResult warnRestoreFloor does not know (a
+// value added to gitcmd later, say) must read as "could not check", never as
+// a silent pass.
+func TestLoop_ListForPush_UnexpectedProbeResultWarnsLikeUnknown(t *testing.T) {
+	stubProbe(t, func(string) (gitcmd.ProbeResult, string) {
+		return gitcmd.ProbeResult(99), "git rev-list: something new"
+	})
+	in := bufio.NewScanner(strings.NewReader("list for-push\n\n"))
+	out := bufio.NewWriter(&bytes.Buffer{})
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(transport.NewFake(), "/my-files/r", ".", in, out) })
+
+	if got != 0 {
+		t.Fatalf("loop() = %d, want 0: an unexpected probe result must never block the push; stderr=%q", got, stderr)
+	}
+	warns := warningLines(stderr)
+	if len(warns) != 1 {
+		t.Fatalf("stderr has %d WARNING lines, want exactly one: %q", len(warns), stderr)
+	}
+	for _, want := range []string{
+		"could not check", "git 2.45.0 or newer", "does not block the push", "something new",
+	} {
+		if !strings.Contains(warns[0], want) {
+			t.Errorf("warning %q does not contain %q", warns[0], want)
+		}
+	}
+}
+
+// TestLoop_ListForPush_SilentWhenTheProbeIsOK is RED (Task 4; it failed to
+// compile before the probe seam existed): a passing probe adds nothing to
+// stderr.
+func TestLoop_ListForPush_SilentWhenTheProbeIsOK(t *testing.T) {
+	stubProbe(t, func(string) (gitcmd.ProbeResult, string) { return gitcmd.ProbeOK, "" })
+	in := bufio.NewScanner(strings.NewReader("list for-push\n\n"))
+	out := bufio.NewWriter(&bytes.Buffer{})
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(transport.NewFake(), "/my-files/r", ".", in, out) })
+
+	if got != 0 {
+		t.Fatalf("loop() = %d, want 0; stderr=%q", got, stderr)
+	}
+	if stderr != "" {
+		t.Errorf("stderr = %q, want nothing on ProbeOK", stderr)
+	}
+}
+
+// TestLoop_ListForPush_RealProbeIsSilentOnTheSuitesGit is RED (Task 4) and pins
+// the PRODUCTION wiring: with the seam set to the real probe (TestMain saved it
+// in realProbeRestoreFloor before stubbing), a fresh repo's absolute git dir on
+// the suite's own git (at the floor) yields no warning at all.
+func TestLoop_ListForPush_RealProbeIsSilentOnTheSuitesGit(t *testing.T) {
+	stubProbe(t, realProbeRestoreFloor)
+	gitDir := filepath.Join(emptyGitRepo(t), ".git")
+	in := bufio.NewScanner(strings.NewReader("list for-push\n\n"))
+	out := bufio.NewWriter(&bytes.Buffer{})
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(transport.NewFake(), "/my-files/r", gitDir, in, out) })
+
+	if got != 0 {
+		t.Fatalf("loop() = %d, want 0; stderr=%q", got, stderr)
+	}
+	if strings.Contains(stderr, "WARNING") {
+		t.Errorf("stderr = %q, want no WARNING from the real probe on a git at the floor", stderr)
 	}
 }
 

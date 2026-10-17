@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -310,6 +311,22 @@ type ambiguousTrashTransport struct {
 
 func (a ambiguousTrashTransport) Trash(p string) (transport.Outcome, error) {
 	return transport.Ambiguous, nil
+}
+
+// trashFailsForTransport wraps a Fake but makes Trash report Ambiguous, with a
+// nil error, for one exact path only, and calls through to the Fake for every
+// other path. It drives a phase-4 delete failure of one ref while the rest of
+// the batch, a sibling delete included, runs normally (spec §5, phase 5).
+type trashFailsForTransport struct {
+	*transport.Fake
+	path string
+}
+
+func (tr trashFailsForTransport) Trash(p string) (transport.Outcome, error) {
+	if p == tr.path {
+		return transport.Ambiguous, nil
+	}
+	return tr.Fake.Trash(p)
 }
 
 // TestReleaseFailsClosedOnAmbiguousTrash covers the requirement that Release
@@ -2153,6 +2170,768 @@ func TestPushFinalStateDFPreflightOrderIndependentOfInputOrder(t *testing.T) {
 		// real pin is the code-path assertion above via M4's routing.
 		t.Errorf("refs/heads/feature = %q, want %q", sha2, sha)
 	}
+}
+
+// ---- Case-variant refs (spec §5, D2(a), Amendment A1) ----------------------
+//
+// A create is a destination absent from the pre-batch advertised set. Each
+// fixture keeps remote HEAD on refs/heads/main whenever main is seeded, and
+// no batch deletes main, so HEAD protection never refuses a delete in place of
+// the rule under test. A create a test expects to land, or whose refusal is
+// pinned by "no pack", points at a commit the pre-batch remote lacks:
+// otherwise the pack would be empty and the pack assertion vacuous.
+
+// seedCaseRemote bootstraps a Fake at /r and writes each of refs on it,
+// returning the Fake and the pre-batch advertised map Push takes.
+func seedCaseRemote(t *testing.T, refs map[string]string) (*transport.Fake, map[string]string) {
+	t.Helper()
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	if err := Bootstrap(f, "/r"); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	remote := make(map[string]string, len(refs))
+	for ref, sha := range refs {
+		if out, err := WriteRef(f, "/r", ref, sha, false); err != nil || out != transport.Committed {
+			t.Fatalf("seed %s: %v, %v", ref, out, err)
+		}
+		remote[ref] = sha
+	}
+	if _, ok := refs["refs/heads/main"]; ok {
+		if out, err := WriteHEAD(f, "/r", "refs/heads/main"); err != nil || out != transport.Committed {
+			t.Fatalf("seed HEAD: %v, %v", out, err)
+		}
+	}
+	return f, remote
+}
+
+// assertCaseRemote checks the remote's advertised refs, as ScanRefs reads
+// them, against want exactly.
+func assertCaseRemote(t *testing.T, f *transport.Fake, want map[string]string) {
+	t.Helper()
+	scan, err := ScanRefs(f, "/r")
+	if err != nil {
+		t.Fatalf("ScanRefs: %v", err)
+	}
+	if !reflect.DeepEqual(scan.Refs, want) {
+		t.Errorf("remote refs = %v, want %v", scan.Refs, want)
+	}
+}
+
+// assertNoPack checks that nothing in the batch cost a pack upload.
+func assertNoPack(t *testing.T, f *transport.Fake) {
+	t.Helper()
+	if packs, idxs := countPackFiles(f, "/r"); packs != 0 || idxs != 0 {
+		t.Errorf("a phase-2 refusal must cost no pack, got pack=%d idx=%d", packs, idxs)
+	}
+}
+
+// assertCaseRefused checks that r is refused by the case rule with a reason
+// that begins with prefix.
+func assertCaseRefused(t *testing.T, r Result, prefix string) {
+	t.Helper()
+	if r.OK {
+		t.Fatalf("%s must be refused, got %+v", r.Ref, r)
+	}
+	if !strings.HasPrefix(r.Err, prefix) {
+		t.Errorf("%s: refusal must begin %q, got %q", r.Ref, prefix, r.Err)
+	}
+}
+
+// TestPushRefusesACaseVariantCreateBesideAnExistingRef is RED (spec §5,
+// D2(a)): a create spelled like an existing ref except for letter case is
+// refused in phase 2, so it costs no pack and the remote is unchanged.
+func TestPushRefusesACaseVariantCreateBesideAnExistingRef(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	f, remote := seedCaseRemote(t, map[string]string{"refs/heads/main": c1})
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	res := Push(f, "/r", gitDir, []protocol.RefUpdate{{Src: c2, Dst: "refs/heads/Main"}}, remote, nil)
+	if len(res) != 1 || res[0].OK {
+		t.Fatalf("a case-variant create must be refused, got %+v", res)
+	}
+	for _, want := range []string{"refs/heads/main", "conflicts by letter case"} {
+		if !strings.Contains(res[0].Err, want) {
+			t.Errorf("refusal must contain %q, got %q", want, res[0].Err)
+		}
+	}
+	assertNoPack(t, f)
+	assertCaseRemote(t, f, map[string]string{"refs/heads/main": c1})
+}
+
+// TestPushRefusesBothSameBatchCaseVariantCreates is RED (spec §5: conflicts
+// are groups, so EVERY create in a conflicting group is refused, not the
+// second one seen). Each refusal names the other.
+func TestPushRefusesBothSameBatchCaseVariantCreates(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	f, remote := seedCaseRemote(t, nil)
+
+	ups := []protocol.RefUpdate{
+		{Src: c1, Dst: "refs/heads/main"},
+		{Src: c1, Dst: "refs/heads/Main"},
+	}
+	res := Push(f, "/r", gitDir, ups, remote, nil)
+	if len(res) != 2 {
+		t.Fatalf("want 2 results, got %+v", res)
+	}
+	assertCaseRefused(t, res[0], "refs/heads/main conflicts by letter case with refs/heads/Main (")
+	assertCaseRefused(t, res[1], "refs/heads/Main conflicts by letter case with refs/heads/main (")
+	assertNoPack(t, f)
+	assertCaseRemote(t, f, map[string]string{})
+}
+
+// TestPushCaseVariantRefusalIsPerCreateNotPerBatch is RED: the refusal is
+// per create. An update of the existing ref in the same batch still lands,
+// with its own pack.
+func TestPushCaseVariantRefusalIsPerCreateNotPerBatch(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	f, remote := seedCaseRemote(t, map[string]string{"refs/heads/main": c1})
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{
+		{Src: c2, Dst: "refs/heads/main"},
+		{Src: c2, Dst: "refs/heads/Main"},
+	}
+	res := Push(f, "/r", gitDir, ups, remote, nil)
+	if len(res) != 2 {
+		t.Fatalf("want 2 results, got %+v", res)
+	}
+	if !res[0].OK {
+		t.Fatalf("the update of the existing ref must succeed, got %+v", res[0])
+	}
+	assertCaseRefused(t, res[1], "refs/heads/Main conflicts by letter case with refs/heads/main (")
+	if packs, idxs := countPackFiles(f, "/r"); packs != 1 || idxs != 1 {
+		t.Errorf("the update must still cost exactly one pack, got pack=%d idx=%d", packs, idxs)
+	}
+	assertCaseRemote(t, f, map[string]string{"refs/heads/main": c2})
+}
+
+// TestPushRefusesFileDirAndDirDirCaseVariants is RED: spec F13's other two
+// shapes, a leaf against a directory prefix (Feat/x beside feat) and two
+// directory prefixes (Grp/b beside grp/a). The exact-spelling D/F preflight
+// passes both, so the case rule is what refuses them.
+func TestPushRefusesFileDirAndDirDirCaseVariants(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{"refs/heads/main": c1, "refs/heads/feat": c1, "refs/heads/grp/a": c1}
+	f, remote := seedCaseRemote(t, seeded)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{
+		{Src: c2, Dst: "refs/heads/Feat/x"},
+		{Src: c2, Dst: "refs/heads/Grp/b"},
+	}
+	res := Push(f, "/r", gitDir, ups, remote, nil)
+	if len(res) != 2 {
+		t.Fatalf("want 2 results, got %+v", res)
+	}
+	assertCaseRefused(t, res[0],
+		"refs/heads/Feat/x conflicts by letter case with refs/heads/feat (heads/Feat vs heads/feat): ")
+	assertCaseRefused(t, res[1],
+		"refs/heads/Grp/b conflicts by letter case with refs/heads/grp/a (heads/Grp vs heads/grp): ")
+	assertNoPack(t, f)
+	assertCaseRemote(t, f, seeded)
+}
+
+// TestPushRefusesANonASCIICaseVariant is RED (Review Focus 1): the fold is
+// Unicode simple folding, not ASCII, so a variant differing only in "Ü"
+// against "ü" is refused like an ASCII one.
+func TestPushRefusesANonASCIICaseVariant(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{"refs/heads/main": c1, "refs/heads/Über": c1}
+	f, remote := seedCaseRemote(t, seeded)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	res := Push(f, "/r", gitDir, []protocol.RefUpdate{{Src: c2, Dst: "refs/heads/über"}}, remote, nil)
+	if len(res) != 1 {
+		t.Fatalf("want 1 result, got %+v", res)
+	}
+	assertCaseRefused(t, res[0],
+		"refs/heads/über conflicts by letter case with refs/heads/Über (heads/über vs heads/Über): ")
+	assertNoPack(t, f)
+	assertCaseRemote(t, f, seeded)
+}
+
+// TestPushCaseRuleCoversTags is RED (spec D2(a)'s stated cost): the rule is
+// not only about branches.
+func TestPushCaseRuleCoversTags(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{"refs/heads/main": c1, "refs/tags/Release-1": c1}
+	f, remote := seedCaseRemote(t, seeded)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	res := Push(f, "/r", gitDir, []protocol.RefUpdate{{Src: c2, Dst: "refs/tags/release-1"}}, remote, nil)
+	if len(res) != 1 {
+		t.Fatalf("want 1 result, got %+v", res)
+	}
+	assertCaseRefused(t, res[0],
+		"refs/tags/release-1 conflicts by letter case with refs/tags/Release-1 (tags/release-1 vs tags/Release-1): ")
+	assertNoPack(t, f)
+	assertCaseRemote(t, f, seeded)
+}
+
+// TestPushTagAndBranchOfTheSameNameStillCoexist is a GUARD: prefixes start at
+// the namespace component, so refs/tags/main and refs/heads/main never fold
+// equal and a tag named like a branch still lands.
+func TestPushTagAndBranchOfTheSameNameStillCoexist(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	f, remote := seedCaseRemote(t, map[string]string{"refs/heads/main": c1})
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	res := Push(f, "/r", gitDir, []protocol.RefUpdate{{Src: c2, Dst: "refs/tags/main"}}, remote, nil)
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("a tag named like an existing branch must be accepted, got %+v", res)
+	}
+	assertCaseRemote(t, f, map[string]string{"refs/heads/main": c1, "refs/tags/main": c2})
+}
+
+// TestPushExistingPairStillTakesUpdatesDeletesReplacesAndUnrelatedRefs is a
+// GUARD (Review Focus 2, A1): only creates are refused, so a remote that
+// already holds main beside Main still takes an update to one member, a push
+// to an unrelated ref, a same-batch replacement of a member (delete and
+// recreate: the name was on the pre-batch remote, so it is no create), and
+// the documented repair, a delete of one member.
+func TestPushExistingPairStillTakesUpdatesDeletesReplacesAndUnrelatedRefs(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	f, remote := seedCaseRemote(t, map[string]string{"refs/heads/main": c1, "refs/heads/Main": c1})
+
+	// Batch 1: update one member, create an unrelated ref.
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+	res := Push(f, "/r", gitDir, []protocol.RefUpdate{
+		{Src: c2, Dst: "refs/heads/main"},
+		{Src: c2, Dst: "refs/heads/topic"},
+	}, remote, nil)
+	if len(res) != 2 || !res[0].OK || !res[1].OK {
+		t.Fatalf("batch 1: an update of a pair member and an unrelated create must succeed, got %+v", res)
+	}
+	want := map[string]string{"refs/heads/main": c2, "refs/heads/Main": c1, "refs/heads/topic": c2}
+	assertCaseRemote(t, f, want)
+
+	// Batch 2: replace the other member (delete and recreate at a new commit).
+	remote = map[string]string{"refs/heads/main": c2, "refs/heads/Main": c1, "refs/heads/topic": c2}
+	c3 := commitOnPushRepo(t, gitDir, "c.txt", "three")
+	res = Push(f, "/r", gitDir, []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/Main"},
+		{Src: c3, Dst: "refs/heads/Main"},
+	}, remote, nil)
+	if len(res) != 2 || !res[0].OK || !res[1].OK {
+		t.Fatalf("batch 2: replacing a pair member must succeed, got %+v", res)
+	}
+	want = map[string]string{"refs/heads/main": c2, "refs/heads/Main": c3, "refs/heads/topic": c2}
+	assertCaseRemote(t, f, want)
+
+	// Batch 3: the repair, deleting one member.
+	remote = want
+	res = Push(f, "/r", gitDir, []protocol.RefUpdate{{Src: "", Dst: "refs/heads/Main"}}, remote, nil)
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("batch 3: deleting a pair member must succeed, got %+v", res)
+	}
+	assertCaseRemote(t, f, map[string]string{"refs/heads/main": c2, "refs/heads/topic": c2})
+}
+
+// TestPushExistingDirectoryPairBlocksNewChildren is RED (Review Focus 2,
+// spec §5 "strict where a pair already exists"): under a pre-existing
+// directory pair Feat/ beside feat/, a new ref under either spelling is
+// refused until the pair is repaired. Two separate pushes, so each refusal
+// is down to the existing pair alone.
+func TestPushExistingDirectoryPairBlocksNewChildren(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{"refs/heads/main": c1, "refs/heads/Feat/a": c1, "refs/heads/feat/b": c1}
+	f, remote := seedCaseRemote(t, seeded)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	res := Push(f, "/r", gitDir, []protocol.RefUpdate{{Src: c2, Dst: "refs/heads/feat/c"}}, remote, nil)
+	if len(res) != 1 {
+		t.Fatalf("want 1 result, got %+v", res)
+	}
+	assertCaseRefused(t, res[0],
+		"refs/heads/feat/c conflicts by letter case with refs/heads/Feat/a (heads/feat vs heads/Feat): ")
+
+	res = Push(f, "/r", gitDir, []protocol.RefUpdate{{Src: c2, Dst: "refs/heads/Feat/d"}}, remote, nil)
+	if len(res) != 1 {
+		t.Fatalf("want 1 result, got %+v", res)
+	}
+	assertCaseRefused(t, res[0],
+		"refs/heads/Feat/d conflicts by letter case with refs/heads/feat/b (heads/Feat vs heads/feat): ")
+	assertNoPack(t, f)
+	assertCaseRemote(t, f, seeded)
+}
+
+// TestPushCaseChangingRenameIsRefusedWhole is RED (Review Focus 3, A1): with
+// main present, a batch renaming Main to MAIN (delete Main, create MAIN) has
+// its create refused, and the delete is refused with it, so Main survives
+// rather than the rename being half-applied.
+func TestPushCaseChangingRenameIsRefusedWhole(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+	seeded := map[string]string{"refs/heads/main": c1, "refs/heads/Main": c2}
+	f, remote := seedCaseRemote(t, seeded)
+	c3 := commitOnPushRepo(t, gitDir, "c.txt", "three")
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/Main"},
+		{Src: c3, Dst: "refs/heads/MAIN"},
+	}
+	res := Push(f, "/r", gitDir, ups, remote, nil)
+	if len(res) != 2 || res[0].OK || res[1].OK {
+		t.Fatalf("a case-changing rename beside a variant must be refused whole, got %+v", res)
+	}
+	for _, want := range []string{"case-changing rename", "the rename was not applied"} {
+		if !strings.Contains(res[0].Err, want) {
+			t.Errorf("the delete's refusal must contain %q, got %q", want, res[0].Err)
+		}
+	}
+	const wantDel = "refs/heads/Main: delete refused because it pairs with the refused " +
+		"case-changing rename to refs/heads/MAIN; the rename was not applied"
+	if res[0].Err != wantDel {
+		t.Errorf("delete refusal:\n got %q\nwant %q", res[0].Err, wantDel)
+	}
+	assertCaseRefused(t, res[1],
+		"refs/heads/MAIN conflicts by letter case with refs/heads/main (heads/MAIN vs heads/main): ")
+	assertNoPack(t, f)
+	assertCaseRemote(t, f, seeded)
+}
+
+// TestPushRenameRefusalsReachAFixedPoint is RED (A1; Codex's plan-review
+// round-3 counterexample, with a healthy transport). The batch renames
+// Foo/a to FOO/A and Foo/b to FOO/B beside an existing FOO/a. One pass refuses
+// FOO/A (against FOO/a) and so keeps Foo/a; the kept Foo/a then puts
+// heads/Foo beside FOO/B's heads/FOO. A single pass would already have
+// approved FOO/B and the delete of Foo/b, so phase 2 must repeat until a pass
+// refuses nothing.
+func TestPushRenameRefusalsReachAFixedPoint(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{
+		"refs/heads/main": c1, "refs/heads/Foo/a": c1, "refs/heads/FOO/a": c1, "refs/heads/Foo/b": c1,
+	}
+	f, remote := seedCaseRemote(t, seeded)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/Foo/a"},
+		{Src: "", Dst: "refs/heads/Foo/b"},
+		{Src: c2, Dst: "refs/heads/FOO/A"},
+		{Src: c2, Dst: "refs/heads/FOO/B"},
+	}
+	res := Push(f, "/r", gitDir, ups, remote, nil)
+	if len(res) != 4 {
+		t.Fatalf("want 4 results, got %+v", res)
+	}
+	for i, r := range res {
+		if r.OK {
+			t.Fatalf("result %d (%s) must be refused; got %+v", i, ups[i].Dst, res)
+		}
+	}
+	assertCaseRemote(t, f, seeded)
+	assertNoPack(t, f)
+
+	// Which pass refused what, through the reasons each one gives.
+	for i, x := range []string{"refs/heads/FOO/A", "refs/heads/FOO/B"} {
+		want := ups[i].Dst + ": delete refused because it pairs with the refused " +
+			"case-changing rename to " + x + "; the rename was not applied"
+		if res[i].Err != want {
+			t.Errorf("result %d:\n got %q\nwant %q", i, res[i].Err, want)
+		}
+	}
+	assertCaseRefused(t, res[2],
+		"refs/heads/FOO/A conflicts by letter case with refs/heads/FOO/a (heads/FOO/A vs heads/FOO/a): ")
+	assertCaseRefused(t, res[3],
+		"refs/heads/FOO/B conflicts by letter case with refs/heads/Foo/a (heads/FOO vs heads/Foo): ")
+}
+
+// TestPushCaseRefusalTextIsOrderIndependent is RED (Review Focus 5): the
+// three-create batch main, Main, MAIN in all six orders. Every create is
+// refused with a non-empty reason naming the other two, and each
+// destination's reason is byte-identical whatever the batch order.
+func TestPushCaseRefusalTextIsOrderIndependent(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	names := []string{"refs/heads/main", "refs/heads/Main", "refs/heads/MAIN"}
+	perms := [][]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}}
+
+	var first map[string]string
+	for _, p := range perms {
+		f, remote := seedCaseRemote(t, nil)
+		ups := make([]protocol.RefUpdate, len(p))
+		for i, k := range p {
+			ups[i] = protocol.RefUpdate{Src: c1, Dst: names[k]}
+		}
+		res := Push(f, "/r", gitDir, ups, remote, nil)
+		if len(res) != len(ups) {
+			t.Fatalf("order %v: want %d results, got %+v", p, len(ups), res)
+		}
+		errs := map[string]string{}
+		for i, r := range res {
+			if r.OK || r.Err == "" {
+				t.Fatalf("order %v: %s must be refused with a reason, got %+v", p, ups[i].Dst, r)
+			}
+			for _, other := range names {
+				if other != ups[i].Dst && !strings.Contains(r.Err, other+" (") {
+					t.Errorf("order %v: %s's refusal must name %s, got %q", p, ups[i].Dst, other, r.Err)
+				}
+			}
+			errs[ups[i].Dst] = r.Err
+		}
+		if first == nil {
+			first = errs
+			continue
+		}
+		if !reflect.DeepEqual(errs, first) {
+			t.Errorf("order %v changed the refusal text:\n got %q\nwant %q", p, errs, first)
+		}
+	}
+}
+
+// TestPushCaseRuleIgnoresSkippedNames is a GUARD (spec §5's one stated
+// exception): skipped names are never advertised, so they are not in the
+// check set. A create of main beside a content-skipped Main is accepted.
+func TestPushCaseRuleIgnoresSkippedNames(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	f, remote := seedCaseRemote(t, nil)
+	f.Files["/r/refs/heads/Main"] = []byte("junk") // never advertised; ScanRefs skips it
+	skipped := []SkippedRef{{Path: "refs/heads/Main", Kind: SkipContent, Reason: "not a ref: junk"}}
+
+	res := Push(f, "/r", gitDir, []protocol.RefUpdate{{Src: c1, Dst: "refs/heads/main"}}, remote, skipped)
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("a create beside a skipped case variant must be accepted, got %+v", res)
+	}
+	assertCaseRemote(t, f, map[string]string{"refs/heads/main": c1})
+}
+
+// TestPushPhase5RefusesACreateWhoseVariantDeleteFailed is RED (spec §5,
+// phase 5): phase 2 clears the create Feat/x only because the same batch
+// deletes feat, and that delete then fails in phase 4. Phase 5 re-checks the
+// create against the live set, which still holds feat, and refuses it before
+// ensureRefParents, so no Feat folder is left behind. The pack phase 3
+// uploaded for the create stays, unreferenced, as spec §5 documents.
+//
+// The refusal ends by naming the delete it depended on (spec §5, "naming the
+// delete it depended on"; final-review fix C1, RED when added: the suffix
+// assertion fired, since the message then ended at "on every platform").
+func TestPushPhase5RefusesACreateWhoseVariantDeleteFailed(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{"refs/heads/main": c1, "refs/heads/feat": c1}
+	f, remote := seedCaseRemote(t, seeded)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/feat"},
+		{Src: c2, Dst: "refs/heads/Feat/x"},
+	}
+	tr := trashFailsForTransport{Fake: f, path: "/r/refs/heads/feat"}
+	res := Push(tr, "/r", gitDir, ups, remote, nil)
+	if len(res) != 2 {
+		t.Fatalf("want 2 results, got %+v", res)
+	}
+	if res[0].OK {
+		t.Errorf("the delete of refs/heads/feat must fail in phase 4, got %+v", res[0])
+	}
+	const wantCreate = "refs/heads/Feat/x conflicts by letter case with refs/heads/feat " +
+		"(heads/Feat vs heads/feat): "
+	if res[1].OK || !strings.HasPrefix(res[1].Err, wantCreate) {
+		t.Errorf("the create must be refused in phase 5, naming refs/heads/feat:\n got %+v\nwant Err beginning %q",
+			res[1], wantCreate)
+	}
+	const wantClause = " (the same-batch delete of refs/heads/feat did not commit)"
+	if !strings.HasSuffix(res[1].Err, wantClause) {
+		t.Errorf("the phase-5 refusal must name the delete it depended on:\n got %q\nwant it to end %q",
+			res[1].Err, wantClause)
+	}
+	if f.Dirs["/r/refs/heads/Feat"] {
+		t.Error("a create refused in phase 5 must leave no parent folder: the re-check runs before ensureRefParents")
+	}
+	if _, ok := f.Files["/r/refs/heads/Feat/x"]; ok {
+		t.Error("the refused create must not be written")
+	}
+	assertCaseRemote(t, f, seeded)
+	if packs, idxs := countPackFiles(f, "/r"); packs != 1 || idxs != 1 {
+		t.Errorf("phase 3 uploads the create's pack before phase 5 refuses it, so exactly one "+
+			"unreferenced pack must remain, got pack=%d idx=%d", packs, idxs)
+	}
+}
+
+// TestPushPhase5NeverRefusesAReplacement is a GUARD (A1; the Codex and Kimi
+// counterexample): phase 5 re-checks creates only, never a replacement. The
+// remote holds feat beside Feat; the batch deletes both and recreates Feat,
+// and the feat delete fails in phase 4. Recreating Feat adds no spelling the
+// remote lacked before the batch, so it must land. Re-checking it against a
+// live set that still holds feat would refuse it after its own delete had
+// committed, and lose Feat.
+func TestPushPhase5NeverRefusesAReplacement(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	f, remote := seedCaseRemote(t, map[string]string{
+		"refs/heads/main": c1, "refs/heads/feat": c1, "refs/heads/Feat": c1,
+	})
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/feat"},
+		{Src: "", Dst: "refs/heads/Feat"},
+		{Src: c2, Dst: "refs/heads/Feat"},
+	}
+	tr := trashFailsForTransport{Fake: f, path: "/r/refs/heads/feat"}
+	res := Push(tr, "/r", gitDir, ups, remote, nil)
+	if len(res) != 3 {
+		t.Fatalf("want 3 results, got %+v", res)
+	}
+	if res[0].OK {
+		t.Errorf("the delete of refs/heads/feat must fail in phase 4, got %+v", res[0])
+	}
+	if !res[1].OK {
+		t.Errorf("the delete of refs/heads/Feat must commit, got %+v", res[1])
+	}
+	if !res[2].OK {
+		t.Errorf("the replacement of refs/heads/Feat must land, got %+v", res[2])
+	}
+	assertCaseRemote(t, f, map[string]string{
+		"refs/heads/main": c1, "refs/heads/feat": c1, "refs/heads/Feat": c2,
+	})
+}
+
+// trashFailsForPaths is trashFailsForTransport for several paths at once: a
+// Trash of any of them returns Ambiguous, so its delete fails in phase 4.
+type trashFailsForPaths struct {
+	*transport.Fake
+	paths map[string]bool
+}
+
+func (tr trashFailsForPaths) Trash(p string) (transport.Outcome, error) {
+	if tr.paths[p] {
+		return transport.Ambiguous, nil
+	}
+	return tr.Fake.Trash(p)
+}
+
+// TestPushPhase5NamesEveryFailedDeleteItDependedOn is RED (final-review fix
+// C1; compile failure before it: failedDeleteClause did not exist). When a
+// phase-5 create depended on several same-batch deletes and they all failed,
+// the refusal names each, sorted, in the plural form. The remote already
+// holds the pair feat and fEAT; the batch repairs it by deleting both and
+// creates Feat/x, and both deletes fail in phase 4.
+func TestPushPhase5NamesEveryFailedDeleteItDependedOn(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{"refs/heads/main": c1, "refs/heads/feat": c1, "refs/heads/fEAT": c1}
+	f, remote := seedCaseRemote(t, seeded)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/feat"},
+		{Src: "", Dst: "refs/heads/fEAT"},
+		{Src: c2, Dst: "refs/heads/Feat/x"},
+	}
+	tr := trashFailsForPaths{Fake: f, paths: map[string]bool{
+		"/r/refs/heads/feat": true, "/r/refs/heads/fEAT": true,
+	}}
+	res := Push(tr, "/r", gitDir, ups, remote, nil)
+	if len(res) != 3 {
+		t.Fatalf("want 3 results, got %+v", res)
+	}
+	if res[0].OK || res[1].OK {
+		t.Errorf("both deletes must fail in phase 4, got %+v", res)
+	}
+	const want = "refs/heads/Feat/x conflicts by letter case with refs/heads/fEAT (heads/Feat vs heads/fEAT), " +
+		"refs/heads/feat (heads/Feat vs heads/feat): a Windows clone would mishandle the pair (README, " +
+		"Honest limits), so this create is refused on every platform " +
+		"(the same-batch deletes of refs/heads/fEAT and refs/heads/feat did not commit)"
+	if res[2].OK || res[2].Err != want {
+		t.Errorf("phase-5 refusal:\n got %+v\nwant Err %q", res[2], want)
+	}
+	assertCaseRemote(t, f, seeded)
+}
+
+// TestFailedDeleteClauseForms is RED (final-review fix C1; compile failure
+// before it): the clause phase 5 appends has one exact form per count, with
+// the refs sorted whatever order they arrive in, and nothing for none.
+func TestFailedDeleteClauseForms(t *testing.T) {
+	for _, tc := range []struct {
+		refs []string
+		want string
+	}{
+		{nil, ""},
+		{[]string{"refs/heads/a"}, " (the same-batch delete of refs/heads/a did not commit)"},
+		{[]string{"refs/heads/b", "refs/heads/a"}, " (the same-batch deletes of refs/heads/a and refs/heads/b did not commit)"},
+		{[]string{"refs/heads/c", "refs/heads/a", "refs/heads/b"},
+			" (the same-batch deletes of refs/heads/a, refs/heads/b and refs/heads/c did not commit)"},
+	} {
+		if got := failedDeleteClause(tc.refs); got != tc.want {
+			t.Errorf("failedDeleteClause(%q) = %q, want %q", tc.refs, got, tc.want)
+		}
+	}
+}
+
+// TestPushRenameWholeSparesADeleteOfAnAbsentName is RED (final-review fix
+// C2): the rename-whole step refuses only deletes of names the pre-batch
+// remote holds. A delete of an absent name is a valid no-op, and refusing it
+// produced a self-referential "rename to refs/heads/Main" message. The create
+// is still refused against main.
+func TestPushRenameWholeSparesADeleteOfAnAbsentName(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{"refs/heads/main": c1}
+	f, remote := seedCaseRemote(t, seeded)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/Main"},
+		{Src: c2, Dst: "refs/heads/Main"},
+		{Src: "", Dst: "refs/heads/mAIN"},
+	}
+	res := Push(f, "/r", gitDir, ups, remote, nil)
+	if len(res) != 3 {
+		t.Fatalf("want 3 results, got %+v", res)
+	}
+	if !res[0].OK {
+		t.Errorf("the delete of the absent refs/heads/Main is a no-op and must succeed, got %+v", res[0])
+	}
+	assertCaseRefused(t, res[1],
+		"refs/heads/Main conflicts by letter case with refs/heads/main (heads/Main vs heads/main): ")
+	if !res[2].OK {
+		t.Errorf("the delete of the absent refs/heads/mAIN is a no-op and must succeed, got %+v", res[2])
+	}
+	assertNoPack(t, f)
+	assertCaseRemote(t, f, seeded)
+}
+
+// TestPushRenameWholeSparesAReplacementsDelete is RED (final-review fix C3;
+// A1: replacements are never refused). The remote holds main beside Main; the
+// batch replaces Main (delete and recreate at c2) and creates MAIN. MAIN is
+// refused, but the delete of Main is half of a replacement, not of a rename,
+// so it commits and the recreate lands.
+func TestPushRenameWholeSparesAReplacementsDelete(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	f, remote := seedCaseRemote(t, map[string]string{"refs/heads/main": c1, "refs/heads/Main": c1})
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/Main"},
+		{Src: c2, Dst: "refs/heads/Main"},
+		{Src: c2, Dst: "refs/heads/MAIN"},
+	}
+	res := Push(f, "/r", gitDir, ups, remote, nil)
+	if len(res) != 3 {
+		t.Fatalf("want 3 results, got %+v", res)
+	}
+	if !res[0].OK {
+		t.Errorf("the delete half of the replacement must not be refused, got %+v", res[0])
+	}
+	if !res[1].OK {
+		t.Errorf("the recreate half of the replacement must land, got %+v", res[1])
+	}
+	assertCaseRefused(t, res[2], "refs/heads/MAIN conflicts by letter case with refs/heads/Main "+
+		"(heads/MAIN vs heads/Main), refs/heads/main (heads/MAIN vs heads/main): ")
+	assertCaseRemote(t, f, map[string]string{"refs/heads/main": c1, "refs/heads/Main": c2})
+}
+
+// TestPushPlainCaseChangingRenameSucceeds is a GUARD (final-review fix C4(i)):
+// a case-changing rename with no surviving variant (delete Main, create main,
+// nothing else folding equal) is no pair at all, so both halves land.
+func TestPushPlainCaseChangingRenameSucceeds(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	f, remote := seedCaseRemote(t, map[string]string{"refs/heads/Main": c1})
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/Main"},
+		{Src: c1, Dst: "refs/heads/main"},
+	}
+	res := Push(f, "/r", gitDir, ups, remote, nil)
+	if len(res) != 2 || !res[0].OK || !res[1].OK {
+		t.Fatalf("a rename with no surviving variant must succeed whole, got %+v", res)
+	}
+	assertCaseRemote(t, f, map[string]string{"refs/heads/main": c1})
+}
+
+// TestPushRenameDeleteNamesTheSmallestRefusedCreate is a GUARD (final-review
+// fix C4(ii), Review Focus 5): a delete that folds equal to several refused
+// creates names the smallest of them, byte-identically in every batch order.
+// Here MAIN sorts before mAIN.
+func TestPushRenameDeleteNamesTheSmallestRefusedCreate(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+	entries := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/Main"},
+		{Src: c2, Dst: "refs/heads/MAIN"},
+		{Src: c2, Dst: "refs/heads/mAIN"},
+	}
+	perms := [][]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}}
+	const wantDel = "refs/heads/Main: delete refused because it pairs with the refused " +
+		"case-changing rename to refs/heads/MAIN; the rename was not applied"
+
+	for _, p := range perms {
+		seeded := map[string]string{"refs/heads/main": c1, "refs/heads/Main": c1}
+		f, remote := seedCaseRemote(t, seeded)
+		ups := make([]protocol.RefUpdate, len(p))
+		for i, k := range p {
+			ups[i] = entries[k]
+		}
+		res := Push(f, "/r", gitDir, ups, remote, nil)
+		if len(res) != len(ups) {
+			t.Fatalf("order %v: want %d results, got %+v", p, len(ups), res)
+		}
+		for i, r := range res {
+			if r.OK {
+				t.Fatalf("order %v: %s must be refused, got %+v", p, ups[i].Dst, res)
+			}
+			if ups[i].Src == "" && r.Err != wantDel {
+				t.Errorf("order %v: delete refusal:\n got %q\nwant %q", p, r.Err, wantDel)
+			}
+		}
+		assertNoPack(t, f)
+		assertCaseRemote(t, f, seeded)
+	}
+}
+
+// TestPushCreateBeneathAKeptRefIsRefusedInTheSamePass is a GUARD (final-review
+// fix C4(iii)): the D/F preflight is not re-run inside the fixed-point loop,
+// so a create beneath a ref the loop keeps must be refused by the case rule.
+// The batch renames Main to MAIN beside main, and also creates Main/x, which
+// lies beneath Main's exact spelling. Pass 1 refuses MAIN, which keeps Main,
+// and refuses Main/x in the same pass: its heads/Main differs from MAIN's
+// heads/MAIN but folds equal. Naming MAIN, which leaves the set after pass 1,
+// shows it was pass 1. Nothing is written and no pack is built.
+func TestPushCreateBeneathAKeptRefIsRefusedInTheSamePass(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{"refs/heads/main": c1, "refs/heads/Main": c1}
+	f, remote := seedCaseRemote(t, seeded)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/Main"},
+		{Src: c2, Dst: "refs/heads/MAIN"},
+		{Src: c2, Dst: "refs/heads/Main/x"},
+	}
+	res := Push(f, "/r", gitDir, ups, remote, nil)
+	if len(res) != 3 {
+		t.Fatalf("want 3 results, got %+v", res)
+	}
+	const wantDel = "refs/heads/Main: delete refused because it pairs with the refused " +
+		"case-changing rename to refs/heads/MAIN; the rename was not applied"
+	if res[0].OK || res[0].Err != wantDel {
+		t.Errorf("delete refusal:\n got %+v\nwant Err %q", res[0], wantDel)
+	}
+	assertCaseRefused(t, res[1], "refs/heads/MAIN conflicts by letter case with refs/heads/Main/x "+
+		"(heads/MAIN vs heads/Main), refs/heads/main (heads/MAIN vs heads/main): ")
+	assertCaseRefused(t, res[2], "refs/heads/Main/x conflicts by letter case with refs/heads/MAIN "+
+		"(heads/Main vs heads/MAIN), refs/heads/main (heads/Main vs heads/main): ")
+	assertNoPack(t, f)
+	assertCaseRemote(t, f, seeded)
 }
 
 // TestPushOtherNamespaceRequiresForce covers the design's conservative

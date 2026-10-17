@@ -2,9 +2,9 @@
 
 **Date:** 2026-10-15. **Scope:** the v2 remote helper (`git-remote-proton`) only. The v1
 `GitProtonBackup` module stays Windows-only: its transport is the Proton Drive Windows sync app and
-the Windows Cloud Files API (README, "Why PowerShell?"). **Shape:** a stage spec; a dated plan
-follows once Craig rules on the decisions below. **Status:** Draft. Decisions D1–D8 await Craig.
-Nothing in this document is built yet. **Builds on:** PR #13, merged 2026-10-16 as `7b858ee`. It
+the Windows Cloud Files API (README, "Why PowerShell?"). **Shape:** a stage spec; its plan is
+`docs/superpowers/plans/2026-10-16-v2-linux-port.md`. **Status:** Approved 2026-10-16: Craig ruled on
+D1–D8, taking every recommendation ("Rulings", under Decisions). Nothing in this document is built yet. **Builds on:** PR #13, merged 2026-10-16 as `7b858ee`. It
 fixed the Linux shim-test bug, added the git 2.45.0 floor to the README, and took design revision
 v6.8. This stage's README edits build on it.
 
@@ -217,13 +217,19 @@ If D2 adopts the refusal, the rule is as follows.
 
 **Only creates are refused.**
 
-- A create is a destination that does not exist on the remote when it is written. That is the
-  batch-aware existence phase 5 already computes, `preExists && !deletedThisBatch` [code
-  `push.go:508-509`]. So a same-batch delete-then-recreate of one name counts as a create.
+- A create is a destination absent from the pre-batch advertised set. A same-batch
+  delete-then-recreate of a name that already existed is a replacement: it adds no spelling the
+  remote didn't already have, and this rule never refuses it. *(Amendment A1, 2026-10-16.)*
 - A create is refused when any of its prefixes conflicts with a prefix of another ref in the set it is
   checked against. The refusal names every conflicting ref, sorted.
-- Updates and deletes are never refused by this rule. A remote that already holds a pair still takes
-  pushes to its other refs, and a user can repair it by deleting one of the pair.
+- Updates, replacements and ordinary deletes are never refused by this rule. The one exception is a
+  case-changing rename: when this rule refuses a create, every same-batch delete of a ref the remote
+  holds, that the batch does not also rewrite, and whose full name folds equal to the create, is
+  refused too, so the rename isn't half-applied. A create that another phase-2 check refuses (a ref
+  and a folder of refs under the same name, or a name a skipped file occupies) keeps git's ordinary
+  per-ref behaviour: its paired delete still commits. Phase 2 repeats this until nothing changes. A
+  remote that already holds a pair still takes pushes to its other refs, and a user can repair it by
+  deleting one of the pair. *(Amendments A1 and A2, 2026-10-16.)*
 - The rule is strict where a pair already exists. Under a pre-existing directory pair such as
   `Feat/a` beside `feat/b`, a new ref under either spelling is refused until the pair is repaired.
 
@@ -236,11 +242,14 @@ header]:
 - Conflicts are computed as groups over that set, with no dependence on iteration order. Every
   create in a conflicting group is refused, so two same-batch creates `main` and `Main` are **both**
   refused.
+- The check repeats until a pass refuses nothing, because refusing a rename's delete keeps that
+  ref, and the kept ref can expose a new conflict (A1).
 
 **Phase 5 (creates and updates).**
 
-- Before each create, the rule is checked again against the live set: the pre-batch advertised refs,
-  minus the deletes that **committed** in phase 4, plus the creates already committed in this phase.
+- Before each create (a name absent from the pre-batch set; replacements are never re-checked),
+  the rule is checked again against the live set: the pre-batch advertised refs, minus the deletes
+  that **committed** in phase 4, plus the creates already committed in this phase.
 - So a create cleared in phase 2 by a same-batch delete is refused if any of the deletes it relied on
   failed.
 - **Nothing in phase 5 does this today.** `deletedThisBatch` only chooses create against update for
@@ -292,8 +301,7 @@ The helper, from the release's two linux assets:
 
 ```
 mkdir -p ~/.local/bin
-sha256sum -c git-remote-proton-linux-amd64.sha256
-install -m 0755 git-remote-proton-linux-amd64 ~/.local/bin/git-remote-proton
+sha256sum -c git-remote-proton-linux-amd64.sha256 && install -m 0755 git-remote-proton-linux-amd64 ~/.local/bin/git-remote-proton
 type -a git-remote-proton   # exactly one, the one just installed
 ```
 
@@ -301,10 +309,12 @@ The CLI, from Proton's download URL for the certified version:
 
 ```
 curl -fLo proton-drive https://proton.me/download/drive/cli/0.9.0/linux-x64/proton-drive
-echo "<certified SHA-512>  proton-drive" | sha512sum -c
-install -m 0755 proton-drive ~/.local/bin/proton-drive
+echo "<certified SHA-512>  proton-drive" | sha512sum -c && install -m 0755 proton-drive ~/.local/bin/proton-drive
 type -a proton-drive
 ```
+
+Each `install` is chained to its check with `&&`, so a failed check stops the install. *(Amendment
+A3, 2026-10-16.)*
 
 The `<certified SHA-512>` is the value the Linux gate record holds (§8), labelled with its
 certification date.
@@ -463,8 +473,46 @@ case-variant creates. It changes no existing ref and refuses no update or delete
 
 ## Decisions for Craig
 
-Ordered so the ones the others follow from come first. Every default is my recommendation, not a
-ruling. Rulings go into design v6.9's revision history when this ships, with the options not taken.
+Ordered so the ones the others follow from come first. The options below are kept as written for
+the record; the rulings come first. When this ships, design v6.9's revision history carries them.
+
+**Rulings, 2026-10-16.** Each is Craig's call, accepting my recommended default; none is an
+unopposed default.
+
+| | Ruled | Not taken |
+|---|---|---|
+| D1 | (a) linux/amd64 glibc only | (b) arm64 built but ungated; (c) musl |
+| D2 | (a) refuse case-variant **creates** on every platform (§5), no override | (b) allow and document |
+| D3 | (a) attended use gated and supported; `pass` and keyring unlock documented as "not gated" | (b) gate the `pass` store live; (c) say nothing |
+| D4 | (a) keep the exact token; add a refusal-only sentence for `cli-drive-<distro>@` | (b) accept distro tokens as certified; (c) no change |
+| D5 | (a) name git 2.45.0 in the fetch error **and** (d) warn on push when this git cannot restore | (b) refuse to start below 2.45.0; (c) docs only; (e) download-everything fallback |
+| D6 | (a) cross-compile in the existing Windows job; README install commands; no `install.sh` | (b) separate Linux release job plus `install.sh` |
+| D7 | venue (a) the WSL distro with the pre-tag sign-in probe; afterwards (a) log out and delete keyring and cache | venue (b) a separate Linux machine, kept only as the fallback if the sign-in probe fails; venue (c) a CI runner; afterwards (b) keep the WSL session |
+| D8 | (a) Linux contract table at every future certification, plus the drift script's linux/x64 comparison | (b) Windows table plus a Linux smoke only |
+
+**Amendment A1, 2026-10-16. Craig's call, approving it as shown.** Plan review (Codex, Kimi) found
+that §5's round-3 definition of a create let a phase-5 refusal destroy the very ref a batch was
+replacing, whenever a sibling delete failed in phase 4. Codex then found that refusing a rename's
+delete in one pass could expose a new conflict, losing a ref with no transport fault at all.
+
+A1 makes three changes:
+1. A create is a name absent from the pre-batch set, so replacements are never refused.
+2. A case-changing rename is refused whole.
+3. Phase 2 repeats until stable.
+
+Not taken: keeping the round-3 definition, and refusing a replacement's paired delete in a single
+pass (the round-1 plan fix). One residual is documented, not fixed: a rename can still lose the old
+name if a sibling delete hits a transport fault between phases 4 and 5.
+
+**Amendment A2, 2026-10-16. Craig's call, taking the recommended default.** Execution showed the
+rename-whole refusal is safe only where the case rule refused the create; widening it to every
+phase-2 refusal needs the D/F preflight inside the fixed-point loop (the final review ran the
+counterexample). A2 narrows the exception to case-rule refusals, and to deletes of names the remote
+holds that the batch does not also rewrite. Not taken: widening it to every phase-2 refusal.
+
+**Amendment A3, 2026-10-16. Craig's call, taking the recommended default.** §6's install commands
+chain each checksum to its `install` with `&&`, as the README does, so a failed check stops the
+install. Not taken: §6's unchained lines.
 
 **D1 — Platform scope of the first Linux release.**
 - (a) linux/amd64 glibc only. *Recommended:* it is the only Linux build F5 ran and the only one a
@@ -575,98 +623,6 @@ These are my calls; a plan may change them with a reason.
 - The exact README wording.
 - The hermetic env pass-through test's shape.
 - Where D5(d)'s probe sits within `list for-push`, provided it runs before the lock.
-
-## Revisions
-
-Scaffolding for the review loop; delete before the plan is written.
-
-**Round 1 (2026-10-16; Codex, Gemini via agy, and the repo-aware Fireworks.ai roster: DeepSeek and
-Kimi; all four reported).**
-
-- Case-variant mechanism rebuilt [Codex+Gemini+DeepSeek+Kimi].
-- F13 and the git floor probed.
-- CI moved to a behavioural check [Gemini+Kimi+DeepSeek].
-- D5(d) added [Gemini+DeepSeek].
-- Gate step 5's lock writes made explicit [Kimi+DeepSeek].
-- Gate step 2 gets `GPB_LIVE_ACCOUNT` [DeepSeek].
-- Isolation preconditions [DeepSeek+Codex].
-- Sign-in probe before tagging [Gemini+DeepSeek].
-- Session checks and the task pause [DeepSeek+Gemini].
-- Cleanup and existing-clone fetches [Codex+Gemini].
-- `release.yml` touch points [Gemini+DeepSeek].
-- Install commands [All].
-- The certified SHA-512 [Codex+Gemini].
-- AVX2 [All].
-- F11/D4 corrected [Kimi+DeepSeek].
-- D3 and D8 wording [Codex+DeepSeek+Gemini].
-- v6.9, the manifest bump, the F8 test, the anti-goal scope.
-- Rejected: including skipped names in the fold check [Kimi+Gemini].
-
-**Round 2 (2026-10-16; all four reported; DeepSeek said Blockers: none but listed majors).**
-
-Defects in round-1 fixes, applied:
-
-- **Phase 5.** §5 claimed phase 5 already re-checks via `deletedThisBatch`. It doesn't
-  [Gemini, confirmed `push.go:470-515`]. §5 now specifies a new live-set re-check, and order-free
-  group conflicts in phase 2 so same-batch pairs are both refused [Gemini].
-- **Pre-existing directory pairs** blocking new children is now stated [Gemini].
-- **Gate step 5** separates a single-create push (no ref or pack write) from a mixed push (one pack)
-  [Kimi].
-- **Gate cleanup** trashes the gate subtrees and checks the row set **before** logout [Gemini].
-- **The task pause** now starts before the first sign-in; the task is unpaused only on a passing
-  Windows check, with a STOP path [Codex].
-- **The CI check** was a test whose failure would stop the job before its fallback could run. It is
-  now an explicit branching shell step, with `-count=1` on the suite [Kimi+DeepSeek+Gemini].
-- **D5(d)** said both "temp repo" and "one call". It is now F3's measured single-call probe, placed
-  before the lock [Gemini+DeepSeek+Kimi].
-- **`releasing.md`'s list** now includes step 5 and the stand-in's asset-count and digest lines
-  [Gemini+DeepSeek].
-- **The certified SHA-512's home** is the Linux gate record, and the drift constant is a
-  certification touch point [DeepSeek+Gemini+Kimi].
-
-New, applied:
-
-- AVX2 re-based on Proton's README text [Kimi+DeepSeek].
-- Windows-side preconditions [Kimi].
-- `contract_test.go`'s stale untouchable list (no `Archive`, no `Tax Documents`) [Gemini, confirmed].
-- The confinement sentence covers trash [Kimi].
-- `PROTON_DRIVE_CACHE_DIR` verified in the probe [Kimi].
-- The F8 test pins an unrelated variable too [Kimi].
-- The CLI install commands [DeepSeek].
-- D4(a)'s refusal-only constraint [DeepSeek].
-- The skipped-ref rationale made exact, with the repaired-skip path [DeepSeek].
-- The macOS roadmap wording [Kimi].
-
-**Round 3 (2026-10-16; all four reported; Gemini and DeepSeek said Blockers: none, DeepSeek
-listing majors; this is the loop's last round, and its fixes have not been re-reviewed).**
-
-Defects in round-2 fixes, applied:
-
-- **Gate step 0** no longer accepts a Windows helper by its CLI token. It must match the draft's
-  bytes, with its resolved path and hash recorded [Codex+DeepSeek].
-- **The README's CLI hash line** now has a gate step that runs §6's commands as written
-  [DeepSeek].
-- **The skipped-ref wording** was too strong. The one way a push can lay down half of a pair is now
-  stated as an exception, and round 1's rejection stands [DeepSeek].
-
-New, applied:
-
-- **The phase-5 re-check** sits before `ensureRefParents` and gets a hermetic test with a failing
-  `Trash`; "Still untested" records that no gate step reaches it [DeepSeek].
-- **The check set** uses `finalSet`'s algebra, and "create" means batch-aware non-existence
-  [Gemini].
-- **The rejection a user sees after phase 2 passed** is described [Kimi].
-- **The ways a pair can appear without the user pushing one** are listed [Kimi].
-- **A Windows check** runs after the contract table [Kimi].
-- **The mixed push** is fetched and checked with `fsck` [Kimi].
-- **D5(d)'s failure handling, cost and limits** are spelled out [Kimi+DeepSeek].
-- **CI's git** floats on purpose [Kimi].
-- **AVX2** is described as the CLI's requirement, with the honest-limit line [Kimi].
-- **The install checks** run in a new login shell [Kimi].
-- **D4(a)** gets a hermetic test [Kimi].
-- **D2's cost** now covers tags and the absence of an override [DeepSeek].
-- **The asset count** follows D1 [DeepSeek].
-- **Sidecar defects** ship as a new tag [Kimi].
 
 ## Still untested, and how it gets tested
 
