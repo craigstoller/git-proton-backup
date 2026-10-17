@@ -1364,6 +1364,23 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   | Length of the conflict list in a case refusal | Uncapped, as spec §5 says ("names every conflicting ref") | Cap it at 5, like `maxDescribedBlockers` |
   | Pre-existing case pairs before adoption | Before 0.10.0 is adopted for scheduled pushes, `git ls-remote` each v2 remote those pushes reach and fold-compare each namespace (gate brief, "After the gate") | Adopt without checking |
 
+- **Windows gate-brief rulings (2026-10-17, Craig's calls, each taking the recommended default).**
+  Made on the v0.10.0 Windows gate brief after its three panel rounds; the brief's calls list marks
+  each where it applies. The options not taken are on the right.
+
+  | | Ruled | Not taken |
+  |---|---|---|
+  | Order (ruling 11) | Smoke and cleanup run before adoption, and the consumer-pin commit comes last, after the fleet verify, the account check and the drift re-check | v0.9.0's order, which adopted first because that release moved the CLI pin |
+  | Account check after the verify (ruling 12) | `Test-AccountClosure` compares the account with `myfiles-final` after each fleet verify: the accepted one, a failed one (recorded only) and the rollback's (needed before the tasks are re-enabled) | No account check after the verify |
+  | Identity capture (ruling 13) | Cut: the update push is judged on uid stability in the snapshots, the `ls-remote` sha, a read-back and one new pack | Keep v0.9.0's `filesystem info` BEFORE/AFTER capture, the brief's only raw account JSON |
+  | Gate record (ruling 14) | `v0.10.0-windows-gate.md` holds counts and verdicts only and carries the one publication closure, which the Linux record points to | A closure in each gate record |
+  | D5 lines on a Windows push (call 13) | Any D5 line BLOCKs; a hand-run probe may be recorded after the BLOCK | The Linux brief's call 37: a "could not check" warning diagnosed by hand, BLOCKED only if the hand-run probe cannot answer |
+  | Held-pipe lines (the Linux brief's call 20, which the Windows brief's call 21 applies) | Recorded, and the step is judged on its other evidence | BLOCKED like any other unexpected `git-remote-proton:` line |
+  | Evidence that the Linux gate passed (call 2) | The Linux ledger and B.3 record, its unpause decision, the verdict line of the record Craig names, and his word | Finding the record by a glob and `Select-String` |
+  | Rollback helper (call 3) | Linux B.3's copy, or else v0.9.0's published exe checked against its sidecar (step 0.3b) | A STOP when the Linux gate kept no rollback copy |
+  | Pre-existing case pairs (call 6) | Step 3, before adoption, fails closed, and a pair found is a STOP | A scan that skips what it cannot read, or one that leaves non-ASCII ref names to a hand read |
+  | Interim unpause (call 22) | Allowed: after a BLOCK before step 6, a read-only check, then Craig may re-enable the tasks while a retry waits | The tasks stay paused until a retry passes or the release is abandoned |
+
 **v6.8, 2026-10-15 — selective fetch's minimum git recorded: 2.45.0.**
 
 - **What this records.** Stage 3b (spec of 2026-08-03) made "`rev-list --missing=print` reports
