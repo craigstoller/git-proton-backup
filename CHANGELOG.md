@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## 0.10.0 — 2026-10-21
 
 The v2 remote helper (`git-remote-proton`) now runs on Linux. The certified Proton Drive CLI is
 unchanged (`cli-drive@0.9.0+75612299`).
