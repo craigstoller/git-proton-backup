@@ -500,6 +500,9 @@ func chdirForTest(t *testing.T, dir string) {
 // callers create the directory first; the functions under test are lexical
 // and never look at the disk, so that changes nothing they do. If either side
 // cannot be resolved, the raw compare decides, with the errors in the detail.
+// It compares identity only: a relative got such as "." resolves against the
+// cwd, which these tests have made wt, so it would pass. Callers assert
+// filepath.IsAbs first.
 func sameDir(want, got string) (bool, string) {
 	wantEval, wErr := filepath.EvalSymlinks(want)
 	gotEval, gErr := filepath.EvalSymlinks(got)
@@ -564,6 +567,9 @@ func TestResolveGitDirDefaultsToAbsoluteCwdWhenUnset(t *testing.T) {
 	got, err := resolveGitDir()
 	if err != nil {
 		t.Fatalf("resolveGitDir: %v", err)
+	}
+	if !filepath.IsAbs(got) {
+		t.Fatalf("resolveGitDir() = %q, want an absolute path", got)
 	}
 	if same, detail := sameDir(wt, got); !same {
 		t.Errorf("resolveGitDir() = %q, want %q (%s)", got, wt, detail)
