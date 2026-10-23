@@ -179,10 +179,10 @@ From v0.10.0, v2 runs on Linux; v1 does not, because its transport is the Window
 arm64 helper is built, and Proton's arm64 and musl CLI builds were not run.
 
 **What is tested.** The helper is a static Go binary; the Proton Drive CLI it drives is Proton's
-glibc `linux/x64` build. The Linux live gate is still to run: the first Linux release takes one
-against the draft's exact bytes, on Ubuntu 24.04 under WSL2 (the design's venue,
-[spec D7](docs/superpowers/specs/2026-10-15-v2-linux-port-design.md), with a separate Linux machine
-as the fallback if the sign-in probe fails). Later releases follow
+glibc `linux/x64` build. v0.10.0 passed the Linux live gate against the draft's exact bytes, on
+Ubuntu 24.04 under WSL2 (the design's venue,
+[spec D7](docs/superpowers/specs/2026-10-15-v2-linux-port-design.md); record:
+[v0.10.0-linux-gate.md](docs/research/gates/v0.10.0-linux-gate.md)). Later releases follow
 [docs/releasing.md](docs/releasing.md): a live gate, or, when eligible, a stand-in that gives the
 Linux binary offline checks only. Other distributions are expected to work and are not gated.
 
@@ -199,7 +199,7 @@ Linux binary offline checks only. Other distributions are expected to work and a
   the commands below and checked against its SHA-512.
 - **A credential store the CLI can use.** On Linux the CLI keeps its sign-in session in a Secret
   Service (GNOME Keyring, KWallet, anything that speaks `org.freedesktop.secrets`), and it has to be
-  unlocked in the session that runs git. That is the store the Linux gate is to cover. With no session bus the CLI
+  unlocked in the session that runs git. That is the store the Linux gate covered. With no session bus the CLI
   fails before any network attempt, and the helper passes its message through unchanged
   (`Failed to load session from secrets … Cannot autolaunch D-Bus`). The CLI's other store,
   `pass` (`PROTON_DRIVE_CREDENTIALS_STORE=pass`), reaches the CLI untouched: the helper sets no
@@ -216,13 +216,15 @@ this there:
 mkdir -p ~/.local/bin
 sha256sum -c git-remote-proton-linux-amd64.sha256 && install -m 0755 git-remote-proton-linux-amd64 ~/.local/bin/git-remote-proton
 
-# Proton's CLI, certified version 0.9.0 (SHA-512 recorded 2026-10-16):
+# Proton's CLI, certified version 0.9.0 (SHA-512 certified 2026-10-22 by the Linux live gate):
 curl -fLo proton-drive https://proton.me/download/drive/cli/0.9.0/linux-x64/proton-drive
 echo "3533025ba69ae112b64e3e01fbcc1ad0688136a4043f6cf6a72886967d85fdcd9ec235479c2e113171614be5225bfba93427509a05ca5aa6071d924fa7e91ca8  proton-drive" | sha512sum -c && install -m 0755 proton-drive ~/.local/bin/proton-drive
 ```
 
 The SHA-512 is the value Proton's feed listed for this build on 2026-10-16, and it equals the
-binary the project's Linux probes ran. Each `install` is chained to its check with `&&`, so a
+binary the v0.10.0 Linux live gate ran on 2026-10-22
+([record](docs/research/gates/v0.10.0-linux-gate.md)). Each `install` is chained to its check with
+`&&`, so a
 failed check stops the install. A passing check means you hold the bytes that were tested; a
 failing one means they are not (Proton may have re-cut the build, or the download is damaged), so
 do not install it. Proton's download page advertises only the current release, so this
@@ -468,9 +470,9 @@ promised.
 
 - **macOS** — an aspiration only, if there's demonstrated interest. Nothing is built, gated or
   documented for it.
-- **Linux** — `git-remote-proton` (v2) gains Linux support in the next release: CLI-direct
+- **Linux** — `git-remote-proton` (v2) gained Linux support in v0.10.0: CLI-direct
   upload, bypassing the sync-folder transport entirely, as a linux/amd64 helper driving Proton's
-  glibc CLI. Its live gate is still to run (planned on Ubuntu 24.04 under WSL2; see [Install on
+  glibc CLI. It passed its live gate on Ubuntu 24.04 under WSL2 (see [Install on
   Linux](#install-on-linux-v2)). Still open, and not gated: other architectures and musl,
   unattended use, and other credential stores (see [Honest limits](#honest-limits)). For v1 specifically, the alternative is waiting for Proton to
   ship a Linux sync client.

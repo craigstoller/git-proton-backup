@@ -9,9 +9,9 @@ unchanged (`cli-drive@0.9.0+75612299`).
   `git-remote-proton-linux-amd64`, with its `.sha256`, beside the Windows files: five assets in all.
   The README has install commands for it and for Proton's certified Linux CLI, with the CLI's
   SHA-512 to check the download against, and lists the prerequisites: git 2.45.0 or newer, an AVX2
-  CPU, and a credential store the CLI can use. The first release carrying it takes a Linux live
-  gate, planned on Ubuntu 24.04 under WSL2 (or a separate Linux machine, if the sign-in probe
-  fails); `docs/releasing.md` sets the procedure for this and later releases. Unattended use
+  CPU, and a credential store the CLI can use. This release passed a Linux live gate on Ubuntu
+  24.04 under WSL2 (`docs/research/gates/v0.10.0-linux-gate.md`); `docs/releasing.md` sets the
+  procedure for later releases. Unattended use
   (cron, systemd timers), the `pass` credential store, other distributions, arm64 and musl are not
   gated.
 - **git-remote-proton: a push now refuses to create a ref that differs from another only by letter
