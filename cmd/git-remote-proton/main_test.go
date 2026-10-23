@@ -482,6 +482,44 @@ func chdirForTest(t *testing.T, dir string) {
 	})
 }
 
+// sameDir reports whether want and got name the same directory on disk, and
+// returns a detail for the caller's failure message. A raw string compare is
+// wrong for the paths below on macOS: t.TempDir() builds on $TMPDIR, spelled
+// /var/folders/..., and /var is a symlink to /private/var. chdirForTest's
+// os.Chdir leaves $PWD naming the old directory, so os.Getwd (and so
+// filepath.Abs, which resolveGitDir and absolutizeInheritedGitPaths use)
+// falls back to the kernel's getcwd and answers /private/var/folders/... Same
+// directory, two spellings. The first macOS run of this suite (Apple Silicon,
+// 2026-10-23) failed all three tests that compared them as strings; Linux's
+// /tmp is not a symlink, so they had always passed there.
+//
+// This is the comparison internal/repo's assertSamePackDir makes for the same
+// class of alias (Windows 8.3 short names): filepath.EvalSymlinks on both
+// sides, then os.SameFile if the resolved strings still differ. A genuinely
+// different directory still fails. EvalSymlinks needs the path to exist, so
+// callers create the directory first; the functions under test are lexical
+// and never look at the disk, so that changes nothing they do. If either side
+// cannot be resolved, the raw compare decides, with the errors in the detail.
+// It compares identity only: a relative got such as "." resolves against the
+// cwd, which these tests have made wt, so it would pass. Callers assert
+// filepath.IsAbs first.
+func sameDir(want, got string) (bool, string) {
+	wantEval, wErr := filepath.EvalSymlinks(want)
+	gotEval, gErr := filepath.EvalSymlinks(got)
+	if wErr == nil && gErr == nil {
+		if wantEval == gotEval {
+			return true, ""
+		}
+		wantInfo, wStatErr := os.Stat(wantEval)
+		gotInfo, gStatErr := os.Stat(gotEval)
+		if wStatErr == nil && gStatErr == nil && os.SameFile(wantInfo, gotInfo) {
+			return true, ""
+		}
+		return false, fmt.Sprintf("normalised: got=%s want=%s", gotEval, wantEval)
+	}
+	return want == got, fmt.Sprintf("path normalisation failed: got-err=%v want-err=%v", gErr, wErr)
+}
+
 // TestResolveGitDirMakesARelativeGITDIRAbsolute covers the Stage 3a live-gate
 // finding (task 7): git commonly sets GIT_DIR to a RELATIVE path (".git" is
 // its own default), and every incremental fetch failed live because a
@@ -492,6 +530,10 @@ func chdirForTest(t *testing.T, dir string) {
 // at the source, before anything downstream ever sees it.
 func TestResolveGitDirMakesARelativeGITDIRAbsolute(t *testing.T) {
 	wt := t.TempDir()
+	// Exists only so sameDir can resolve it; resolveGitDir never looks.
+	if err := os.MkdirAll(filepath.Join(wt, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
 	chdirForTest(t, wt)
 	t.Setenv("GIT_DIR", ".git")
 
@@ -502,8 +544,9 @@ func TestResolveGitDirMakesARelativeGITDIRAbsolute(t *testing.T) {
 	if !filepath.IsAbs(got) {
 		t.Fatalf("resolveGitDir() = %q, want an absolute path", got)
 	}
-	if want := filepath.Join(wt, ".git"); got != want {
-		t.Errorf("resolveGitDir() = %q, want %q", got, want)
+	want := filepath.Join(wt, ".git")
+	if same, detail := sameDir(want, got); !same {
+		t.Errorf("resolveGitDir() = %q, want %q (%s)", got, want, detail)
 	}
 }
 
@@ -525,8 +568,11 @@ func TestResolveGitDirDefaultsToAbsoluteCwdWhenUnset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveGitDir: %v", err)
 	}
-	if got != wt {
-		t.Errorf("resolveGitDir() = %q, want %q", got, wt)
+	if !filepath.IsAbs(got) {
+		t.Fatalf("resolveGitDir() = %q, want an absolute path", got)
+	}
+	if same, detail := sameDir(wt, got); !same {
+		t.Errorf("resolveGitDir() = %q, want %q (%s)", got, wt, detail)
 	}
 }
 
@@ -540,6 +586,16 @@ func TestResolveGitDirDefaultsToAbsoluteCwdWhenUnset(t *testing.T) {
 // its own right) is the fix. See resolveGitDir's doc.
 func TestAbsolutizeInheritedGitPaths(t *testing.T) {
 	wt := t.TempDir()
+	commonDir := filepath.Join(filepath.Dir(wt), "main", ".git")
+	objectDir := filepath.Join(wt, "objects")
+	// Exist only so sameDir can resolve them; absolutizeInheritedGitPaths never
+	// looks. filepath.Dir(wt) is t.TempDir()'s own per-test root, which the
+	// testing package removes whole, so the sibling is cleaned up too.
+	for _, d := range []string{commonDir, objectDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
 	chdirForTest(t, wt)
 
 	t.Setenv("GIT_COMMON_DIR", "../main/.git")
@@ -557,13 +613,13 @@ func TestAbsolutizeInheritedGitPaths(t *testing.T) {
 			t.Errorf("%s = %q, want an absolute path", name, got)
 		}
 	}
-	if want := filepath.Join(filepath.Dir(wt), "main", ".git"); os.Getenv("GIT_COMMON_DIR") != want {
+	if same, detail := sameDir(commonDir, os.Getenv("GIT_COMMON_DIR")); !same {
 		t.Errorf("GIT_COMMON_DIR = %q, want %q — resolution must be anchored at this "+
 			"process's cwd, the same cwd the relative value was already implicitly "+
-			"relative to", os.Getenv("GIT_COMMON_DIR"), want)
+			"relative to (%s)", os.Getenv("GIT_COMMON_DIR"), commonDir, detail)
 	}
-	if want := filepath.Join(wt, "objects"); os.Getenv("GIT_OBJECT_DIRECTORY") != want {
-		t.Errorf("GIT_OBJECT_DIRECTORY = %q, want %q", os.Getenv("GIT_OBJECT_DIRECTORY"), want)
+	if same, detail := sameDir(objectDir, os.Getenv("GIT_OBJECT_DIRECTORY")); !same {
+		t.Errorf("GIT_OBJECT_DIRECTORY = %q, want %q (%s)", os.Getenv("GIT_OBJECT_DIRECTORY"), objectDir, detail)
 	}
 	if got := os.Getenv("GIT_WORK_TREE"); got != "../tree" {
 		t.Errorf("GIT_WORK_TREE = %q, want it untouched: it names the working tree, not the "+
