@@ -8,6 +8,24 @@
   wrote refs for a push nobody asked for in that shape. It now refuses the batch with a stderr
   message and exits non-zero before any further remote read or write, and still releases the
   lock.
+- **git-remote-proton: a killed push now tries to release its remote lock when the helper can
+  catch the kill.** Until now a signal ended the helper without running its cleanup, so `.lock`
+  stayed on the remote and every later push failed with `repo is locked` until someone removed it
+  by hand. On Linux, SIGTERM, SIGINT and SIGHUP (from `kill`, `timeout`, systemd or a terminal)
+  now start one bounded attempt to remove the helper's own lock. It stops the Proton CLI call in
+  flight, waits 5 s, removes `.lock` only if it still carries the helper's nonce, retries a
+  failed call, prints what it found for each lock (removed, absent, foreign, unreadable, failed
+  or not attempted) and exits with 128 plus the signal number, within 62 s of the first signal at
+  worst. Under systemd that needs `KillMode=control-group` and `TimeoutStopSec=` of 75 s or more.
+  On Windows only Ctrl-C and Ctrl-Break in a console window are covered. Git Bash's `kill`,
+  `Stop-Process`, a Task Scheduler stop and SIGKILL still leave the lock, and a closed console
+  window almost always does too. The kind of kill that orphaned a lock in the Stage 5 gate, a
+  tool timeout reaching a push through Git Bash on Windows, is among those that still leak. Two
+  related changes: a lock whose acquisition ended in doubt (the upload's result was lost) is now
+  released on the normal exit path too, and a session whose writes to git failed (git died, or
+  its pipe broke) now exits 1. It exited 0 on Windows, and on Linux SIGPIPE killed the helper
+  with the lock held. The README's honest limits list what each platform covers and the manual
+  remedy; the v2 design is now v6.11.
 
 ## 0.10.0 — 2026-10-21
 

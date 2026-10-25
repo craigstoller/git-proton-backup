@@ -51,7 +51,12 @@ the rules from scratch.
    so the runner is left diagnosing and clearing an orphaned remote lock rather than seeing a
    clean failure. Established by Stage 5's S1 (`docs/research/gates/stage5-gate.md`): a
    2-minute harness timeout killed the bootstrap push mid-flight and orphaned the `.lock`,
-   which then had to be diagnosed and cleared by hand before the push could be re-issued.
+   which then had to be diagnosed and cleared by hand before the push could be re-issued. The
+   rule stays in force after the helper learned to release its lock on a catchable signal
+   (design v6.11), because a harness kill through Git Bash on Windows ends the helper without
+   running its handler (measured, probes P1 and P2 of
+   `docs/superpowers/specs/2026-10-24-v2-lock-release-on-signal-design.md`), so an S1-style leak
+   can still happen.
 
 10. **A hermetic audit of a staged CLI binary may run its `--version` and help output
     unauthenticated without asking, under the account's existing telemetry setting.** The
