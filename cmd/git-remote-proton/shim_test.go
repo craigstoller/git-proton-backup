@@ -51,6 +51,24 @@ const (
 	unconfirmedStopEnv = "GPB_TEST_UNCONFIRMED_STOP"
 )
 
+// The shutdown timings helperRole sets under shrinkEnv, in seconds rather than
+// a minute per case. A release call is bounded at shrunkReleaseCall and killed
+// at shrunkReleaseCall - shrunkReleaseDrain (2.8 s), which leaves room for E9's
+// and W2's 1.5 s delay rule and stays well under the cap. Named so the signal
+// cases can bound and check their waits by the values the helper really runs
+// with.
+const (
+	shrunkCap          = 8 * time.Second
+	shrunkGrace        = 500 * time.Millisecond
+	shrunkTerm         = 500 * time.Millisecond
+	shrunkConfirm      = 2 * time.Second
+	shrunkRetryPause   = 200 * time.Millisecond
+	shrunkOutcomeWait  = 300 * time.Millisecond
+	shrunkSettle       = 300 * time.Millisecond
+	shrunkReleaseCall  = 3 * time.Second
+	shrunkReleaseDrain = 200 * time.Millisecond
+)
+
 // afterLoopReady is the file the held run() writes in the shim's ready dir
 // (testcli.ReadyDirEnv) once loop has returned; holdLimit bounds the hold.
 const (
@@ -116,17 +134,14 @@ func helperRole() int {
 	// As the m.Run() path does, or every case would run the real probe.
 	probeRestoreFloor = func(string) (gitcmd.ProbeResult, string) { return gitcmd.ProbeOK, "" }
 	if os.Getenv(shrinkEnv) == "1" {
-		// Seconds, not a minute, per case. A release call is bounded at 3 s and
-		// killed at 2.8 s, which leaves room for E9's and W2's 1.5 s delay rule
-		// and stays well under the 8 s cap.
-		shutdownCap = 8 * time.Second
-		childGrace = 500 * time.Millisecond
-		childTerm = 500 * time.Millisecond
-		childConfirm = 2 * time.Second
-		retryPause = 200 * time.Millisecond
-		outcomeWait = 300 * time.Millisecond
-		repo.SettleDelay = 300 * time.Millisecond
-		transport.SetReleaseBoundsForTest(3*time.Second, 200*time.Millisecond)
+		shutdownCap = shrunkCap
+		childGrace = shrunkGrace
+		childTerm = shrunkTerm
+		childConfirm = shrunkConfirm
+		retryPause = shrunkRetryPause
+		outcomeWait = shrunkOutcomeWait
+		repo.SettleDelay = shrunkSettle
+		transport.SetReleaseBoundsForTest(shrunkReleaseCall, shrunkReleaseDrain)
 	}
 	if os.Getenv(holdAfterLoopEnv) != "" {
 		afterLoopHook = holdAfterLoop

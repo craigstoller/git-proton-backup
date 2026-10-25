@@ -2,11 +2,13 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -483,4 +485,138 @@ func assertNoShimLeft(t *testing.T, tree string) {
 func lockPresent(tree, root string) bool {
 	_, err := os.Stat(testcli.LocalPath(tree, root+"/"+repo.LockName))
 	return err == nil
+}
+
+// exchange sends each request in turn and reads its reply up to its blank
+// line, as git does, from a goroutine, and fails the test unless every reply
+// has arrived within within. Unlike pushMain it leaves stdin open, so the
+// helper then waits for git's next command (E3). Not with pushMain on the same
+// helper: nothing else may read Stdout meanwhile.
+func (h *helperRun) exchange(t *testing.T, within time.Duration, reqs ...string) {
+	t.Helper()
+	if h.pushDone != nil {
+		t.Fatal("exchange: pushMain is reading this helper's stdout")
+	}
+	done := make(chan error, 1)
+	go func() {
+		for _, req := range reqs {
+			if _, err := io.WriteString(h.Stdin, req); err != nil {
+				done <- fmt.Errorf("send %q: %w", req, err)
+				return
+			}
+			if err := h.readReply(); err != nil {
+				done <- fmt.Errorf("reply to %q: %w", req, err)
+				return
+			}
+		}
+		done <- nil
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("exchange: %v; stderr:\n%s", err, h.stderrText())
+		}
+	case <-time.After(within):
+		// The goroutine ends when teardown closes the pipes.
+		t.Fatalf("exchange: the replies to %q had not all arrived %v after the first request; stderr so far:\n%s",
+			reqs, within, h.stderrText())
+	}
+}
+
+// The coordinator's words (§5.6), spelled out here rather than taken from
+// shutdown.go's builders, so a case checks what the helper printed, not what
+// the code that prints it says.
+const (
+	removedWords = "removed: the lock is gone"
+	absentWords  = "absent: no lock of ours is on the remote (it was never created, or was already removed)"
+	foreignWords = "foreign: another process holds the lock; it was left alone"
+	// pushCutShort starts the line a shutdown adds when it cut a push batch
+	// short (the batch had begun its remote writes and its statuses were not
+	// out yet).
+	pushCutShort = linePrefix + "the push did not finish: some of its remote changes may have landed"
+)
+
+// pushCatch is how the catch line for sig (its Unix name) begins when a push
+// holds, or may hold, the lock.
+func pushCatch(sig string) string {
+	return linePrefix + "received " + sig + ": stopping the push and checking the remote lock, which takes up to a minute"
+}
+
+// remedyWords is the manual remedy a failed or not-attempted result line ends
+// with, for lock path p and the nonce the line names.
+func remedyWords(p, nonce string) string {
+	return "once no push or --set-head for this repo is running, check with the Proton CLI whether " + p +
+		" still exists and, if it does, remove it (proton-drive filesystem trash " + p +
+		"); a lock bearing nonce " + nonce + ", if one appears there later, is ours to remove too"
+}
+
+// lockResult finds the coordinator's result line for root's lock and returns
+// the nonce it names and the words after it. It fails the test unless stderr
+// holds exactly one such line.
+func lockResult(t *testing.T, stderr, root string) (nonce, words string) {
+	t.Helper()
+	re := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(linePrefix+"lock "+root+"/"+repo.LockName) +
+		` \(nonce ([0-9a-f]{32})\): (.*)\n`)
+	m := re.FindAllStringSubmatch(stderr, -1)
+	if len(m) != 1 {
+		t.Fatalf("want exactly one result line for %s/%s, found %d; stderr:\n%s", root, repo.LockName, len(m), stderr)
+	}
+	return m[0][1], m[0][2]
+}
+
+// seedRemote writes body at the remote path in the shim's tree, as an earlier
+// writer would have left it.
+func seedRemote(t *testing.T, tree, remote string, body []byte) {
+	t.Helper()
+	p := testcli.LocalPath(tree, remote)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatalf("seed %s: %v", remote, err)
+	}
+	if err := os.WriteFile(p, body, 0o644); err != nil {
+		t.Fatalf("seed %s: %v", remote, err)
+	}
+}
+
+// remoteLockNonce is the nonce in root's .lock in the shim's tree.
+func remoteLockNonce(t *testing.T, tree, root string) string {
+	t.Helper()
+	b, err := os.ReadFile(testcli.LocalPath(tree, root+"/"+repo.LockName))
+	if err != nil {
+		t.Fatalf("read %s/%s: %v", root, repo.LockName, err)
+	}
+	var body struct {
+		Nonce string `json:"nonce"`
+	}
+	if err := json.Unmarshal(b, &body); err != nil {
+		t.Fatalf("%s/%s holds %q: %v", root, repo.LockName, b, err)
+	}
+	return body.Nonce
+}
+
+// readyPid is the shim pid a ready file holds.
+func readyPid(t *testing.T, path string) int {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		t.Fatalf("%s holds %q, not a pid", path, b)
+	}
+	return pid
+}
+
+// waitGone polls every 5 ms until pid reads as gone and returns how long after
+// since that was first seen, so it is never early. It fails the test if pid is
+// still alive when within has passed since since.
+func waitGone(t *testing.T, pid int, since time.Time, within time.Duration) time.Duration {
+	t.Helper()
+	for processAlive(pid) {
+		if time.Since(since) > within {
+			t.Fatalf("pid %d still running %v after the wait began", pid, within)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return time.Since(since)
 }
