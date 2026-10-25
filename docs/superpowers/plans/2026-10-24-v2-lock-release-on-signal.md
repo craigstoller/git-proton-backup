@@ -57,6 +57,26 @@ Scaffolding for the review loop; delete it before execution starts.
   - Ctrl-Break arriving as SIGTERM: Go maps it to `os.Interrupt` (`runtime/os_windows.go`, probe P4);
   - returning at once on a failed flush: the approved S16 relies on the stdin EOF that follows, since git owns both pipes;
   - the extra settle after a signal lands between registration and the gate: harmless, because the release then finds *absent*.
+- **Round 2** (all four reported; Codex and agy canaries exact; DeepSeek: "Blockers: none"). It found defects in round 1's fixes, now corrected:
+  - `KillReleaseCalls` closes release admission before its kill snapshot;
+  - the test bounds pair a 3 s call with a 200 ms drain (`SetReleaseBoundsForTest`, which refuses a drain that is not under half the call);
+  - the group-kill test uses a parent that is still alive;
+  - the signal goroutine loops, and the shutdown runs on its own goroutine, so a second OS signal is read (a new test drives that through the channel);
+  - the retry loop stops on the final step's flag, not elapsed time; the final step stops the cap timer;
+  - a full save-and-restore of every package variable a coordinator test changes;
+  - `notifySIGPIPE`'s channel has an owner;
+  - the in-flight exit channel closes when `Wait` returns, before the drain, with a test;
+  - a parked call closes its pipe reader;
+  - the late writer gets its own copy of the staged bytes and only a `late-` pid file;
+  - `startHelper` sets `GIT_DIR` and keeps the raw stdout and stderr pipes, so E5 can break stdout and E17 can fill stderr;
+  - the shim's `before` now blocks ahead of the skip decision, so E14 has a firing point;
+  - `quietStderr` silences `--set-head`'s direct writes;
+  - polling for zombie pids;
+  - E13's write tolerates a gone helper;
+  - the second-`list for-push` behaviour stated;
+  - `SIGTERM = 15` on Windows checked in the Go source.
+
+  Confirmed, no change: `TestAcquireLockFailsClosedOnUnrecognisedOutcome` is the only test whose handle assertion changes. A grep of every `AcquireLock(` call in the test files shows the others expect success or discard the handle.
 
 ---
 
@@ -152,15 +172,22 @@ git commit -m "refactor(transport): run owns its child - one merged pipe, exit o
 - Produces:
   - `func ShutGate()`: idempotent. After it returns, `run` on any non-release `*CLI` starts no child. A caller that reaches the gate, or whose child returns after the gate shut, blocks until `ReopenGateForTest` (never, in production) and then returns `("", -1, errGateReopened)`.
   - `func StopInFlight(grace, term, confirm time.Duration) bool`: stops **every** in-flight non-release child. The record is a set, not a single slot. The protocol goroutine runs one call at a time today, but the set makes that an observation rather than an assumption. For each child: wait `grace` for it to exit; then, on Unix, send SIGTERM and wait `term`; then `Process.Kill()` and wait `confirm`. Returns true when nothing was in flight or every exit was confirmed (the process reaped, not its output drained), false otherwise.
-  - `func KillReleaseCalls(within time.Duration)`: kills every in-flight release child (group and all on Unix) and waits up to `within` for each to be reaped. The coordinator calls it at the cap (Task 5).
+  - `func KillReleaseCalls(within time.Duration)`: under the package mutex, first closes release admission. From then on, `run` on a release instance returns `("", -1, errReleaseClosed)` without starting a child. Then it kills every in-flight release child (group and all on Unix) and waits up to `within` for each to be reaped. The coordinator calls it at the cap (Task 5). Closing admission first means a release call that was about to start cannot slip past the kill.
   - `func NewReleaseCLI(exe string, w io.Writer) *CLI`: an empty `exe` becomes `"proton-drive"`, as in `NewCLI`. It sets `release: true` (exempt from the gate), `warnW: w`, and copies `callTimeout: releaseCallTimeout` and `drain: releaseDrain` **at construction**, so a test that changes the variables later does not race a running call. It starts its children in their own process group. A call's whole life stays within `callTimeout`: the kill fires at `callTimeout − drain`, then the drain gets at most `drain`. On Unix the kill takes the whole group. The kill timer is stopped, under the same mutex, the moment the child's exit is observed, so it can never fire on a reaped or reused process ID.
   - `var releaseCallTimeout = 15 * time.Second`, `var releaseDrain = 2 * time.Second`.
   - `func ReopenGateForTest()`: test-only. Reopens the gate and releases parked callers.
-  - `func SetReleaseCallTimeoutForTest(d time.Duration)`: test-only, for `cmd`'s end-to-end helper role (Task 6), which cannot reach the unexported variable.
+  - `func SetReleaseBoundsForTest(call, drain time.Duration)`: test-only, for `cmd`'s end-to-end helper role (Task 6), which cannot reach the unexported variables. It panics unless `0 < drain` and `drain < call/2`, so a release call always gets real time before its kill.
+  - `func ResetReleaseAdmissionForTest()`: test-only. Reopens release admission after a `KillReleaseCalls`.
   - Unix (`procgroup_unix.go`): `func setOwnGroup(cmd *exec.Cmd)` (`SysProcAttr{Setpgid: true}`), `func terminate(p *os.Process) bool` (SIGTERM, returns true), `func killGroup(p *os.Process) error` (`syscall.Kill(-p.Pid, syscall.SIGKILL)`).
   - Windows (`procgroup_windows.go`): `setOwnGroup` sets `CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP`; `terminate` returns false (Windows has no gentle signal for one process); `killGroup` is `p.Kill()`.
 
-- [ ] **Step 1: Write the failing tests** in `gate_test.go`. Add three roles to `cli_test.go`: `roleHang` (writes `GPB_TEST_HELPER_RELEASE`+".started", then sleeps up to `lingerCap`), `roleHangIgnoreTerm` (the same, but `signal.Ignore(syscall.SIGTERM)` first) and `roleShortSleep` (writes ".started", sleeps 300 ms, exits 0). Each test calls `t.Cleanup(ReopenGateForTest)`.
+- [ ] **Step 1: Write the failing tests** in `gate_test.go`. Add four roles to `cli_test.go`:
+  - `roleHang`: writes `GPB_TEST_HELPER_RELEASE`+".started", then sleeps up to `lingerCap`;
+  - `roleHangIgnoreTerm`: the same, but `signal.Ignore(syscall.SIGTERM)` first;
+  - `roleShortSleep`: writes ".started", sleeps 300 ms, exits 0;
+  - `roleHangWithGrandchild`: starts a `roleHang` grandchild that writes ".grandchild" with its pid, then hangs itself, so the parent is still alive when the bound fires.
+
+  Each test calls `t.Cleanup` to reopen the gate and release admission, and to restore every package variable it changed (`releaseCallTimeout`, `releaseDrain`, `waitDelay`, `testHookExited`).
 
 ```go
 func TestGateParksANewCallAndStartsNoChild(t *testing.T)      // ShutGate(); go run(); assert no ".started" file and run has not returned after 500ms; ReopenGateForTest(); assert run returned errGateReopened
@@ -174,8 +201,10 @@ func TestReleaseCLIIsExemptFromTheGate(t *testing.T)           // ShutGate(); Ne
 func TestNewReleaseCLIDefaultsTheExecutable(t *testing.T)      // NewReleaseCLI("", io.Discard).Exe == "proton-drive"
 func TestReleaseCLIKillsACallAtItsBound(t *testing.T)          // releaseCallTimeout = 1*time.Second, releaseDrain = 300*time.Millisecond, set before NewReleaseCLI; roleHang returns within 1500ms with a non-zero code
 func TestKillReleaseCallsReapsARunningReleaseChild(t *testing.T) // a release run of roleHang in a goroutine; after ".started", KillReleaseCalls(2*time.Second); the child process is gone and the run returns
+func TestKillReleaseCallsClosesAdmissionFirst(t *testing.T)    // KillReleaseCalls(time.Second); then a release run of roleCertified returns errReleaseClosed, and no ".started" file appears
+func TestStopInFlightConfirmsExitBeforeTheDrain(t *testing.T)  // roleCLI (it exits; its grandchild holds the pipe) with waitDelay = 10s: StopInFlight(2s, time.Second, time.Second) == true within 3s, long before the drain ends
 func TestReleaseCLIDrainsForAtMostTwoSeconds(t *testing.T)     // roleCLI (grandchild holds pipe): returns within releaseDrain+1s; warning lands in the writer passed to NewReleaseCLI, not os.Stderr
-func TestReleaseCLIKillsTheWholeGroupOnUnix(t *testing.T)      // Unix only: roleCLI whose grandchild hangs; after the bound, the grandchild is gone too
+func TestReleaseCLIKillsTheWholeGroupOnUnix(t *testing.T)      // Unix only: roleHangWithGrandchild, releaseCallTimeout = 1s, releaseDrain = 200ms; after the bound, the parent and the grandchild named in ".grandchild" are both gone
 ```
 
 - [ ] **Step 2: Run them to make sure they fail**
@@ -183,7 +212,7 @@ func TestReleaseCLIKillsTheWholeGroupOnUnix(t *testing.T)      // Unix only: rol
 Run: `go test ./internal/transport/ -run 'TestGate|TestStopInFlight|TestReleaseCLI' -count=1 -v`
 Expected: FAIL to compile (`ShutGate`, `StopInFlight`, `NewReleaseCLI`, `ReopenGateForTest` undefined).
 
-- [ ] **Step 3: Implement `gate.go`, the two `procgroup` files, and the `run` changes.** One package mutex guards, together: the shut flag, the set of in-flight `*exec.Cmd`s with their exit channels (a release child is tracked in a second set), and the reopen channel. That way no child can start between the check and the registration. Order inside `run`, for a non-release instance: lock → if shut, unlock and park → start → record in flight → unlock → wait → under the lock, remove the record and check the flag → if shut, park. A release instance skips the gate, calls `setOwnGroup`, records itself in the release set, and arms its kill timer as described in Interfaces. `StopInFlight` and `KillReleaseCalls` copy the set under the lock and wait on the exit channels outside it. A parked caller, including a `repo` release running on a gated instance after the gate shut, stays parked: in production the coordinator ends the process, and in tests `ReopenGateForTest` returns it `errGateReopened`.
+- [ ] **Step 3: Implement `gate.go`, the two `procgroup` files, and the `run` changes.** One package mutex guards, together: the shut flag, the set of in-flight `*exec.Cmd`s with their exit channels (a release child is tracked in a second set), and the reopen channel. That way no child can start between the check and the registration. Order inside `run`, for a non-release instance: lock → if shut, unlock and park → start → record in flight → unlock → `cmd.Wait()` → **close the record's exit channel at once, where `testHookExited` fires and before the drain begins** (`StopInFlight` and `KillReleaseCalls` wait on that channel with windows of a few seconds, while a drain may run 30 s) → drain → under the lock, remove the record and check the flag → if shut, close the pipe's read end from a background goroutine, so its reader cannot leak, and park. A release instance skips the gate, calls `setOwnGroup`, records itself in the release set, and arms its kill timer as described in Interfaces. `StopInFlight` and `KillReleaseCalls` copy the set under the lock and wait on the exit channels outside it. A parked caller, including a `repo` release running on a gated instance after the gate shut, stays parked: in production the coordinator ends the process, and in tests `ReopenGateForTest` returns it `errGateReopened`.
 
 - [ ] **Step 4: Run them to make sure they pass, then the whole package**
 
@@ -305,7 +334,7 @@ func TestLoop_CleanSessionStillExitsZero(t *testing.T) // the existing TestLoop_
 Run: `go test ./cmd/git-remote-proton/ -run 'TestLoop_FailedProtocolWrite|TestLoop_InDoubtAcquisition|TestLoop_CleanSession' -count=1 -v`
 Expected: the first two FAIL (exit 0 with the lock left behind; and the in-doubt lock left behind).
 
-- [ ] **Step 3: Change `loop`.** Name the result `code`. Replace every bare `out.Flush()` with a helper call that records the first error in a local `writeFailed`. Register a second `defer` at the top of `loop`, beside the lock-release defer and before the command loop, so that it covers every `return`. It flushes once more, records any error, and turns a `code` of 0 into 1 if `writeFailed`. The order of the two defers does not matter: the release defer never touches `code`. In the `list for-push` arm: `l, err := repo.AcquireLock(t, root); if l != nil { lock = l }; if err != nil { warn(err); return 1 }`. Leave the lock-release defer's body and its comment as they are; `Release()` now settles an in-doubt handle itself.
+- [ ] **Step 3: Change `loop`.** Name the result `code`. Replace every bare `out.Flush()` with a helper call that records the first error in a local `writeFailed`. Register a second `defer` at the top of `loop`, beside the lock-release defer and before the command loop, so that it covers every `return`. It flushes once more, records any error, and turns a `code` of 0 into 1 if `writeFailed`. The order of the two defers does not matter: the release defer never touches `code`. In the `list for-push` arm: `l, err := repo.AcquireLock(t, root); if l != nil { lock = l }; if err != nil { warn(err); return 1 }`. Leave the lock-release defer's body and its comment as they are; `Release()` now settles an in-doubt handle itself. One behaviour is deliberately unchanged: a second `list for-push` in one session (git does not send one) overwrites `lock`, so the normal path releases only the last handle, as today. The register holds both, so a signal would release both.
 
 - [ ] **Step 4: Run the package's tests**
 
@@ -336,13 +365,14 @@ git commit -m "fix(helper): a failed protocol write exits 1, and an in-doubt loc
 - Produces:
   - `type opMode int` with `modeRead`, `modePush`, `modeSetHead`.
   - `type coordinator struct{ … }` and these functions. Every method is a no-op on a nil receiver.
-    - `func installShutdown() *coordinator`: called first in `run()`. It calls `signal.Notify` for `shutdownSignals()`, calls `notifySIGPIPE()`, and starts the goroutine that waits for the first signal. That goroutine, and SIGPIPE's drainer, select on the coordinator's `done` channel too.
+    - `func installShutdown() *coordinator`: called first in `run()`. It makes the signal channel (capacity 4) and calls `signal.Notify` for `shutdownSignals()`. It makes the SIGPIPE channel (capacity 1), calls `notifySIGPIPE(pipeCh)` and starts its drainer. It starts the signal goroutine. That goroutine **loops**: each signal it receives goes to `c.trigger(s)`, which returns at once, so a second signal is still read while the release runs. Both goroutines also select on the coordinator's `done` channel.
     - `func (c *coordinator) setMode(m opMode)`
     - `func (c *coordinator) batchStarted()` and `func (c *coordinator) batchDone()`: `loop` calls the second once a batch's status lines are flushed.
     - `func (c *coordinator) finish(code int) int`: called on every return from `run()`. It decides under the coordinator's lock and releases the lock before acting. If shutdown has begun, it blocks forever outside the lock (the coordinator ends the process). Otherwise it marks the coordinator stopped (a signal after this point is ignored), calls `signal.Stop` on both channels, closes `done` (both goroutines return), calls `repo.ResetRegister()`, sets `curCoord = nil`, and returns `code`.
-    - `func (c *coordinator) trigger(s os.Signal)`: the entry point the signal goroutine calls, and tests call directly.
-  - Platform: `func shutdownSignals() []os.Signal`. Unix: `os.Interrupt`, `syscall.SIGTERM`, `syscall.SIGHUP`, each dropped if `signal.Ignored`. Windows: `os.Interrupt`, `syscall.SIGTERM`. Go delivers both Ctrl-C and Ctrl-Break as `os.Interrupt`, per `runtime/os_windows.go` and spec P4, so they exit 130. Also `func notifySIGPIPE(ch chan os.Signal)` (Unix: `Notify(ch, syscall.SIGPIPE)`; Windows: no-op) and `func signalNumber(s os.Signal) int` (`os.Interrupt` 2; otherwise the `syscall.Signal` value, so SIGTERM is 15 on both platforms).
-  - `func resetShutdownStateForTest()`, in `shutdown_test.go`: sets `silenced` false and `curCoord` nil, calls `repo.ResetRegister()` and `transport.ReopenGateForTest()`. Every coordinator test registers it with `t.Cleanup`.
+    - `func (c *coordinator) trigger(s os.Signal)`: the entry point the signal goroutine calls, and tests call directly. On the first signal it starts the shutdown sequence on a **new goroutine** and returns. On any later one it queues the "still running" line and returns.
+    - `var quietStderr io.Writer`: wraps `os.Stderr` and drops writes once `silenced` is set. `run()` passes it to `dispatchUtility` in place of `os.Stderr`, so `runSetHead`'s direct writes are silenced too.
+  - Platform: `func shutdownSignals() []os.Signal`. Unix: `os.Interrupt`, `syscall.SIGTERM`, `syscall.SIGHUP`, each dropped if `signal.Ignored`. Windows: `os.Interrupt`, `syscall.SIGTERM`. Go delivers both Ctrl-C and Ctrl-Break as `os.Interrupt`, per `runtime/os_windows.go` and spec P4, so they exit 130. Also `func notifySIGPIPE(ch chan os.Signal)` (Unix: `Notify(ch, syscall.SIGPIPE)`; Windows: no-op) and `func signalNumber(s os.Signal) int` (`os.Interrupt` 2; otherwise the `syscall.Signal` value, so SIGTERM is 15 on both platforms: `syscall/types_windows.go` defines `SIGTERM = Signal(0xf)`, read in go1.27.0).
+  - `func saveShutdownStateForTest(t *testing.T)`, in `shutdown_test.go`. It snapshots every package variable a coordinator test may change: `exitFn`, `stderrTarget`, `newReleaseTransport`, `stopInFlight`, `afterLoopHook`, the six timing variables, `repo.SettleDelay`, `silenced` and `curCoord`. Its `t.Cleanup` restores them all, stops any armed cap timer, calls `repo.ResetRegister()`, `transport.ReopenGateForTest()` and `transport.ResetReleaseAdmissionForTest()`, and closes any blocking test writer the test created. Every coordinator test calls it first. That way no test depends on file order, and `-count=2` sees a clean start.
   - Package seams, so tests can shrink or replace them:
     - `var exitFn = os.Exit`
     - `var stderrTarget io.Writer = os.Stderr`
@@ -352,7 +382,7 @@ git commit -m "fix(helper): a failed protocol write exits 1, and an in-doubt loc
     - `var shutdownCap, childGrace, childTerm, childConfirm, retryPause, outcomeWait = 60*time.Second, 5*time.Second, 3*time.Second, 2*time.Second, 2*time.Second, 1*time.Second`
   - `var silenced atomic.Bool`: `warn` returns at once when it is set.
 
-- [ ] **Step 1: Write the failing tests** in `shutdown_test.go`. Each test builds a coordinator without real OS signals: shrunk timings; `exitFn` replaced by a function that records each code it is given; `stderrTarget` a `*syncBuffer` (a mutex-guarded `bytes.Buffer`); and `newReleaseTransport` returning a `transport.Fake` (or a wrapper). It drives `c.trigger(syscall.SIGTERM)`, with `t.Cleanup(resetShutdownStateForTest)`. Assertions about line order compare the coordinator's own lines only; `repo`'s direct stderr notes are outside that order (spec §5.1).
+- [ ] **Step 1: Write the failing tests** in `shutdown_test.go`. Each test builds a coordinator without real OS signals: shrunk timings; `exitFn` replaced by a function that records each code it is given; `stderrTarget` a `*syncBuffer` (a mutex-guarded `bytes.Buffer`); and `newReleaseTransport` returning a `transport.Fake` (or a wrapper). It drives `c.trigger(syscall.SIGTERM)` after `saveShutdownStateForTest(t)`, and waits on the recorded exit. Assertions about line order compare the coordinator's own lines only; `repo`'s direct stderr notes are outside that order (spec §5.1).
 
 ```go
 func TestShutdown_HeldLockIsRemovedAndExitIs143(t *testing.T)           // register a held lock on the Fake; want exit 143, .lock gone, stderr has the catch line then "removed" with the path and nonce
@@ -374,7 +404,8 @@ func TestShutdown_CapDuringAReleaseCallExitsExactlyOnce(t *testing.T)   // relea
 func TestShutdown_FinishAfterShutdownBeganBlocksWithoutTheLock(t *testing.T) // trigger first; finish(0) in a goroutine does not return within 300ms, while setMode from another goroutine still returns at once
 func TestShutdown_FinishAfterStopIgnoresALateSignal(t *testing.T)       // finish(0) returns 0 and curCoord is nil; a later trigger leaves exitFn uncalled
 func TestShutdown_WarnIsSilencedOnceShutdownBegins(t *testing.T)
-func TestRun_InProcessLeavesNoNotifyBehind(t *testing.T)                // run() twice in-process (the TestRun_RefusesUnsupportedAddress shape); signal.Ignored state is unchanged afterwards and no coordinator goroutine is left (runtime.NumGoroutine before vs after, with a short settle)
+func TestShutdown_SecondOSSignalIsReadDuringTheRelease(t *testing.T)    // through the signal goroutine itself (send on its channel), not trigger: a slow release, a second signal mid-release, and the "still running" line appears before the result line
+func TestRun_InProcessLeavesNoNotifyBehind(t *testing.T)                // run() twice in-process (the TestRun_RefusesUnsupportedAddress shape); signal.Ignored state is unchanged afterwards, and no goroutine was added by those two calls (runtime.NumGoroutine just before them vs just after, with a short settle; earlier tests' goroutines are in both counts)
 ```
 
 - [ ] **Step 2: Run them to make sure they fail**
@@ -387,8 +418,8 @@ Expected: FAIL to compile (`installShutdown`, `coordinator` undefined).
   2. `transport.ShutGate()`, then `silenced.Store(true)`, then queue the catch line (the no-lock form when nothing is registered);
   3. `ok := stopInFlight(childGrace, childTerm, childConfirm)`;
   4. if `!ok`, mark every registered lock *not attempted*;
-  5. else, if any lock is registered, `repo.Settle()`, and then for each lock call `ReleaseVia(rt)` until its outcome is `Final()` or the cap, pausing `retryPause` between attempts. Record each lock's latest outcome and error in mutex-guarded coordinator state, so the cap callback can report them;
-  6. the final step, run once through a `sync.Once`: build the result lines from that state, write them, wait until the write finishes or `outcomeWait` passes, whichever comes first, and call `exitFn(128 + signalNumber(first))`.
+  5. else, if any lock is registered, `repo.Settle()`, and then for each lock call `ReleaseVia(rt)` until its outcome is `Final()`, pausing `retryPause` between attempts. Before each attempt, check one flag, "the final step has started", set under the coordinator's lock; stop when it is set. Elapsed time is not the test. Record each lock's latest outcome and error in mutex-guarded coordinator state, so the cap callback can report them;
+  6. the final step, run once through a `sync.Once`: set that flag, stop the cap timer, build the result lines from the recorded state, write them, wait until the write finishes or `outcomeWait` passes (whichever comes first), and call `exitFn(128 + signalNumber(first))`.
 
   **stderr.** Ordinary lines go through one writer goroutine fed by a channel of capacity 64. A send never blocks: when the channel is full the line is dropped. The writer drops lines whose write fails. The result lines in item 6 skip that channel and are written by their own goroutine, so a full channel can never drop them. Only a stderr that is blocked or dead can lose them, and then nobody could read them anyway. Task 10 documents that state. The release transport is built as `newReleaseTransport(asyncW)`, where `asyncW` is an `io.Writer` over the same non-blocking channel, so the release CLI's drain warning and `Traced`'s `gpb: downloaded` line never block either (S14). Define `syncBuffer` (a mutex-guarded `bytes.Buffer` with `Write` and `String`) in `shutdown_test.go`; Task 6 reuses it. A second signal sends the "still running" line and changes nothing else. Message content follows §5.6. Every line starts `git-remote-proton: `, and each result line names the path, the nonce and the outcome in words.
 
@@ -423,9 +454,9 @@ git commit -m "feat(helper): release the remote lock on SIGINT, SIGTERM, SIGHUP 
   - Shim environment: `GPB_TESTCLI_BLOCK` holds rules separated by `;`. Each rule is `verb:leaf:once|every:before|after[:delay=<ms>][:ignoreterm][:late=<ms>][:fail]`.
     - `verb` is one of `upload`, `download`, `trash`, `info`, `create-folder` and `--version`.
     - `leaf` is the name the remote node has, or will have, or `*` (a `*.pack` suffix match is allowed). For `upload` that is `filepath.Base` of the **local** file argument, because the CLI names the remote node after the local basename (probe C11, as `runUpload` already does). For the other verbs it is `leafOf` of the remote path argument.
-    - A rule that matches writes `<GPB_TESTCLI_READY_DIR>/ready-<verb>-<leaf>-<n>`, then blocks until killed, or for `delay` before carrying on. `before`/`after` places the block before or after the shim writes its file.
+    - A rule that matches writes `<GPB_TESTCLI_READY_DIR>/ready-<verb>-<leaf>-<n>`, then blocks until killed, or for `delay` before carrying on. `before` blocks before the shim looks at the target at all: before its existence check, its skip decision or any write. So an `upload` that would be skipped as already existing (`Refused`) still blocks first. `after` blocks once the shim has finished acting on the target, written or skipped, and before it prints its result.
     - `ignoreterm` makes the shim ignore SIGTERM while it blocks (Unix).
-    - `late` starts a copy of the shim, role `late-writer`, that writes the upload's target after that many milliseconds. It is **detached**: its own process group on Unix (`Setpgid`), `CREATE_NEW_PROCESS_GROUP` on Windows, and not waited on, so a kill of the shim's group cannot reach it. It records its pid as `<tree>/.pids/late-<pid>`.
+    - `late` makes `runUpload` first copy the staged file's bytes to `<ready>/late-<n>.data`, because `AcquireLock` deletes its staging folder as soon as the upload call returns. It then starts a copy of the shim, role `late-writer`, which writes that copy to the upload's target after that many milliseconds. The late writer is **detached**: its own process group on Unix (`Setpgid`), `CREATE_NEW_PROCESS_GROUP` on Windows, and not waited on, so a kill of the shim's group cannot reach it. It records its pid only as `<tree>/.pids/late-<pid>`, never as a plain shim pid.
     - `fail` makes the shim exit 1 with no summary JSON, after any `late` writer has started.
     - `once` is tracked across processes with an `O_EXCL` marker file in the ready dir.
     - Every shim run records its pid as `<tree>/.pids/<pid>` and removes it on a normal exit.
@@ -434,14 +465,14 @@ git commit -m "feat(helper): release the remote lock on SIGINT, SIGTERM, SIGHUP 
     - `git-remote-proton-testhelper` (a copy of the test binary made by `startHelper`) runs the helper role;
     - anything else is the test runner. It sets `repo.SettleDelay = 0` (Task 4's line), stubs the probe, and runs `m.Run()`.
 
-    The helper role stubs `probeRestoreFloor`. With `GPB_TEST_SHRINK=1` it sets `shutdownCap=8s`, `childGrace=500ms`, `childTerm=500ms`, `childConfirm=2s`, `retryPause=200ms`, `outcomeWait=300ms` and `repo.SettleDelay=300ms`, and calls `transport.SetReleaseCallTimeoutForTest(2 * time.Second)`, which stays well under `shutdownCap`. It installs `afterLoopHook` when `GPB_TEST_HOLD_AFTER_LOOP` is set, and a `stopInFlight` that returns false when `GPB_TEST_UNCONFIRMED_STOP` is set. Then it runs `os.Exit(run())`, with `os.Args = [exe, "origin", <address>]` for a push or fetch, or `[exe, "--set-head", <address>, <branch>]`. `buildShimOnPath` stops setting `GPB_TESTCLI_ROLE`; the base name replaces it.
+    The helper role stubs `probeRestoreFloor`. With `GPB_TEST_SHRINK=1` it sets `shutdownCap=8s`, `childGrace=500ms`, `childTerm=500ms`, `childConfirm=2s`, `retryPause=200ms`, `outcomeWait=300ms` and `repo.SettleDelay=300ms`, and calls `transport.SetReleaseBoundsForTest(3*time.Second, 200*time.Millisecond)`. That gives a release call 2.8 s before its kill, room for E9's and W2's 1.5 s `delay`, and stays well under `shutdownCap`. It installs `afterLoopHook` when `GPB_TEST_HOLD_AFTER_LOOP` is set, and a `stopInFlight` that returns false when `GPB_TEST_UNCONFIRMED_STOP` is set. Then it runs `os.Exit(run())`, with `os.Args = [exe, "origin", <address>]` for a push or fetch, or `[exe, "--set-head", <address>, <branch>]`. `buildShimOnPath` stops setting `GPB_TESTCLI_ROLE`; the base name replaces it.
   - Harness (`signal_harness_test.go`):
-    - `type helperRun struct{ Cmd *exec.Cmd; Stdin io.WriteCloser; Stdout *bufio.Reader; Stderr *syncBuffer; Tree, Ready string }`
-    - `func startHelper(t *testing.T, opts helperOpts) *helperRun`. `helperOpts` carries the address, the block rules, extra environment, `ownGroup bool`, and the git dir.
+    - `type helperRun struct{ Cmd *exec.Cmd; Stdin io.WriteCloser; StdoutR *os.File; Stdout *bufio.Reader; Stderr *syncBuffer; StderrR *os.File; Tree, Ready string }`. `StdoutR` is the raw read end of the helper's stdout pipe, made with `os.Pipe` and owned by the test, which closes it to break the helper's stdout (E5). `Stdout` is a `bufio.Reader` over it. `StderrR` and `StderrW` are set only when `opts.RawStderr`. The helper's stderr is then a raw pipe; the test holds the read end and never reads it, and keeps its own copy of the write end, so it can fill the pipe itself (E17). `Stderr` is nil in that case. Otherwise `Stderr` collects stderr. Add `StderrW *os.File` to the struct.
+    - `func startHelper(t *testing.T, opts helperOpts) *helperRun`. `helperOpts` carries the address, the block rules, extra environment, `ownGroup bool`, `RawStderr bool`, and the git dir. It copies the test binary to a temp dir as `git-remote-proton-testhelper`(`.exe`), and puts the shim dir first on PATH. It sets the helper's working directory to the git repo, and `GIT_DIR` to `opts.GitDir` in **the helper's** environment: `run()` reads `GIT_DIR` itself. That is the test setting its own child's environment, not the helper setting `cmd.Env`. It registers `t.Cleanup` to kill the helper if it is still running.
     - `func (h *helperRun) pushMain(t *testing.T)`: sends `capabilities`, `list for-push` and `push refs/heads/main:refs/heads/main` with the blank lines git sends, reading each response until its blank line, in a goroutine.
     - `func waitReady(t *testing.T, dir, prefix string, within time.Duration) string`
     - `func (h *helperRun) wait(t *testing.T, within time.Duration) (exitCode int)`: fails the test if the helper died by a signal rather than exiting.
-    - `func assertNoShimLeft(t *testing.T, tree string)`: every pid recorded under `<tree>/.pids/`, apart from `late-*` ones, must be gone within 5 s. A `late-*` pid must be gone within its delay plus 5 s.
+    - `func assertNoShimLeft(t *testing.T, tree string)`: polls every 100 ms. Every pid recorded under `<tree>/.pids/`, apart from `late-*` ones, must read as gone within 5 s. Polling absorbs the moment a killed shim is still a zombie, which `kill(pid, 0)` reports as alive until it is reaped. A `late-*` pid must be gone within its delay plus 5 s.
     - `func processAlive(pid int) bool`, one per platform in the test files. Unix: `syscall.Kill(pid, 0)` returns nil (an exited shim is reparented and reaped, so it reads as gone). Windows: `OpenProcess` plus `GetExitCodeProcess` reporting `STILL_ACTIVE` (259), through `syscall.NewLazyDLL("kernel32.dll")`.
     - `func lockPresent(tree, root string) bool`
 
@@ -500,7 +531,7 @@ git commit -m "test(helper): end-to-end signal harness over the scripted shim; E
 func TestSignal_E2_ProcessGroupSignalLikeTimeout(t *testing.T)    // ownGroup: syscall.Kill(-pgid, SIGTERM); 143, lock gone
 func TestSignal_E3_IdleAfterListForPush(t *testing.T)             // send only capabilities + list for-push, read the advertisement, signal; 143, lock gone
 func TestSignal_E4_DuringTheLockUpload(t *testing.T)              // subtests: "upload:.lock:once:before" -> "absent", lock absent; "upload:.lock:once:after" -> "removed", lock gone
-func TestSignal_E5_GitDiesMidBatch(t *testing.T)                  // "upload:*.pack:once:before:delay=1500"; after ready, close Stdin and Stdout's read end; exit 1, lock gone, not killed by a signal
+func TestSignal_E5_GitDiesMidBatch(t *testing.T)                  // "upload:*.pack:once:before:delay=1500"; after ready, close h.Stdin and h.StdoutR; exit 1, lock gone, not killed by a signal
 func TestSignal_E9_SecondSignalDuringASlowRelease(t *testing.T)   // "trash:.lock:once:before:delay=1500"; SIGTERM, wait for ready-trash, SIGINT; 143, lock gone, a "still running" line
 func TestSignal_E10_ReleaseThatNeverEnds(t *testing.T)            // "trash:.lock:every:before"; exit 143 within shutdownCap+5s, "failed", lock present
 func TestSignal_E14_ForeignLockDuringAcquire(t *testing.T)        // seed another nonce's .lock; block "upload:.lock:once:before" (our own lock upload, still registered, killed in flight); signal; "foreign", lock unchanged byte for byte. (A signal after a Refused acquisition has returned gives the no-lock line instead: the entry is already gone.)
@@ -544,8 +575,8 @@ func TestSignal_E7_SetHeadDuringItsHEADUpload(t *testing.T)    // --set-head arg
 func TestSignal_E8_FetchDuringADownload(t *testing.T)          // seed a pushed repo (pushViaLoop into the shim tree), fetch via the protocol; "download:*.pack:once:before"; 143 within 3s; no .lock ever created; assertNoShimLeft. Subtest "group signal, production timings": GPB_TEST_SHRINK unset, ownGroup, SIGINT to the group: the shim dies of it, and the helper exits 130 within 2s
 func TestSignal_E11_DuringTheMarkerUpload(t *testing.T)        // empty root; "upload:gpb-remote.json:once:before"; 143; no .lock
 func TestSignal_E12_DuringTheVersionCheck(t *testing.T)        // "--version:*:once:before"; 143; child gone
-func TestSignal_E13_RightAfterLoopReturns(t *testing.T)        // GPB_TEST_HOLD_AFTER_LOOP=<file>: the hook writes ready-afterloop and waits for <file>.go; signal; wait until the no-lock catch line appears on stderr; only then create <file>.go; exit 143, lock gone (removed by the normal defer)
-func TestSignal_E17_StderrNeverRead(t *testing.T)              // leave Stderr's pipe unread and the ReadTo trace on; SIGTERM mid-upload; lock gone; exit within about 1s of the lock disappearing, well inside shutdownCap
+func TestSignal_E13_RightAfterLoopReturns(t *testing.T)        // GPB_TEST_HOLD_AFTER_LOOP=<file>: the hook writes ready-afterloop and waits for <file>.go; signal; wait until the no-lock catch line appears on stderr; only then create <file>.go, ignoring any error (the helper may already be exiting); exit 143, lock gone (removed by the normal defer)
+func TestSignal_E17_StderrNeverRead(t *testing.T)              // RawStderr; "upload:*.pack:once:before"; after ready, a test goroutine writes 128 KB into h.StderrW, filling the helper's stderr pipe (nobody reads StderrR; the goroutine blocks and is freed at cleanup); then SIGTERM; lock gone; exit within about 1s of the lock disappearing, well inside shutdownCap
 func TestSignal_E18_NoSignalLockUploadErrorsThenLandsLate(t *testing.T) // "upload:.lock:once:before:late=100" plus the shim exiting 1 instead of blocking (rule flag "fail"); no signal; exit 1; lock gone after the settle
 func TestSignal_E19_UnconfirmedChildExit(t *testing.T)         // GPB_TEST_UNCONFIRMED_STOP=1; "upload:*.pack:once:before"; 143; "not attempted" with the manual remedy; lock present
 func TestSignal_E20_DuringParentFolderCreation(t *testing.T)   // Review Focus 4: GPB_CREATE_PARENTS=1, a missing parent, "create-folder:*:once:before"; 143; no .lock; no marker
