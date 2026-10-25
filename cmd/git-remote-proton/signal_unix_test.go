@@ -548,7 +548,7 @@ func TestSignal_E9_SecondSignalDuringASlowRelease(t *testing.T) {
 	if strings.Contains(stderr, pushCatch("SIGINT")) {
 		t.Errorf("the second signal got a catch line of its own:\n%s", stderr)
 	}
-	still := linePrefix + "received SIGINT while already stopping: ignored; the shutdown, and any lock check, is still running"
+	still := stillRunning("SIGINT")
 	at, result := strings.Index(stderr, still), strings.Index(stderr, linePrefix+"lock ")
 	switch {
 	case at < 0:

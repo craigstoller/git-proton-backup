@@ -562,6 +562,12 @@ func noLockCatch(sig string) string {
 	return linePrefix + "received " + sig + ": stopping (this process holds no remote lock)\n"
 }
 
+// stillRunning is how the line for sig (its Unix name) begins when sig arrives
+// while the shutdown is already running (E9, W2).
+func stillRunning(sig string) string {
+	return linePrefix + "received " + sig + " while already stopping: ignored; the shutdown, and any lock check, is still running"
+}
+
 // waitStderr waits up to within for the helper's collected stderr to hold s,
 // and fails the test at the deadline.
 func (h *helperRun) waitStderr(t *testing.T, s string, within time.Duration) {
