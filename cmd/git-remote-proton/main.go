@@ -550,11 +550,11 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 				}
 				batch = append(batch, l)
 			}
-			// The loop above also stops on EOF or a read error: git died while
-			// still sending the batch. What arrived parses as a complete batch,
-			// so applying it would be a partial set of remote writes nobody
-			// asked for in that shape. Fail closed before any remote read or
-			// write; the defer above still releases the lock.
+			// The loop above also stops on EOF or a read error: git died, or the
+			// read failed, before the whole batch arrived. What arrived parses as
+			// a complete batch, so applying it would be a partial set of remote
+			// writes nobody asked for in that shape. Fail closed before any
+			// remote read or write; the defer above still releases the lock.
 			if !terminated {
 				err := in.Err()
 				if err == nil {

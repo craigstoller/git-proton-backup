@@ -116,6 +116,11 @@ func TestLoop_PushWithoutListForPushRejected(t *testing.T) {
 // being exactly the list-for-push advertisement proves the lock was acquired
 // (it is taken before advertising), so the lock assertion checks a real
 // release rather than a lock that was never there.
+//
+// The refusal must come before any remote READ too, and before the poison
+// check: the List count pins the first (a check that slid past the push arm's
+// ScanRefs would still write nothing), and the poisoned case the second (a
+// check after the poison branch would print its status lines and exit 0).
 func TestLoop_TruncatedPushBatchFailsClosed(t *testing.T) {
 	const script = "list for-push\npush refs/heads/main:refs/heads/main\n" // no blank line
 	for _, tc := range []struct {
@@ -123,20 +128,23 @@ func TestLoop_TruncatedPushBatchFailsClosed(t *testing.T) {
 		in         io.Reader
 		wantStderr []string
 	}{
-		{"eof", strings.NewReader(script), []string{"terminating blank line"}},
+		{"eof", strings.NewReader(script), []string{"terminating blank line", "unexpected EOF"}},
+		{"eof poisoned", strings.NewReader(script + "option cas true\n"),
+			[]string{"terminating blank line", "unexpected EOF"}},
 		{"read error", io.MultiReader(strings.NewReader(script), errReader{err: errors.New("broken pipe")}),
 			[]string{"terminating blank line", "broken pipe"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ft := transport.NewFake()
 			root := "/my-files/r"
+			counter := &refsListCounter{Fake: ft, root: root}
 			gitDir := newGitRepoWithCommit(t)
 			in := bufio.NewScanner(tc.in)
 			var outBuf bytes.Buffer
 			out := bufio.NewWriter(&outBuf)
 
 			var got int
-			stderr := captureStderr(t, func() { got = loop(ft, root, gitDir, in, out) })
+			stderr := captureStderr(t, func() { got = loop(counter, root, gitDir, in, out) })
 			out.Flush()
 
 			if got != 1 {
@@ -144,6 +152,9 @@ func TestLoop_TruncatedPushBatchFailsClosed(t *testing.T) {
 			}
 			if outBuf.String() != "\n" {
 				t.Errorf("stdout = %q, want only the list-for-push advertisement (\"\\n\"): no push status lines for a batch that was never applied", outBuf.String())
+			}
+			if counter.n != 1 {
+				t.Errorf("List(%s/refs) ran %d times, want 1 (the list-for-push advertisement's scan): a truncated batch must be refused before the push arm reads the remote", root, counter.n)
 			}
 			for _, w := range tc.wantStderr {
 				if !strings.Contains(stderr, w) {
@@ -163,6 +174,22 @@ func TestLoop_TruncatedPushBatchFailsClosed(t *testing.T) {
 			}
 		})
 	}
+}
+
+// refsListCounter wraps a Fake and counts List calls on root+"/refs", the
+// first call every repo.ScanRefs makes, so a test can tell how many ref scans
+// a session ran against the remote.
+type refsListCounter struct {
+	*transport.Fake
+	root string
+	n    int
+}
+
+func (c *refsListCounter) List(p string) ([]transport.Node, error) {
+	if p == c.root+"/refs" {
+		c.n++
+	}
+	return c.Fake.List(p)
 }
 
 // ambiguousTrashTransport wraps a Fake but makes Trash report Ambiguous with a

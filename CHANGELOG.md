@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## [Unreleased]
 
 - **git-remote-proton: a push batch that git never finished sending is no longer applied.** If
   git died, or its pipe broke, after sending push lines but before the blank line that ends the
