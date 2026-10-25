@@ -53,8 +53,9 @@ number reasoned from a record. **[untested]** a claim nothing here has checked.
    blocks up to `waitDelay` (30 s) after the child exits while anything else still holds the
    output pipe, a hang seen once at Stage 2.1. **[code]**
 7. **The one leak on record would not have been prevented.** Stage 5's S1: on Windows, an agent
-   harness's tool timeout killed a push through Git Bash (`exit 143`) and orphaned `.lock`
-   **[record]** (`docs/research/gates/stage5-gate.md`). Git Bash's `kill -TERM` ends a native
+   harness's tool timeout killed a push (`exit 143`, SIGTERM) and orphaned `.lock` **[record]**
+   (`docs/research/gates/stage5-gate.md`). That harness's shell tool on Windows is Git Bash, so the
+   kill came through it **[inference]**. Git Bash's `kill -TERM` ends a native
    Windows Go process without running its handler **[measured P1]**. So no signal handler could
    have caught S1. This fix narrows the leak; it does not close it on Windows.
 8. **Scheduled Linux pushes are the case that needs it now.** The Linux spec runs each push under a
@@ -67,7 +68,7 @@ number reasoned from a record. **[untested]** a claim nothing here has checked.
 |---|---|---|---|---|
 | Ctrl-C or Ctrl-Break in a console window (Windows Terminal, conhost) running the push | Windows | `os.Interrupt`. The system sets no time limit | **Releases** | [measured P4] Ctrl-Break; [doc] Go maps Ctrl-C the same way; [doc] Microsoft: no timeout |
 | Ctrl-C in Git Bash's own mintty window | Windows | [untested] Probably nothing: MSYS delivers no console events to native programs (P1, P2) | Assumed to leak (U6) | [inference] |
-| The console window is closed, or Task Manager's **End task** on it | Windows | `SIGTERM` (Go's mapping of `CTRL_CLOSE_EVENT`). The system ends the process 5 s later | **Best effort** (S18). A release usually needs longer than 5 s [estimate, §5.6] | [doc] Go runtime, Microsoft HandlerRoutine |
+| The console window is closed, or Task Manager's **End task** on it | Windows | `SIGTERM` (Go's mapping of `CTRL_CLOSE_EVENT`). The system ends the process 5 s later | **Usually leaks, as today.** The normal sequence runs (S18), and the system's 5 s almost always ends it before the release [estimate, §5.6] | [doc] Go runtime, Microsoft HandlerRoutine |
 | Logoff or shutdown of an interactive session | Windows | Nothing. Go would map those events to SIGTERM, but Windows sends them only to services and terminates interactive programs | Leaks, as today | [doc] Microsoft, Go runtime |
 | `Stop-Process`, `taskkill /F`, a process-tree kill | Windows | Nothing (TerminateProcess) | Leaks, as today | [measured P3] Stop-Process; the rest [inference] |
 | Git Bash `kill` of any signal, MSYS `timeout`, a harness timeout through Git Bash (S1) | Windows | Nothing. TERM and HUP terminate; INT is ignored | Leaks, as today | [measured P1, P2] |
@@ -84,9 +85,9 @@ number reasoned from a record. **[untested]** a claim nothing here has checked.
 
 **What the Windows half buys.** On Windows the only catchable route is an attended Ctrl-C or
 Ctrl-Break in a console window. That is still the commonest way a person stops a push they are
-watching, and the Windows-specific code is small: the signal set (S2), the console-close shortcut
-(S18) and one test (W1). Everything else is shared with Linux. Unattended Windows kills stay
-uncatchable, and §7 says so in the release notes.
+watching, and the Windows-specific code is small: the signal set (S2), the release children's
+process group (S7) and two tests (W1, W2). Everything else is shared with Linux. Unattended Windows
+kills stay uncatchable, and §7 says so in the release notes.
 
 ## 3. Goals, non-goals, anti-goals
 
@@ -106,8 +107,10 @@ uncatchable, and §7 says so in the release notes.
 - Lock takeover or any stale-lock detection (see S1 for why).
 - A general CLI startup retry (the design's open "retry with backoff on the SQLite signature"
   item). Only the shutdown release retries (S10).
-- Noticing git's death in the middle of a batch. The helper cannot see it until its next protocol
-  read or write, which comes after the batch (S16).
+- Noticing git's death while a batch runs. Once the batch is buffered, the helper's next protocol
+  read or write comes after it (S16). Found in review and out of scope here: the loop that buffers
+  the batch stops at EOF as well as at the blank line, so a git that dies while still sending the
+  batch leaves a truncated batch that runs as if complete **[code]**. That is a separate fix.
 - Cleaning up local temp folders or local git child processes on a signal. Today's behaviour
   stands: they are inert, under the OS temp folder.
 - Any change to the Proton CLI pin.
@@ -119,8 +122,8 @@ uncatchable, and §7 says so in the release notes.
   could then interleave with our write.
 - Any change in behaviour when no signal arrives: the same exit codes, messages and CLI calls on
   every path that today ends without a signal. Two exceptions, both on paths that already fail: an
-  in-doubt acquisition gains a release attempt (S8), and a session whose protocol write failed
-  exits 1 instead of 0 (S16).
+  in-doubt acquisition gains a release attempt after the settle wait (S8, S17), and a session whose
+  protocol write failed exits 1 instead of 0 (S16).
 - A helper that hangs after a signal, or prints that it removed a lock it did not remove.
 
 ## 4. Decisions (the agent's recommendations)
@@ -130,21 +133,21 @@ uncatchable, and §7 says so in the release notes.
 | S1 | **Scope: catchable terminations only.** Signals, a broken stdout, and in-doubt acquisition. Uncatchable kills keep today's manual recovery. | (B) Auto-clear a lock whose holder is on this host and whose PID is gone. That is a form of takeover, which v2 removed on purpose, and hostnames are not unique identities while PIDs get reused. (C) A watchdog process that outlives the helper. A tree kill or job kill takes it too, and it adds a process to reason about. | §1.7, §2; design "Release cannot be conditional, so v2 has no takeover" |
 | S2 | **Signals.** Unix: SIGINT, SIGTERM, SIGHUP start shutdown. Each is skipped if it was already ignored when the helper started (`signal.Ignored`), so `nohup` and background jobs keep their meaning. SIGPIPE is `Notify`'d and discarded (§5.2). SIGQUIT keeps Go's default, a goroutine dump with no release: that is the debugging exit, and the dump is most useful on a stuck push. Windows: `os.Interrupt` (Ctrl-C, Ctrl-Break) and `syscall.SIGTERM` (console close). | Handling SIGQUIT too: it would lose the dump. Respecting nothing that was inherited: `Notify` un-ignores SIGHUP and SIGINT [doc], which would break `nohup git push`. | [doc] `os/signal`; [measured P9] |
 | S3 | **One shutdown coordinator takes over on the first signal.** It shuts the CLI gate, stops the in-flight child, releases through its own CLI instance under a deadline, and ends the process itself. The goroutine running the protocol is parked at the gate, both before it can start a child and after a child it started returns, so it never acts on a killed call's result. | Cancel a context and let the code unwind. That needs a context through every transport, repo and gitcmd call (gitcmd uses one only inside its restore-floor probe). It still cannot interrupt the blocking stdin read where the helper waits for git. And a minutes-long local pack build would eat the caller's stop window before the release even began. | §5.3; [code] |
-| S4 | **Release mid-batch is allowed once the remote is quiet**: the in-flight child's exit is confirmed (S5), and, if that call may have changed the remote, the settle wait has passed (S17). The rest of the batch is abandoned: no new remote write starts after the signal. | Finish the batch first: unbounded, and a push killed for being stuck never finishes. Release at once without stopping the child: violates the second anti-goal. | §5.7 |
+| S4 | **Release mid-batch is allowed once the remote is quiet**: the in-flight child's exit is confirmed (S5), and the settle wait has passed (S17). The rest of the batch is abandoned: no new remote write starts after the signal. | Finish the batch first: unbounded, and a push killed for being stuck never finishes. Release at once without stopping the child: violates the second anti-goal. | §5.7 |
 | S5 | **The in-flight child gets 5 s to exit on its own** (it usually received the same signal). Then, on Unix, SIGTERM and 3 s more. Then a kill (SIGKILL, or TerminateProcess). **Release waits for the operating system to confirm the process has exited** (S13 separates that from draining its output). If the exit is not confirmed by the cap, nothing is released, and the helper says so. | Kill at once: needlessly cuts a ref write that was about to land. Never kill: a stuck child would block the release forever. Treat "kill delivered" as enough: a child in an uninterruptible wait has not stopped. | §5.3 |
-| S6 | **A 60 s cap from the first signal to exit**, enforced by its own timer. At the cap the timer kills any release child, tries the outcome line for up to 1 s, and exits, whatever else is running. No stderr write can delay it. | No cap: a release stuck on the same network stall that got the push killed would hang until SIGKILL, silently. 30 s: too tight for §5.6's figures. | [record] S1 timeline; systemd's default `TimeoutStopSec=` is 90 s [doc] |
-| S7 | **Further signals during shutdown are noted on stderr and otherwise ignored.** The 60 s cap bounds the wait. SIGKILL (`kill -9`, `Stop-Process`) remains the way to stop at once, at the cost of the lock. **Release-phase CLI children start in their own process group** (Unix `Setpgid`; Windows `CREATE_NEW_PROCESS_GROUP`, which disables Ctrl-C for them), so a later Ctrl-C in the same window does not kill them. Their per-call bound and the cap still apply. | A second signal abandons the release. On Windows, every later Ctrl-C typed in that console reaches the helper, even after git has died and the prompt is back [doc], so a user tidying a prompt line would abort the release. A per-platform rule would be two behaviours to document. | [doc] Microsoft "CTRL+C and CTRL+BREAK signals" |
-| S8 | **A lock is registered before its upload starts, and stays registered** unless the upload was `Refused` with no error (someone else's lock) or the CLI never started. Every exit path (normal, error, signal) then attempts a nonce-checked release of every registered lock. Release reports a **typed outcome** (§5.5), so the helper never says it removed a lock it found absent or foreign. | Leave acquisition as it is: keeps the §1.4 leak, and a signal during the upload would leak exactly as today. | §5.4 |
+| S6 | **A 60 s cap from the first signal to exit**, enforced by its own timer. At the cap the timer kills any release child, tries the outcome line for up to 1 s, and exits, whatever else is running. **The coordinator never waits on stderr**: each line it writes goes out from a separate goroutine, so a full or dead stderr can delay neither the cleanup nor the exit. | No cap: a release stuck on the same network stall that got the push killed would hang until SIGKILL, silently. 30 s: too tight for §5.6's figures. | [record] S1 timeline; systemd's default `TimeoutStopSec=` is 90 s [doc] |
+| S7 | **Further signals during shutdown are noted on stderr and otherwise ignored.** The 60 s cap bounds the wait. SIGKILL (`kill -9`, `Stop-Process`) remains the way to stop at once, at the cost of the lock. **Release-phase CLI children start in their own process group** (Unix `Setpgid`; Windows `CREATE_NEW_PROCESS_GROUP`, which disables Ctrl-C for them), so a later Ctrl-C in the same window does not kill them. A keyboard Ctrl-Break still reaches every process on the console [doc], so on Windows a Ctrl-Break during the release can still kill a release call, and S10 retries it. On Unix, a release call that runs out its bound is killed with its whole group, grandchildren included. Their per-call bound and the cap still apply. | A second signal abandons the release. On Windows, every later Ctrl-C typed in that console reaches the helper, even after git has died and the prompt is back [doc], so a user tidying a prompt line would abort the release. A per-platform rule would be two behaviours to document. | [doc] Microsoft "CTRL+C and CTRL+BREAK signals" |
+| S8 | **An acquisition whose result is in doubt still hands back its lock.** `AcquireLock` returns a handle on every result except a `Refused` with no error (someone else's lock) and a failure before the upload starts; when the result is in doubt it returns the handle *and* the error. The caller's defer releases its own handle on every exit path, after the settle wait when the acquisition was in doubt (S17). Separately, each acquisition is entered in a process-wide register before its upload starts, which only the coordinator reads (S15). Release reports a **typed outcome** (§5.5), so the helper never says it removed a lock it found absent or foreign. | Leave acquisition as it is: keeps the §1.4 leak, and a signal during the upload would leak exactly as today. Releasing through the register on the normal path too (round 1's fix): in a test that holds a lock with `AcquireLock` and then calls `SetHead` in the same process (`TestSetHeadRefusesWhenLockHeld`), `SetHead`'s defer would remove the other holder's lock. A "CLI never started" exemption: the transport cannot tell it from an in-doubt upload error, and the startup check already refuses a CLI that cannot start. | §5.4; [code] `repo_test.go` |
 | S9 | **All three entry points are covered**: the push path, `--set-head`, and the read paths (fetch, `list`, `--version`). The read paths hold no lock: they stop the child and exit. | Push only: `--set-head` holds the same lock. | [code] |
-| S10 | **The shutdown release retries the whole nonce-checked release** until it reaches a final outcome or the cap, pausing 2 s between attempts. **Each release CLI call is bounded at 15 s**, so one hung call cannot use the whole cap. A transport error, a killed or timed-out call, or a download that failed is retried. Contents that downloaded and did not parse (`unreadable`) are final and are not retried: they need a person. Each attempt re-reads the lock first, so a retry after a `Trash` that did land finds nothing. This covers a CLI startup collision with a push the user starts right after the kill (§5.8), a passing network blip, and a call killed by a stray signal. | A retry only on the SQLite "database is locked" signature: narrower, but that signature is the only failure it would cover. No retry: one collision would leak the lock this fix exists to release. | [record] design A8: startups collide, and the loser never reaches the network |
+| S10 | **The shutdown release retries the whole nonce-checked release** until it reaches a final outcome or the cap, pausing 2 s between attempts. **Each release CLI call is bounded at 15 s from start to the end of its output**, so one hung call cannot use the whole cap: on the coordinator's instance the output drain after exit is bounded at 2 s, not `waitDelay`'s 30 s. A transport error, a killed or timed-out call, or a download that failed is retried. Contents that downloaded and did not parse (`unreadable`) are final and are not retried: they need a person. Each attempt re-reads the lock first, so a retry after a `Trash` that did land finds nothing. This covers a CLI startup collision with a push the user starts right after the kill (§5.8), a passing network blip, and a call killed by a stray signal. | A retry only on the SQLite "database is locked" signature: narrower, but that signature is the only failure it would cover. No retry: one collision would leak the lock this fix exists to release. | [record] design A8: startups collide, and the loser never reaches the network |
 | S11 | **Exit code 128 + the first signal's number** (SIGINT 130, SIGTERM 143, SIGHUP 129), on both platforms (`os.Interrupt` counts as 2), whatever the release outcome. stderr says which. Who sees it: git, and only when git outlived the helper (`kill` to the helper alone). When git dies of the same signal, a script sees git's or `timeout`'s code, and systemd marks the unit failed for its timeout; neither reads the helper's. | Exit 1: loses which signal it was. 0 after a successful release: the push did not complete. | Shell convention; [inference] git's and systemd's reporting |
-| S12 | **The normal-path release is unchanged.** One attempt, failures warned (the `loop` defer's documented contract), now through the register. | Adding S10's retry there too: a behaviour change outside this fix. A possible follow-up. | [code] `loop` defer comment |
-| S13 | **`CLI.run` is reworked to own its child.** It starts the child with output pipes the helper creates, so the process's exit (`Wait`) is observed apart from draining its output. It records the child as in flight, and keeps the process handle for S5's stop. After the process exits, the output is drained for up to `waitDelay` as today, with today's warning when that runs out. Every `CLI` method still goes through `run`, so no call site changes. | `exec.CommandContext`: it kills on cancel, but its `Wait` still blocks on the pipe drain, so exit and drain stay tied. Keeping `CombinedOutput`: no handle, and the 30 s drain lands inside the cap. | [code] `cli.go` `run`, `waitDelay` |
-| S14 | **One process-wide gate in `internal/transport`** covers every `*CLI` the process creates: `run()`'s, `runSetHead()`'s, and `EnforceCertified`'s calls through them. The coordinator's release instance, made by its own constructor, is the only exemption. It does not repeat `EnforceCertified`: this process already certified the CLI on its PATH at startup, and nothing changes PATH. | A gate per instance: `run()` and `runSetHead()` each build their own CLI, so a signal during the version check would be missed. Re-certifying the release instance: one more CLI startup inside the collision window S10 worries about. | [code] `main.go` |
-| S15 | **The register lives in `internal/repo`**, process-wide. `AcquireLock` fills it, so `loop` and `SetHead` need no new plumbing. The coordinator reads it through a `repo` function. It never holds a mutex across a CLI call, so the coordinator and a normal-path release never deadlock. Tests reset it. No test in `internal/repo` or `cmd` runs in parallel [code: both packages say so]. | A register in `cmd`: `AcquireLock` cannot reach it, and its failure paths drop the nonce. A register threaded through `SetHead`/`AcquireLock`: wider API change for the same effect. | [code] `lock.go`, `sethead.go` |
-| S16 | **A failed protocol write is remembered, and `loop` then exits 1, not 0.** Release takes the normal path. A broken stdout does not start the coordinator: the next step after a status write is the stdin read, which returns EOF at once when git is gone, and then the defer releases. | Starting the coordinator on a failed write: it would only bound the normal release, which S12 keeps as it is. Exit 0: reports success for a session git never finished. | [code] `loop`; §1.3 |
-| S17 | **A settle wait of 5 s before reading the lock**, when the stopped call may have changed the remote (an upload, a trash, a folder create). A request the killed child had already sent can still be applied by the server after the child dies. The wait lets it land first: a late lock upload is then seen and removed, and a late ref write lands before anyone else can take the lock. | No wait: a late-landing lock upload would be read as absent, then appear, and leak while the helper said none was there. A longer wait: costs every signalled push for a delay nobody has measured. | [inference]; [untested] U7 |
-| S18 | **On a Windows console close (SIGTERM on Windows) the sequence is cut short**: no grace, no settle; the child got the same event. It goes straight to the release, best effort, inside the system's 5 s. | The full sequence: S5's grace alone would spend the whole 5 s. | [doc] Microsoft: close timeout 5000 ms |
+| S12 | **The normal-path release is unchanged.** One attempt on the caller's own handle, failures warned (the `loop` defer's documented contract). The one addition: an in-doubt handle waits out S17's settle first. | Adding S10's retry there too: a behaviour change outside this fix. A possible follow-up. | [code] `loop` defer comment |
+| S13 | **`CLI.run` is reworked to own its child.** It starts the child with **one** pipe the helper creates, given to the child as both stdout and stderr, so callers still read one merged stream as `CombinedOutput` gives today (`Stat` finds `Node not found` in it, and every error message quotes it). A reader goroutine starts with the child and drains the pipe while it runs, so a large output never fills the pipe. The process's exit (`Wait`) is observed apart from the drain: after exit, the reader is given up to `waitDelay` to reach EOF, as today, with today's warning when that runs out (2 s on the coordinator's instance, S10). `run` records the child as in flight and keeps its process handle for S5's stop. Every `CLI` method still goes through `run`, so no call site changes. | `exec.CommandContext`: it kills on cancel, but its `Wait` still blocks on the pipe drain, so exit and drain stay tied. Keeping `CombinedOutput`: no handle, and the 30 s drain lands inside the cap. | [code] `cli.go` `run`, `waitDelay` |
+| S14 | **One process-wide gate in `internal/transport`** covers every `*CLI` the process creates: `run()`'s, `runSetHead()`'s, and `EnforceCertified`'s calls through them. The coordinator's release instance, made by its own constructor, is the only exemption. It does not repeat `EnforceCertified`: this process already certified the CLI on its PATH at startup, and nothing changes PATH. The gate shuts only on a signal; tests that shut it get a test-only way to reopen it. | A gate per instance: `run()` and `runSetHead()` each build their own CLI, so a signal during the version check would be missed. Re-certifying the release instance: one more CLI startup inside the collision window S10 worries about. | [code] `main.go` |
+| S15 | **The register lives in `internal/repo`**, process-wide, and **only the coordinator reads it.** `AcquireLock` enters each acquisition after its staging file is written and before its upload starts. An entry leaves on a `Refused` with no error, and on a final release outcome from either path. The coordinator reads it through a `repo` function. It never holds a mutex across a CLI call, so the coordinator and a normal-path release never deadlock. Tests of the coordinator reset it; no test in `internal/repo` or `cmd` runs in parallel [code: both packages say so]. | A register in `cmd`: `AcquireLock` cannot reach it, and its failure paths drop the nonce. A register threaded through `SetHead`/`AcquireLock`: wider API change for the same effect. | [code] `lock.go`, `sethead.go` |
+| S16 | **A failed protocol write is remembered, and `loop` then exits 1, not 0.** `loop` checks each `Flush` itself (a `bufio.Writer` keeps its first write error), and flushes once more before it returns, so `run()`'s deferred `Flush` can no longer hide a failure behind a 0. Release takes the normal path. A broken stdout does not start the coordinator: the next step after a status write is the stdin read, which returns EOF at once when git is gone, and then the defer releases. | Starting the coordinator on a failed write: it would only bound the normal release, which S12 keeps as it is. Exit 0: reports success for a session git never finished. | [code] `loop`; §1.3 |
+| S17 | **A settle wait of 5 s before reading the lock**, on the shutdown path whenever a lock is registered, and on the normal path whenever the acquisition was in doubt. A request a killed or failed child had already sent can still be applied by the server after the child ends. The wait lets it land first: a late lock upload is then seen and removed, and a late ref write lands before anyone else can take the lock. Applied whenever a lock is registered, not only when a write was seen in flight: a child that died of the same signal can finish before the coordinator looks, and then nothing was in flight to see. | No wait: a late-landing lock upload would be read as absent, then appear, and leak while the helper said none was there. A wait only after a write seen in flight: misses the child that died first. A longer wait: costs every signalled push for a delay nobody has measured. | [inference]; [untested] U7 |
+| S18 | **No shortcut for a Windows console close.** It runs the normal sequence, safety waits included. The system ends the process 5 s after the event, which is almost always before the release, so the lock usually stays, exactly as today, and its manual remedy applies. | Skip the grace and the settle to fit 5 s (round 1's fix): that releases while the child or its last request may still be landing, against the second anti-goal, to save a case that rarely finishes anyway. | [doc] Microsoft: close timeout 5000 ms |
 
 ## 5. Design
 
@@ -154,7 +157,8 @@ The coordinator is installed at the very start of `run()`, before any CLI child 
 covers `dispatchUtility` (`--version`, `--set-head`), `EnforceCertified`, and `loop`. A signal
 before installation gets Go's default; no lock can exist that early. When `run()` returns with no
 signal received, it stops the notifications (`signal.Stop`) and the coordinator, so tests that
-call `run()` in-process leak nothing.
+call `run()` in-process leak nothing. By then `loop`'s and `SetHead`'s defers have already released
+every handle, so a signal that arrives after that point and gets Go's default exit leaks nothing.
 
 **Once shutdown has begun, only the coordinator ends the process.** `main`'s `os.Exit(run())`
 waits for it. Otherwise a `loop` that returns on its own (git closed stdin, say) could exit the
@@ -170,9 +174,9 @@ before the protocol goroutine parks at its next CLI call. That is accepted rathe
   git then fail with `EPIPE` [measured P8]. It must be `Notify`, not `signal.Ignore`: an ignored
   disposition carries across exec, so every git and CLI child would inherit it, while a caught one
   is reset to the default in the child [inference].
-- **A failed protocol write (both platforms)** is recorded by the writer under `loop`'s buffer. The
-  code ignores `Flush` errors today. `loop` then reads stdin, meets EOF, returns 1 (S16), and the
-  defer releases.
+- **A failed protocol write (both platforms)** is caught by `loop` itself, from the error each
+  `Flush` returns (S16). The code ignores `Flush` errors today. `loop` then reads stdin, meets EOF,
+  returns 1, and the defer releases.
 - The first shutdown signal starts the sequence in §5.3. Later ones follow S7.
 
 ### 5.3 The shutdown sequence
@@ -181,18 +185,17 @@ before the protocol goroutine parks at its next CLI call. That is accepted rathe
 2. **Shut the CLI gate** (S14). From now on no CLI child starts through any instance but the
    coordinator's. A caller that reaches the gate is parked for good, and so is a caller whose
    child returns after this point: it never sees that result. The gate and the in-flight record
-   share one lock, so no child can start between the check and the registration. Only then print
-   the catch line (§5.6); if stderr blocks, the timer still ends the process.
+   share one lock, so no child can start between the check and the registration. Then send the
+   catch line (§5.6), from its own goroutine (S6): cleanup never waits for it.
 3. **Stop the in-flight child**, if there is one (S5): wait up to 5 s for it to exit; on Unix, then
    send SIGTERM and wait up to 3 s; then kill it and wait up to 2 s more. Exit means the process
    has exited, not that its output has drained (S13). If no exit is confirmed, skip to step 6 with
-   "not confirmed". On a Windows console close, skip the waits (S18).
-4. **Settle** for 5 s if the stopped call may have changed the remote (S17). Skipped on a Windows
-   console close.
+   "not confirmed". A Windows console close runs these steps unchanged (S18).
+4. **Settle** for 5 s if any lock is registered (S17).
 5. **Release every registered lock** (§5.4, §5.5) through the coordinator's CLI instance: its
-   children in their own process group (S7), each call bounded at 15 s, every call killed at the
-   deadline. Retry per S10.
-6. Print the outcome line. Exit with S11's code.
+   children in their own process group (S7), each call bounded at 15 s including its output, every
+   call killed at the deadline. Retry per S10.
+6. Send the outcome line, give it up to 1 s, and exit with S11's code.
 
 Local git children (pack builds, the restore-floor probe) are not stopped. They never touch the
 remote. When only the helper was signalled they run to completion as orphans and exit; that leaves
@@ -200,36 +203,43 @@ temp files behind, as a crash does today. **[inference]** A signal that kills a 
 (a group signal) can make `repo.Push` take an error path; its next CLI call parks at the gate
 (§5.1 says what it may print first).
 
-### 5.4 Locks in doubt: register before upload
+### 5.4 Locks in doubt: a handle on every result, and a register for the coordinator
 
-`AcquireLock` makes its nonce and registers `(path, nonce)` **before** `CreateExclusive` starts.
-Then:
+`AcquireLock` makes its nonce and writes its staging file. A failure there returns today's error
+and no handle: nothing was uploaded. Then it enters `(path, nonce)` in the register (S15) and
+calls `CreateExclusive`:
 
-- `CreateExclusive` returns `Refused` with no error: someone else's lock. Drop it from the register
-  and return today's error. No release attempt, no extra calls.
-- The CLI never started (the binary is missing, or the basename check refused before any upload):
-  drop it, return today's error.
-- **Any other result keeps it registered**: `Committed`, an error from `CreateExclusive` (a killed
-  upload lands here), `Ambiguous`, an unrecognised outcome, a read-back I/O error, or a read-back
-  that shows another nonce. Each returns today's error, or the held lock. The exit path's release
-  then reads `.lock` and acts on what it finds (§5.5).
-- A release whose outcome is final (removed, absent, foreign, unreadable) drops it from the
-  register. One that is not confirmed keeps it, so a later attempt can try again.
+- `Refused` with no error: someone else's lock. The entry leaves the register; no handle; today's
+  error. The calls are exactly today's: its diagnostic read-back of the holder's lock, and nothing
+  more.
+- `Committed`, and the read-back shows our nonce: the lock is held. A handle, no error.
+- **Anything else is in doubt**: an error from `CreateExclusive` (a killed upload lands here, as
+  `Ambiguous` with an error), `Ambiguous` with no error (the real CLI can return a contradictory
+  count tuple), an unrecognised outcome, a read-back I/O error, or a read-back that shows another
+  nonce. `AcquireLock` returns today's error **and** a handle marked in doubt. The entry stays.
 
-`loop`'s and `SetHead`'s defers release through the register instead of through a single `*Lock`.
-That way an in-doubt acquisition is covered on the normal exit path too: one of the two behaviour
-changes outside signals (§3).
+`loop` and `SetHead` keep the handle whenever one comes back, error or not, and their defers
+release that handle and nothing else: after S17's settle wait if it is in doubt, then one attempt
+(S12). That way an in-doubt acquisition is covered on the normal exit path too, one of the two
+behaviour changes outside signals (§3). A final outcome from either path (removed, absent,
+foreign, unreadable) takes the entry out of the register; *failed* leaves it, so the coordinator
+can try again if a signal follows.
+
+The coordinator alone drains the register as a whole. It is the only reader, so a test that holds
+a lock with `AcquireLock` and then calls `SetHead` in the same process
+(`TestSetHeadRefusesWhenLockHeld`) still sees `SetHead` touch nothing of the other holder's.
 
 ### 5.5 The release and its outcomes
 
-The same nonce-first logic as `Lock.Release`, item 6 intact, taking the transport it runs on as an
-argument so the coordinator can pass its own instance. It returns one of these outcomes instead of
-folding several into `nil`:
+The same nonce-first logic as `Lock.Release`, item 6 intact, in a form that takes the transport it
+runs on, so the coordinator can pass its own instance. `Release()` keeps its signature for its
+existing callers, tests included. The new form returns one of these outcomes instead of folding
+several into `nil`:
 
 | Outcome | When | Final? |
 |---|---|---|
 | **removed** | `.lock` held our nonce, and `Trash` returned `Committed` | yes |
-| **absent** | No `.lock`: our acquisition never landed, or it was already removed | yes |
+| **absent** | No `.lock`: our acquisition never landed, or it was already removed, perhaps by our own normal-path release a moment before the signal | yes |
 | **foreign** | `.lock` holds another nonce. Left alone | yes |
 | **unreadable** | `.lock` downloaded but did not parse. Not removed, not retried | yes |
 | **failed** | Any transport error, a killed or timed-out call, or a `Trash` that did not return `Committed` | no: retried on the shutdown path (S10), reported on the normal path |
@@ -247,7 +257,8 @@ starts `git-remote-proton:`, like `warn`.
   and may leave the lock.
 - **On the first signal, no lock:** which signal, and that the helper is stopping.
 - **The result, one line per registered lock:** the lock path and the nonce, then the outcome in
-  plain words. *removed*: the lock is gone. *absent*: no lock of ours was on the remote.
+  plain words. *removed*: the lock is gone. *absent*: no lock of ours is on the remote (never
+  created, or already removed).
   *foreign*: another process holds it, and it was left alone. *unreadable*: today's message.
   *failed* or *not confirmed*: the reason, and today's manual remedy, worded so it applies only
   once no push for this repo is running, with a note that a lock bearing this nonce, if one
@@ -256,19 +267,21 @@ starts `git-remote-proton:`, like `warn`.
   changes may have landed while git was told nothing (statuses go out only after the whole batch,
   §1.3); and that re-running the push starts from the remote's real state.
 - **A later signal:** that it was received and the check is still running (S7).
-- **Cut short by the system** (a Windows console close at 5 s): no result line arrives. That state
-  is named in the README's lock-recovery steps: the lock is either gone or still there, never
+- **Cut short by the system** (a Windows console close ends the process 5 s after the event): no
+  result line arrives, and the catch line's "wait for the result line" cannot be met. That state is
+  named in the README's lock-recovery steps: the lock is either gone or still there, never
   half-removed, and the usual check applies.
 
 In a terminal, git dies at once, so the prompt can come back while the helper is still releasing,
 and these lines land after it. On Linux the shell takes the terminal's foreground back, so a later
 Ctrl-C does not reach the helper [inference]. On Windows it does [doc]; S7 covers that.
 
-**How long it takes [estimate].** When the child died of the same signal: the settle wait (5 s, when
-the call was a write), then a release of four CLI calls (`Stat` and download to read the lock;
-`Trash`, which `Stat`s first, then trashes), about 8–24 s at S1's 2–6 s per call. So about 13–29 s.
-When only the helper was signalled, add up to 10 s to stop the child. Retries fill the rest of the
-60 s cap. A Windows console close (5 s) will rarely finish.
+**How long it takes [estimate].** When the child died of the same signal: the settle wait (5 s),
+then a release of four CLI calls (`Stat` and download to read the lock; `Trash`, which `Stat`s
+first, then trashes), about 8–24 s at S1's 2–6 s per call. So about 13–29 s. When only the helper
+was signalled, add up to 10 s to stop the child. A call that hangs costs at most 15 s before the
+next attempt. Retries fill the rest of the 60 s cap. A Windows console close (5 s) will almost
+never reach the release.
 
 ### 5.7 Why releasing mid-batch is safe
 
@@ -297,8 +310,11 @@ died could still land late. A late lock upload would then leak, with the result 
 *absent*; the nonce in that line lets a person recognise it. A late ref write would need a second
 writer to take the lock in the meantime, which takes it several CLI calls. Neither delay has been
 measured (U7). This is the same class as item 6's race, and is accepted on the same terms. A
-grandchild of the CLI that outlives the child's kill is out of reach. The only one seen (Stage
-2.1's `waitDelay` hang) appeared after the child had finished its work. **[record, inference]**
+grandchild of the protocol's in-flight CLI child that outlives the child's kill is out of reach:
+that child shares the helper's process group, so the helper cannot kill its group without killing
+itself and git. The only grandchild seen (Stage 2.1's `waitDelay` hang) appeared after the child
+had finished its work. A release child's grandchildren are reached on Unix, through its own group
+(S7). **[record, inference]**
 
 ### 5.8 What callers must do (and the Linux unattended spec must say)
 
@@ -306,7 +322,9 @@ grandchild of the CLI that outlives the child's kill is out of reach. The only o
   SIGKILL [measured P10b]. Keep `TimeoutStopSec=` at 75 s or more; the default 90 s is enough.
 - **GNU `timeout`:** git exits on the SIGTERM at once, and `timeout` returns while the helper is
   still releasing [measured P11]. A script that starts the next push straight away runs it
-  alongside the release; S10's retry makes that cost time, not the lock [inference].
+  alongside the release. If it pushes the same repo, that push meets the old lock (`repo is
+  locked`) and fails, unretried, until the release ends. If its CLI startup collides with a
+  release call, S10's retry makes that cost the release time, not the lock [inference].
 - **To wait for the helper**, read the push's **stderr** through a pipe: `git push … 2>&1 | logger`.
   The helper inherits only git's stderr; its stdin and stdout are git's own protocol pipes
   [inference from how git starts a remote helper; not read here]. A pipeline returns only once
@@ -331,17 +349,23 @@ today. New tests run with `-count=1` (brief-checklist rule 5).
 
 **Layer 1: units (Fake transport, `internal/repo`).**
 - The lock is registered before `CreateExclusive` is called (a Fake hook looks at the register
-  during the call).
-- Registration after each `CreateExclusive` result, per §5.4: `Refused` with no error and a CLI
-  that never started drop it; an error, `Ambiguous`, an unrecognised outcome, a read-back error and
-  a foreign read-back keep it. `Refused` adds no calls (pinned by a call count).
+  during the call), and not at all when staging fails.
+- Each §5.4 result: `Refused` with no error returns no handle, leaves no entry, and makes exactly
+  today's calls (its read-back of the holder's lock, pinned by a call count). `Committed` with our
+  nonce returns a held handle. An error from `CreateExclusive`, `Ambiguous` with and without an
+  error, an unrecognised outcome, a read-back error and a foreign read-back each return the error
+  *and* an in-doubt handle, and keep the entry.
+- `SetHead` and `loop` release their own handle and nothing else: `TestSetHeadRefusesWhenLockHeld`
+  passes unchanged. An in-doubt handle waits out the settle before its one release attempt; a
+  Fake that lands `.lock` after `CreateExclusive` returned its error, inside that wait, ends
+  *removed*.
 - Each §5.5 outcome, from the remote state that produces it. A release through a different
   transport removes our nonce and leaves another nonce alone.
 - S10: a Fake that fails N times then succeeds ends *removed* within the cap. *unreadable* is not
   retried. A Fake that never succeeds ends at the cap with *failed*. A call that hangs is cut at
   the per-call bound, and the next attempt still runs.
-- The register is reset between tests, and holds no lock across a call (a Fake call that reads the
-  register from inside does not deadlock).
+- Coordinator tests reset the register, and it holds no lock across a call (a Fake call that reads
+  the register from inside does not deadlock).
 
 **Layer 2: the CLI child (`internal/transport`, the existing re-exec roles).**
 - Once the gate is shut, `run` starts no child (a role writes a marker per start) and does not
@@ -351,21 +375,26 @@ today. New tests run with `-count=1` (brief-checklist rule 5).
 - A child that exits while a grandchild still holds its output pipe: the exit is confirmed at once,
   and the drain runs on for `waitDelay`, with today's warning (S13). The normal path's behaviour
   through a WaitDelay, `TestVersionSucceedsThroughAWaitDelay` among others, is unchanged.
-- The coordinator's instance kills a hung call at its bound, and starts its children in their own
-  process group.
+- Output stays one merged stream: a role that writes `Node not found` to stderr still reads as
+  absence through `Stat`. A role that writes more than a pipe buffer (over 64 KB) before exiting
+  completes, with all of it read.
+- The coordinator's instance kills a hung call at its bound, drains for at most 2 s after exit,
+  and starts its children in their own process group (on Unix, killed group and all).
+- A test-only reopen restores the gate, so later tests in the package are unaffected.
 
 **Layer 3: end to end, with real OS signals (`cmd/git-remote-proton`).** The helper runs as a
-re-exec'd test binary with the shim on PATH, driven through the protocol over pipes. The helper's
-role and the shim's are told apart by something the helper does not pass on, such as the
-executable's base name (`proton-drive`) or a role variable the helper clears before it starts
-children; today the shim role is an inherited variable, which the helper would also obey. The
-shim gains block rules: one or more of *(verb, leaf, once or every time, before or after writing
+re-exec'd test binary with the shim on PATH, driven through the protocol over pipes. Today the
+shim role is an inherited variable, which a re-exec'd helper would also obey. `TestMain` tells the
+two apart by the executable's base name instead (`proton-drive` is the shim). A variable the
+helper cleared for its children is not an option: the helper sets no `cmd.Env`, a pinned design
+guarantee (v6.9, F8). The shim gains block rules: one or more of *(verb, leaf, once or every time, before or after writing
 its file)*. A blocked call writes a ready file and waits. One more rule simulates a server that
 applies a request late: after the shim is killed, a detached writer it started puts the file in
 place after a set delay.
 
 Each signal case asserts the exit code, the state of `.lock` in the shim tree, that no shim
-process survives, and the result line. The non-signal cases (E5, E6) assert their own outcome.
+process survives, and the result line. The non-signal cases (E5, E6, E18) assert their own
+outcome.
 
 | # | Case | Platform |
 |---|---|---|
@@ -381,13 +410,14 @@ process survives, and the result line. The non-signal cases (E5, E6) assert thei
 | E10 | A release whose `trash` blocks every time ends at the shrunk cap with *failed* and S11's code. `.lock` remains | Unix |
 | E11 | A signal during `Bootstrap`'s marker upload: exit, no lock created | Unix |
 | E12 | A signal during `EnforceCertified`'s `--version` call: exit, child gone | Unix |
-| E13 | A signal that lands as `loop` returns normally (a seam holds `main` between `run()`'s return and `os.Exit`): the coordinator, not `main`, ends the process, and the lock ends *removed* or already gone | Unix |
+| E13 | A signal that lands just after `loop` returns normally, before `run()` stops the notifications (a seam holds `run()` there): the coordinator ends the process with S11's code and the no-lock catch line, the normal defer having already removed the lock | Unix |
 | E14 | Another process's lock is in place; a signal during `AcquireLock`: *foreign*, `.lock` untouched | Unix |
 | E15 | A late-landing lock upload inside the settle wait: *removed*. One landing after it: the result says *absent* and names the nonce | Unix |
 | E16 | Helper-only SIGTERM while the shim ignores SIGTERM: the shim is killed, then the release runs | Unix |
-| E17 | stderr not read by anyone (a full pipe): the helper still exits by the cap | Unix |
-| W1 | Ctrl-Break by `GenerateConsoleCtrlEvent` to a helper started with `CREATE_NEW_PROCESS_GROUP`, blocked in the pack upload. The shim child is in the same group and gets the event too, as with a real Ctrl-C: *removed* | Windows |
-| W2 | As W1, then a second Ctrl-Break to the helper's group during the release: ignored, and the release child, in its own group, finishes | Windows |
+| E17 | stderr not read by anyone (a full pipe) and a SIGTERM with the lock held: `.lock` still ends removed, and the helper exits by the cap | Unix |
+| E18 | No signal: the lock upload returns an error, and the shim lands `.lock` late, inside the settle wait. The normal exit path ends *removed*, exit 1 | Unix |
+| W1 | Ctrl-Break by `GenerateConsoleCtrlEvent` to a helper started with `CREATE_NEW_PROCESS_GROUP`, blocked in the pack upload. The shim child is in the same group and gets the event too, as it would a Ctrl-Break typed in the console: *removed* | Windows |
+| W2 | As W1, then a second Ctrl-Break sent to the helper's group only, during the release: the helper ignores it, and the release child, in its own group, does not receive it and finishes. This pins the group targeting. That a typed Ctrl-C is disabled in that group, and a typed Ctrl-Break is not, is [doc] and not tested | Windows |
 
 W1 and W2 use the method measured in P4, which worked from both the PowerShell tool and Git Bash,
 neither of them an interactive console. If `GenerateConsoleCtrlEvent` fails because no console is
@@ -433,8 +463,11 @@ agent's suggestion). The CLI pin does not move.
 - API names and file layout. A small `cmd/git-remote-proton/shutdown.go` for the coordinator is the
   suggestion. The gate, in-flight tracking and the release instance's constructor go in
   `internal/transport/cli.go`; the register and the typed release in `internal/repo/lock.go`.
-- How `run` creates its pipes and bounds the drain, within S13: the parent closes its copies of the
-  write ends after the child starts, or EOF never comes.
+- How `run` creates its pipe and bounds the drain, within S13: one pipe for both streams, the
+  reader started with the child, and the parent's copy of the write end closed once the child has
+  started, or EOF never comes.
+- How `AcquireLock`'s in-doubt handle is shaped (a flag on `*Lock`, say), within §5.4's contract
+  that callers keep any handle that comes back, error or not.
 - The exact constants, within these limits: S5's waits, S10's pause and per-call bound, S17's
   settle, and the 60 s cap. Changing the cap means changing §5.8's 75 s figures and the docs in §7.
 - Message wording, within §5.6.
@@ -464,7 +497,9 @@ agent's suggestion). The CLI pin does not move.
 - **U8** [inference] That git gives a remote helper its stderr and keeps the helper's stdin and
   stdout as its own pipes (§5.8's stderr rule). This was not read from git's source here.
 - **Residual, by design:** every uncatchable kill in §2 still leaks. That includes S1's own route
-  on Windows. The manual remedy and rule 9 remain the answer.
+  on Windows. The manual remedy and rule 9 remain the answer. A Windows console close usually
+  leaks too (S18). A Ctrl-Break typed during a Windows release can kill a release call, which S10
+  retries until the cap.
 
 ## Revisions
 
@@ -491,6 +526,23 @@ Scaffolding for the review loop; delete it before the plan is written.
   coordinator on a broken stdout (S16 gives the reason); and the note that S3 overstates the
   context plumbing (gitcmd's one context is local to its probe, so the plumbing S3 describes is
   still needed).
+- **Round 2** (all four reported; Codex and agy canaries exact). It found defects in round 1's
+  fixes, now corrected: the normal path no longer releases through the process-wide register,
+  which would have removed another holder's lock in `TestSetHeadRefusesWhenLockHeld`. Instead
+  `AcquireLock` hands back an in-doubt handle that its caller releases, and only the coordinator
+  reads the register (S8, S12, S15, §5.4). The "CLI never started" exemption is gone; the
+  transport cannot tell it apart (§5.4). S18's console-close shortcut, which skipped the safety
+  waits, is reversed: no shortcut (S18, §2). The coordinator never waits on stderr, so a full
+  stderr cannot stop the cleanup (S6, §5.3). The settle wait applies whenever a lock is
+  registered, and on the normal path after an in-doubt acquisition (S17, E18). `run` keeps one
+  merged output stream and drains it while the child runs (S13). The release call's 15 s bound
+  covers its output, with a 2 s drain (S10). `loop` checks its own `Flush` errors (S16). E13 now
+  holds `run()` before the notifications stop. *absent* is worded to cover a lock our own normal
+  release had just removed. Also applied: registration only after staging succeeds; the `Refused`
+  call-count pin made exact; W1's wording and W2 rebuilt on group targeting; roles by base name
+  only (the helper sets no `cmd.Env`); a test-only gate reopen; the release children's group kill
+  on Unix and the narrowed grandchild residual; the next-push wording in §5.8; S1's Git Bash route
+  marked as inference; the pre-existing truncated-batch bug recorded as out of scope (§3).
 
 ## Appendix A — probes, 2026-10-24 21:51–22:00 PT
 
