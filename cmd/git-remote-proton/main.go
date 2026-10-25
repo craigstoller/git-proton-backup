@@ -537,9 +537,11 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 				return 1
 			}
 			batch := []string{line}
+			terminated := false
 			for in.Scan() {
 				l := in.Text()
 				if l == "" {
+					terminated = true
 					break
 				}
 				if strings.HasPrefix(l, "option ") {
@@ -547,6 +549,20 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 					continue
 				}
 				batch = append(batch, l)
+			}
+			// The loop above also stops on EOF or a read error: git died, or the
+			// read failed, before the whole batch arrived. What arrived parses as
+			// a complete batch, so applying it would be a partial set of remote
+			// writes nobody asked for in that shape. Fail closed before any
+			// remote read or write; the defer above still releases the lock.
+			if !terminated {
+				err := in.Err()
+				if err == nil {
+					err = io.ErrUnexpectedEOF
+				}
+				warn(fmt.Errorf("push batch ended without its terminating blank line, "+
+					"so none of it was applied: %w", err))
+				return 1
 			}
 			// One parser for both the poisoned and non-poisoned paths: a
 			// hand-rolled `dst := b[strings.Index(b, ":")+1:]` on the poison
