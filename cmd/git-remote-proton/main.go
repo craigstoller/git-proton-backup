@@ -50,7 +50,9 @@ const createParentsEnv = "GPB_CREATE_PARENTS"
 // main only chooses the process exit code. All cleanup lives in run's defers:
 // calling os.Exit directly from deep inside the command loop would skip every
 // deferred func (Go does not run defers on os.Exit), which is exactly the lock
-// leak the "release on every exit path" rule exists to prevent.
+// leak the "release on every exit path" rule exists to prevent. The one other
+// caller is the shutdown coordinator (shutdown.go, through exitFn): after a
+// signal it releases every registered lock itself, and only then exits.
 func main() {
 	os.Exit(run())
 }
@@ -115,6 +117,8 @@ func dispatchUtility(args []string, stdout, stderr io.Writer) (bool, int) {
 			fmt.Fprintln(stderr, "usage: git-remote-proton --set-head <proton::address> <branch>")
 			return true, 1
 		}
+		// So a shutdown during it says HEAD may or may not have changed (§5.6).
+		curCoord.setMode(modeSetHead)
 		return true, runSetHeadFn(args[2], args[3], stdout, stderr)
 	}
 	return false, 0
@@ -141,13 +145,21 @@ func runSetHead(addr, branch string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// run installs the shutdown coordinator before anything else, so no CLI child
+// can start before a signal would be handled, and routes every return through
+// its finish: with no signal that stops the coordinator and returns the code;
+// once a signal has started shutdown, it waits for the coordinator to end the
+// process (shutdown.go).
 func run() int {
-	if handled, code := dispatchUtility(os.Args, os.Stdout, os.Stderr); handled {
-		return code
+	curCoord = installShutdown()
+	// quietStderr, not os.Stderr: runSetHead's own messages go quiet with warn
+	// once shutdown begins.
+	if handled, code := dispatchUtility(os.Args, os.Stdout, quietStderr); handled {
+		return curCoord.finish(code)
 	}
 	if len(os.Args) < 3 {
 		fmt.Fprintln(os.Stderr, "git-remote-proton: must be run by git as a remote helper")
-		return 1
+		return curCoord.finish(1)
 	}
 	// Canonicalise BEFORE anything else touches the address. Every remote path
 	// in this process is built by concatenation onto root, so a trailing slash
@@ -161,12 +173,12 @@ func run() int {
 	root, err := repo.CanonicalRoot(os.Args[2])
 	if err != nil {
 		warn(err)
-		return 1
+		return curCoord.finish(1)
 	}
 	gitDir, err := resolveGitDir()
 	if err != nil {
 		warn(err)
-		return 1
+		return curCoord.finish(1)
 	}
 	// The rest of GIT_DIR's class, resolved at the same point and for the same
 	// reason. See resolveGitDir's doc for which variables are covered, which
@@ -174,7 +186,7 @@ func run() int {
 	// rather than safe.
 	if err := absolutizeInheritedGitPaths(); err != nil {
 		warn(err)
-		return 1
+		return curCoord.finish(1)
 	}
 	// git sets GIT_DIR (commonly a RELATIVE path, e.g. ".git") in this
 	// process's own environment before spawning the helper. internal/gitcmd
@@ -196,13 +208,17 @@ func run() int {
 	if err := transport.EnforceCertified(cli,
 		os.Getenv(uncertifiedCLIEnv) == "1", os.Stderr); err != nil {
 		warn(err)
-		return 1
+		return curCoord.finish(1)
 	}
 	in := bufio.NewScanner(os.Stdin)
 	out := bufio.NewWriter(os.Stdout)
 	defer out.Flush()
 
-	return loop(transport.NewTraced(cli, os.Stderr), root, gitDir, in, out)
+	code := loop(transport.NewTraced(cli, os.Stderr), root, gitDir, in, out)
+	if afterLoopHook != nil {
+		afterLoopHook()
+	}
+	return curCoord.finish(code)
 }
 
 // resolveGitDir captures GIT_DIR from the environment and resolves it to an
@@ -480,6 +496,8 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 			flush()
 
 		case line == "list for-push":
+			// From here a lock may be held: a shutdown says so (§5.6).
+			curCoord.setMode(modePush)
 			// EnsureParents runs BEFORE Bootstrap, and ONLY here — see
 			// createParentsEnv's doc above for why this is the one and only
 			// call site. Its stderr argument is the real os.Stderr, not the
@@ -633,6 +651,9 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 			// before any pack is built. This call site's job is only to pass
 			// through what ScanRefs just found.
 			remote := scan.Refs
+			// Between these two marks a shutdown says the push did not finish:
+			// its remote writes may have landed while git was told nothing.
+			curCoord.batchStarted()
 			for _, r := range repo.Push(t, root, gitDir, ups, remote, scan.Skipped) {
 				if r.OK {
 					fmt.Fprintf(out, "ok %s\n", r.Ref)
@@ -642,6 +663,7 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 			}
 			fmt.Fprint(out, "\n")
 			flush()
+			curCoord.batchDone()
 
 		case strings.HasPrefix(line, "fetch "):
 			var wants []string
@@ -787,6 +809,11 @@ func parseFetchLine(l string) (sha string, err error) {
 	return sp[1], nil
 }
 
+// warn is silent once shutdown has begun: the coordinator's lines are the
+// account from then on (§5.1).
 func warn(err error) {
+	if silenced.Load() {
+		return
+	}
 	fmt.Fprintf(os.Stderr, "git-remote-proton: %v\n", err)
 }
