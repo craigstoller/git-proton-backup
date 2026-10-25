@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **git-remote-proton: a push batch that git never finished sending is no longer applied.** If
+  git died, or its pipe broke, after sending push lines but before the blank line that ends the
+  batch, the helper ran what had arrived as if it were the whole batch: it uploaded a pack and
+  wrote refs for a push nobody asked for in that shape. It now refuses the batch with a stderr
+  message and exits non-zero before any further remote read or write, and still releases the
+  lock.
+
 ## 0.10.0 — 2026-10-21
 
 The v2 remote helper (`git-remote-proton`) now runs on Linux. The certified Proton Drive CLI is

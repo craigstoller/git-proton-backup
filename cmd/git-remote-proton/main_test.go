@@ -103,6 +103,68 @@ func TestLoop_PushWithoutListForPushRejected(t *testing.T) {
 	}
 }
 
+// TestLoop_TruncatedPushBatchFailsClosed covers a git that dies while still
+// sending a push batch: the push line arrives, the blank line that ends the
+// batch never does. The batch-buffering loop also stops on EOF or a read
+// error, and before the fix nothing checked which, so the truncated batch was
+// parsed and handed to repo.Push as if complete — a pack uploaded and a ref
+// written that nobody asked for in that shape.
+//
+// gitDir is a real repository with a commit, so the push WOULD succeed if it
+// ran: the no-pack and no-ref assertions fail on the unfixed code rather than
+// passing because the push happened to break for some other reason. stdout
+// being exactly the list-for-push advertisement proves the lock was acquired
+// (it is taken before advertising), so the lock assertion checks a real
+// release rather than a lock that was never there.
+func TestLoop_TruncatedPushBatchFailsClosed(t *testing.T) {
+	const script = "list for-push\npush refs/heads/main:refs/heads/main\n" // no blank line
+	for _, tc := range []struct {
+		name       string
+		in         io.Reader
+		wantStderr []string
+	}{
+		{"eof", strings.NewReader(script), []string{"terminating blank line"}},
+		{"read error", io.MultiReader(strings.NewReader(script), errReader{err: errors.New("broken pipe")}),
+			[]string{"terminating blank line", "broken pipe"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ft := transport.NewFake()
+			root := "/my-files/r"
+			gitDir := newGitRepoWithCommit(t)
+			in := bufio.NewScanner(tc.in)
+			var outBuf bytes.Buffer
+			out := bufio.NewWriter(&outBuf)
+
+			var got int
+			stderr := captureStderr(t, func() { got = loop(ft, root, gitDir, in, out) })
+			out.Flush()
+
+			if got != 1 {
+				t.Errorf("loop() = %d, want 1: a push batch git never finished sending must fail closed", got)
+			}
+			if outBuf.String() != "\n" {
+				t.Errorf("stdout = %q, want only the list-for-push advertisement (\"\\n\"): no push status lines for a batch that was never applied", outBuf.String())
+			}
+			for _, w := range tc.wantStderr {
+				if !strings.Contains(stderr, w) {
+					t.Errorf("stderr = %q, want it to contain %q", stderr, w)
+				}
+			}
+			for p := range ft.Files {
+				if strings.HasPrefix(p, root+"/packs/") {
+					t.Errorf("no pack may be uploaded for a truncated batch, found %s", p)
+				}
+			}
+			if _, ok := ft.Files[root+"/refs/heads/main"]; ok {
+				t.Errorf("a truncated batch must not write the ref: found %s/refs/heads/main", root)
+			}
+			if _, ok := ft.Files[root+"/"+repo.LockName]; ok {
+				t.Errorf("the lock must still be released when a truncated batch fails closed: %s/%s is present", root, repo.LockName)
+			}
+		})
+	}
+}
+
 // ambiguousTrashTransport wraps a Fake but makes Trash report Ambiguous with a
 // nil error — the shape that drives repo.Lock.Release to return its "release
 // is unconfirmed" error without any I/O failure occurring. Fake's FailNext is
