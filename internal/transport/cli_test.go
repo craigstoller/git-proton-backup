@@ -6,8 +6,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -80,6 +82,23 @@ const (
 	// pipe buffer to stdout and exits 0, so a test can see that run reads the
 	// pipe while the child is still running instead of after it has exited.
 	roleBigOutput = "big-output"
+
+	// The four gate stand-ins (gate_test.go), below runHangRole. Each ignores
+	// its args and leaves markers named for its pid (writeMarker), so a test
+	// waiting for two children counts two files and can look each one up.
+	// hang and hang-ignore-term write "started" and then wait out lingerCap
+	// unless killed; short-sleep writes "started", sleeps 300 ms, writes
+	// "finished" and exits 0; hang-with-grandchild starts a hang grandchild
+	// that stays in its process group and writes "grandchild", then hangs.
+	roleHang               = "hang"
+	roleHangIgnoreTerm     = "hang-ignore-term"
+	roleShortSleep         = "short-sleep"
+	roleHangWithGrandchild = "hang-with-grandchild"
+
+	// helperGrandchildEnv, set to any value, makes the hang role write a
+	// "grandchild" marker instead of "started": roleHangWithGrandchild's child
+	// is told apart from its parent by the marker's name.
+	helperGrandchildEnv = "GPB_TEST_HELPER_GRANDCHILD"
 )
 
 // bigOutputBytes is how many 'x' bytes roleBigOutput writes: several times any
@@ -125,6 +144,12 @@ func TestMain(m *testing.M) {
 		runEnvEchoRole()
 	case roleBigOutput:
 		runBigOutputRole()
+	case roleHang, roleHangIgnoreTerm:
+		runHangRole(os.Getenv(helperEnv) == roleHangIgnoreTerm)
+	case roleShortSleep:
+		runShortSleepRole()
+	case roleHangWithGrandchild:
+		runHangWithGrandchildRole()
 	}
 	if err := setupHelper(); err != nil {
 		fmt.Fprintln(os.Stderr, "helper setup:", err)
@@ -257,6 +282,56 @@ func runEnvEchoRole() {
 func runBigOutputRole() {
 	os.Stdout.WriteString(strings.Repeat("x", bigOutputBytes) + "\nEND\n")
 	os.Exit(0)
+}
+
+// writeMarker records that this process reached a point: an empty file named
+// <GPB_TEST_HELPER_RELEASE>.<kind>.<pid>. The gate tests point that variable
+// into their own temp dir, so they count only their own children's markers.
+func writeMarker(kind string) {
+	os.WriteFile(fmt.Sprintf("%s.%s.%d", os.Getenv(helperReleaseEnv), kind, os.Getpid()), nil, 0o600)
+}
+
+// runHangRole is the stand-in for a CLI call that never finishes on its own.
+// With ignoreTerm it ignores SIGTERM first, before the marker that tells the
+// test it may start signalling. It then waits like runLingerRole: until the
+// release file appears or lingerCap passes, so a child a test forgot to kill
+// still ends. It never returns.
+func runHangRole(ignoreTerm bool) {
+	if ignoreTerm {
+		signal.Ignore(syscall.SIGTERM)
+	}
+	kind := "started"
+	if os.Getenv(helperGrandchildEnv) != "" {
+		kind = "grandchild"
+	}
+	writeMarker(kind)
+	runLingerRole()
+}
+
+// runShortSleepRole is the stand-in for a call that finishes inside the stop
+// sequence's grace: the "finished" marker exists only if it was not killed. It
+// never returns.
+func runShortSleepRole() {
+	writeMarker("started")
+	time.Sleep(300 * time.Millisecond)
+	writeMarker("finished")
+	os.Exit(0)
+}
+
+// runHangWithGrandchildRole starts a hang grandchild, which stays in this
+// process's group (nothing here asks for a new one), then hangs itself, so the
+// parent is still alive when a release call's bound fires and the kill must
+// take the whole group. The grandchild's stdio is not inherited: the test
+// looks for its pid, not its output. It never returns.
+func runHangWithGrandchildRole() {
+	g := exec.Command(os.Getenv(helperExeEnv))
+	g.Env = append(os.Environ(), helperEnv+"="+roleHang, helperGrandchildEnv+"=1")
+	if err := g.Start(); err != nil {
+		fmt.Fprintln(os.Stderr, "helper could not start its grandchild:", err)
+		os.Exit(3)
+	}
+	writeMarker("started")
+	runLingerRole()
 }
 
 // ensureDirStep is one scripted response: raw combined output plus exit code.

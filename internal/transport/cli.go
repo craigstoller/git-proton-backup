@@ -43,21 +43,23 @@ import (
 var waitDelay = 30 * time.Second
 
 // testHookExited is a test seam: when non-nil, run calls it with the child's pid
-// once the child's exit is observed and before the drain wait begins. Nil in
-// production. Tests set it before a call and clear it after the call returns,
-// never during one.
+// once the child's exit is observed and before the drain wait begins (the
+// call's in-flight record already shows the exit by then). Nil in production.
+// Tests set it before a call and clear it after the call returns, never
+// during one.
 var testHookExited func(pid int)
 
 // CLI drives the proton-drive executable. Only Exe is set by callers; the
 // unexported fields default to today's behaviour when zero: no call timeout,
 // drain bounded by waitDelay, warnings to os.Stderr, not a release instance.
+// Only NewReleaseCLI (gate.go) sets them.
 type CLI struct {
 	Exe string
 
-	callTimeout time.Duration // 0: no bound on a single call (unused until the signal gate)
+	callTimeout time.Duration // 0: no bound on a single call; else the child is killed at callTimeout - drain
 	drain       time.Duration // 0: waitDelay; the post-exit drain bound
 	warnW       io.Writer     // nil: os.Stderr; where run's abandoned-pipe warning goes
-	release     bool          // true only on the instance that releases the lock (unused until the signal gate)
+	release     bool          // exempt from the gate, own process group: the coordinator's instance only
 }
 
 func NewCLI(exe string) *CLI {
@@ -84,53 +86,21 @@ func NewCLI(exe string) *CLI {
 //     stderr, never stdout: stdout is protocol-only;
 //   - the child exited non-zero: an *exec.ExitError, whether or not the drain
 //     finished, and no warning.
+//
+// The gate (gate.go) wraps all of that. A gated call made after ShutGate
+// starts no child and parks, and so does one whose result arrives after it; a
+// release call returns errReleaseClosed once KillReleaseCalls has run. Each
+// call is in an in-flight set from before its start to after its drain, and
+// its record shows the child's exit the moment Wait returns, so StopInFlight
+// and KillReleaseCalls wait on the exit, never on the drain.
 func (c *CLI) run(args ...string) (string, int, error) {
-	cmd := exec.Command(c.Exe, args...)
-	// ONE pipe for both streams: handing the same *os.File to Stdout and Stderr
-	// makes os/exec give the child one handle for both, so the output keeps the
-	// interleaving the child wrote it in (what CombinedOutput did).
-	pr, pw, err := os.Pipe()
+	// The gate comes first: a call it parks creates no pipe and starts no child.
+	f, park, err := admit(c.release)
+	if park != nil {
+		return parked(park)
+	}
 	if err != nil {
 		return "", -1, err
-	}
-	cmd.Stdout, cmd.Stderr = pw, pw
-	if err := cmd.Start(); err != nil {
-		pr.Close()
-		pw.Close()
-		return "", -1, err
-	}
-	// The child has its own copy now. Ours must go, or EOF could never arrive.
-	pw.Close()
-
-	// Read while the child runs: a child that writes more than a pipe buffer
-	// blocks until someone reads. mu guards buf against the copy taken below
-	// when the drain runs out and this goroutine is still appending.
-	var (
-		mu   sync.Mutex
-		buf  []byte
-		done = make(chan struct{})
-	)
-	go func() {
-		defer close(done)
-		chunk := make([]byte, 32*1024)
-		for {
-			n, rerr := pr.Read(chunk)
-			if n > 0 {
-				mu.Lock()
-				buf = append(buf, chunk[:n]...)
-				mu.Unlock()
-			}
-			if rerr != nil {
-				return // io.EOF, or the read end closed by the drain timeout below
-			}
-		}
-	}()
-
-	// With stdio all *os.File there are no copy goroutines inside os/exec, so
-	// Wait returns when the PROCESS exits, whatever still holds the pipe.
-	werr := cmd.Wait()
-	if testHookExited != nil {
-		testHookExited(cmd.Process.Pid)
 	}
 
 	// Bounds the post-exit pipe drain so a grandchild holding the inherited
@@ -140,22 +110,54 @@ func (c *CLI) run(args ...string) (string, int, error) {
 	if limit <= 0 {
 		limit = waitDelay
 	}
-	timer := time.NewTimer(limit)
-	defer timer.Stop()
-	drained := false
-	select {
-	case <-done:
-		drained = true
-		pr.Close()
-	case <-timer.C:
-		// Abandon the pipe. Close from a goroutine nobody waits on: on Windows
-		// Close can block behind a Read that is still in progress, and that
-		// Read ends only when the grandchild lets go.
-		go pr.Close()
+
+	cmd := exec.Command(c.Exe, args...)
+	if c.release {
+		setOwnGroup(cmd)
 	}
-	mu.Lock()
-	out := string(buf)
-	mu.Unlock()
+	// ONE pipe for both streams: handing the same *os.File to Stdout and Stderr
+	// makes os/exec give the child one handle for both, so the output keeps the
+	// interleaving the child wrote it in (what CombinedOutput did).
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return f.noChild(err)
+	}
+	cmd.Stdout, cmd.Stderr = pw, pw
+	// A bounded call is killed at callTimeout - limit, counted from here, so
+	// the drain that follows the kill still ends inside callTimeout.
+	killAt := time.Now().Add(c.callTimeout - limit)
+	// No lock is held across the start (gate.go).
+	if err := startCmd(cmd); err != nil {
+		pr.Close()
+		pw.Close()
+		return f.noChild(err)
+	}
+	// The child has its own copy now. Ours must go, or EOF could never arrive.
+	pw.Close()
+	out := readPipe(pr)
+	f.fill(cmd.Process)
+	var bound *time.Timer
+	if c.callTimeout > 0 {
+		bound = time.AfterFunc(time.Until(killAt), f.killAtBound)
+	}
+
+	// With stdio all *os.File there are no copy goroutines inside os/exec, so
+	// Wait returns when the PROCESS exits, whatever still holds the pipe.
+	werr := cmd.Wait()
+	f.exit()
+	if bound != nil {
+		bound.Stop() // a callback already running finds the exit recorded and does nothing
+	}
+	if testHookExited != nil {
+		testHookExited(cmd.Process.Pid)
+	}
+
+	text, drained := out.finish(limit)
+	// The drain closed the read end on both its paths (at EOF, or abandoned
+	// from a goroutine), so a call that parks here leaks no reader.
+	if park := f.leave(); park != nil {
+		return parked(park)
+	}
 
 	err = werr
 	if !drained && werr == nil {
@@ -173,9 +175,62 @@ func (c *CLI) run(args ...string) (string, int, error) {
 	// If Wait never produced a ProcessState, ExitCode() would panic. Fail
 	// closed instead: report a non-zero code and the error.
 	if cmd.ProcessState == nil {
-		return out, -1, err
+		return text, -1, err
 	}
-	return out, cmd.ProcessState.ExitCode(), err
+	return text, cmd.ProcessState.ExitCode(), err
+}
+
+// pipeReader drains a child's merged output on its own goroutine while the
+// child runs: a child that writes more than a pipe buffer blocks until someone
+// reads. mu guards buf against the copy finish takes when the drain runs out
+// and the goroutine is still appending.
+type pipeReader struct {
+	pr   *os.File
+	mu   sync.Mutex
+	buf  []byte
+	done chan struct{} // closed when the reader stops
+}
+
+func readPipe(pr *os.File) *pipeReader {
+	r := &pipeReader{pr: pr, done: make(chan struct{})}
+	go func() {
+		defer close(r.done)
+		chunk := make([]byte, 32*1024)
+		for {
+			n, rerr := pr.Read(chunk)
+			if n > 0 {
+				r.mu.Lock()
+				r.buf = append(r.buf, chunk[:n]...)
+				r.mu.Unlock()
+			}
+			if rerr != nil {
+				return // io.EOF, or the read end closed by finish's timeout
+			}
+		}
+	}()
+	return r
+}
+
+// finish gives the drain up to limit to reach EOF, once the child has exited,
+// and returns what was read and whether the drain finished. The read end is
+// closed either way.
+func (r *pipeReader) finish(limit time.Duration) (string, bool) {
+	timer := time.NewTimer(limit)
+	defer timer.Stop()
+	drained := false
+	select {
+	case <-r.done:
+		drained = true
+		r.pr.Close()
+	case <-timer.C:
+		// Abandon the pipe. Close from a goroutine nobody waits on: on Windows
+		// Close can block behind a Read that is still in progress, and that
+		// Read ends only when the grandchild lets go.
+		go r.pr.Close()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return string(r.buf), drained
 }
 
 // nodeWire mirrors the CLI payload. activeRevision is json.RawMessage because
