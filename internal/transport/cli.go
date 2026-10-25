@@ -9,21 +9,23 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
-// waitDelay bounds how long Wait may block draining the child's output pipes
+// waitDelay bounds how long run may block draining the child's output pipe
 // AFTER the child itself has already exited. It is not a command timeout.
 //
-// MECHANISM (documented os/exec behaviour, not speculation). CombinedOutput
-// sets Stdout/Stderr to a *bytes.Buffer, which is not an *os.File, so os/exec
-// creates an os.Pipe(), hands the write end to the child, and copies from the
-// read end on a goroutine. Wait does not return until that goroutine sees EOF,
-// and EOF requires EVERY holder of the write end to close it — not just the
-// direct child. proton-drive is a Node program; a Node process that spawns a
-// worker or keeps a helper alive passes the inherited handle to a grandchild,
-// and we block forever. WaitDelay makes os/exec close the pipe and give up
-// instead (go.dev/issue/23019).
+// MECHANISM. The child's stdout and stderr are one os.Pipe, and EOF on its read
+// end requires EVERY holder of the write end to close it — not just the direct
+// child. proton-drive is a Node program; a Node process that spawns a worker or
+// keeps a helper alive passes the inherited handle to a grandchild, and a
+// drain that waits for EOF blocks forever. run therefore reads the pipe on its
+// own goroutine, waits for the PROCESS apart from that drain, and gives the
+// drain this long to reach EOF once the process has exited; past that it closes
+// the read end and uses what it has. (Before run owned the pipe, os/exec's own
+// copy goroutine did the draining and cmd.WaitDelay was the bound on it,
+// go.dev/issue/23019; the bound is the same, applied to the explicit drain.)
 //
 // This was OBSERVED during the Stage 2.1 live gate: the first `git push` hung
 // past a two-minute timeout AFTER its success output had already been
@@ -34,13 +36,29 @@ import (
 // It is a var, not a const, only so the test can shrink it; nothing in
 // production writes to it.
 //
-// LIMIT, stated plainly: with no Context set, the WaitDelay timer starts when
-// Wait observes the child has exited. A child that never exits at all is NOT
-// bounded by this. That is the correct scope — the observed hang was after the
-// child exited, and a real command timeout is a separate, unrelated decision.
+// LIMIT, stated plainly: the timer starts when run observes the child has
+// exited. A child that never exits at all is NOT bounded by this. That is the
+// correct scope — the observed hang was after the child exited, and a real
+// command timeout is a separate, unrelated decision.
 var waitDelay = 30 * time.Second
 
-type CLI struct{ Exe string }
+// testHookExited is a test seam: when non-nil, run calls it with the child's pid
+// once the child's exit is observed and before the drain wait begins. Nil in
+// production. Tests set it before a call and clear it after the call returns,
+// never during one.
+var testHookExited func(pid int)
+
+// CLI drives the proton-drive executable. Only Exe is set by callers; the
+// unexported fields default to today's behaviour when zero: no call timeout,
+// drain bounded by waitDelay, warnings to os.Stderr, not a release instance.
+type CLI struct {
+	Exe string
+
+	callTimeout time.Duration // 0: no bound on a single call (unused until the signal gate)
+	drain       time.Duration // 0: waitDelay; the post-exit drain bound
+	warnW       io.Writer     // nil: os.Stderr; where run's abandoned-pipe warning goes
+	release     bool          // true only on the instance that releases the lock (unused until the signal gate)
+}
 
 func NewCLI(exe string) *CLI {
 	if exe == "" {
@@ -49,33 +67,115 @@ func NewCLI(exe string) *CLI {
 	return &CLI{Exe: exe}
 }
 
+// run starts the CLI and returns its merged stdout+stderr, its exit code and an
+// error. It owns the child's output pipe instead of delegating to
+// CombinedOutput, so the child's EXIT is observed apart from the DRAIN of its
+// output: exit means the process has gone, which is what a caller deciding
+// whether the remote is quiet needs to know; the drain can lag it by as long as
+// a grandchild holds the pipe open.
+//
+// Error contract (unchanged from CombinedOutput with WaitDelay set):
+//   - the child could not be started: code -1 and the start error;
+//   - the child exited 0 and the drain finished: nil error;
+//   - the child exited 0 but the drain ran out: the output read so far, code 0
+//     and exec.ErrWaitDelay (the command SUCCEEDED; every caller branches on
+//     code != 0 first, so this flows through as the success it is), plus a
+//     warning on stderr so a recurrence is diagnosable instead of invisible —
+//     stderr, never stdout: stdout is protocol-only;
+//   - the child exited non-zero: an *exec.ExitError, whether or not the drain
+//     finished, and no warning.
 func (c *CLI) run(args ...string) (string, int, error) {
 	cmd := exec.Command(c.Exe, args...)
+	// ONE pipe for both streams: handing the same *os.File to Stdout and Stderr
+	// makes os/exec give the child one handle for both, so the output keeps the
+	// interleaving the child wrote it in (what CombinedOutput did).
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return "", -1, err
+	}
+	cmd.Stdout, cmd.Stderr = pw, pw
+	if err := cmd.Start(); err != nil {
+		pr.Close()
+		pw.Close()
+		return "", -1, err
+	}
+	// The child has its own copy now. Ours must go, or EOF could never arrive.
+	pw.Close()
+
+	// Read while the child runs: a child that writes more than a pipe buffer
+	// blocks until someone reads. mu guards buf against the copy taken below
+	// when the drain runs out and this goroutine is still appending.
+	var (
+		mu   sync.Mutex
+		buf  []byte
+		done = make(chan struct{})
+	)
+	go func() {
+		defer close(done)
+		chunk := make([]byte, 32*1024)
+		for {
+			n, rerr := pr.Read(chunk)
+			if n > 0 {
+				mu.Lock()
+				buf = append(buf, chunk[:n]...)
+				mu.Unlock()
+			}
+			if rerr != nil {
+				return // io.EOF, or the read end closed by the drain timeout below
+			}
+		}
+	}()
+
+	// With stdio all *os.File there are no copy goroutines inside os/exec, so
+	// Wait returns when the PROCESS exits, whatever still holds the pipe.
+	werr := cmd.Wait()
+	if testHookExited != nil {
+		testHookExited(cmd.Process.Pid)
+	}
+
 	// Bounds the post-exit pipe drain so a grandchild holding the inherited
 	// write end cannot hang the helper forever. See waitDelay: DO NOT DELETE
 	// this as unnecessary — the hang it prevents is invisible when it happens.
-	cmd.WaitDelay = waitDelay
-	out, err := cmd.CombinedOutput()
-	if errors.Is(err, exec.ErrWaitDelay) {
-		// The command itself SUCCEEDED. os/exec substitutes ErrWaitDelay for a
-		// nil error only when the process exited with a successful status
-		// (exec.go: `if err == nil { err = goroutineErr }`), and ProcessState
-		// is set, so the exit code returned below is the real one and every
-		// caller here — all of which branch on code != 0 first — flows through
-		// as the success it is. Warn so a recurrence is diagnosable instead of
-		// invisible. stderr, never stdout: stdout is protocol-only.
-		fmt.Fprintf(os.Stderr, "git-remote-proton: %s exited but something still held its "+
+	limit := c.drain
+	if limit <= 0 {
+		limit = waitDelay
+	}
+	timer := time.NewTimer(limit)
+	defer timer.Stop()
+	drained := false
+	select {
+	case <-done:
+		drained = true
+		pr.Close()
+	case <-timer.C:
+		// Abandon the pipe. Close from a goroutine nobody waits on: on Windows
+		// Close can block behind a Read that is still in progress, and that
+		// Read ends only when the grandchild lets go.
+		go pr.Close()
+	}
+	mu.Lock()
+	out := string(buf)
+	mu.Unlock()
+
+	err = werr
+	if !drained && werr == nil {
+		// The command itself SUCCEEDED: only the drain ran out. This is the
+		// exec.ErrWaitDelay carve-out documented above, now produced here.
+		err = exec.ErrWaitDelay
+		w := c.warnW
+		if w == nil {
+			w = os.Stderr
+		}
+		fmt.Fprintf(w, "git-remote-proton: %s exited but something still held its "+
 			"output pipe open after %s; the pipe was abandoned and the command's result used "+
-			"as-is (output may be truncated)\n", c.Exe, waitDelay)
+			"as-is (output may be truncated)\n", c.Exe, limit)
 	}
-	// If the executable never started (not on PATH, permission denied, etc.),
-	// cmd.ProcessState is nil and ExitCode() would panic. Fail closed instead:
-	// report a non-zero code and the start error.
+	// If Wait never produced a ProcessState, ExitCode() would panic. Fail
+	// closed instead: report a non-zero code and the error.
 	if cmd.ProcessState == nil {
-		return string(out), -1, err
+		return out, -1, err
 	}
-	code := cmd.ProcessState.ExitCode()
-	return string(out), code, err
+	return out, cmd.ProcessState.ExitCode(), err
 }
 
 // nodeWire mirrors the CLI payload. activeRevision is json.RawMessage because
