@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/craigstoller/git-proton-backup/internal/gitcmd"
+	"github.com/craigstoller/git-proton-backup/internal/repo"
 	"github.com/craigstoller/git-proton-backup/internal/testcli"
 	"github.com/craigstoller/git-proton-backup/internal/transport"
 )
@@ -48,6 +49,10 @@ func TestMain(m *testing.M) {
 	// function back through realProbeRestoreFloor.
 	realProbeRestoreFloor = probeRestoreFloor
 	probeRestoreFloor = func(string) (gitcmd.ProbeResult, string) { return gitcmd.ProbeOK, "" }
+	// An in-doubt lock handle settles (5 s in production) before its release
+	// reads the remote. Nothing here has a late request to wait out, so the
+	// wait is only time spent.
+	repo.SettleDelay = 0
 	os.Exit(m.Run())
 }
 

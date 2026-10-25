@@ -320,10 +320,24 @@ func absolutizeInheritedGitPaths() error {
 // from run so the fail-closed exit-code paths can be exercised directly with
 // an in-memory transport.Fake and buffered io.Reader/io.Writer in tests — no
 // live account, no real git remote.
-func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bufio.Writer) int {
+//
+// code is named so a deferred step can adjust it.
+func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bufio.Writer) (code int) {
 	var opts protocol.Options
 	var lock *repo.Lock
 	var checkConnectivity bool
+	// writeFailed records that a write to git failed. Every Flush below goes
+	// through flush, and the second defer flushes once more, so a failure cannot
+	// be hidden: run()'s own deferred Flush runs after loop has returned and
+	// could never change the code. A bufio.Writer keeps its first write error
+	// and returns it from every later Flush, so that last flush also catches a
+	// failure inside an Fprint that was never flushed on its own.
+	writeFailed := false
+	flush := func() {
+		if err := out.Flush(); err != nil {
+			writeFailed = true
+		}
+	}
 	defer func() {
 		if lock != nil {
 			// Release on EVERY exit path; a leak wedges the repo. Its error is
@@ -346,6 +360,17 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 			}
 		}
 	}()
+	// Registered after the release defer, so it runs first: git gets its last
+	// output before a release that may wait out an in-doubt lock's settle.
+	defer func() {
+		flush()
+		// git owns both pipes: once stdout is broken, nothing said here reaches
+		// it, and a session whose answers were lost is not a successful one.
+		// Only a 0 is raised; a failure already being reported stays as it is.
+		if writeFailed && code == 0 {
+			code = 1
+		}
+	}()
 
 	for in.Scan() {
 		line := in.Text()
@@ -355,7 +380,7 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 			// recognises a connectivity-ok response from a helper that
 			// advertised the capability.
 			fmt.Fprint(out, "option\npush\nfetch\ncheck-connectivity\n\n")
-			out.Flush()
+			flush()
 
 		case strings.HasPrefix(line, "option "):
 			// check-connectivity is HONOURED, not poisoned: poison exists for
@@ -363,12 +388,12 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 			if v, ok := strings.CutPrefix(line, "option check-connectivity "); ok {
 				checkConnectivity = strings.TrimSpace(v) == "true"
 				fmt.Fprint(out, "ok\n")
-				out.Flush()
+				flush()
 				continue
 			}
 			opts.Observe(line)
 			fmt.Fprint(out, "unsupported\n") // advisory only; poison flag is the real defence
-			out.Flush()
+			flush()
 
 		case line == "list":
 			// The FETCH-side advertisement. Read-only: no Bootstrap, no lock.
@@ -452,7 +477,7 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 				}
 			}
 			fmt.Fprint(out, "\n")
-			out.Flush()
+			flush()
 
 		case line == "list for-push":
 			// EnsureParents runs BEFORE Bootstrap, and ONLY here — see
@@ -477,11 +502,16 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 			// holding the single-writer lock. It only ever warns.
 			warnRestoreFloor(gitDir)
 			l, err := repo.AcquireLock(t, root) // BEFORE advertising
+			// A handle can come back WITH an error: the upload may have landed
+			// without us knowing. Keep it either way, so the release defer
+			// settles and removes it; the session still fails on the error.
+			if l != nil {
+				lock = l
+			}
 			if err != nil {
 				warn(err)
 				return 1
 			}
-			lock = l
 			scan, err := repo.ScanRefs(t, root)
 			if err != nil {
 				warn(err)
@@ -499,7 +529,7 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 				fmt.Fprintf(out, "%s %s\n", sha, name)
 			}
 			fmt.Fprint(out, "\n")
-			out.Flush()
+			flush()
 
 			// The push-survey HEAD diagnostic: ADVISORY, and COST-GATED on
 			// something already having been skipped. This is deliberately
@@ -588,7 +618,7 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 					fmt.Fprintf(out, "error %s unsupported option %s\n", u.Dst, opts.Poisoned)
 				}
 				fmt.Fprint(out, "\n")
-				out.Flush()
+				flush()
 				continue
 			}
 			scan, err := repo.ScanRefs(t, root)
@@ -611,7 +641,7 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 				}
 			}
 			fmt.Fprint(out, "\n")
-			out.Flush()
+			flush()
 
 		case strings.HasPrefix(line, "fetch "):
 			var wants []string
@@ -670,7 +700,7 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 				fmt.Fprint(out, "connectivity-ok\n")
 			}
 			fmt.Fprint(out, "\n")
-			out.Flush()
+			flush()
 
 		case line == "":
 			return 0

@@ -235,6 +235,118 @@ func TestLoop_LockReleaseFailureIsReportedButDoesNotFailThePush(t *testing.T) {
 	}
 }
 
+// failWriter fails every Write: git's end of the pipe is gone.
+type failWriter struct{}
+
+func (failWriter) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
+
+// TestLoop_FailedProtocolWriteExitsOneAndReleases covers a git that is gone
+// while the helper still has something to say. Flush errors used to be dropped
+// and run()'s deferred Flush could not change the code, so a session whose
+// advertisement never reached git ended in a reported success.
+//
+// The session is a bare "list for-push" and then EOF, so the only thing that
+// can turn this exit into a 1 is the failed write itself. stderr must be empty
+// as well: every early return in the list-for-push arm warns, so silence is what
+// proves the run got as far as the advertisement and the 1 is not one of those.
+func TestLoop_FailedProtocolWriteExitsOneAndReleases(t *testing.T) {
+	ft := transport.NewFake()
+	const root = "/my-files/r"
+	in := bufio.NewScanner(strings.NewReader("list for-push\n"))
+	out := bufio.NewWriter(failWriter{})
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(ft, root, ".", in, out) })
+
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want nothing: the session was meant to reach the advertisement", stderr)
+	}
+	if got != 1 {
+		t.Errorf("loop() = %d, want 1: a protocol write that failed must not be reported as a successful session", got)
+	}
+	if _, ok := ft.Files[root+"/"+repo.MarkerName]; !ok {
+		t.Errorf("no marker at %s/%s: the session did not reach Bootstrap and the lock", root, repo.MarkerName)
+	}
+	if _, ok := ft.Files[root+"/"+repo.LockName]; ok {
+		t.Errorf("the lock must be released when the write fails: %s/%s is present", root, repo.LockName)
+	}
+}
+
+// inDoubtLockTransport wraps a Fake so that CreateExclusive for the lock lands
+// the upload and then reports Ambiguous with an error: a killed or timed-out
+// upload the server went on to apply. Everything else passes through.
+type inDoubtLockTransport struct{ *transport.Fake }
+
+func (c inDoubtLockTransport) CreateExclusive(p, local string) (transport.Outcome, error) {
+	if !strings.HasSuffix(p, "/"+repo.LockName) {
+		return c.Fake.CreateExclusive(p, local)
+	}
+	body, err := os.ReadFile(local)
+	if err != nil {
+		return transport.Ambiguous, err
+	}
+	c.Files[p] = body
+	return transport.Ambiguous, errors.New("upload timed out")
+}
+
+// TestLoop_InDoubtAcquisitionIsReleasedOnExit covers the acquisition that fails
+// after its lock reached the remote. AcquireLock hands back the handle together
+// with the error, and loop used to drop the handle on the error, so the lock
+// stayed on the remote and every later push was refused until a human cleared it.
+//
+// The session still fails (the acquisition error is warned and loop returns 1);
+// what changes is that the handle is kept and the defer releases it.
+func TestLoop_InDoubtAcquisitionIsReleasedOnExit(t *testing.T) {
+	ft := transport.NewFake()
+	const root = "/my-files/r"
+	in := bufio.NewScanner(strings.NewReader("list for-push\n"))
+	out := bufio.NewWriter(&bytes.Buffer{})
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(inDoubtLockTransport{ft}, root, ".", in, out) })
+
+	if got != 1 {
+		t.Errorf("loop() = %d, want 1: a lock acquisition that errored fails the session", got)
+	}
+	if !strings.Contains(stderr, "upload timed out") {
+		t.Errorf("stderr = %q, want the acquisition error", stderr)
+	}
+	if _, ok := ft.Files[root+"/"+repo.LockName]; ok {
+		t.Errorf("an in-doubt lock must be released on exit: %s/%s is still present", root, repo.LockName)
+	}
+}
+
+// TestLoop_CleanSessionStillExitsZero guards the other direction of the two
+// tests above: a session whose writes all succeed is still a 0, and its output
+// still reaches the writer now that loop's own final flush is what delivers it.
+func TestLoop_CleanSessionStillExitsZero(t *testing.T) {
+	for _, tc := range []struct {
+		name, script string
+	}{
+		{"capabilities", "capabilities\n"},
+		{"list for-push", "list for-push\n\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ft := transport.NewFake()
+			const root = "/my-files/r"
+			var outBuf bytes.Buffer
+			in := bufio.NewScanner(strings.NewReader(tc.script))
+
+			got := loop(ft, root, ".", in, bufio.NewWriter(&outBuf))
+
+			if got != 0 {
+				t.Errorf("loop() = %d, want 0: nothing failed in this session", got)
+			}
+			if outBuf.Len() == 0 {
+				t.Error("nothing reached the writer")
+			}
+			if _, ok := ft.Files[root+"/"+repo.LockName]; ok {
+				t.Errorf("the lock must be released: %s/%s is present", root, repo.LockName)
+			}
+		})
+	}
+}
+
 // TestLoop_ListForPush_CreateParentsEnvCreatesParents is RED (Task 11): the
 // protocol path honours GPB_CREATE_PARENTS, set via t.Setenv exactly as the
 // task's environment rules require — read fresh from the real process
