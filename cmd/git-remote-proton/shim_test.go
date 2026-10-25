@@ -70,9 +70,11 @@ const (
 )
 
 // afterLoopReady is the file the held run() writes in the shim's ready dir
-// (testcli.ReadyDirEnv) once loop has returned; holdLimit bounds the hold.
+// (testcli.ReadyDirEnv) once loop has returned; afterLoopGo, created there by
+// the test, lets run() go on; holdLimit bounds the hold.
 const (
 	afterLoopReady = "ready-after-loop"
+	afterLoopGo    = "after-loop.go"
 	holdLimit      = 30 * time.Second
 )
 
@@ -158,15 +160,21 @@ func helperRole() int {
 }
 
 // holdAfterLoop holds run() between loop's return and finish (E13): it writes
-// afterLoopReady in the ready dir, then waits for the test's signal, whose
-// shutdown ends the process. After holdLimit it gives up and lets run() finish.
+// afterLoopReady in the ready dir, then waits until the test creates
+// afterLoopGo there, which it does once its signal's shutdown has begun. After
+// holdLimit it gives up and lets run() finish.
 func holdAfterLoop() {
-	ready := filepath.Join(os.Getenv(testcli.ReadyDirEnv), afterLoopReady)
+	dir := os.Getenv(testcli.ReadyDirEnv)
+	ready := filepath.Join(dir, afterLoopReady)
 	if err := os.WriteFile(ready, nil, 0o644); err != nil {
 		fmt.Fprintf(os.Stderr, "git-remote-proton-testhelper: cannot write %s: %v\n", ready, err)
 		return
 	}
-	time.Sleep(holdLimit)
+	for end := time.Now().Add(holdLimit); time.Now().Before(end); time.Sleep(10 * time.Millisecond) {
+		if _, err := os.Stat(filepath.Join(dir, afterLoopGo)); err == nil {
+			return
+		}
+	}
 }
 
 // copyTestBinary copies this test binary into dir under base, plus ".exe" on

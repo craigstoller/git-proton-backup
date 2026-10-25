@@ -61,6 +61,16 @@ type helperOpts struct {
 	// Production keeps the production shutdown timings. Otherwise the helper
 	// gets GPB_TEST_SHRINK=1 (helperRole).
 	Production bool
+	// Wrapper, when set, is an argv prefix the helper is started through:
+	// Wrapper[0] runs with Wrapper[1:], then the helper's path, then Args. It
+	// must exec the helper, so the pid the test signals is the helper's. E6
+	// uses sh -c 'trap "" HUP; exec "$0" "$@"', so the helper starts with SIGHUP
+	// already ignored.
+	Wrapper []string
+	// Seed, when non-nil, is given the shim's tree once the /my-files mount is
+	// made and before the helper starts, for a case whose helper reads the
+	// remote before the test could otherwise seed it (--set-head reads at once).
+	Seed func(tree string)
 }
 
 // helperRun is one running helper.
@@ -109,6 +119,9 @@ func startHelper(t *testing.T, opts helperOpts) *helperRun {
 	if err := os.MkdirAll(testcli.LocalPath(tree, "/my-files"), 0o755); err != nil {
 		t.Fatalf("create the /my-files mount in the shim tree: %v", err)
 	}
+	if opts.Seed != nil {
+		opts.Seed(tree)
+	}
 	ready := t.TempDir()
 
 	gitDir, workDir := opts.GitDir, opts.GitDir
@@ -128,7 +141,8 @@ func startHelper(t *testing.T, opts helperOpts) *helperRun {
 		args = []string{"origin", addr}
 	}
 
-	cmd := exec.Command(copyTestBinary(t, t.TempDir(), helperExeBase), args...)
+	argv := append(append(append([]string(nil), opts.Wrapper...), copyTestBinary(t, t.TempDir(), helperExeBase)), args...)
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = workDir
 	// The variables this harness decides, whatever the test process carries.
 	env := withoutKeys(os.Environ(), append([]string{"GIT_DIR", testcli.BlockEnv, testcli.ReadyDirEnv,
@@ -540,6 +554,25 @@ const (
 // holds, or may hold, the lock.
 func pushCatch(sig string) string {
 	return linePrefix + "received " + sig + ": stopping the push and checking the remote lock, which takes up to a minute"
+}
+
+// noLockCatch is the whole catch line for sig (its Unix name) when no lock is
+// registered.
+func noLockCatch(sig string) string {
+	return linePrefix + "received " + sig + ": stopping (this process holds no remote lock)\n"
+}
+
+// waitStderr waits up to within for the helper's collected stderr to hold s,
+// and fails the test at the deadline.
+func (h *helperRun) waitStderr(t *testing.T, s string, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for !strings.Contains(h.stderrText(), s) {
+		if time.Now().After(deadline) {
+			t.Fatalf("stderr had not shown %q %v after the wait began; stderr so far:\n%s", s, within, h.stderrText())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // remedyWords is the manual remedy a failed or not-attempted result line ends
