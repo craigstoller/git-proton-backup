@@ -3757,8 +3757,8 @@ func TestAcquireLockFailsClosedOnUnrecognisedOutcome(t *testing.T) {
 	if err == nil {
 		t.Fatal("AcquireLock must fail closed on an unrecognised outcome")
 	}
-	if l != nil {
-		t.Error("no Lock may be handed back when the outcome was not recognised")
+	if l == nil || !l.InDoubt() {
+		t.Error("an unrecognised outcome must hand back an in-doubt handle, never a held one")
 	}
 	if !strings.Contains(err.Error(), "outcome(42)") {
 		t.Errorf("the refusal must name the outcome it saw, got: %v", err)
