@@ -30,6 +30,7 @@ Feature work is specified and planned in dated pairs under [superpowers/](superp
 
 - [superpowers/specs/2026-10-15-v2-linux-port-design.md](superpowers/specs/2026-10-15-v2-linux-port-design.md) - The Linux port of `git-remote-proton`: the findings behind it (F1–F14), the case-variant ref rule, the install and gate design, and Craig's rulings D1–D8. Approved 2026-10-16; its design record is v6.9 of the v2 design doc.
 - [superpowers/plans/2026-10-16-v2-linux-port.md](superpowers/plans/2026-10-16-v2-linux-port.md) - The 12-task implementation plan for that spec.
+- [superpowers/specs/2026-10-24-v2-lock-release-on-signal-design.md](superpowers/specs/2026-10-24-v2-lock-release-on-signal-design.md) - Making `git-remote-proton` release its remote `.lock` when a push is killed by a signal it can catch, on both platforms: what can and cannot be caught (probed), the shutdown sequence, and recommendations S1–S12. Draft, awaiting Craig's approval.
 
 ## Conventions
 
