@@ -7,10 +7,12 @@ Linux spec (`docs/superpowers/specs/2026-10-24-v2-linux-unattended-design.md`, o
 `claude/strange-dewdney-e8fc56` until it lands), which kept that work docs-only and made this fix a
 separate task for both platforms. Its fact K15 found the gap.
 
-**Status: draft, awaiting Craig's approval.** Craig handed every choice to the agent ("Skip the
-questions and go with your recommendations", 2026-10-24 21:46 PT). So each decision in §4 is
-**the agent's recommendation**, not a ruling. Each becomes one only when Craig approves this
-document. No code is written until then.
+**Status: approved by Craig, 2026-10-24 23:08 PT** ("Approved, write the plan"). Craig had handed
+every choice to the agent ("Skip the questions and go with your recommendations", 21:46 PT), so
+each decision in §4 is **the agent's recommendation, approved by Craig** with the document. The
+plan is `docs/superpowers/plans/2026-10-24-v2-lock-release-on-signal.md`. The review history
+(three full-panel rounds, round 3's fixes not re-reviewed) is in this file's git log, commits
+`61fe262`, `b753743` and `10bc801`.
 
 **Basis marks.** **[code]** read from the tree at `8848f41`. **[doc]** a named external document,
 read 2026-10-24. **[record]** a document in this repo. **[measured Pn]** probe *n* in Appendix A,
@@ -128,7 +130,7 @@ kills stay uncatchable, and §7 says so in the release notes.
   protocol write failed exits 1 instead of 0 (S16).
 - A helper that hangs after a signal, or prints that it removed a lock it did not remove.
 
-## 4. Decisions (the agent's recommendations)
+## 4. Decisions (the agent's recommendations, approved by Craig 2026-10-24)
 
 | # | Decision | Considered and not taken | Basis |
 |---|---|---|---|
@@ -532,68 +534,6 @@ agent's suggestion). The CLI pin does not move.
   on Windows. The manual remedy and rule 9 remain the answer. A Windows console close usually
   leaks too (S18). A Ctrl-Break typed during a Windows release can kill a release call, which S10
   retries until the cap.
-
-## Revisions
-
-Scaffolding for the review loop; delete it before the plan is written.
-
-- **Round 1** (Codex, Gemini via agy, and DeepSeek reported; Kimi INCOMPLETE, canary missing; its
-  findings were checked against the code before use). Applied: confirmed process exit instead of
-  "kill delivered", with `run` reworked so exit and output drain are separate (S5, S13); a settle
-  wait before reading the lock, for requests that land after the child dies (S17); a killed lock
-  upload, which returns an error, keeps its registration (§1.4, §5.4, S8); typed release outcomes,
-  so no false "released" (§5.5, §5.6, S8); the "refs reported ok" claim removed (statuses are
-  flushed only after the batch); a process-wide gate with one exemption, and the register placed in
-  `internal/repo` (S14, S15); the protocol goroutine parked after a child returns too, and its
-  warnings suppressed (S3, §5.1); an independent cap timer, gate before any stderr write (S6,
-  §5.3); per-call bound and retry categories for the release (S10); release children in their own
-  process group (S7); a failed protocol write exits 1 (S16); a cut-short sequence for Windows
-  console close (S18); the logoff/shutdown row and the mintty case in §2; the stderr-pipe and
-  `pipefail` rules and `--kill-after` sizing in §5.8; who sees S11's exit code; the goals reworded
-  to "no new remote write starts"; tests E11–E17 and W2, a shim that can block more than once and
-  can land a file late, helper and shim roles told apart, and no `Notify` leak from in-process
-  `run()` calls; §7's index wording, the Linux sentence pinned, the Windows caveat in the
-  CHANGELOG. Rejected: probing U1/U2 before coding (it needs the signed-in CLI and the account,
-  which this task must not touch; the gate check in §8 is the first safe point); starting the
-  coordinator on a broken stdout (S16 gives the reason); and the note that S3 overstates the
-  context plumbing (gitcmd's one context is local to its probe, so the plumbing S3 describes is
-  still needed).
-- **Round 2** (all four reported; Codex and agy canaries exact). It found defects in round 1's
-  fixes, now corrected: the normal path no longer releases through the process-wide register,
-  which would have removed another holder's lock in `TestSetHeadRefusesWhenLockHeld`. Instead
-  `AcquireLock` hands back an in-doubt handle that its caller releases, and only the coordinator
-  reads the register (S8, S12, S15, §5.4). The "CLI never started" exemption is gone; the
-  transport cannot tell it apart (§5.4). S18's console-close shortcut, which skipped the safety
-  waits, is reversed: no shortcut (S18, §2). The coordinator never waits on stderr, so a full
-  stderr cannot stop the cleanup (S6, §5.3). The settle wait applies whenever a lock is
-  registered, and on the normal path after an in-doubt acquisition (S17, E18). `run` keeps one
-  merged output stream and drains it while the child runs (S13). The release call's 15 s bound
-  covers its output, with a 2 s drain (S10). `loop` checks its own `Flush` errors (S16). E13 now
-  holds `run()` before the notifications stop. *absent* is worded to cover a lock our own normal
-  release had just removed. Also applied: registration only after staging succeeds; the `Refused`
-  call-count pin made exact; W1's wording and W2 rebuilt on group targeting; roles by base name
-  only (the helper sets no `cmd.Env`); a test-only gate reopen; the release children's group kill
-  on Unix and the narrowed grandchild residual; the next-push wording in §5.8; S1's Git Bash route
-  marked as inference; the pre-existing truncated-batch bug recorded as out of scope (§3).
-- **Round 3** (Codex, DeepSeek and Kimi reported; agy's first run was denied a `command`
-  permission and produced nothing, and its single retry reported; Codex and agy canaries exact;
-  DeepSeek: "Blockers: none"). Applied, and **not re-reviewed** (the loop's three-round cap):
-  §5.8's wrapper advice was wrong (a reader inside `timeout` dies with the group signal), now the
-  reader sits outside the time limit, P11b's measured shape; the one existing test whose contract
-  S8 changes is named (§5.4, §6); `run()` clears the register on a normal return, and decides
-  "wait for the coordinator" or "stop the notifications" under the coordinator's own lock (§5.1,
-  S15); the coordinator's instance writes its drain warning and trace lines through the
-  non-blocking writer (S14); the settle is zeroed in tests that do not test it (S17); E17 now
-  expects an exit about 1 s after the release, not at the cap; a *not attempted* state for a
-  child whose exit was never confirmed, with E19 (S5, §5.3, §5.5); `--set-head` and read-path
-  lines in §5.6; the unparseable read-back named as in doubt (§5.4); `warn`'s flag atomic;
-  Layer 3's probe stub and git need stated; the design-doc record split into v6.10 and v6.11 (§7);
-  the goal narrowed to the interrupted operation's own writes; S5's "cap" wording; the phases
-  numbered; the Windows claim marked as inference; §8's U7 evidence qualified. Rejected, with the
-  reason in §5.7: giving the protocol's CLI child its own process group so its grandchildren can be
-  killed. agy's quotations did not all match the text and were checked against the spec and the
-  code before use; the two that held (the test contract, the synchronous trace writes) were
-  applied.
 
 ## Appendix A — probes, 2026-10-24 21:51–22:00 PT
 
