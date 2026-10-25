@@ -1271,7 +1271,8 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   | Console window closed, or Task Manager's End task | Windows | Usually leaks, as before: the normal sequence runs (S18), and the system's 5 s ends the process first | [doc], [estimate] |
   | Logoff or shutdown of an interactive session | Windows | Leaks | [doc]: Windows sends those events only to services |
   | `Stop-Process`, `taskkill /F`, a process-tree kill | Windows | Leaks | [measured P3] Stop-Process; the rest [inference] |
-  | Git Bash `kill`, MSYS `timeout`, a harness timeout through Git Bash (Stage 5's S1) | Windows | Leaks: TERM and HUP end the helper without its handler running, and INT is ignored | [measured P1, P2] |
+  | Git Bash `kill`, MSYS `timeout` | Windows | Leaks: TERM and HUP end the helper without its handler running, and INT is ignored | [measured P1, P2], on a probe program, not on the helper |
+  | A harness tool timeout (Stage 5's S1, `exit 143`) | Windows | Leaks, if the kill came through Git Bash | The gate record says only that the runner harness's tool timeout killed the push (`exit 143`, SIGTERM) [record]; that it came through Git Bash, whose `kill` P1 and P2 measured, is [inference] |
   | Task Scheduler's stop or time limit | Windows | Assumed to leak | [untested] (U4) |
   | `kill -TERM`, `-INT` or `-HUP` to the helper alone | Linux | **Releases**; the helper stops its CLI child first | [measured P6] |
   | Ctrl-C or a hangup in a terminal | Linux | **Releases** | [inference from P6, P7] |
@@ -1307,10 +1308,16 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   | S17 | A 5 s settle before reading the lock, on the shutdown path whenever a lock is registered and on the normal path whenever the acquisition was in doubt: a request a killed or failed child had already sent can still be applied by the server after the child ends. Not applied when the child's exit was never confirmed, because nothing is released then | No wait: a late lock upload would be read as absent, then appear and leak. A wait only after a write seen in flight: it misses a child that died first. A longer wait: it delays every signalled push for a gap nobody has measured |
   | S18 | No shortcut for a Windows console close: it runs the normal sequence, safety waits included. The system ends the process 5 s after the event, almost always before the release, so the lock usually stays, as before | Skip the grace and the settle to fit 5 s: that releases while the child or its last request may still be landing, to save a case that rarely finishes anyway |
 
-- **Execution ruling (2026-10-25, Craig's call).** The spec's non-goals set one gap aside as a
-  separate fix: a git that dies while still sending a batch left a truncated batch that ran as if
-  complete. Craig ruled that this fix land on main first (PR #16, recorded in the CHANGELOG under
-  Unreleased), and this work merged main before it was finished.
+- **Execution ruling (2026-10-25, Craig's call, relayed 12:09 PT).** The spec's non-goals set one
+  gap aside as a separate fix: a git that dies while still sending a batch left a truncated batch
+  that ran as if complete. The option not taken is on the right.
+
+  | | Ruled | Not taken |
+  |---|---|---|
+  | Order of landing | The truncated-batch fix (PR #16) lands on main before this work; its entry is in the CHANGELOG under Unreleased | The plan's own default: this branch lands first, and the truncated-batch fix rebases onto it |
+
+  The cost: the plan's Task 4 waited for PR #16, which merged on 2026-10-25 at 12:20 PT as
+  `fa8ce41` and was brought into this branch by merge `6e8ebf7`.
 - **Shipped values (the code is authoritative).** `shutdownCap` 60 s, `childGrace` 5 s,
   `childTerm` 3 s, `childConfirm` 2 s, `retryPause` 2 s and `outcomeWait` 1 s are in
   `cmd/git-remote-proton/shutdown.go`; the release call bound (15 s) and its drain (2 s) are in

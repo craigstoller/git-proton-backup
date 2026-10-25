@@ -19,8 +19,9 @@
   worst. Under systemd that needs `KillMode=control-group` and `TimeoutStopSec=` of 75 s or more.
   On Windows only Ctrl-C and Ctrl-Break in a console window are covered. Git Bash's `kill`,
   `Stop-Process`, a Task Scheduler stop and SIGKILL still leave the lock, and a closed console
-  window almost always does too. The kind of kill that orphaned a lock in the Stage 5 gate, a
-  tool timeout reaching a push through Git Bash on Windows, is among those that still leak. Two
+  window almost always does too. The kill that orphaned a lock in the Stage 5 gate, a tool
+  timeout that probably reached the push through Git Bash on Windows, is among those that still
+  leak. Two
   related changes: a lock whose acquisition ended in doubt (the upload's result was lost) is now
   released on the normal exit path too, and a session whose writes to git failed (git died, or
   its pipe broke) now exits 1. It exited 0 on Windows, and on Linux SIGPIPE killed the helper
