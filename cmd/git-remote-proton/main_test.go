@@ -103,6 +103,95 @@ func TestLoop_PushWithoutListForPushRejected(t *testing.T) {
 	}
 }
 
+// TestLoop_TruncatedPushBatchFailsClosed covers a git that dies while still
+// sending a push batch: the push line arrives, the blank line that ends the
+// batch never does. The batch-buffering loop also stops on EOF or a read
+// error, and before the fix nothing checked which, so the truncated batch was
+// parsed and handed to repo.Push as if complete — a pack uploaded and a ref
+// written that nobody asked for in that shape.
+//
+// gitDir is a real repository with a commit, so the push WOULD succeed if it
+// ran: the no-pack and no-ref assertions fail on the unfixed code rather than
+// passing because the push happened to break for some other reason. stdout
+// being exactly the list-for-push advertisement proves the lock was acquired
+// (it is taken before advertising), so the lock assertion checks a real
+// release rather than a lock that was never there.
+//
+// The refusal must come before any remote READ too, and before the poison
+// check: the List count pins the first (a check that slid past the push arm's
+// ScanRefs would still write nothing), and the poisoned case the second (a
+// check after the poison branch would print its status lines and exit 0).
+func TestLoop_TruncatedPushBatchFailsClosed(t *testing.T) {
+	const script = "list for-push\npush refs/heads/main:refs/heads/main\n" // no blank line
+	for _, tc := range []struct {
+		name       string
+		in         io.Reader
+		wantStderr []string
+	}{
+		{"eof", strings.NewReader(script), []string{"terminating blank line", "unexpected EOF"}},
+		{"eof poisoned", strings.NewReader(script + "option cas true\n"),
+			[]string{"terminating blank line", "unexpected EOF"}},
+		{"read error", io.MultiReader(strings.NewReader(script), errReader{err: errors.New("broken pipe")}),
+			[]string{"terminating blank line", "broken pipe"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ft := transport.NewFake()
+			root := "/my-files/r"
+			counter := &refsListCounter{Fake: ft, root: root}
+			gitDir := newGitRepoWithCommit(t)
+			in := bufio.NewScanner(tc.in)
+			var outBuf bytes.Buffer
+			out := bufio.NewWriter(&outBuf)
+
+			var got int
+			stderr := captureStderr(t, func() { got = loop(counter, root, gitDir, in, out) })
+			out.Flush()
+
+			if got != 1 {
+				t.Errorf("loop() = %d, want 1: a push batch git never finished sending must fail closed", got)
+			}
+			if outBuf.String() != "\n" {
+				t.Errorf("stdout = %q, want only the list-for-push advertisement (\"\\n\"): no push status lines for a batch that was never applied", outBuf.String())
+			}
+			if counter.n != 1 {
+				t.Errorf("List(%s/refs) ran %d times, want 1 (the list-for-push advertisement's scan): a truncated batch must be refused before the push arm reads the remote", root, counter.n)
+			}
+			for _, w := range tc.wantStderr {
+				if !strings.Contains(stderr, w) {
+					t.Errorf("stderr = %q, want it to contain %q", stderr, w)
+				}
+			}
+			for p := range ft.Files {
+				if strings.HasPrefix(p, root+"/packs/") {
+					t.Errorf("no pack may be uploaded for a truncated batch, found %s", p)
+				}
+			}
+			if _, ok := ft.Files[root+"/refs/heads/main"]; ok {
+				t.Errorf("a truncated batch must not write the ref: found %s/refs/heads/main", root)
+			}
+			if _, ok := ft.Files[root+"/"+repo.LockName]; ok {
+				t.Errorf("the lock must still be released when a truncated batch fails closed: %s/%s is present", root, repo.LockName)
+			}
+		})
+	}
+}
+
+// refsListCounter wraps a Fake and counts List calls on root+"/refs", the
+// first call every repo.ScanRefs makes, so a test can tell how many ref scans
+// a session ran against the remote.
+type refsListCounter struct {
+	*transport.Fake
+	root string
+	n    int
+}
+
+func (c *refsListCounter) List(p string) ([]transport.Node, error) {
+	if p == c.root+"/refs" {
+		c.n++
+	}
+	return c.Fake.List(p)
+}
+
 // ambiguousTrashTransport wraps a Fake but makes Trash report Ambiguous with a
 // nil error — the shape that drives repo.Lock.Release to return its "release
 // is unconfirmed" error without any I/O failure occurring. Fake's FailNext is
