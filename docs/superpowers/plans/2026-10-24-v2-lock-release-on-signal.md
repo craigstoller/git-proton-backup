@@ -12,6 +12,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-24-v2-lock-release-on-signal-design.md` (approved 2026-10-24). Read it first; this plan cites its decisions as S1–S18 and its sections as §n.
 
+**Status:** approved by Craig, 2026-10-25 11:13 PT ("Approved, subagent-driven"). Three full-panel review rounds before approval; round 3's fixes were not re-reviewed (the loop's cap), so the per-task reviews are their first check.
+
 ## Global Constraints
 
 - `go.mod` declares `go 1.22`: use nothing newer (no `os.Process` pidfd APIs, no `x/sys`).
@@ -32,67 +34,6 @@
 3. **Ctrl-C on a fetch or clone**: with no lock registered there is no settle wait. A terminal Ctrl-C reaches the CLI child too, so it dies and the helper exits within about a second, at production timings. (A `kill` to the helper alone still runs S5's stop sequence, up to about 10 s.) Tests: Task 5, `TestShutdown_NoLockMeansNoSettleAndPromptExit`; Task 8, E8's production-timing subtest.
 4. **A signal while `EnsureParents` is creating parent folders** (`GPB_CREATE_PARENTS=1`), before any lock exists: prompt exit with no lock created. Test: Task 8, case E20.
 5. **SIGINT and SIGTERM arriving together**: the exit code comes from the first, and the second is only noted. Test: Task 5, `TestShutdown_SecondSignalIsNotedAndIgnored`.
-
-## Revisions
-
-Scaffolding for the review loop; delete it before execution starts.
-
-- **Round 1** (Codex, Gemini via agy, DeepSeek and Kimi all reported). Applied:
-  - the cap kills running release children and exits exactly once (`KillReleaseCalls`, a `sync.Once`, the last attempt's error kept for the result line);
-  - a non-blocking stderr channel of capacity 64, with result lines that bypass it, and a saturation test;
-  - the drain reads into a mutex-guarded buffer and never waits on `Close`; both pipe ends close on a failed start; `run`'s `exec.ErrWaitDelay` contract pinned;
-  - one deadline across a release call's kill and drain; its timer stopped once the child has exited;
-  - every in-flight child tracked, not one;
-  - `NewReleaseCLI("")` defaults to `proton-drive`;
-  - E14 rebuilt on the lock upload;
-  - mode lines keyed on the register and on `batchDone`;
-  - `finish` stops its goroutines, nils `curCoord` and never blocks while holding the lock; a test reset for `silenced`;
-  - both test roles dispatched by base name, before any variable; the late writer detached, with its pid recorded; portable `processAlive`; E13 waits for the catch line;
-  - a staging seam; `repo.Settle` shared by both paths; the `Trash`-refused outcome; the shim's upload leaf rule;
-  - the 30 m and 60 m timeouts on the Linux runs; production-timing proof for Review Focus 3;
-  - the docs describe a bounded attempt; W1/W2 CI as a merge gate; the U7 note; the `690ebf3` collision inside `loop`.
-
-  Rejected:
-  - re-opening the spec's quiescence and settle decisions (S4, S5, S17, §5.7): approved, and out of a plan's reach;
-  - Ctrl-Break arriving as SIGTERM: Go maps it to `os.Interrupt` (`runtime/os_windows.go`, probe P4);
-  - returning at once on a failed flush: the approved S16 relies on the stdin EOF that follows, since git owns both pipes;
-  - the extra settle after a signal lands between registration and the gate: harmless, because the release then finds *absent*.
-- **Round 2** (all four reported; Codex and agy canaries exact; DeepSeek: "Blockers: none"). It found defects in round 1's fixes, now corrected:
-  - `KillReleaseCalls` closes release admission before its kill snapshot;
-  - the test bounds pair a 3 s call with a 200 ms drain (`SetReleaseBoundsForTest`, which refuses a drain that is not under half the call);
-  - the group-kill test uses a parent that is still alive;
-  - the signal goroutine loops, and the shutdown runs on its own goroutine, so a second OS signal is read (a new test drives that through the channel);
-  - the retry loop stops on the final step's flag, not elapsed time; the final step stops the cap timer;
-  - a full save-and-restore of every package variable a coordinator test changes;
-  - `notifySIGPIPE`'s channel has an owner;
-  - the in-flight exit channel closes when `Wait` returns, before the drain, with a test;
-  - a parked call closes its pipe reader;
-  - the late writer gets its own copy of the staged bytes and only a `late-` pid file;
-  - `startHelper` sets `GIT_DIR` and keeps the raw stdout and stderr pipes, so E5 can break stdout and E17 can fill stderr;
-  - the shim's `before` now blocks ahead of the skip decision, so E14 has a firing point;
-  - `quietStderr` silences `--set-head`'s direct writes;
-  - polling for zombie pids;
-  - E13's write tolerates a gone helper;
-  - the second-`list for-push` behaviour stated;
-  - `SIGTERM = 15` on Windows checked in the Go source.
-
-- **Round 3** (all four reported; Codex and agy canaries exact; DeepSeek: "Blockers: none"). Applied, and **not re-reviewed** (the loop's three-round cap):
-  - no lock is held across `cmd.Start()`; a slot is reserved, then filled, with a stalled-start test;
-  - the cap's exit depends on no transport lock (the kill runs on its own goroutine with a bounded wait), with a test; the 62 s worst case is stated;
-  - one ordered stderr writer, with a test that the no-lock catch line is out before exit;
-  - the release kill callback re-checks the child's record under the mutex;
-  - one register snapshot per shutdown;
-  - the late writer starts its delay at the shim's death;
-  - test cleanup also stops signal registration and parked `finish` calls;
-  - per-pid role markers; a "finished" marker for the grace test, which keeps the gate open;
-  - the drain-timeout warning stays exit-0-only, as today;
-  - sanitized marker file names for Windows; the `create-folder` leaf;
-  - `processAlive`'s Windows error branch;
-  - `stderrTarget` is the coordinator's alone;
-  - `quietStderr`'s reach stated honestly (it does not silence `repo`'s or the probe's direct writes);
-  - W1's coverage stated honestly.
-
-  Confirmed, no change: `TestAcquireLockFailsClosedOnUnrecognisedOutcome` is the only test whose handle assertion changes. A grep of every `AcquireLock(` call in the test files shows the others expect success or discard the handle.
 
 ---
 
