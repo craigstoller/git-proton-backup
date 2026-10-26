@@ -33,8 +33,8 @@
   related changes: a lock whose acquisition ended in doubt (the upload's result was lost, or the
   upload was reported refused but the lock there carries the nonce that same attempt uploaded,
   which is untested) is now released on the normal exit path too, after a 5 s wait in case the
-  upload lands late (any other lock the session took is released on exit as well, without that
-  wait), and a session whose writes to git failed (git died, or its pipe broke) now exits 1. It
+  upload lands late (the helper also attempts to release any other lock the session took, without
+  that wait), and a session whose writes to git failed (git died, or its pipe broke) now exits 1. It
   exited 0 on Windows, and on Linux SIGPIPE killed the helper with the lock held. The README's
   honest limits list what each platform covers and the manual remedy; the v2 design is now v6.11.
 

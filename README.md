@@ -494,10 +494,10 @@ download them; you don't need this tool, or even a Windows machine, to get your 
       repo address and so one `.lock` path, and git sends one `list for-push` per session. A
       second try at that path can show up here only in a session git does not produce: while it
       is under way, or afterwards if it ended in doubt or succeeded (it can succeed only if the
-      first lock was removed by hand meanwhile). Either way, every lock the helper took in a
-      session is released when it exits. If the second try ended in doubt, the helper keeps the
-      lock it already held and releases the second try first, after the 5 s wait, then the held
-      one. If it succeeded, the new lock is the one held, and releasing the first attempt finds
+      first lock was removed by hand meanwhile). Either way, the helper attempts to release every
+      lock it took in a session when it exits. On a normal exit, if the second try ended in
+      doubt, the helper keeps the lock it already held and releases the second try first, after
+      the 5 s wait, then the held one; after a signal, the locks go in the order they were taken. If it succeeded, the new lock is the one held, and releasing the first attempt finds
       nothing of its own and changes nothing. Separately, any attempt to take the lock, the first
       one or a `--set-head` run's, whose upload was reported refused but whose lock carries the
       nonce that same attempt uploaded is treated as ours and in doubt, and released. That case is
