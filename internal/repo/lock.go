@@ -115,8 +115,10 @@ const (
 // refused us). Or a handle marked in doubt TOGETHER WITH the error: the lock
 // may or may not be on the remote, and the caller must still release the
 // handle (after the settle wait, which Release applies). The lock is entered in
-// the register before the upload starts. A refusal takes it out again at once;
-// anything else keeps it there until a release reaches a final outcome.
+// the register before the upload starts. A refusal takes it out again once its
+// diagnostic read shows someone else's lock (or none, or an unreadable one);
+// a refusal whose read shows our own nonce, and anything else, keep it there
+// until a release reaches a final outcome.
 func AcquireLock(t transport.Transport, root string) (*Lock, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
@@ -163,12 +165,26 @@ func AcquireLock(t transport.Transport, root string) (*Lock, error) {
 		// and the operator needs to know which they are looking at before
 		// touching anything by hand.
 		//
-		// A refusal means the name was taken and nothing of ours was written:
-		// the entry leaves the register and no handle comes back, before the
-		// diagnostic read so a signal during it cannot find a lock that is not
-		// ours.
-		unregister(l)
+		// A refusal means the name was taken and, as a rule, nothing of ours
+		// was written: the entry leaves the register and no handle comes
+		// back. The one exception is found by the diagnostic read itself: a
+		// lock that carries OUR nonce means the CLI retried an upload whose
+		// first attempt had landed [untested]. That lock is ours, so the
+		// handle is kept, in doubt and still registered, and the caller's
+		// defer settles and releases it (spec §5.4, A3).
+		//
+		// The entry now leaves AFTER the read rather than before it. The
+		// order existed to narrow a window in which a signal could find a
+		// lock that is not ours, and release is nonce-first, so a
+		// coordinator that found this entry during the read would see a
+		// foreign nonce and leave the other holder's lock alone. Either
+		// order is safe; this one lets the own-nonce case keep its entry.
 		held, presence, _ := readLock(t, p)
+		if presence == lockPresent && held.Nonce == nonce {
+			return l, fmt.Errorf("lock upload for %s was reported refused, but the lock there carries "+
+				"this push's own nonce %s; treating it as ours and in doubt", p, nonce)
+		}
+		unregister(l)
 		switch presence {
 		case lockPresent:
 			return nil, fmt.Errorf("repo is locked by nonce %s on %s (pid %d) since %s; "+

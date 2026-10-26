@@ -133,6 +133,18 @@ func (r refusedCreateTransport) CreateExclusive(p, local string) (transport.Outc
 	return transport.Refused, nil
 }
 
+// refusedAfterLandingTransport lets the upload land and then reports Refused
+// with a nil error: the shape of a CLI that retried an upload whose first
+// attempt had already landed, so the retry found the name taken by our own body.
+type refusedAfterLandingTransport struct {
+	*transport.Fake
+}
+
+func (r refusedAfterLandingTransport) CreateExclusive(p, local string) (transport.Outcome, error) {
+	r.Fake.CreateExclusive(p, local)
+	return transport.Refused, nil
+}
+
 // hookCreateTransport runs hook at the start of CreateExclusive, then writes.
 type hookCreateTransport struct {
 	*transport.Fake
@@ -305,6 +317,50 @@ func TestAcquireLockRefusedMakesTodaysCallsAndNoHandle(t *testing.T) {
 				t.Error("the other holder's lock must be left exactly as it was")
 			}
 		})
+	}
+}
+
+// TestAcquireLockRefusedThatShowsOurOwnNonceKeepsTheHandle (spec §5.4, A3): a
+// refusal whose diagnostic read-back shows OUR nonce means the lock on the
+// remote is ours (the CLI retried an upload whose first attempt had landed
+// [untested]). The handle is kept, in doubt, and stays registered, so the
+// normal defer and the coordinator can release it. The calls are exactly the
+// ones a refusal already makes: nothing is added to find this out.
+func TestAcquireLockRefusedThatShowsOurOwnNonceKeepsTheHandle(t *testing.T) {
+	cleanRegister(t)
+	replaceSettle(t, func() {})
+	f := transport.NewFake()
+	c := &callLogTransport{Transport: refusedAfterLandingTransport{f}}
+
+	l, err := AcquireLock(c, sigRoot)
+
+	if l == nil {
+		t.Fatal("the lock on the remote carries our nonce: the handle must be kept so it can be released")
+	}
+	if !l.InDoubt() {
+		t.Error("a refused upload is not proof the lock is held: the handle must be marked in doubt")
+	}
+	if err == nil {
+		t.Fatal("a refused acquisition must still be an error")
+	}
+	if !strings.Contains(err.Error(), "own nonce") {
+		t.Errorf("error = %v, want it to say the lock carries this push's own nonce", err)
+	}
+	if !registeredHas(l) {
+		t.Error("the kept handle must stay registered, so the coordinator can release it")
+	}
+	if want := []string{"CreateExclusive", "Stat", "ReadTo"}; !reflect.DeepEqual(c.calls, want) {
+		t.Errorf("calls = %v, want exactly today's %v", c.calls, want)
+	}
+
+	if rerr := l.Release(); rerr != nil {
+		t.Fatalf("release: %v", rerr)
+	}
+	if _, ok := f.Files[sigLock]; ok {
+		t.Error("the release must remove the lock that carries our nonce")
+	}
+	if registeredHas(l) {
+		t.Error("a removed lock must leave the register")
 	}
 }
 
