@@ -235,6 +235,351 @@ func TestLoop_LockReleaseFailureIsReportedButDoesNotFailThePush(t *testing.T) {
 	}
 }
 
+// failWriter fails every Write: git's end of the pipe is gone.
+type failWriter struct{}
+
+func (failWriter) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
+
+// TestLoop_FailedProtocolWriteExitsOneAndReleases covers a git that is gone
+// while the helper still has something to say. Flush errors used to be dropped
+// and run()'s deferred Flush could not change the code, so a session whose
+// advertisement never reached git ended in a reported success.
+//
+// The session is a bare "list for-push" and then EOF, so the only thing that
+// can turn this exit into a 1 is the failed write itself. stderr must be empty
+// as well: every early return in the list-for-push arm warns, so silence is what
+// proves the run got as far as the advertisement and the 1 is not one of those.
+func TestLoop_FailedProtocolWriteExitsOneAndReleases(t *testing.T) {
+	ft := transport.NewFake()
+	const root = "/my-files/r"
+	in := bufio.NewScanner(strings.NewReader("list for-push\n"))
+	out := bufio.NewWriter(failWriter{})
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(ft, root, ".", in, out) })
+
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want nothing: the session was meant to reach the advertisement", stderr)
+	}
+	if got != 1 {
+		t.Errorf("loop() = %d, want 1: a protocol write that failed must not be reported as a successful session", got)
+	}
+	if _, ok := ft.Files[root+"/"+repo.MarkerName]; !ok {
+		t.Errorf("no marker at %s/%s: the session did not reach Bootstrap and the lock", root, repo.MarkerName)
+	}
+	if _, ok := ft.Files[root+"/"+repo.LockName]; ok {
+		t.Errorf("the lock must be released when the write fails: %s/%s is present", root, repo.LockName)
+	}
+}
+
+// inDoubtLockTransport wraps a Fake so that CreateExclusive for the lock lands
+// the upload and then reports Ambiguous with an error: a killed or timed-out
+// upload the server went on to apply. Everything else passes through.
+type inDoubtLockTransport struct{ *transport.Fake }
+
+func (c inDoubtLockTransport) CreateExclusive(p, local string) (transport.Outcome, error) {
+	if !strings.HasSuffix(p, "/"+repo.LockName) {
+		return c.Fake.CreateExclusive(p, local)
+	}
+	body, err := os.ReadFile(local)
+	if err != nil {
+		return transport.Ambiguous, err
+	}
+	c.Files[p] = body
+	return transport.Ambiguous, errors.New("upload timed out")
+}
+
+// TestLoop_InDoubtAcquisitionIsReleasedOnExit covers the acquisition that fails
+// after its lock reached the remote. AcquireLock hands back the handle together
+// with the error, and loop used to drop the handle on the error, so the lock
+// stayed on the remote and every later push was refused until a human cleared it.
+//
+// The session still fails (the acquisition error is warned and loop returns 1);
+// what changes is that the handle is kept and the defer releases it.
+func TestLoop_InDoubtAcquisitionIsReleasedOnExit(t *testing.T) {
+	ft := transport.NewFake()
+	const root = "/my-files/r"
+	in := bufio.NewScanner(strings.NewReader("list for-push\n"))
+	out := bufio.NewWriter(&bytes.Buffer{})
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(inDoubtLockTransport{ft}, root, ".", in, out) })
+
+	if got != 1 {
+		t.Errorf("loop() = %d, want 1: a lock acquisition that errored fails the session", got)
+	}
+	if !strings.Contains(stderr, "upload timed out") {
+		t.Errorf("stderr = %q, want the acquisition error", stderr)
+	}
+	if _, ok := ft.Files[root+"/"+repo.LockName]; ok {
+		t.Errorf("an in-doubt lock must be released on exit: %s/%s is still present", root, repo.LockName)
+	}
+}
+
+// secondLockInDoubtTransport wraps a Fake so that the FIRST CreateExclusive of
+// the lock passes through and the SECOND answers Ambiguous with an error
+// WITHOUT writing: a killed upload the server never applied. Everything else
+// passes through. locks counts the lock uploads attempted, so a test can prove
+// the second acquisition really ran.
+type secondLockInDoubtTransport struct {
+	*transport.Fake
+	locks int
+}
+
+func (c *secondLockInDoubtTransport) CreateExclusive(p, local string) (transport.Outcome, error) {
+	if !strings.HasSuffix(p, "/"+repo.LockName) {
+		return c.Fake.CreateExclusive(p, local)
+	}
+	c.locks++
+	if c.locks == 1 {
+		return c.Fake.CreateExclusive(p, local)
+	}
+	return transport.Ambiguous, errors.New("killed")
+}
+
+// TestLoop_SecondListForPushKeepsTheHeldLock covers a session that sends a second
+// "list for-push" while the first lock is held. git sends one per session, but
+// loop accepts another. When that second acquisition ends in doubt, its handle
+// must not replace the held one: the release defer would settle the new handle,
+// read the held lock's nonce on the remote, report it foreign, and leave the
+// held lock on the remote, silently.
+//
+// The wrapper makes the second upload fail without writing. A second upload that
+// reaches the server is refused (the held .lock is still there) and comes back
+// with no handle; one that ends in doubt comes back WITH a handle, which is the
+// shape this test needs.
+//
+// The register assertion pins the other half of the design: loop still releases
+// the in-doubt handle it did not keep, FIRST, while the held lock still blocks
+// the name. Release is nonce-first, so it reads the held lock, finds another
+// nonce, leaves it alone and drops its own register entry (foreign).
+func TestLoop_SecondListForPushKeepsTheHeldLock(t *testing.T) {
+	repo.ResetRegister()
+	t.Cleanup(repo.ResetRegister)
+	ft := transport.NewFake()
+	const root = "/my-files/r"
+	tr := &secondLockInDoubtTransport{Fake: ft}
+	in := bufio.NewScanner(strings.NewReader("list for-push\nlist for-push\n"))
+	out := bufio.NewWriter(&bytes.Buffer{})
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(tr, root, ".", in, out) })
+
+	if tr.locks != 2 {
+		t.Errorf("lock uploads = %d, want 2: the session did not reach the second acquisition", tr.locks)
+	}
+	if got != 1 {
+		t.Errorf("loop() = %d, want 1: a lock acquisition that errored fails the session", got)
+	}
+	if !strings.Contains(stderr, "killed") {
+		t.Errorf("stderr = %q, want the second acquisition's error", stderr)
+	}
+	if _, ok := ft.Files[root+"/"+repo.LockName]; ok {
+		t.Errorf("the held lock must be released on exit: %s/%s is still present", root, repo.LockName)
+	}
+	if n := len(repo.RegisteredLocks()); n != 0 {
+		t.Errorf("register holds %d locks, want 0 (the in-doubt second handle is released as foreign)", n)
+	}
+}
+
+// heldLockClearedTransport wraps a Fake so that the held .lock is removed just
+// before the SECOND upload of it, as an operator clearing it by hand would, and
+// the upload then goes through normally. locks counts the lock uploads.
+type heldLockClearedTransport struct {
+	*transport.Fake
+	locks int
+}
+
+func (c *heldLockClearedTransport) CreateExclusive(p, local string) (transport.Outcome, error) {
+	if strings.HasSuffix(p, "/"+repo.LockName) {
+		c.locks++
+		if c.locks == 2 {
+			delete(c.Fake.Files, p)
+		}
+	}
+	return c.Fake.CreateExclusive(p, local)
+}
+
+// TestLoop_SecondListForPushSucceedingIsAdopted is the other half of the test
+// above: a second "list for-push" whose acquisition SUCCEEDS. That is possible
+// only if the held .lock is gone (here: cleared by hand), so the handle that
+// replaces the held one loses nothing, and it is the one that must be released.
+// Keeping the first handle instead would read the second lock's nonce at exit,
+// call it foreign, and leave the second lock on the remote with a clean exit.
+func TestLoop_SecondListForPushSucceedingIsAdopted(t *testing.T) {
+	repo.ResetRegister()
+	t.Cleanup(repo.ResetRegister)
+	ft := transport.NewFake()
+	const root = "/my-files/r"
+	tr := &heldLockClearedTransport{Fake: ft}
+	in := bufio.NewScanner(strings.NewReader("list for-push\nlist for-push\n"))
+	out := bufio.NewWriter(&bytes.Buffer{})
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(tr, root, ".", in, out) })
+
+	if tr.locks != 2 {
+		t.Errorf("lock uploads = %d, want 2: the session did not reach the second acquisition", tr.locks)
+	}
+	if got != 0 {
+		t.Errorf("loop() = %d, want 0: both acquisitions succeeded; stderr:\n%s", got, stderr)
+	}
+	if _, ok := ft.Files[root+"/"+repo.LockName]; ok {
+		t.Errorf("the second lock must be released on exit: %s/%s is still present", root, repo.LockName)
+	}
+}
+
+// TestLoop_SecondListForPushSucceedingLeavesTheRegisterEmpty: the handle a
+// successful second acquisition replaces is still a handle loop was given. Its
+// lock is gone, so releasing it reads the second lock's nonce and is a no-op
+// (foreign), but that release is what takes its entry out of the register.
+func TestLoop_SecondListForPushSucceedingLeavesTheRegisterEmpty(t *testing.T) {
+	repo.ResetRegister()
+	t.Cleanup(repo.ResetRegister)
+	ft := transport.NewFake()
+	const root = "/my-files/r"
+	tr := &heldLockClearedTransport{Fake: ft}
+	in := bufio.NewScanner(strings.NewReader("list for-push\nlist for-push\n"))
+	out := bufio.NewWriter(&bytes.Buffer{})
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(tr, root, ".", in, out) })
+
+	if got != 0 {
+		t.Errorf("loop() = %d, want 0: both acquisitions succeeded; stderr:\n%s", got, stderr)
+	}
+	if _, ok := ft.Files[root+"/"+repo.LockName]; ok {
+		t.Errorf("the second lock must be released on exit: %s/%s is still present", root, repo.LockName)
+	}
+	if n := len(repo.RegisteredLocks()); n != 0 {
+		t.Errorf("register holds %d locks, want 0: the replaced first handle was never released", n)
+	}
+}
+
+// secondLockLandsInDoubtTransport wraps a Fake so that the held .lock is removed
+// just before the SECOND upload of it, as an operator clearing it by hand would,
+// and that upload then LANDS its body and answers Ambiguous with an error: a
+// killed upload the server went on to apply. locks counts the lock uploads.
+type secondLockLandsInDoubtTransport struct {
+	*transport.Fake
+	locks int
+}
+
+func (c *secondLockLandsInDoubtTransport) CreateExclusive(p, local string) (transport.Outcome, error) {
+	if !strings.HasSuffix(p, "/"+repo.LockName) {
+		return c.Fake.CreateExclusive(p, local)
+	}
+	c.locks++
+	if c.locks == 1 {
+		return c.Fake.CreateExclusive(p, local)
+	}
+	delete(c.Fake.Files, p)
+	body, err := os.ReadFile(local)
+	if err != nil {
+		return transport.Ambiguous, err
+	}
+	c.Fake.Files[p] = body
+	return transport.Ambiguous, errors.New("killed")
+}
+
+// TestLoop_SecondInDoubtAcquisitionThatLandedIsReleased is the cell the
+// adoption rule leaves open: a second "list for-push" with the held lock cleared
+// by hand, whose upload lands and then reports Ambiguous. The in-doubt handle is
+// not adopted (the held one stays `lock`), yet its lock IS on the remote. Before
+// loop released every handle it was given, the exit released only the held
+// handle, which read the second nonce, called it foreign and left the second
+// lock on the remote with the register still holding its entry.
+func TestLoop_SecondInDoubtAcquisitionThatLandedIsReleased(t *testing.T) {
+	repo.ResetRegister()
+	t.Cleanup(repo.ResetRegister)
+	ft := transport.NewFake()
+	const root = "/my-files/r"
+	tr := &secondLockLandsInDoubtTransport{Fake: ft}
+	in := bufio.NewScanner(strings.NewReader("list for-push\nlist for-push\n"))
+	out := bufio.NewWriter(&bytes.Buffer{})
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(tr, root, ".", in, out) })
+
+	if tr.locks != 2 {
+		t.Errorf("lock uploads = %d, want 2: the session did not reach the second acquisition", tr.locks)
+	}
+	if got != 1 {
+		t.Errorf("loop() = %d, want 1: a lock acquisition that errored fails the session", got)
+	}
+	if !strings.Contains(stderr, "killed") {
+		t.Errorf("stderr = %q, want the second acquisition's error", stderr)
+	}
+	if _, ok := ft.Files[root+"/"+repo.LockName]; ok {
+		t.Errorf("the in-doubt second lock landed and must be released on exit: %s/%s is still present", root, repo.LockName)
+	}
+	if n := len(repo.RegisteredLocks()); n != 0 {
+		t.Errorf("register holds %d locks, want 0: every handle loop was given is released", n)
+	}
+}
+
+// TestLoop_SecondListForPushRefusedByOwnHeldLock is the realistic cell (git
+// sends one list for-push per session, but a second one arrives): our own held
+// lock refuses the second acquisition, which comes back with no handle. A GUARD:
+// it passes on the code before and after releasing every handle, and pins that
+// the refused attempt costs the held lock nothing.
+func TestLoop_SecondListForPushRefusedByOwnHeldLock(t *testing.T) {
+	repo.ResetRegister()
+	t.Cleanup(repo.ResetRegister)
+	ft := transport.NewFake()
+	const root = "/my-files/r"
+	in := bufio.NewScanner(strings.NewReader("list for-push\nlist for-push\n"))
+	out := bufio.NewWriter(&bytes.Buffer{})
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(ft, root, ".", in, out) })
+
+	if got != 1 {
+		t.Errorf("loop() = %d, want 1: the second acquisition was refused", got)
+	}
+	if !strings.Contains(stderr, "repo is locked") {
+		t.Errorf("stderr = %q, want the repo-is-locked error", stderr)
+	}
+	if _, ok := ft.Files[root+"/"+repo.LockName]; ok {
+		t.Errorf("the held lock must be released on exit: %s/%s is still present", root, repo.LockName)
+	}
+	if n := len(repo.RegisteredLocks()); n != 0 {
+		t.Errorf("register holds %d locks, want 0", n)
+	}
+}
+
+// TestLoop_CleanSessionStillExitsZero guards the other direction of the two
+// tests above: a session whose writes all succeed is still a 0, and its output
+// still reaches the writer. Each command's own flush() delivers it; loop's
+// final flush, in its defer, only checks once more for a failed write.
+func TestLoop_CleanSessionStillExitsZero(t *testing.T) {
+	for _, tc := range []struct {
+		name, script string
+	}{
+		{"capabilities", "capabilities\n"},
+		{"list for-push", "list for-push\n\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ft := transport.NewFake()
+			const root = "/my-files/r"
+			var outBuf bytes.Buffer
+			in := bufio.NewScanner(strings.NewReader(tc.script))
+
+			got := loop(ft, root, ".", in, bufio.NewWriter(&outBuf))
+
+			if got != 0 {
+				t.Errorf("loop() = %d, want 0: nothing failed in this session", got)
+			}
+			if outBuf.Len() == 0 {
+				t.Error("nothing reached the writer")
+			}
+			if _, ok := ft.Files[root+"/"+repo.LockName]; ok {
+				t.Errorf("the lock must be released: %s/%s is present", root, repo.LockName)
+			}
+		})
+	}
+}
+
 // TestLoop_ListForPush_CreateParentsEnvCreatesParents is RED (Task 11): the
 // protocol path honours GPB_CREATE_PARENTS, set via t.Setenv exactly as the
 // task's environment rules require — read fresh from the real process

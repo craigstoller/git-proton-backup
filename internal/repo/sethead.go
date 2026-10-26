@@ -24,19 +24,24 @@ func SetHead(t transport.Transport, root, branchArg string) (string, error) {
 		return "", err
 	}
 	lock, err := AcquireLock(t, root)
+	// A handle can come back WITH an error: the acquisition was in doubt and the
+	// lock may be on the remote. The defer below releases it all the same, then
+	// the acquisition's error is what SetHead reports.
+	if lock != nil {
+		// Release on EVERY exit path; its error is reported, never masking the
+		// operation's own result — the same contract cmd's loop defer documents.
+		// The report goes to os.Stderr directly, this package's convention for
+		// advisory warnings (idxcache.go does the same) — so tests cannot capture
+		// it.
+		defer func() {
+			if rerr := lock.Release(); rerr != nil {
+				fmt.Fprintf(os.Stderr, "git-remote-proton: %v\n", rerr)
+			}
+		}()
+	}
 	if err != nil {
 		return "", err
 	}
-	// Release on EVERY exit path; its error is reported, never masking the
-	// operation's own result — the same contract cmd's loop defer documents.
-	// The report goes to os.Stderr directly, this package's convention for
-	// advisory warnings (idxcache.go does the same) — so tests cannot capture
-	// it.
-	defer func() {
-		if rerr := lock.Release(); rerr != nil {
-			fmt.Fprintf(os.Stderr, "git-remote-proton: %v\n", rerr)
-		}
-	}()
 
 	// Existence check via an EXACT-PATH Stat, not a full-tree ListRefs walk:
 	// the target branch's own ref path is Stat'd directly, and Stat absence

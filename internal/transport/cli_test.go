@@ -6,16 +6,18 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
 
 // --- WaitDelay: the grandchild-holds-the-pipe hang -------------------------
 //
-// These tests drive run()'s WaitDelay behaviour against a REAL process tree,
-// hermetically: the test binary re-execs ITSELF as the stand-in
+// These tests drive run()'s drain bound (waitDelay) against a REAL process
+// tree, hermetically: the test binary re-execs ITSELF as the stand-in
 // "proton-drive" (the standard os/exec helper-process technique). No Proton
 // CLI is invoked, nothing touches the network, and no account is involved.
 //
@@ -23,10 +25,10 @@ import (
 //
 //	cli       — the stand-in proton-drive. Prints a version line, then spawns
 //	            a grandchild that INHERITS its stdout/stderr (the write end of
-//	            the pipe os/exec created for CombinedOutput) and outlives it.
-//	            This is the exact shape that makes Wait block forever without
-//	            WaitDelay set: EOF on that pipe needs EVERY holder of the write
-//	            end to close it, not just the process we waited for.
+//	            the pipe run() created for the child) and outlives it. This is
+//	            the exact shape that makes a drain wait forever without a bound:
+//	            EOF on that pipe needs EVERY holder of the write end to close
+//	            it, not just the process we waited for.
 //	cli-clean — the same stand-in with NO grandchild: the control case that
 //	            proves the delay does not fire on a well-behaved command.
 //	linger    — the grandchild. Holds the inherited pipe until released.
@@ -75,7 +77,39 @@ const (
 	// Task 2). It echoes two inherited variables back so a test can see what
 	// CLI.run actually handed the child.
 	roleEnvEcho = "env-echo"
+
+	// The large-output stand-in, below runBigOutputRole. It writes more than a
+	// pipe buffer to stdout and exits 0, so a test can see that run reads the
+	// pipe while the child is still running instead of after it has exited.
+	roleBigOutput = "big-output"
+
+	// The four gate stand-ins (gate_test.go), below runHangRole. Each ignores
+	// its args and leaves markers named for its pid (writeMarker), so a test
+	// waiting for two children counts two files and can look each one up.
+	// hang and hang-ignore-term write "started" and then wait out lingerCap
+	// unless killed; short-sleep writes "started", sleeps 300 ms, writes
+	// "finished" and exits 0; hang-with-grandchild starts a hang grandchild
+	// that stays in its process group and writes "grandchild", then hangs.
+	roleHang               = "hang"
+	roleHangIgnoreTerm     = "hang-ignore-term"
+	roleShortSleep         = "short-sleep"
+	roleHangWithGrandchild = "hang-with-grandchild"
+
+	// trash-hang answers `filesystem info` with a file node and exits 0, and
+	// hangs like hang on every other call: a Trash whose Stat succeeds and
+	// whose trash call is the one killed.
+	roleTrashHang = "trash-hang"
+
+	// helperGrandchildEnv, set to any value, makes the hang role write a
+	// "grandchild" marker instead of "started": roleHangWithGrandchild's child
+	// is told apart from its parent by the marker's name.
+	helperGrandchildEnv = "GPB_TEST_HELPER_GRANDCHILD"
 )
+
+// bigOutputBytes is how many 'x' bytes roleBigOutput writes: several times any
+// pipe buffer (64 KiB on Linux and Windows, 16 KiB on some Unixes), so a child
+// that blocks on a full pipe can only finish if the parent is reading.
+const bigOutputBytes = 200 * 1024
 
 // helperVersionLine is what the stand-in prints, shaped like the real CLI's
 // --version output so Version() can be driven end to end through it.
@@ -113,6 +147,16 @@ func TestMain(m *testing.M) {
 		runEnsureDirRole(os.Getenv(helperEnv))
 	case roleEnvEcho:
 		runEnvEchoRole()
+	case roleBigOutput:
+		runBigOutputRole()
+	case roleHang, roleHangIgnoreTerm:
+		runHangRole(os.Getenv(helperEnv) == roleHangIgnoreTerm)
+	case roleShortSleep:
+		runShortSleepRole()
+	case roleHangWithGrandchild:
+		runHangWithGrandchildRole()
+	case roleTrashHang:
+		runTrashHangRole()
 	}
 	if err := setupHelper(); err != nil {
 		fmt.Fprintln(os.Stderr, "helper setup:", err)
@@ -208,7 +252,7 @@ func runVersionRole(role string) {
 // the args; the role alone selects which failure shape comes back. Both
 // failure messages land on stderr, matching runVersionRole's
 // roleNonzeroVersion convention for a CLI failure — and it does not actually
-// matter which stream: run()'s cmd.CombinedOutput() (cli.go:51) merges
+// matter which stream: run()'s single merged pipe puts
 // stdout and stderr into one string before Stat ever sees it, so a role that
 // wrote to stdout instead would exercise the identical code path. It never
 // returns.
@@ -235,6 +279,77 @@ func runEnvEchoRole() {
 	fmt.Println("PDCS=" + os.Getenv("PROTON_DRIVE_CREDENTIALS_STORE"))
 	fmt.Println("ARB=" + os.Getenv("GPB_TEST_ARBITRARY_PASSTHROUGH"))
 	os.Exit(0)
+}
+
+// runBigOutputRole is the stand-in proton-drive for the large-output test. It
+// ignores its args and spawns no grandchild: it writes bigOutputBytes of 'x'
+// and a closing marker line to stdout in ONE write, then exits 0. The write
+// cannot complete until the parent has read most of it, which is the point. It
+// never returns.
+func runBigOutputRole() {
+	os.Stdout.WriteString(strings.Repeat("x", bigOutputBytes) + "\nEND\n")
+	os.Exit(0)
+}
+
+// writeMarker records that this process reached a point: an empty file named
+// <GPB_TEST_HELPER_RELEASE>.<kind>.<pid>. The gate tests point that variable
+// into their own temp dir, so they count only their own children's markers.
+func writeMarker(kind string) {
+	os.WriteFile(fmt.Sprintf("%s.%s.%d", os.Getenv(helperReleaseEnv), kind, os.Getpid()), nil, 0o600)
+}
+
+// runHangRole is the stand-in for a CLI call that never finishes on its own.
+// With ignoreTerm it ignores SIGTERM first, before the marker that tells the
+// test it may start signalling. It then waits like runLingerRole: until the
+// release file appears or lingerCap passes, so a child a test forgot to kill
+// still ends. It never returns.
+func runHangRole(ignoreTerm bool) {
+	if ignoreTerm {
+		signal.Ignore(syscall.SIGTERM)
+	}
+	kind := "started"
+	if os.Getenv(helperGrandchildEnv) != "" {
+		kind = "grandchild"
+	}
+	writeMarker(kind)
+	runLingerRole()
+}
+
+// runShortSleepRole is the stand-in for a call that finishes inside the stop
+// sequence's grace: the "finished" marker exists only if it was not killed. It
+// never returns.
+func runShortSleepRole() {
+	writeMarker("started")
+	time.Sleep(300 * time.Millisecond)
+	writeMarker("finished")
+	os.Exit(0)
+}
+
+// runHangWithGrandchildRole starts a hang grandchild, which stays in this
+// process's group (nothing here asks for a new one), then hangs itself, so the
+// parent is still alive when a release call's bound fires and the kill must
+// take the whole group. The grandchild's stdio is not inherited: the test
+// looks for its pid, not its output. It never returns.
+func runHangWithGrandchildRole() {
+	g := exec.Command(os.Getenv(helperExeEnv))
+	g.Env = append(os.Environ(), helperEnv+"="+roleHang, helperGrandchildEnv+"=1")
+	if err := g.Start(); err != nil {
+		fmt.Fprintln(os.Stderr, "helper could not start its grandchild:", err)
+		os.Exit(3)
+	}
+	writeMarker("started")
+	runLingerRole()
+}
+
+// runTrashHangRole answers an info call (os.Args: exe, filesystem, info, path,
+// --json) with a file node, so Trash's Stat finds the target, and hangs on any
+// other call. It never returns.
+func runTrashHangRole() {
+	if len(os.Args) > 2 && os.Args[1] == "filesystem" && os.Args[2] == "info" {
+		fmt.Println(`{"uid":"u1","name":{"value":".lock"},"type":"file"}`)
+		os.Exit(0)
+	}
+	runHangRole(false)
 }
 
 // ensureDirStep is one scripted response: raw combined output plus exit code.
@@ -371,8 +486,8 @@ func teardownHelper() {
 	os.Remove(helperRelease)
 }
 
-// shortWaitDelay installs a test-scale WaitDelay and restores the production
-// value afterwards.
+// shortWaitDelay installs a test-scale waitDelay, run's post-exit drain bound,
+// and restores the production value afterwards.
 func shortWaitDelay(t *testing.T, d time.Duration) {
 	t.Helper()
 	prev := waitDelay
@@ -381,7 +496,7 @@ func shortWaitDelay(t *testing.T, d time.Duration) {
 }
 
 // TestRunAbandonsAPipeHeldOpenByAGrandchild is the I1 regression test. Without
-// cmd.WaitDelay this blocks until the grandchild exits — which, in production,
+// a bound on the drain this blocks until the grandchild exits — which, in production,
 // is however long a stray Node worker happens to live, with git having printed
 // nothing at all when the hang lands on the startup version probe.
 //
@@ -389,7 +504,7 @@ func shortWaitDelay(t *testing.T, d time.Duration) {
 // only exits when the release marker appears, and nothing writes that marker
 // until teardownHelper runs after the whole package. So the pipe is
 // GUARANTEED to still be held while run() is executing, and ErrWaitDelay is
-// returned only when os/exec gave up on that pipe and closed it. run()
+// returned only when run gave up on that pipe and closed it. run()
 // returning at all is therefore the evidence, not the clock.
 func TestRunAbandonsAPipeHeldOpenByAGrandchild(t *testing.T) {
 	shortWaitDelay(t, 250*time.Millisecond)
@@ -402,9 +517,9 @@ func TestRunAbandonsAPipeHeldOpenByAGrandchild(t *testing.T) {
 	if !errors.Is(err, exec.ErrWaitDelay) {
 		t.Fatalf("want exec.ErrWaitDelay after the delay fires, got %v (after %s)", err, elapsed)
 	}
-	// The carve-out every caller depends on: the command SUCCEEDED. os/exec
-	// substitutes ErrWaitDelay for a nil error only on a successful exit, so
-	// the exit code must still be the real one.
+	// The carve-out every caller depends on: the command SUCCEEDED. run
+	// substitutes ErrWaitDelay only for an exit 0 whose drain ran out, so the
+	// exit code must still be the real one.
 	if code != 0 {
 		t.Errorf("want exit code 0 alongside ErrWaitDelay, got %d", code)
 	}
@@ -454,6 +569,101 @@ func TestRunReportsNoWaitDelayWhenNothingHoldsThePipe(t *testing.T) {
 	}
 	if !strings.Contains(out, helperVersionLine) {
 		t.Errorf("got %q", out)
+	}
+}
+
+// --- run owns its child (S13) ------------------------------------------------
+//
+// run no longer uses CombinedOutput: it creates one pipe for both streams,
+// reads it on its own goroutine, and waits for the PROCESS apart from the
+// drain. These tests pin what that separation adds (the exit is seen before the
+// drain ends) and what it must not lose (one merged stream; large outputs).
+
+// TestRunObservesExitBeforeTheDrainEnds is RED against CombinedOutput, which
+// ties the child's exit to the end of the drain: with a grandchild holding the
+// pipe, Wait returns only once the drain has given up, so testHookExited could
+// never fire well before run does. Here it must fire at the exit, and run must
+// then spend the drain bound still waiting on the pipe.
+//
+// The grandchild is released the way TestRunAbandonsAPipeHeldOpenByAGrandchild's
+// is: the package's release marker, which nothing writes until teardownHelper,
+// so the pipe is held for the whole call and no process outlives the package. A
+// marker private to this test would have to be deleted with its temp directory
+// right after being written, which can beat the grandchild's next poll and
+// strand it until lingerCap.
+func TestRunObservesExitBeforeTheDrainEnds(t *testing.T) {
+	shortWaitDelay(t, 2*time.Second)
+	t.Setenv(helperEnv, roleCLI)
+
+	var exitedAt time.Time
+	testHookExited = func(int) { exitedAt = time.Now() }
+	out, code, err := (&CLI{Exe: os.Args[0]}).run("--version")
+	returnedAfter := time.Since(exitedAt)
+	testHookExited = nil
+
+	if exitedAt.IsZero() {
+		t.Fatal("testHookExited never fired: the child's exit was not observed apart from the drain")
+	}
+	if returnedAfter < 1500*time.Millisecond {
+		t.Errorf("run returned %s after the exit was observed, want about the 2s drain bound: "+
+			"the drain did not run on after the exit", returnedAfter)
+	}
+	if !errors.Is(err, exec.ErrWaitDelay) {
+		t.Errorf("want exec.ErrWaitDelay when an exit-0 child's drain runs out, got %v", err)
+	}
+	if code != 0 {
+		t.Errorf("want exit code 0 alongside ErrWaitDelay, got %d", code)
+	}
+	if !strings.Contains(out, helperVersionLine) {
+		t.Errorf("output written before the exit must still be captured, got %q", out)
+	}
+}
+
+// TestRunMergesStderrIntoTheOutput is a GUARD: both streams share one pipe, so
+// what the child writes to stderr is in run's output, and Stat still reads the
+// not-found signature as confirmed absence. It passed under CombinedOutput and
+// is here so the rework cannot split the streams.
+func TestRunMergesStderrIntoTheOutput(t *testing.T) {
+	t.Setenv(helperEnv, roleStatNotFound)
+	c := &CLI{Exe: os.Args[0]}
+
+	out, code, err := c.run("filesystem", "info", "/whatever", "--json")
+
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Errorf("want an *exec.ExitError for a non-zero exit, got %v", err)
+	}
+	if code != 1 {
+		t.Errorf("want exit code 1, got %d", code)
+	}
+	if !strings.Contains(out, notFoundSignature) {
+		t.Errorf("stderr must be in run's output, got %q", out)
+	}
+	n, ok, serr := c.Stat("/whatever")
+	if serr != nil || ok || n != (Node{}) {
+		t.Errorf("Stat must read the signature as absence, got (%+v, %v, %v)", n, ok, serr)
+	}
+}
+
+// TestRunDrainsLargeOutputWhileTheChildRuns is a GUARD: a child that writes
+// more than a pipe buffer before it exits only finishes if the parent reads the
+// pipe meanwhile, and every byte must arrive. It passed under CombinedOutput.
+func TestRunDrainsLargeOutputWhileTheChildRuns(t *testing.T) {
+	t.Setenv(helperEnv, roleBigOutput)
+
+	out, code, err := (&CLI{Exe: os.Args[0]}).run()
+
+	if err != nil {
+		t.Fatalf("a clean exit with a full drain must report no error, got %v", err)
+	}
+	if code != 0 {
+		t.Errorf("want exit code 0, got %d", code)
+	}
+	if len(out) < bigOutputBytes {
+		t.Errorf("got %d bytes, want at least %d: output was lost", len(out), bigOutputBytes)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(out), "END") {
+		t.Errorf("the closing marker is missing: output was cut short (last bytes %q)", out[max(0, len(out)-20):])
 	}
 }
 
@@ -774,7 +984,7 @@ func TestCLITrashStartFailureIsAmbiguous(t *testing.T) {
 
 // TestCLIUploadStartFailureIsAmbiguous exercises CreateExclusive and
 // UpdateRevision end to end against a binary that cannot start, without
-// invoking the real proton-drive CLI: c.run's CombinedOutput on an
+// invoking the real proton-drive CLI: c.run on an
 // unstartable process yields empty output, which parseTransferSummary must
 // treat as unparseable — Ambiguous, not a false Committed or Refused.
 //

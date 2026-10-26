@@ -3,43 +3,96 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/craigstoller/git-proton-backup/internal/gitcmd"
+	"github.com/craigstoller/git-proton-backup/internal/repo"
 	"github.com/craigstoller/git-proton-backup/internal/testcli"
 	"github.com/craigstoller/git-proton-backup/internal/transport"
 )
 
-// testcliRoleEnv, when set to testcliRoleShim, makes THIS test binary's
-// TestMain re-dispatch into testcli.Run instead of running go test's own
-// test suite. This is the "os.Executable() re-exec with a role env var"
-// technique internal/transport/cli_test.go's TestHelperProcess pattern
-// already uses (see its own TestMain), extended here: a COPY of this
-// package's own compiled test binary, placed on PATH under the literal name
-// "proton-drive"(.exe on Windows), IS the fake proton-drive CLI a real
-// *transport.CLI shells out to — argv, the certified-version allowlist
-// check, and every c.run call site in internal/transport/cli.go all run
-// for real, with no live Proton account involved (Task 13).
+// A COPY of this package's own compiled test binary runs in two more roles
+// besides go test's own suite, and the copy's base name, not a variable, says
+// which. This is the os.Executable() re-exec technique
+// internal/transport/cli_test.go's TestHelperProcess pattern already uses,
+// keyed on the name instead of a role variable because the helper sets no
+// cmd.Env on any child (design v6.9, F8): every variable a test gives the
+// helper reaches the shim it starts too, so a role variable would be obeyed
+// by both.
 const (
-	testcliRoleEnv  = "GPB_TESTCLI_ROLE"
-	testcliRoleShim = "shim"
+	// shimExeBase: placed on PATH under this literal name ("proton-drive",
+	// plus .exe on Windows), the copy IS the fake proton-drive CLI a real
+	// *transport.CLI shells out to — argv, the certified-version allowlist
+	// check, and every c.run call site in internal/transport/cli.go all run
+	// for real, with no live Proton account involved (Task 13).
+	shimExeBase = "proton-drive"
+	// helperExeBase: the copy is the real helper, run() and all, driven over
+	// its protocol pipes by the signal harness (startHelper,
+	// signal_harness_test.go) and sent real signals.
+	helperExeBase = "git-remote-proton-testhelper"
+)
+
+// The helper role's seams, read from its environment (startHelper sets the
+// first; a test passes the others in helperOpts.Env).
+const (
+	// shrinkEnv=1 shrinks the shutdown timings (helperRole lists them).
+	shrinkEnv = "GPB_TEST_SHRINK"
+	// holdAfterLoopEnv, when non-empty, holds run() after loop returns (E13).
+	holdAfterLoopEnv = "GPB_TEST_HOLD_AFTER_LOOP"
+	// unconfirmedStopEnv, when non-empty, makes the stop of the in-flight
+	// child report its exit unconfirmed (E19).
+	unconfirmedStopEnv = "GPB_TEST_UNCONFIRMED_STOP"
+)
+
+// The shutdown timings helperRole sets under shrinkEnv, in seconds rather than
+// a minute per case. A release call is bounded at shrunkReleaseCall and killed
+// at shrunkReleaseCall - shrunkReleaseDrain (2.8 s), which leaves room for E9's
+// and W2's 1.5 s delay rule and stays well under the cap. Named so the signal
+// cases can bound and check their waits by the values the helper really runs
+// with.
+const (
+	shrunkCap          = 8 * time.Second
+	shrunkGrace        = 500 * time.Millisecond
+	shrunkTerm         = 500 * time.Millisecond
+	shrunkConfirm      = 2 * time.Second
+	shrunkRetryPause   = 200 * time.Millisecond
+	shrunkOutcomeWait  = 300 * time.Millisecond
+	shrunkSettle       = 300 * time.Millisecond
+	shrunkReleaseCall  = 3 * time.Second
+	shrunkReleaseDrain = 200 * time.Millisecond
+)
+
+// afterLoopReady is the file the held run() writes in the shim's ready dir
+// (testcli.ReadyDirEnv) once loop has returned; afterLoopGo, created there by
+// the test, lets run() go on; holdLimit bounds the hold.
+const (
+	afterLoopReady = "ready-after-loop"
+	afterLoopGo    = "after-loop.go"
+	holdLimit      = 30 * time.Second
 )
 
 // TestMain is package main's test entry point. Its ONLY job before ever
-// touching the go test framework is checking whether THIS invocation is
-// really a re-exec'd shim subprocess (see buildShimOnPath, below): if so,
-// it dispatches straight into testcli.Run using this process's own argv and
-// std streams and exits, without ever calling m.Run() — the same
-// before-flag-parsing early-exit shape cli_test.go's own TestMain uses for
-// its roles, so a shim subprocess run this way never touches -test.* flag
-// parsing at all.
+// touching the go test framework, or any variable, is checking which binary
+// THIS invocation is (testBinaryRole): a re-exec'd shim (see buildShimOnPath,
+// below) dispatches straight into testcli.Run using this process's own argv
+// and std streams, and a re-exec'd helper into helperRole, and either exits
+// without ever calling m.Run() — the same before-flag-parsing early-exit
+// shape cli_test.go's own TestMain uses for its roles, so a subprocess run
+// this way never touches -test.* flag parsing at all. Anything else is the
+// test runner.
 func TestMain(m *testing.M) {
-	if os.Getenv(testcliRoleEnv) == testcliRoleShim {
+	switch testBinaryRole() {
+	case shimExeBase:
 		os.Exit(testcli.Run(os.Args[1:], os.Stdout, os.Stderr))
+	case helperExeBase:
+		os.Exit(helperRole())
 	}
 	// Every TestLoop_* test that reaches "list for-push" would otherwise spawn
 	// a real git for the restore-floor probe (D5(d)). Stub the seam for the whole
@@ -48,6 +101,10 @@ func TestMain(m *testing.M) {
 	// function back through realProbeRestoreFloor.
 	realProbeRestoreFloor = probeRestoreFloor
 	probeRestoreFloor = func(string) (gitcmd.ProbeResult, string) { return gitcmd.ProbeOK, "" }
+	// An in-doubt lock handle settles (5 s in production) before its release
+	// reads the remote. Nothing here has a late request to wait out, so the
+	// wait is only time spent.
+	repo.SettleDelay = 0
 	os.Exit(m.Run())
 }
 
@@ -55,57 +112,130 @@ func TestMain(m *testing.M) {
 // it stubs the seam, so a test can wire the real thing back in.
 var realProbeRestoreFloor func(string) (gitcmd.ProbeResult, string)
 
-// buildShimOnPath copies this test binary into a private temp directory
-// under the literal name "proton-drive"(.exe on Windows only), points
-// GPB_TESTCLI_TREE at a second, empty temp directory (the shim's local
-// tree — every Proton Drive remote path the test seeds, or the real code
-// under test writes, maps onto a file under it via testcli.LocalPath), and
-// prepends that directory to PATH: the mechanism transport.NewCLI("")'s
-// default exe name ("proton-drive") resolves through when *transport.CLI
-// shells out.
+// testBinaryRole is this executable's base name with any ".exe" stripped: what
+// TestMain dispatches on. os.Executable, not os.Args[0], so the answer is the
+// file actually running, whatever argv[0] its parent gave it.
+func testBinaryRole() string {
+	exe, err := os.Executable()
+	if err != nil {
+		exe = os.Args[0]
+	}
+	base := filepath.Base(exe)
+	if ext := filepath.Ext(base); strings.EqualFold(ext, ".exe") {
+		base = strings.TrimSuffix(base, ext)
+	}
+	return base
+}
+
+// helperRole is the helper as git would run it, with the seams the signal
+// cases need set from its environment; run(), its signal handling, its CLI and
+// its git are the real ones. os.Args is the argv startHelper gave it: [exe,
+// "origin", <address>] for a push or fetch, or [exe, "--set-head", <address>,
+// <branch>].
+func helperRole() int {
+	// As the m.Run() path does, or every case would run the real probe.
+	probeRestoreFloor = func(string) (gitcmd.ProbeResult, string) { return gitcmd.ProbeOK, "" }
+	if os.Getenv(shrinkEnv) == "1" {
+		shutdownCap = shrunkCap
+		childGrace = shrunkGrace
+		childTerm = shrunkTerm
+		childConfirm = shrunkConfirm
+		retryPause = shrunkRetryPause
+		outcomeWait = shrunkOutcomeWait
+		repo.SettleDelay = shrunkSettle
+		transport.SetReleaseBoundsForTest(shrunkReleaseCall, shrunkReleaseDrain)
+	}
+	if os.Getenv(holdAfterLoopEnv) != "" {
+		afterLoopHook = holdAfterLoop
+	}
+	if os.Getenv(unconfirmedStopEnv) != "" {
+		// The child is still stopped, so nothing is left running; only the
+		// coordinator is told its exit was not confirmed (E19).
+		stopInFlight = func(grace, term, confirm time.Duration) bool {
+			transport.StopInFlight(grace, term, confirm)
+			return false
+		}
+	}
+	return run()
+}
+
+// holdAfterLoop holds run() between loop's return and finish (E13): it writes
+// afterLoopReady in the ready dir, then waits until the test creates
+// afterLoopGo there, which it does once its signal's shutdown has begun. After
+// holdLimit it gives up and lets run() finish.
+func holdAfterLoop() {
+	dir := os.Getenv(testcli.ReadyDirEnv)
+	ready := filepath.Join(dir, afterLoopReady)
+	if err := os.WriteFile(ready, nil, 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "git-remote-proton-testhelper: cannot write %s: %v\n", ready, err)
+		return
+	}
+	for end := time.Now().Add(holdLimit); time.Now().Before(end); time.Sleep(10 * time.Millisecond) {
+		if _, err := os.Stat(filepath.Join(dir, afterLoopGo)); err == nil {
+			return
+		}
+	}
+}
+
+// copyTestBinary copies this test binary into dir under base, plus ".exe" on
+// Windows only, and returns the copy's path.
 //
-// Copying (rather than pointing PATH at os.Executable() directly) is not
-// optional: PATH lookup matches on the *basename* transport.NewCLI expects
-// ("proton-drive"), and os.Executable() here is this package's own test
-// binary, named nothing like that. On Windows the copy additionally needs
-// the ".exe" suffix — LookPath's PATHEXT-driven search only finds it under
-// that literal name. Everywhere else it must carry no suffix at all, since
-// LookPath there matches the bare name exactly. The suffix is therefore
-// keyed on runtime.GOOS, never borrowed from os.Executable(): on Linux this
-// test binary is git-remote-proton.test, whose ".test" extension would name
-// the copy "proton-drive.test" and leave it unfindable (the first Linux run,
-// 2026-10-15, failed all three shim tests exactly that way).
-func buildShimOnPath(t *testing.T) (treeDir string) {
+// Copying (rather than pointing at os.Executable() directly) is not optional:
+// PATH lookup matches on the *basename* transport.NewCLI expects
+// ("proton-drive"), and TestMain dispatches on the base name too, while
+// os.Executable() here is this package's own test binary, named nothing like
+// either. On Windows the copy additionally needs the ".exe" suffix — LookPath's
+// PATHEXT-driven search only finds it under that literal name. Everywhere else
+// it must carry no suffix at all, since LookPath there matches the bare name
+// exactly. The suffix is therefore keyed on runtime.GOOS, never borrowed from
+// os.Executable(): on Linux this test binary is git-remote-proton.test, whose
+// ".test" extension would name the copy "proton-drive.test" and leave it
+// unfindable (the first Linux run, 2026-10-15, failed all three shim tests
+// exactly that way).
+func copyTestBinary(t *testing.T, dir, base string) string {
 	t.Helper()
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
 	}
-	shimDir := t.TempDir()
-	shimName := "proton-drive"
 	if runtime.GOOS == "windows" {
-		shimName += ".exe"
+		base += ".exe"
 	}
-	shimExe := filepath.Join(shimDir, shimName)
+	dst := filepath.Join(dir, base)
 	in, err := os.Open(self)
 	if err != nil {
 		t.Fatalf("open self: %v", err)
 	}
 	defer in.Close()
-	out, err := os.OpenFile(shimExe, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o755)
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o755)
 	if err != nil {
-		t.Fatalf("create shim copy: %v", err)
+		t.Fatalf("create %s: %v", base, err)
 	}
 	if _, err := io.Copy(out, in); err != nil {
 		out.Close()
-		t.Fatalf("copy shim binary: %v", err)
+		t.Fatalf("copy the test binary to %s: %v", base, err)
 	}
 	if err := out.Close(); err != nil {
-		t.Fatalf("close shim copy: %v", err)
+		t.Fatalf("close %s: %v", base, err)
 	}
+	return dst
+}
+
+// buildShimOnPath copies this test binary into a private temp directory
+// under the literal name "proton-drive"(.exe on Windows only; see
+// copyTestBinary), points GPB_TESTCLI_TREE at a second, empty temp directory
+// (the shim's local tree — every Proton Drive remote path the test seeds, or
+// the real code under test writes, maps onto a file under it via
+// testcli.LocalPath), and prepends that directory to PATH: the mechanism
+// transport.NewCLI("")'s default exe name ("proton-drive") resolves through
+// when *transport.CLI shells out. The copy's name is what makes it the shim
+// (TestMain); no role variable is set.
+func buildShimOnPath(t *testing.T) (treeDir string) {
+	t.Helper()
+	shimDir := t.TempDir()
+	copyTestBinary(t, shimDir, shimExeBase)
 
 	treeDir = t.TempDir()
-	t.Setenv(testcliRoleEnv, testcliRoleShim)
 	t.Setenv(testcli.TreeEnv, treeDir)
 	t.Setenv("PATH", shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	// Deterministic regardless of what the ambient environment happens to

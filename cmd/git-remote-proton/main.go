@@ -50,7 +50,9 @@ const createParentsEnv = "GPB_CREATE_PARENTS"
 // main only chooses the process exit code. All cleanup lives in run's defers:
 // calling os.Exit directly from deep inside the command loop would skip every
 // deferred func (Go does not run defers on os.Exit), which is exactly the lock
-// leak the "release on every exit path" rule exists to prevent.
+// leak the "release on every exit path" rule exists to prevent. The one other
+// caller is the shutdown coordinator (shutdown.go, through exitFn): after a
+// signal it releases every registered lock itself, and only then exits.
 func main() {
 	os.Exit(run())
 }
@@ -115,6 +117,9 @@ func dispatchUtility(args []string, stdout, stderr io.Writer) (bool, int) {
 			fmt.Fprintln(stderr, "usage: git-remote-proton --set-head <proton::address> <branch>")
 			return true, 1
 		}
+		// So a shutdown during it names --set-head, and says HEAD may or may not
+		// have changed once HEAD's upload has started (§5.6, headWriteStarted).
+		curCoord.setMode(modeSetHead)
 		return true, runSetHeadFn(args[2], args[3], stdout, stderr)
 	}
 	return false, 0
@@ -141,13 +146,25 @@ func runSetHead(addr, branch string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// run installs the shutdown coordinator before anything else, so no CLI child
+// can start before a signal would be handled, and routes every return through
+// its finish: with no signal that stops the coordinator and returns the code;
+// once a signal has started shutdown, it waits for the coordinator to end the
+// process (shutdown.go).
 func run() int {
-	if handled, code := dispatchUtility(os.Args, os.Stdout, os.Stderr); handled {
-		return code
+	curCoord = installShutdown()
+	// UpdateHEAD reports the start of HEAD's upload here, so a --set-head
+	// shutdown says HEAD may have changed only once it could have. finish
+	// clears it.
+	repo.OnHEADWrite = curCoord.headWriteStarted
+	// quietStderr, not os.Stderr: runSetHead's own messages go quiet with warn
+	// once shutdown begins.
+	if handled, code := dispatchUtility(os.Args, os.Stdout, quietStderr); handled {
+		return curCoord.finish(code)
 	}
 	if len(os.Args) < 3 {
 		fmt.Fprintln(os.Stderr, "git-remote-proton: must be run by git as a remote helper")
-		return 1
+		return curCoord.finish(1)
 	}
 	// Canonicalise BEFORE anything else touches the address. Every remote path
 	// in this process is built by concatenation onto root, so a trailing slash
@@ -161,12 +178,12 @@ func run() int {
 	root, err := repo.CanonicalRoot(os.Args[2])
 	if err != nil {
 		warn(err)
-		return 1
+		return curCoord.finish(1)
 	}
 	gitDir, err := resolveGitDir()
 	if err != nil {
 		warn(err)
-		return 1
+		return curCoord.finish(1)
 	}
 	// The rest of GIT_DIR's class, resolved at the same point and for the same
 	// reason. See resolveGitDir's doc for which variables are covered, which
@@ -174,7 +191,7 @@ func run() int {
 	// rather than safe.
 	if err := absolutizeInheritedGitPaths(); err != nil {
 		warn(err)
-		return 1
+		return curCoord.finish(1)
 	}
 	// git sets GIT_DIR (commonly a RELATIVE path, e.g. ".git") in this
 	// process's own environment before spawning the helper. internal/gitcmd
@@ -196,13 +213,17 @@ func run() int {
 	if err := transport.EnforceCertified(cli,
 		os.Getenv(uncertifiedCLIEnv) == "1", os.Stderr); err != nil {
 		warn(err)
-		return 1
+		return curCoord.finish(1)
 	}
 	in := bufio.NewScanner(os.Stdin)
 	out := bufio.NewWriter(os.Stdout)
 	defer out.Flush()
 
-	return loop(transport.NewTraced(cli, os.Stderr), root, gitDir, in, out)
+	code := loop(transport.NewTraced(cli, os.Stderr), root, gitDir, in, out)
+	if afterLoopHook != nil {
+		afterLoopHook()
+	}
+	return curCoord.finish(code)
 }
 
 // resolveGitDir captures GIT_DIR from the environment and resolves it to an
@@ -320,11 +341,44 @@ func absolutizeInheritedGitPaths() error {
 // from run so the fail-closed exit-code paths can be exercised directly with
 // an in-memory transport.Fake and buffered io.Reader/io.Writer in tests — no
 // live account, no real git remote.
-func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bufio.Writer) int {
+//
+// code is named so a deferred step can adjust it.
+func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bufio.Writer) (code int) {
 	var opts protocol.Options
 	var lock *repo.Lock
+	// strays are the handles loop was given and did not keep as lock: a second
+	// acquisition that ended in doubt (not adopted), and a held handle that a
+	// second acquisition that succeeded replaced. The release defer releases
+	// them too, strays first.
+	var strays []*repo.Lock
 	var checkConnectivity bool
+	// writeFailed records that a write to git failed. Every Flush below goes
+	// through flush, and the second defer flushes once more, so a failure cannot
+	// be hidden: run()'s own deferred Flush runs after loop has returned and
+	// could never change the code. A bufio.Writer keeps its first write error
+	// and returns it from every later Flush, so that last flush also catches a
+	// failure inside an Fprint that was never flushed on its own.
+	writeFailed := false
+	flush := func() {
+		if err := out.Flush(); err != nil {
+			writeFailed = true
+		}
+	}
 	defer func() {
+		// Strays first, so that an in-doubt stray settles and reads while the
+		// held lock still blocks the name: an upload of the stray's that lands
+		// late is refused then (CreateExclusive uploads with the skip strategy).
+		// Released the other way round, the held lock would be gone first, and a
+		// late upload could take the free name after the stray's read, with
+		// nothing left to release it. Every release is nonce-first, so a stray
+		// whose lock is not on the remote, or belongs to another handle, is a
+		// no-op (absent or foreign) that only takes its register entry out. Same
+		// warning shape as the held lock's, below.
+		for _, s := range strays {
+			if err := s.Release(); err != nil {
+				warn(err)
+			}
+		}
 		if lock != nil {
 			// Release on EVERY exit path; a leak wedges the repo. Its error is
 			// REPORTED but deliberately does NOT change the exit code.
@@ -346,6 +400,17 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 			}
 		}
 	}()
+	// Registered after the release defer, so it runs first: git gets its last
+	// output before a release that may wait out an in-doubt lock's settle.
+	defer func() {
+		flush()
+		// git owns both pipes: once stdout is broken, nothing said here reaches
+		// it, and a session whose answers were lost is not a successful one.
+		// Only a 0 is raised; a failure already being reported stays as it is.
+		if writeFailed && code == 0 {
+			code = 1
+		}
+	}()
 
 	for in.Scan() {
 		line := in.Text()
@@ -355,7 +420,7 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 			// recognises a connectivity-ok response from a helper that
 			// advertised the capability.
 			fmt.Fprint(out, "option\npush\nfetch\ncheck-connectivity\n\n")
-			out.Flush()
+			flush()
 
 		case strings.HasPrefix(line, "option "):
 			// check-connectivity is HONOURED, not poisoned: poison exists for
@@ -363,12 +428,12 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 			if v, ok := strings.CutPrefix(line, "option check-connectivity "); ok {
 				checkConnectivity = strings.TrimSpace(v) == "true"
 				fmt.Fprint(out, "ok\n")
-				out.Flush()
+				flush()
 				continue
 			}
 			opts.Observe(line)
 			fmt.Fprint(out, "unsupported\n") // advisory only; poison flag is the real defence
-			out.Flush()
+			flush()
 
 		case line == "list":
 			// The FETCH-side advertisement. Read-only: no Bootstrap, no lock.
@@ -452,9 +517,11 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 				}
 			}
 			fmt.Fprint(out, "\n")
-			out.Flush()
+			flush()
 
 		case line == "list for-push":
+			// From here a lock may be held: a shutdown says so (§5.6).
+			curCoord.setMode(modePush)
 			// EnsureParents runs BEFORE Bootstrap, and ONLY here — see
 			// createParentsEnv's doc above for why this is the one and only
 			// call site. Its stderr argument is the real os.Stderr, not the
@@ -477,11 +544,40 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 			// holding the single-writer lock. It only ever warns.
 			warnRestoreFloor(gitDir)
 			l, err := repo.AcquireLock(t, root) // BEFORE advertising
+			// A handle can come back WITH an error: the upload may have landed
+			// without us knowing. Keep it either way, so the release defer
+			// settles and removes it; the session still fails on the error.
+			//
+			// Which handle is kept as lock decides the release order: strays
+			// first, then lock. git sends one list for-push per session. A second
+			// acquisition that ends in doubt stays a stray and the held handle
+			// stays lock, so the in-doubt stray settles and reads while the held
+			// lock still blocks the name. A second acquisition that SUCCEEDED
+			// becomes lock: the name was free, so the first .lock must already be
+			// gone, and the first handle, now a stray, finds the second nonce on
+			// release (foreign) and only leaves the register.
+			//
+			// Whichever handle is not kept as lock is not dropped: it joins
+			// strays, and the release defer releases it before the held lock
+			// (after the settle wait, if it is in doubt). On a signal the
+			// coordinator finds the same handles in the register; on a normal exit
+			// nothing else would, so dropping one would leave an in-doubt second
+			// lock that had landed on the remote.
+			if l != nil {
+				switch {
+				case lock == nil:
+					lock = l
+				case err == nil:
+					strays = append(strays, lock)
+					lock = l
+				default:
+					strays = append(strays, l)
+				}
+			}
 			if err != nil {
 				warn(err)
 				return 1
 			}
-			lock = l
 			scan, err := repo.ScanRefs(t, root)
 			if err != nil {
 				warn(err)
@@ -499,7 +595,7 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 				fmt.Fprintf(out, "%s %s\n", sha, name)
 			}
 			fmt.Fprint(out, "\n")
-			out.Flush()
+			flush()
 
 			// The push-survey HEAD diagnostic: ADVISORY, and COST-GATED on
 			// something already having been skipped. This is deliberately
@@ -588,7 +684,7 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 					fmt.Fprintf(out, "error %s unsupported option %s\n", u.Dst, opts.Poisoned)
 				}
 				fmt.Fprint(out, "\n")
-				out.Flush()
+				flush()
 				continue
 			}
 			scan, err := repo.ScanRefs(t, root)
@@ -603,6 +699,9 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 			// before any pack is built. This call site's job is only to pass
 			// through what ScanRefs just found.
 			remote := scan.Refs
+			// Between these two marks a shutdown says the push did not finish:
+			// its remote writes may have landed while git was told nothing.
+			curCoord.batchStarted()
 			for _, r := range repo.Push(t, root, gitDir, ups, remote, scan.Skipped) {
 				if r.OK {
 					fmt.Fprintf(out, "ok %s\n", r.Ref)
@@ -611,7 +710,8 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 				}
 			}
 			fmt.Fprint(out, "\n")
-			out.Flush()
+			flush()
+			curCoord.batchDone()
 
 		case strings.HasPrefix(line, "fetch "):
 			var wants []string
@@ -670,7 +770,7 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 				fmt.Fprint(out, "connectivity-ok\n")
 			}
 			fmt.Fprint(out, "\n")
-			out.Flush()
+			flush()
 
 		case line == "":
 			return 0
@@ -757,6 +857,11 @@ func parseFetchLine(l string) (sha string, err error) {
 	return sp[1], nil
 }
 
+// warn is silent once shutdown has begun: the coordinator's lines are the
+// account from then on (§5.1).
 func warn(err error) {
+	if silenced.Load() {
+		return
+	}
 	fmt.Fprintf(os.Stderr, "git-remote-proton: %v\n", err)
 }

@@ -427,6 +427,104 @@ download them; you don't need this tool, or even a Windows machine, to get your 
     already holds a pair keeps taking pushes to its other refs, but under a directory pair
     (`Feat/a` beside `feat/b`) a new ref under either spelling is refused until the pair is
     repaired.
+- **v2: what happens to the remote lock when a push is killed.** A push or a `--set-head` run
+  holds a `.lock` file on the remote, and v2 has no lock takeover, so a lock left behind fails
+  every later push with `repo is locked` until someone removes it. When the helper receives a
+  signal it can catch, it runs one bounded release before it exits: it retries a failed call until
+  its lock reaches an outcome or a 60 s cap passes. That is an attempt; the helper cannot promise
+  the lock is gone. The v6.11 entry in the [design's revision
+  history](docs/v2-remote-helper-design.md) has the detail.
+  - On Linux, SIGTERM, SIGINT and SIGHUP start the attempt, whether they come from `kill`, from
+    `timeout` or systemd. Ctrl-C and a closed terminal are expected to start it through the same
+    signals; neither has been run in a terminal. A signal that was already ignored when the helper
+    started, such as SIGHUP under `nohup`, starts nothing and prints nothing: the push carries on,
+    and the lock is then released only when the helper exits in the ordinary way, however the
+    push ends (a failed push included), not by the signal. Under systemd the attempt needs
+    `KillMode=control-group` (the default) and `TimeoutStopSec=` of 75 s or more. The 75 s is the
+    design's recommendation: 15 s over the 60 s cap, and 13 s over the 62 s worst case below, which
+    has not been run end to end at full length.
+  - On Windows, Ctrl-C and Ctrl-Break in a console window (Windows Terminal or conhost) start the
+    attempt and leave it time to finish. Ctrl-Break has been tested by sending it straight to the
+    helper, against a stand-in for the Proton CLI. Ctrl-C is expected to behave the same, because
+    Go delivers both as an interrupt, but it has not been run. Neither has been run under a real
+    `git push`. Closing the console window starts the attempt too, but it cannot finish (see the
+    case with no result line, below).
+  - If only git dies, no signal arrives. The helper notices when git's end of its pipes closes,
+    which the operating system does when git exits. A batch that git never finished sending is
+    refused unapplied, and the helper releases the lock the usual way and exits 1. A batch it had
+    already received runs to its end, its status writes fail, and it exits 1. With no batch in
+    progress it reads the end of its input, releases the lock and exits 0. A git that stays alive
+    but stops reading would not be noticed.
+  - Once started, the helper stops the Proton CLI call that was running, waits 5 s in case that
+    call's last request is still arriving at the server, then reads the remote `.lock` and
+    removes it only if it carries this helper's own nonce. A failed release call is retried until
+    the lock reaches an outcome or the cap passes. The cap runs from the first signal, so the stop
+    and the 5 s wait come out of it. The helper exits within 62 s of the first signal at worst (a
+    60 s limit, plus up to 1 s to stop a release call still running and up to 1 s to print the
+    result). That bounds how long the helper lives, not whether the lock is gone: only the result
+    line says that. Its exit code is 128 plus the signal's number: 143 for SIGTERM, 129 for
+    SIGHUP, and 130 for SIGINT and for both Ctrl-C and Ctrl-Break, which it reports as SIGINT. A
+    script that runs `git push` sees git's own exit code, or `timeout`'s 124, not the helper's.
+    When the signal also reaches git, as with `timeout` or Ctrl-C, git exits at once, so
+    `timeout` or the shell prompt can return while the helper is still releasing, for up to 62 s,
+    and a push of the same repo started in that time meets the old lock (`repo is locked`). A
+    second signal while the helper works is noted on stderr and ignored. A signal also skips the
+    helper's local cleanups, as before: a staging or download temp folder, or a `git pack-objects`
+    that was building a pack, can be left behind. The tests
+    run against a stand-in for the Proton CLI; how the real CLI behaves when it is signalled, and
+    how long a release takes against it, have not been measured.
+  - For each lock the helper then prints its path, its nonce and one outcome:
+    - *removed*: the lock was ours and is gone.
+    - *absent*: the remote showed no lock of ours at that moment. Either it was never created, or
+      it was already removed, as when the signal arrived while this push's own release was
+      finishing. A request the killed CLI call had already sent can still be applied later than
+      the 5 s wait, so a lock could appear afterwards. It would carry the nonce printed on this
+      line, and it is yours to remove. How late a request can land has not been measured, so
+      check the remote again later before assuming it is clean.
+    - *foreign*: another process holds the lock (a different nonce). Left alone.
+    - *unreadable*: a lock is there but its contents did not parse, so it cannot be shown to be
+      ours. Not removed and not retried; it needs a person.
+    - *failed*: the release calls kept failing, or a removal was never confirmed, until the time
+      limit. The line gives the reason and the manual remedy.
+    - *not attempted*: no release ran, either because the CLI call in flight did not confirm that
+      it had exited (removing the lock then could race that call's own write) or because the
+      time limit came first. The line gives the manual remedy. Locks are released one after
+      another, and a lock whose release never reaches a final outcome uses the rest of the 60 s
+      cap, so any later lock reports *not attempted*. The helper normally holds one lock: it has one
+      repo address and so one `.lock` path, and git sends one `list for-push` per session. A
+      second try at that path can show up here only in a session git does not produce: while it
+      is under way, or afterwards if it ended in doubt or succeeded (it can succeed only if the
+      first lock was removed by hand meanwhile). Either way, the helper attempts to release every
+      lock it took in a session when it exits. On a normal exit, if the second try ended in
+      doubt, the helper keeps the lock it already held and releases the second try first, after
+      the 5 s wait, then the held one; after a signal, the locks go in the order they were taken. If it succeeded, the new lock is the one held, and releasing the first attempt finds
+      nothing of its own and changes nothing. Separately, any attempt to take the lock, the first
+      one or a `--set-head` run's, whose upload was reported refused but whose lock carries the
+      nonce that same attempt uploaded is treated as ours and in doubt, and released. That case is
+      untested: it needs the Proton CLI to retry an upload internally.
+  - Anything that gives the helper no signal it can catch still leaves the lock: SIGKILL, the
+    OOM killer and power loss; under systemd, `KillMode=mixed` or `process`; and SIGQUIT, which
+    keeps Go's goroutine dump on purpose. On Windows that means Git Bash's `kill -TERM` and
+    `kill -HUP` (a `kill -INT` does nothing to a native Windows program) and `Stop-Process`,
+    all measured on a probe program, not on the helper; `taskkill /F`, inferred to act like
+    `Stop-Process`; logoff and shutdown, which Windows sends only to services; and a Task
+    Scheduler stop or time limit, inferred to end the process without a console event, and
+    untested. Ctrl-C in Git Bash's own window is also
+    assumed to leave the lock, and untested. The one leak on record, an agent tool's timeout
+    that killed a push on Windows ([Stage 5 gate](docs/research/gates/stage5-gate.md), S1),
+    probably belongs in this group: the gate record says only that the tool's timeout killed the
+    push, and that the kill came through Git Bash is inferred.
+  - Two situations print no result line. Windows ends the process 5 s after a console window is
+    closed. The helper does start its attempt, but it waits 5 s before its first release call, so
+    the release cannot begin in time and nothing is printed. After a console close the lock
+    stays, unless the push's own release was already under way and removes it. And if stderr is
+    blocked or gone (a pipe nobody reads, a closed terminal), the lines are dropped: the release
+    still runs, and the helper waits at most 1 s for the write. In both cases the lock is either
+    gone or still there, so check.
+  - To remove a leftover lock by hand, start from the lock-held error, which names the lock's
+    path. First make sure no push or `--set-head` for that repo is running: after a signal the old
+    helper can keep releasing for up to 62 s, and that error can appear in the meantime. Then
+    trash the lock with `proton-drive filesystem trash <repo path>/.lock`.
 - **v2 on Linux: unattended use is not gated.** Only attended use is in scope for the Linux gate
   and supported: a session with an unlocked Secret Service. Cron or systemd-timer runs are not
   covered. The helper

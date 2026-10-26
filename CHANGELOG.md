@@ -8,6 +8,35 @@
   wrote refs for a push nobody asked for in that shape. It now refuses the batch with a stderr
   message and exits non-zero before any further remote read or write, and still releases the
   lock.
+- **git-remote-proton: a killed push now tries to release its remote lock when the helper can
+  catch the kill.** Until now a signal ended the helper without running its cleanup, so `.lock`
+  stayed on the remote and every later push failed with `repo is locked` until someone removed it
+  by hand. A `--set-head` run holds the same lock and is covered the same way. On Linux, SIGTERM,
+  SIGINT and SIGHUP (from `kill`, `timeout` or systemd) now start one bounded release: the helper
+  stops the Proton CLI call in flight, waits 5 s, removes `.lock` only if it still carries the
+  helper's nonce, retries a failed call until the lock reaches an outcome or a 60 s cap passes,
+  prints what it found for each lock (removed, absent, foreign, unreadable, failed or not
+  attempted) and exits with 128 plus the signal number, within 62 s of the first signal at worst.
+  Ctrl-C and a closed terminal are expected to work through the same signals but were not run in a
+  terminal, and a signal that was already ignored when the helper started (SIGHUP under `nohup`,
+  say) starts nothing. Under systemd the release needs `KillMode=control-group` and
+  `TimeoutStopSec=` of 75 s or more, the design's figure: 13 s over the 62 s worst case, which has
+  not been run end to end. On Windows, Ctrl-C and Ctrl-Break in a console window are covered.
+  Ctrl-Break was tested against the helper, Ctrl-C is expected to behave the same, and neither has
+  been run under a real `git push`. A closed console window starts the release too, but Windows
+  ends the process 5 s later and the release waits 5 s before its first call, so the lock stays
+  unless the push's own release was already finishing, and no result line is printed. Git Bash's
+  `kill` and `Stop-Process` still leave the lock, and a Task Scheduler stop is expected to (untested). On
+  Linux the kills the helper cannot catch still leave it: SIGKILL, the OOM killer, and systemd's
+  `KillMode=mixed` or `process`. The kill that orphaned a lock in the Stage 5 gate, a tool timeout
+  that probably reached the push through Git Bash on Windows, is among those that still leak. Two
+  related changes: a lock whose acquisition ended in doubt (the upload's result was lost, or the
+  upload was reported refused but the lock there carries the nonce that same attempt uploaded,
+  which is untested) is now released on the normal exit path too, after a 5 s wait in case the
+  upload lands late (the helper also attempts to release any other lock the session took, without
+  that wait), and a session whose writes to git failed (git died, or its pipe broke) now exits 1. It
+  exited 0 on Windows, and on Linux SIGPIPE killed the helper with the lock held. The README's
+  honest limits list what each platform covers and the manual remedy; the v2 design is now v6.11.
 
 ## 0.10.0 — 2026-10-21
 

@@ -3757,8 +3757,8 @@ func TestAcquireLockFailsClosedOnUnrecognisedOutcome(t *testing.T) {
 	if err == nil {
 		t.Fatal("AcquireLock must fail closed on an unrecognised outcome")
 	}
-	if l != nil {
-		t.Error("no Lock may be handed back when the outcome was not recognised")
+	if l == nil || !l.InDoubt() {
+		t.Error("an unrecognised outcome must hand back an in-doubt handle, never a held one")
 	}
 	if !strings.Contains(err.Error(), "outcome(42)") {
 		t.Errorf("the refusal must name the outcome it saw, got: %v", err)
@@ -4000,6 +4000,92 @@ func TestUpdateHEADRefusesNonBranchTarget(t *testing.T) {
 	if _, ok := f.Files["/r/HEAD"]; ok {
 		t.Error("nothing must be written to the transport for a rejected target")
 	}
+}
+
+// 3b  UpdateHEAD calls OnHEADWrite immediately before the upload that writes
+// HEAD, on both the create and the update path, and never before it has
+// anything to write: not for a refused target, not when the Stat fails. The
+// helper's shutdown reports "--set-head was interrupted" only once this has
+// fired, so firing early would claim HEAD might have changed when it could not.
+func TestUpdateHEADCallsOnHEADWriteJustBeforeTheUpload(t *testing.T) {
+	old := OnHEADWrite
+	t.Cleanup(func() { OnHEADWrite = old })
+
+	for _, tc := range []struct {
+		name      string
+		exists    bool
+		wantWrite string
+	}{
+		{"create path", false, "CreateExclusive"},
+		{"update path", true, "UpdateRevision"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := transport.NewFake()
+			f.Dirs["/r"] = true
+			_ = Bootstrap(f, "/r")
+			if tc.exists {
+				f.Files["/r/HEAD"] = []byte("ref: refs/heads/old\n")
+			}
+			c := &callLogTransport{Transport: f}
+			var callsAtHook [][]string
+			OnHEADWrite = func() {
+				callsAtHook = append(callsAtHook, append([]string(nil), c.calls...))
+			}
+
+			if _, err := UpdateHEAD(c, "/r", "refs/heads/new"); err != nil {
+				t.Fatalf("UpdateHEAD: %v", err)
+			}
+
+			if len(callsAtHook) != 1 {
+				t.Fatalf("OnHEADWrite ran %d times, want exactly 1", len(callsAtHook))
+			}
+			if want := []string{"Stat"}; !reflect.DeepEqual(callsAtHook[0], want) {
+				t.Errorf("calls when OnHEADWrite ran = %v, want %v: after the Stat, before the write",
+					callsAtHook[0], want)
+			}
+			if len(c.calls) < 2 || c.calls[1] != tc.wantWrite {
+				t.Errorf("calls = %v, want the %s upload right after the hook", c.calls, tc.wantWrite)
+			}
+		})
+	}
+
+	t.Run("a refused target does not fire it", func(t *testing.T) {
+		f := transport.NewFake()
+		f.Dirs["/r"] = true
+		_ = Bootstrap(f, "/r")
+		fired := false
+		OnHEADWrite = func() { fired = true }
+		if _, err := UpdateHEAD(f, "/r", "refs/tags/v1"); err == nil {
+			t.Fatal("UpdateHEAD must refuse a non-branch target")
+		}
+		if fired {
+			t.Error("OnHEADWrite ran for a target that was refused before any upload")
+		}
+	})
+
+	t.Run("a failed Stat does not fire it", func(t *testing.T) {
+		f := transport.NewFake()
+		f.Dirs["/r"] = true
+		_ = Bootstrap(f, "/r")
+		fired := false
+		OnHEADWrite = func() { fired = true }
+		if _, err := UpdateHEAD(statErrorTransport{f}, "/r", "refs/heads/new"); err == nil {
+			t.Fatal("UpdateHEAD must report a Stat failure")
+		}
+		if fired {
+			t.Error("OnHEADWrite ran although nothing had been uploaded or attempted")
+		}
+	})
+
+	t.Run("a nil hook is safe", func(t *testing.T) {
+		f := transport.NewFake()
+		f.Dirs["/r"] = true
+		_ = Bootstrap(f, "/r")
+		OnHEADWrite = nil
+		if _, err := UpdateHEAD(f, "/r", "refs/heads/new"); err != nil {
+			t.Fatalf("UpdateHEAD with no hook: %v", err)
+		}
+	})
 }
 
 // ambiguousUpdateTransport wraps a Fake but forces UpdateRevision to report

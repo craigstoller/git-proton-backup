@@ -9,21 +9,23 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
-// waitDelay bounds how long Wait may block draining the child's output pipes
+// waitDelay bounds how long run may block draining the child's output pipe
 // AFTER the child itself has already exited. It is not a command timeout.
 //
-// MECHANISM (documented os/exec behaviour, not speculation). CombinedOutput
-// sets Stdout/Stderr to a *bytes.Buffer, which is not an *os.File, so os/exec
-// creates an os.Pipe(), hands the write end to the child, and copies from the
-// read end on a goroutine. Wait does not return until that goroutine sees EOF,
-// and EOF requires EVERY holder of the write end to close it — not just the
-// direct child. proton-drive is a Node program; a Node process that spawns a
-// worker or keeps a helper alive passes the inherited handle to a grandchild,
-// and we block forever. WaitDelay makes os/exec close the pipe and give up
-// instead (go.dev/issue/23019).
+// MECHANISM. The child's stdout and stderr are one os.Pipe, and EOF on its read
+// end requires EVERY holder of the write end to close it — not just the direct
+// child. proton-drive is a Node program; a Node process that spawns a worker or
+// keeps a helper alive passes the inherited handle to a grandchild, and a
+// drain that waits for EOF blocks forever. run therefore reads the pipe on its
+// own goroutine, waits for the PROCESS apart from that drain, and gives the
+// drain this long to reach EOF once the process has exited; past that it closes
+// the read end and uses what it has. (Before run owned the pipe, os/exec's own
+// copy goroutine did the draining and cmd.WaitDelay was the bound on it,
+// go.dev/issue/23019; the bound is the same, applied to the explicit drain.)
 //
 // This was OBSERVED during the Stage 2.1 live gate: the first `git push` hung
 // past a two-minute timeout AFTER its success output had already been
@@ -34,13 +36,31 @@ import (
 // It is a var, not a const, only so the test can shrink it; nothing in
 // production writes to it.
 //
-// LIMIT, stated plainly: with no Context set, the WaitDelay timer starts when
-// Wait observes the child has exited. A child that never exits at all is NOT
-// bounded by this. That is the correct scope — the observed hang was after the
-// child exited, and a real command timeout is a separate, unrelated decision.
+// LIMIT, stated plainly: the timer starts when run observes the child has
+// exited. A child that never exits at all is NOT bounded by this. That is the
+// correct scope — the observed hang was after the child exited, and a real
+// command timeout is a separate, unrelated decision.
 var waitDelay = 30 * time.Second
 
-type CLI struct{ Exe string }
+// testHookExited is a test seam: when non-nil, run calls it with the child's pid
+// once the child's exit is observed and before the drain wait begins (the
+// call's in-flight record already shows the exit by then). Nil in production.
+// Tests set it before a call and clear it after the call returns, never
+// during one.
+var testHookExited func(pid int)
+
+// CLI drives the proton-drive executable. Only Exe is set by callers; the
+// unexported fields default to today's behaviour when zero: no call timeout,
+// drain bounded by waitDelay, warnings to os.Stderr, not a release instance.
+// Only NewReleaseCLI (gate.go) sets them.
+type CLI struct {
+	Exe string
+
+	callTimeout time.Duration // 0: no bound on a single call; else the child is killed at callTimeout - drain
+	drain       time.Duration // 0: waitDelay; the post-exit drain bound
+	warnW       io.Writer     // nil: os.Stderr; where run's abandoned-pipe warning goes
+	release     bool          // exempt from the gate, own process group: the coordinator's instance only
+}
 
 func NewCLI(exe string) *CLI {
 	if exe == "" {
@@ -49,33 +69,180 @@ func NewCLI(exe string) *CLI {
 	return &CLI{Exe: exe}
 }
 
+// run starts the CLI and returns its merged stdout+stderr, its exit code and an
+// error. It owns the child's output pipe instead of delegating to
+// CombinedOutput, so the child's EXIT is observed apart from the DRAIN of its
+// output: exit means the process has gone, which is what a caller deciding
+// whether the remote is quiet needs to know; the drain can lag it by as long as
+// a grandchild holds the pipe open.
+//
+// Error contract (CombinedOutput's with WaitDelay set, plus the killed case):
+//   - the child could not be started: code -1 and the start error, unwrapped
+//     (EnforceCertified's never-started test reads it as it is);
+//   - the child exited 0 and the drain finished: nil error;
+//   - the child exited 0 but the drain ran out: the output read so far, code 0
+//     and exec.ErrWaitDelay (the command SUCCEEDED; every caller branches on
+//     code != 0 first, so this flows through as the success it is), plus a
+//     warning on stderr so a recurrence is diagnosable instead of invisible —
+//     stderr, never stdout: stdout is protocol-only;
+//   - the child exited non-zero: an *exec.ExitError, whether or not the drain
+//     finished, and no warning;
+//   - the child ran and the helper killed it (a release call at its bound or
+//     at the shutdown cap, a gated call stopped by the shutdown): the child's
+//     code (-1 on Unix, where it died of a signal; 1 on Windows, the code
+//     Kill's TerminateProcess gives) and an error naming why, "proton CLI call
+//     killed at its 15s bound: signal: killed", wrapping the *exec.ExitError.
+//
+// The gate (gate.go) wraps all of that. A gated call made after ShutGate
+// starts no child and parks, and so does one whose result arrives after it; a
+// release call returns errReleaseClosed once KillReleaseCalls has run. Each
+// call is in an in-flight set from before its start to after its drain, and
+// its record shows the child's exit the moment Wait returns, so StopInFlight
+// and KillReleaseCalls wait on the exit, never on the drain.
 func (c *CLI) run(args ...string) (string, int, error) {
-	cmd := exec.Command(c.Exe, args...)
+	// The gate comes first: a call it parks creates no pipe and starts no child.
+	f, park, err := admit(c.release, c.callTimeout)
+	if park != nil {
+		return parked(park)
+	}
+	if err != nil {
+		return "", -1, err
+	}
+
 	// Bounds the post-exit pipe drain so a grandchild holding the inherited
 	// write end cannot hang the helper forever. See waitDelay: DO NOT DELETE
 	// this as unnecessary — the hang it prevents is invisible when it happens.
-	cmd.WaitDelay = waitDelay
-	out, err := cmd.CombinedOutput()
-	if errors.Is(err, exec.ErrWaitDelay) {
-		// The command itself SUCCEEDED. os/exec substitutes ErrWaitDelay for a
-		// nil error only when the process exited with a successful status
-		// (exec.go: `if err == nil { err = goroutineErr }`), and ProcessState
-		// is set, so the exit code returned below is the real one and every
-		// caller here — all of which branch on code != 0 first — flows through
-		// as the success it is. Warn so a recurrence is diagnosable instead of
-		// invisible. stderr, never stdout: stdout is protocol-only.
-		fmt.Fprintf(os.Stderr, "git-remote-proton: %s exited but something still held its "+
+	limit := c.drain
+	if limit <= 0 {
+		limit = waitDelay
+	}
+
+	cmd := exec.Command(c.Exe, args...)
+	if c.release {
+		setOwnGroup(cmd)
+	}
+	// ONE pipe for both streams: handing the same *os.File to Stdout and Stderr
+	// makes os/exec give the child one handle for both, so the output keeps the
+	// interleaving the child wrote it in (what CombinedOutput did).
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return f.noChild(err)
+	}
+	cmd.Stdout, cmd.Stderr = pw, pw
+	// A bounded call is killed at callTimeout - limit, counted from here, so
+	// the drain that follows the kill still ends inside callTimeout.
+	killAt := time.Now().Add(c.callTimeout - limit)
+	// No lock is held across the start (gate.go).
+	if err := startCmd(cmd); err != nil {
+		pr.Close()
+		pw.Close()
+		return f.noChild(err)
+	}
+	// The child has its own copy now. Ours must go, or EOF could never arrive.
+	pw.Close()
+	out := readPipe(pr)
+	f.fill(cmd.Process)
+	var bound *time.Timer
+	if c.callTimeout > 0 {
+		bound = time.AfterFunc(time.Until(killAt), f.killAtBound)
+	}
+
+	// With stdio all *os.File there are no copy goroutines inside os/exec, so
+	// Wait returns when the PROCESS exits, whatever still holds the pipe.
+	werr := cmd.Wait()
+	killedBy := f.exit()
+	if bound != nil {
+		bound.Stop() // a callback already running finds the exit recorded and does nothing
+	}
+	if testHookExited != nil {
+		testHookExited(cmd.Process.Pid)
+	}
+
+	text, drained := out.finish(limit)
+	// The drain closed the read end on both its paths (at EOF, or abandoned
+	// from a goroutine), so a call that parks here leaks no reader.
+	if park := f.leave(); park != nil {
+		return parked(park)
+	}
+
+	err = werr
+	if werr != nil && killedBy != "" {
+		// The child ran and we ended it. Said so, so a caller's message does not
+		// read as the CLI's own failure, or, with Unix's -1 for a signalled
+		// child, as a CLI that never started. %w keeps the *exec.ExitError.
+		err = fmt.Errorf("proton CLI call killed %s: %w", killedBy, werr)
+	}
+	if !drained && werr == nil {
+		// The command itself SUCCEEDED: only the drain ran out. This is the
+		// exec.ErrWaitDelay carve-out documented above, now produced here.
+		err = exec.ErrWaitDelay
+		w := c.warnW
+		if w == nil {
+			w = os.Stderr
+		}
+		fmt.Fprintf(w, "git-remote-proton: %s exited but something still held its "+
 			"output pipe open after %s; the pipe was abandoned and the command's result used "+
-			"as-is (output may be truncated)\n", c.Exe, waitDelay)
+			"as-is (output may be truncated)\n", c.Exe, limit)
 	}
-	// If the executable never started (not on PATH, permission denied, etc.),
-	// cmd.ProcessState is nil and ExitCode() would panic. Fail closed instead:
-	// report a non-zero code and the start error.
+	// If Wait never produced a ProcessState, ExitCode() would panic. Fail
+	// closed instead: report a non-zero code and the error.
 	if cmd.ProcessState == nil {
-		return string(out), -1, err
+		return text, -1, err
 	}
-	code := cmd.ProcessState.ExitCode()
-	return string(out), code, err
+	return text, cmd.ProcessState.ExitCode(), err
+}
+
+// pipeReader drains a child's merged output on its own goroutine while the
+// child runs: a child that writes more than a pipe buffer blocks until someone
+// reads. mu guards buf against the copy finish takes when the drain runs out
+// and the goroutine is still appending.
+type pipeReader struct {
+	pr   *os.File
+	mu   sync.Mutex
+	buf  []byte
+	done chan struct{} // closed when the reader stops
+}
+
+func readPipe(pr *os.File) *pipeReader {
+	r := &pipeReader{pr: pr, done: make(chan struct{})}
+	go func() {
+		defer close(r.done)
+		chunk := make([]byte, 32*1024)
+		for {
+			n, rerr := pr.Read(chunk)
+			if n > 0 {
+				r.mu.Lock()
+				r.buf = append(r.buf, chunk[:n]...)
+				r.mu.Unlock()
+			}
+			if rerr != nil {
+				return // io.EOF, or the read end closed by finish's timeout
+			}
+		}
+	}()
+	return r
+}
+
+// finish gives the drain up to limit to reach EOF, once the child has exited,
+// and returns what was read and whether the drain finished. The read end is
+// closed either way.
+func (r *pipeReader) finish(limit time.Duration) (string, bool) {
+	timer := time.NewTimer(limit)
+	defer timer.Stop()
+	drained := false
+	select {
+	case <-r.done:
+		drained = true
+		r.pr.Close()
+	case <-timer.C:
+		// Abandon the pipe. Close from a goroutine nobody waits on: on Windows
+		// Close can block behind a Read that is still in progress, and that
+		// Read ends only when the grandchild lets go.
+		go r.pr.Close()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return string(r.buf), drained
 }
 
 // nodeWire mirrors the CLI payload. activeRevision is json.RawMessage because
@@ -170,14 +337,18 @@ const notFoundSignature = "Node not found"
 
 func (c *CLI) Stat(p string) (Node, bool, error) {
 	out, code, err := c.run("filesystem", "info", p, "--json")
-	if code == -1 {
-		// code == -1 only when run's nil-ProcessState guard fired: the CLI
-		// executable itself never started (not on PATH, permission denied,
-		// ...). That is a transport failure, not a confirmed absence.
+	if code == -1 && !ran(err) {
+		// code -1 with no *exec.ExitError: the CLI executable itself never
+		// started (not on PATH, permission denied, ...), or the gate started no
+		// child. That is a transport failure, not a confirmed absence.
 		// Folding it into (_, false, nil) would silently read "the CLI is
 		// broken" as "this path does not exist" — fail-open, not
 		// fail-closed. A CLI that actually ran and reported not-found still
-		// returns (_, false, nil); that part of the contract is unchanged.
+		// returns (_, false, nil); that part of the contract is unchanged. A
+		// child that ran and died of a signal also has code -1 on Unix (a
+		// release call killed at its bound, say), but it carries an ExitError:
+		// it is a failed call, reported below with run's reason, and never
+		// "did not start", which would send a person to check their PATH.
 		return Node{}, false, fmt.Errorf("proton CLI did not start: %w", err)
 	}
 	if code != 0 {
@@ -193,16 +364,38 @@ func (c *CLI) Stat(p string) (Node, bool, error) {
 		// Preserve the underlying error per the transport convention List and
 		// EnsureDir already follow: dropping c.run's err here would break the
 		// %w chain a caller might inspect.
-		if err != nil {
-			return Node{}, false, fmt.Errorf("info %s failed: %s: %w", p, strings.TrimSpace(bound(out, 200)), err)
-		}
-		return Node{}, false, fmt.Errorf("info %s failed: %s", p, strings.TrimSpace(bound(out, 200)))
+		return Node{}, false, failedCall("info "+p, strings.TrimSpace(bound(out, 200)), err)
 	}
 	n, err := parseNodeJSON([]byte(out))
 	if err != nil {
 		return Node{}, false, fmt.Errorf("unparseable info for %s: %w", p, err)
 	}
 	return n, true, nil
+}
+
+// ran reports whether err came from a child that started: a non-zero exit and
+// a kill both carry the child's *exec.ExitError, and a start failure (an
+// *exec.Error, a PathError, the gate's own refusal) never does. It is the
+// partition EnforceCertified's never-started test uses.
+func ran(err error) bool {
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr)
+}
+
+// failedCall is the error for a CLI call that did not exit 0: what failed, the
+// CLI's output as the caller trimmed it, and run's error. An empty output is
+// left out rather than quoted as nothing: a killed call usually wrote none,
+// and "trash p failed: : signal: killed" reads as a fault in the message.
+func failedCall(what, out string, err error) error {
+	switch {
+	case out != "" && err != nil:
+		return fmt.Errorf("%s failed: %s: %w", what, out, err)
+	case out != "":
+		return fmt.Errorf("%s failed: %s", what, out)
+	case err != nil:
+		return fmt.Errorf("%s failed: %w", what, err)
+	}
+	return fmt.Errorf("%s failed", what)
 }
 
 func (c *CLI) List(p string) ([]Node, error) {
@@ -257,10 +450,7 @@ func (c *CLI) ReadTo(p, localDir string) error {
 	}
 	out, code, err := c.run("filesystem", "download", p, localDir)
 	if code != 0 {
-		if err != nil {
-			return fmt.Errorf("download %s failed: %s: %w", p, strings.TrimSpace(out), err)
-		}
-		return fmt.Errorf("download %s failed: %s", p, strings.TrimSpace(out))
+		return failedCall("download "+p, strings.TrimSpace(out), err)
 	}
 	return nil
 }
@@ -335,9 +525,11 @@ func (c *CLI) EnsureDir(p string) error {
 // createOut is create-folder's own trimmed output, already captured by the
 // caller; it is quoted here, never re-derived.
 //
-// Classification, in order: code == -1 (mirrors Stat's own code==-1 guard,
-// above) -> the CLI executable itself never started for THIS re-observation
-// call, a distinct transport failure, never folded into "not found" or
+// Classification, in order: code == -1 with no *exec.ExitError (mirrors Stat's
+// own never-started guard, above; a child killed by a signal also has -1 on
+// Unix, but it ran, and falls through to the undetermined arm) -> the CLI
+// executable itself never started for THIS re-observation call, a distinct
+// transport failure, never folded into "not found" or
 // "undetermined" (review round 4, M5 — the original version discarded the
 // exit code entirely and would have misdiagnosed this as one of those two);
 // code == 0 AND the raw output parses as a folder node -> resolved, proceed
@@ -354,7 +546,7 @@ func (c *CLI) EnsureDir(p string) error {
 // quoting both as undetermined.
 func (c *CLI) reobserveEnsureDirContradiction(p, createOut string) error {
 	infoOut, infoCode, infoErr := c.run("filesystem", "info", p, "--json")
-	if infoCode == -1 {
+	if infoCode == -1 && !ran(infoErr) {
 		return fmt.Errorf("contradiction creating folder %s could not be re-observed: the "+
 			"Proton CLI did not start for the follow-up info call: %v (original create-folder "+
 			"output: %q)", p, infoErr, bound(createOut, 200))
@@ -529,10 +721,7 @@ func (c *CLI) Trash(p string) (Outcome, error) {
 	}
 	out, code, err := c.run("filesystem", "trash", p, "--json")
 	if code != 0 {
-		if err != nil {
-			return Ambiguous, fmt.Errorf("trash %s failed: %s: %w", p, strings.TrimSpace(out), err)
-		}
-		return Ambiguous, fmt.Errorf("trash %s failed: %s", p, strings.TrimSpace(out))
+		return Ambiguous, failedCall("trash "+p, strings.TrimSpace(out), err)
 	}
 	return parseTrashResult(out)
 }
