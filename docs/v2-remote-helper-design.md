@@ -1345,6 +1345,15 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
 
   The cost: the plan's Task 4 waited for PR #16, which merged on 2026-10-25 at 12:20 PT as
   `fa8ce41` and was brought into this branch by merge `6e8ebf7`.
+- **Spec amendments (2026-10-25, Craig's call: "Proceed with your recommendations", 19:04 PT, on
+  the agent's decision brief).** A1 S6's cap is a 60 s cap on the release, at most 62 s to exit;
+  A2 §2's Git Bash `kill` row splits TERM/HUP (leak, [measured P1] on a probe) from `-INT` (no
+  effect, P2) and MSYS `timeout` ([untested]); A3 a `Refused` acquisition whose read-back shows
+  our own nonce keeps its handle in doubt; A4 *not attempted* has a second trigger, the cap
+  firing before a lock's release could start; A5 the catch line says "about a minute"; A6 U8 is
+  source-read, U9 is added, and E20 joins §6's table; A7 the Windows gate check runs under a real
+  `git push`, typed by hand. Options not taken: each passage as approved on 2026-10-24 (the spec
+  marks each changed passage). All seven were the agent's recommendations.
 - **Shipped values (the code is authoritative).** `shutdownCap` 60 s, `childGrace` 5 s,
   `childTerm` 3 s, `childConfirm` 2 s, `retryPause` 2 s and `outcomeWait` 1 s are in
   `cmd/git-remote-proton/shutdown.go`; the release call bound (15 s) and its drain (2 s) are in
@@ -1508,10 +1517,10 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
 - **Release.** The change ships in the next helper release under `docs/releasing.md`. `.go` files
   changed, so a stand-in is not eligible and both formal live gates run, each adding one live
   check on its own scratch remote: kill a push mid-upload by that platform's catchable route
-  (Linux: SIGTERM to the push's process group; Windows: spec §8 allows Ctrl-Break by
-  `GenerateConsoleCtrlEvent`, which leaves git out, and the agent recommends instead, per U9,
-  Ctrl-C or Ctrl-Break typed by hand in the console of a real `git push`, pending Craig's ruling
-  on amending §8), then confirm `.lock` is gone and the next
+  (Linux: SIGTERM to the push's process group; Windows: Ctrl-C or Ctrl-Break typed by hand in the
+  console of a real `git push`, per U9 and spec §8 as amended 2026-10-25 (A7, Craig's call); a
+  helper started by git does not lead its own console group, so `GenerateConsoleCtrlEvent`,
+  which W1/W2 use, cannot target it [inference]), then confirm `.lock` is gone and the next
   push succeeds. That check is the first evidence for U1–U3 and weak evidence for U7. The CLI
   pin does not move. The version number is left to release time; 0.11.0 is the agent's
   suggestion.
