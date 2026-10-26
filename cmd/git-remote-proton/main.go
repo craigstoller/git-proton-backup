@@ -346,6 +346,11 @@ func absolutizeInheritedGitPaths() error {
 func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bufio.Writer) (code int) {
 	var opts protocol.Options
 	var lock *repo.Lock
+	// strays are the handles loop was given and did not keep as lock: a second
+	// acquisition that ended in doubt (not adopted), and a held handle that a
+	// second acquisition that succeeded replaced. The release defer releases
+	// them too, strays first.
+	var strays []*repo.Lock
 	var checkConnectivity bool
 	// writeFailed records that a write to git failed. Every Flush below goes
 	// through flush, and the second defer flushes once more, so a failure cannot
@@ -360,6 +365,18 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 		}
 	}
 	defer func() {
+		// Strays first, so that an in-doubt stray settles and reads while the
+		// held lock still blocks the name: its upload, if it lands late, is
+		// refused against the held lock (CreateExclusive uploads with the skip
+		// strategy) rather than replacing it. Every release is nonce-first, so a
+		// stray whose lock is not on the remote, or belongs to another handle, is
+		// a no-op (absent or foreign) that only takes its register entry out.
+		// Same warning shape as the held lock's, below.
+		for _, s := range strays {
+			if err := s.Release(); err != nil {
+				warn(err)
+			}
+		}
 		if lock != nil {
 			// Release on EVERY exit path; a leak wedges the repo. Its error is
 			// REPORTED but deliberately does NOT change the exit code.
@@ -533,13 +550,27 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 			// one list for-push per session, and a second acquisition that ends
 			// in doubt would otherwise replace the held lock, whose release then
 			// reads its nonce, reports it foreign, and leaves the held lock on
-			// the remote. The in-doubt second handle stays in the register for a
-			// shutdown. A second acquisition that SUCCEEDED is adopted: the name
+			// the remote. A second acquisition that SUCCEEDED is adopted: the name
 			// was free, so the first .lock must already be gone, and releasing
 			// the first handle instead would find the second nonce and leave the
 			// second lock behind.
-			if l != nil && (lock == nil || err == nil) {
-				lock = l
+			//
+			// Whichever handle is not kept as lock is not dropped: it joins
+			// strays, and the release defer releases it before the held lock
+			// (after the settle wait, if it is in doubt). On a signal the
+			// coordinator finds the same handles in the register; on a normal exit
+			// nothing else would, so dropping one would leave an in-doubt second
+			// lock that had landed on the remote.
+			if l != nil {
+				switch {
+				case lock == nil:
+					lock = l
+				case err == nil:
+					strays = append(strays, lock)
+					lock = l
+				default:
+					strays = append(strays, l)
+				}
 			}
 			if err != nil {
 				warn(err)
