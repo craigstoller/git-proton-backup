@@ -117,7 +117,8 @@ func dispatchUtility(args []string, stdout, stderr io.Writer) (bool, int) {
 			fmt.Fprintln(stderr, "usage: git-remote-proton --set-head <proton::address> <branch>")
 			return true, 1
 		}
-		// So a shutdown during it says HEAD may or may not have changed (§5.6).
+		// So a shutdown during it names --set-head, and says HEAD may or may not
+		// have changed once HEAD's upload has started (§5.6, headWriteStarted).
 		curCoord.setMode(modeSetHead)
 		return true, runSetHeadFn(args[2], args[3], stdout, stderr)
 	}
@@ -152,6 +153,10 @@ func runSetHead(addr, branch string, stdout, stderr io.Writer) int {
 // process (shutdown.go).
 func run() int {
 	curCoord = installShutdown()
+	// UpdateHEAD reports the start of HEAD's upload here, so a --set-head
+	// shutdown says HEAD may have changed only once it could have. finish
+	// clears it.
+	repo.OnHEADWrite = curCoord.headWriteStarted
 	// quietStderr, not os.Stderr: runSetHead's own messages go quiet with warn
 	// once shutdown begins.
 	if handled, code := dispatchUtility(os.Args, os.Stdout, quietStderr); handled {

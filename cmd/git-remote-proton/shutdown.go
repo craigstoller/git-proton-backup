@@ -162,6 +162,11 @@ type coordinator struct {
 	stopped bool // a clean finish ran: later signals are ignored
 	torn    bool // a test's teardown ran: no exit from here on
 
+	// headStarted: UpdateHEAD reported that the upload that writes HEAD is
+	// starting. Guarded by mu like the flags above; --set-head's "interrupted"
+	// line needs it, as the push line needs inBatch.
+	headStarted bool
+
 	// Set once, by the first trigger, before any goroutine that reads them
 	// starts.
 	first     os.Signal
@@ -275,6 +280,18 @@ func (c *coordinator) batchDone() {
 	c.inBatch = false
 }
 
+// headWriteStarted records that the upload that writes HEAD is about to start.
+// Until then a --set-head shutdown has not touched HEAD, and says nothing about
+// it (§5.6).
+func (c *coordinator) headWriteStarted() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.headStarted = true
+}
+
 // finish is called on every return from run(). The choice between "a signal
 // started shutdown, so wait for the coordinator" and "no signal, so stop" is
 // made once, under the same lock trigger takes, so the two never both happen
@@ -283,6 +300,9 @@ func (c *coordinator) finish(code int) int {
 	if c == nil {
 		return code
 	}
+	// The operation is over, so nothing calls the hook again: leave none for a
+	// later in-process run() or test to find.
+	repo.OnHEADWrite = nil
 	c.mu.Lock()
 	began := c.started
 	if !began {
@@ -607,7 +627,7 @@ func (c *coordinator) resultLinesLocked() []string {
 	switch {
 	case c.mode == modePush && c.inBatch:
 		lines = append(lines, pushInterruptedLine)
-	case c.mode == modeSetHead:
+	case c.mode == modeSetHead && c.headStarted:
 		lines = append(lines, setHeadInterruptedLine)
 	}
 	why := "the shutdown time limit was reached before its release could start"

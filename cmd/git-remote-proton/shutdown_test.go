@@ -123,6 +123,7 @@ func saveShutdownStateForTest(t *testing.T) {
 		sStop       = stopInFlight
 		sKill       = killReleaseCalls
 		sHook       = afterLoopHook
+		sHEADWrite  = repo.OnHEADWrite
 		sBuilt      = coordinatorBuilt
 		sCap        = shutdownCap
 		sGrace      = childGrace
@@ -174,6 +175,7 @@ func saveShutdownStateForTest(t *testing.T) {
 		stopInFlight = sStop
 		killReleaseCalls = sKill
 		afterLoopHook = sHook
+		repo.OnHEADWrite = sHEADWrite
 		coordinatorBuilt = sBuilt
 		shutdownCap, childGrace, childTerm, childConfirm, retryPause, outcomeWait = sCap, sGrace, sTerm, sConfirm, sPause, sWait
 		repo.SettleDelay = sSettle
@@ -849,14 +851,19 @@ func TestShutdown_ModeLines(t *testing.T) {
 		{"push batch done", true,
 			func(c *coordinator) { c.setMode(modePush); c.batchStarted(); c.batchDone() },
 			[]string{"stopping the push"}, []string{pushMark, setHeadMark}},
-		{"set-head", true,
-			func(c *coordinator) { c.setMode(modeSetHead) },
+		{"set-head, HEAD upload started", true,
+			func(c *coordinator) { c.setMode(modeSetHead); c.headWriteStarted() },
 			[]string{"stopping --set-head", setHeadMark}, []string{pushMark}},
+		{"set-head, HEAD upload not started", true,
+			func(c *coordinator) { c.setMode(modeSetHead) },
+			[]string{"stopping --set-head"}, []string{setHeadMark, pushMark}},
 		{"no lock, read", false, func(*coordinator) {}, nil, nil},
 		{"no lock, push batch", false,
 			func(c *coordinator) { c.setMode(modePush); c.batchStarted() }, nil, nil},
 		{"no lock, set-head", false,
 			func(c *coordinator) { c.setMode(modeSetHead) }, nil, nil},
+		{"no lock, set-head, HEAD upload started", false,
+			func(c *coordinator) { c.setMode(modeSetHead); c.headWriteStarted() }, nil, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newShutdownFixture(t)
@@ -889,6 +896,83 @@ func TestShutdown_ModeLines(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestShutdown_SetHeadLineOnlyAfterHEADWriteStarted: "--set-head was
+// interrupted: HEAD may or may not have changed" is true only once the upload
+// that writes HEAD has started. A signal during the lock, the branch checks or
+// the HEAD read leaves HEAD untouched, so the line must not claim otherwise;
+// the push mode's inBatch gate has the same shape.
+func TestShutdown_SetHeadLineOnlyAfterHEADWriteStarted(t *testing.T) {
+	const interrupted = "--set-head was interrupted"
+
+	t.Run("before the HEAD upload starts there is no such line", func(t *testing.T) {
+		f := newShutdownFixture(t)
+		l := f.holdLock(t)
+		c := newCoordinator()
+		c.setMode(modeSetHead)
+		c.trigger(syscall.SIGTERM)
+		f.exits.wait(t, 5*time.Second)
+
+		out := f.stderr.String()
+		assertPrefixed(t, out)
+		if strings.Contains(out, interrupted) {
+			t.Errorf("stderr = %q, want no %q line: HEAD's upload had not started", out, interrupted)
+		}
+		if !strings.Contains(out, "stopping --set-head") {
+			t.Errorf("stderr = %q, want the catch line to name --set-head", out)
+		}
+		if res, ri := lineWith(out, sdLock, l.Nonce()); ri < 0 || outcomeOf(res) != "removed" {
+			t.Errorf("result line = %q, want the lock's own result line (removed) all the same", res)
+		}
+	})
+
+	t.Run("after the HEAD upload starts the line comes before the lock's", func(t *testing.T) {
+		f := newShutdownFixture(t)
+		l := f.holdLock(t)
+		c := newCoordinator()
+		c.setMode(modeSetHead)
+		c.headWriteStarted()
+		c.trigger(syscall.SIGTERM)
+		f.exits.wait(t, 5*time.Second)
+
+		out := f.stderr.String()
+		assertPrefixed(t, out)
+		_, hi := lineWith(out, interrupted, setHeadMark)
+		_, ri := lineWith(out, sdLock, l.Nonce())
+		if hi < 0 {
+			t.Fatalf("stderr = %q, want the %q line once HEAD's upload had started", out, interrupted)
+		}
+		if ri < 0 || hi > ri {
+			t.Errorf("stderr = %q: want the --set-head line (at %d) before the lock's result line (at %d)", out, hi, ri)
+		}
+	})
+
+	t.Run("the hook outside --set-head changes nothing", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			mode opMode
+		}{{"push", modePush}, {"read", modeRead}} {
+			t.Run(tc.name, func(t *testing.T) {
+				f := newShutdownFixture(t)
+				f.holdLock(t)
+				c := newCoordinator()
+				c.setMode(tc.mode)
+				c.headWriteStarted()
+				c.trigger(syscall.SIGTERM)
+				f.exits.wait(t, 5*time.Second)
+
+				if out := f.stderr.String(); strings.Contains(out, interrupted) {
+					t.Errorf("stderr = %q, want no %q line outside --set-head", out, interrupted)
+				}
+			})
+		}
+	})
+
+	t.Run("a nil coordinator ignores it", func(t *testing.T) {
+		var c *coordinator
+		c.headWriteStarted() // must not panic: tests call loop and dispatchUtility with none
+	})
 }
 
 func TestShutdown_SaturatedStderrStillExitsOnTime(t *testing.T) {
@@ -1209,5 +1293,50 @@ func TestRun_InProcessLeavesNoNotifyBehind(t *testing.T) {
 		if got := signal.Ignored(s); got != ignored[i] {
 			t.Errorf("signal.Ignored(%v) = %v after run(), want %v as before", s, got, ignored[i])
 		}
+	}
+}
+
+// TestRun_WiresAndClearsTheHEADWriteHook: run() points repo.OnHEADWrite at its
+// coordinator for the whole of the operation, so UpdateHEAD's report reaches the
+// coordinator that will print the --set-head line, and clears it on the way out,
+// so a later in-process run() or test sees none left behind.
+func TestRun_WiresAndClearsTheHEADWriteHook(t *testing.T) {
+	saveShutdownStateForTest(t)
+	repo.OnHEADWrite = nil
+
+	orig, origFn := os.Args, runSetHeadFn
+	t.Cleanup(func() { os.Args, runSetHeadFn = orig, origFn })
+	os.Args = []string{"git-remote-proton", "--set-head", "proton::/my-files/r", "main"}
+
+	var c *coordinator
+	var sawMode opMode
+	var started bool
+	runSetHeadFn = func(addr, branch string, stdout, stderr io.Writer) int {
+		c = curCoord
+		if repo.OnHEADWrite == nil {
+			t.Error("run() did not point repo.OnHEADWrite at its coordinator before --set-head ran")
+			return 1
+		}
+		repo.OnHEADWrite() // what UpdateHEAD does just before HEAD's upload
+		c.mu.Lock()
+		sawMode, started = c.mode, c.headStarted
+		c.mu.Unlock()
+		return 0
+	}
+
+	var got int
+	captureStderr(t, func() { got = run() })
+
+	if got != 0 {
+		t.Fatalf("run() = %d, want 0", got)
+	}
+	if sawMode != modeSetHead {
+		t.Errorf("mode = %v while --set-head ran, want modeSetHead", sawMode)
+	}
+	if !started {
+		t.Error("calling repo.OnHEADWrite did not reach the coordinator: the line would never print")
+	}
+	if repo.OnHEADWrite != nil {
+		t.Error("repo.OnHEADWrite is still set after run() returned: it must not outlive the coordinator")
 	}
 }

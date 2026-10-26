@@ -98,6 +98,13 @@ func WriteHEAD(t transport.Transport, root, branch string) (transport.Outcome, e
 	return transport.Committed, nil
 }
 
+// OnHEADWrite, when non-nil, is called by UpdateHEAD immediately before the
+// upload that writes HEAD. The helper's shutdown coordinator sets it so that it
+// can tell "--set-head was interrupted before HEAD's upload began" (HEAD is
+// untouched) from "during or after it" (HEAD may or may not have changed). Set
+// and cleared on the main goroutine only, outside any UpdateHEAD call.
+var OnHEADWrite func()
+
 // UpdateHEAD points HEAD at branch, OVERWRITING any existing symref — the
 // write half of the --set-head operation, and deliberately not WriteHEAD:
 // that function backfills and never overwrites, a contract its tests pin.
@@ -123,6 +130,11 @@ func UpdateHEAD(t transport.Transport, root, branch string) (transport.Outcome, 
 	_, exists, err := t.Stat(p)
 	if err != nil {
 		return transport.Ambiguous, fmt.Errorf("stat %s: %w", p, err)
+	}
+	// From here a signal can find HEAD mid-write: tell the shutdown coordinator
+	// before the CLI call that writes it, not after the Stat that only reads.
+	if OnHEADWrite != nil {
+		OnHEADWrite()
 	}
 	var out transport.Outcome
 	if exists {
