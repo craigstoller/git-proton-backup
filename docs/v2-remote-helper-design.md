@@ -1354,6 +1354,14 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   source-read, U9 is added, and E20 joins §6's table; A7 the Windows gate check runs under a real
   `git push`, typed by hand. Options not taken: each passage as approved on 2026-10-24 (the spec
   marks each changed passage). All seven were the agent's recommendations.
+- **Spec amendments A8-A11 (2026-10-25, Craig's call: "yes, send that", 20:34 PT, relayed; approved
+  with two corrections).** They bring the spec in line with the follow-ups: A8, `loop` releases
+  every handle its session's acquisitions returned, strays first (§5.4, §6, and S12's row, the
+  second correction); A9, the `--set-head` line only after HEAD's upload began (§5.6); A10, spec
+  A3's exception in the S8 and S15 rows and in §6; A11, anti-goal 3's list of exceptions and §6's
+  closing sentence. A11 counts a stray's release at up to four CLI calls (two stats, a download
+  and a trash) [code: `readLock` and `CLI.Trash`]; the correction as relayed said three, and the
+  code makes four. Options not taken: each passage as it stood on 2026-10-24.
 - **Review questions (2026-10-25, Craig's call, the same instruction; each was the agent's
   recommendation).** Q1, the settle-based premise (S4, S17): no change; the live gates are the
   first evidence. Q2, retrying after an ambiguous `Trash`: kept and documented as residual (4);

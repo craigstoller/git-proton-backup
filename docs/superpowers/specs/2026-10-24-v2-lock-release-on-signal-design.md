@@ -14,7 +14,10 @@ each decision in §4 is **the agent's recommendation, approved by Craig** with t
 agent's decision brief): S6's cap, §2's Git Bash `kill` row, §5.4's `Refused` that shows our own nonce,
 §5.5's second *not attempted* trigger, §5.6's "about a minute", §10's U8 and U9 with E20 in §6, and §8's
 Windows gate check. Each changed passage says so; the options not taken were the passages as approved
-on 2026-10-24. The
+on 2026-10-24. **Amended again 2026-10-25 (A8-A11), Craig's call** ("yes, send that", 20:34 PT, relayed by the
+parent session; approved with two corrections, to A11's call count and adding S12's row to A8): the
+passages that described the handle release, the `--set-head` line and the `Refused` rule before
+the follow-ups A3, Q5 and Q7 shipped. The
 plan is `docs/superpowers/plans/2026-10-24-v2-lock-release-on-signal.md`. The review history
 (three full-panel rounds, round 3's fixes not re-reviewed) is in this file's git log, commits
 `61fe262`, `b753743` and `10bc801`.
@@ -131,9 +134,16 @@ kills stay uncatchable, and §7 says so in the release notes.
 - Removing the lock while our own CLI child may still be writing to the remote. A second writer
   could then interleave with our write.
 - Any change in behaviour when no signal arrives: the same exit codes, messages and CLI calls on
-  every path that today ends without a signal. Two exceptions, both on paths that already fail: an
-  in-doubt acquisition gains a release attempt after the settle wait (S8, S17), and a session whose
-  protocol write failed exits 1 instead of 0 (S16).
+  every path that today ends without a signal. Four exceptions:
+  - an in-doubt acquisition gains a release attempt after the settle wait (S8, S17);
+  - a session whose protocol write failed exits 1 instead of 0 (S16);
+  - a refused acquisition whose read-back shows our own nonce keeps its handle in doubt, with a
+    message of its own (A3);
+  - a session that acquired more than once releases every lock it took, at up to four more CLI
+    calls for each one (two stats, a download and a trash [code]; A8). git never produces such a
+    session.
+
+  The first three are on paths that already fail (amended 2026-10-25, A11).
 - A helper that hangs after a signal, or prints that it removed a lock it did not remove.
 
 ## 4. Decisions (the agent's recommendations, approved by Craig 2026-10-24)
@@ -147,14 +157,14 @@ kills stay uncatchable, and §7 says so in the release notes.
 | S5 | **The in-flight child gets 5 s to exit on its own** (it usually received the same signal). Then, on Unix, SIGTERM and 3 s more. Then a kill (SIGKILL, or TerminateProcess). **Release waits for the operating system to confirm the process has exited** (S13 separates that from draining its output). If the exit is not confirmed by the end of that stop sequence, nothing is released: each registered lock is reported *not attempted* (§5.5), and the helper says so. | Kill at once: needlessly cuts a ref write that was about to land. Never kill: a stuck child would block the release forever. Treat "kill delivered" as enough: a child in an uninterruptible wait has not stopped. | §5.3 |
 | S6 | **A 60 s cap on the release**, enforced by its own timer. At the cap the timer kills any release child (waiting up to 1 s for the kill), tries the outcome line for up to 1 s, and exits: **at most 62 s from the first signal to exit**, whatever else is running (amended 2026-10-25, A1; as approved it read "a 60 s cap from the first signal to exit"). **The coordinator never waits on stderr**: each line it writes goes out from a separate goroutine, so a full or dead stderr can delay neither the cleanup nor the exit. | No cap: a release stuck on the same network stall that got the push killed would hang until SIGKILL, silently. 30 s: too tight for §5.6's figures. | [record] S1 timeline; systemd's default `TimeoutStopSec=` is 90 s [doc] |
 | S7 | **Further signals during shutdown are noted on stderr and otherwise ignored.** The 60 s cap bounds the wait. SIGKILL (`kill -9`, `Stop-Process`) remains the way to stop at once, at the cost of the lock. **Release-phase CLI children start in their own process group** (Unix `Setpgid`; Windows `CREATE_NEW_PROCESS_GROUP`, which disables Ctrl-C for them), so a later Ctrl-C in the same window does not kill them. A keyboard Ctrl-Break still reaches every process on the console [doc], so on Windows a Ctrl-Break during the release can still kill a release call, and S10 retries it. On Unix, a release call that runs out its bound is killed with its whole group, grandchildren included. Their per-call bound and the cap still apply. | A second signal abandons the release. On Windows, every later Ctrl-C typed in that console reaches the helper, even after git has died and the prompt is back [doc], so a user tidying a prompt line would abort the release. A per-platform rule would be two behaviours to document. | [doc] Microsoft "CTRL+C and CTRL+BREAK signals" |
-| S8 | **An acquisition whose result is in doubt still hands back its lock.** `AcquireLock` returns a handle on every result except a `Refused` with no error (someone else's lock) and a failure before the upload starts; when the result is in doubt it returns the handle *and* the error. The caller's defer releases its own handle on every exit path, after the settle wait when the acquisition was in doubt (S17). Separately, each acquisition is entered in a process-wide register before its upload starts, which only the coordinator reads (S15). Release reports a **typed outcome** (§5.5), so the helper never says it removed a lock it found absent or foreign. | Leave acquisition as it is: keeps the §1.4 leak, and a signal during the upload would leak exactly as today. Releasing through the register on the normal path too (round 1's fix): in a test that holds a lock with `AcquireLock` and then calls `SetHead` in the same process (`TestSetHeadRefusesWhenLockHeld`), `SetHead`'s defer would remove the other holder's lock. A "CLI never started" exemption: the transport cannot tell it from an in-doubt upload error, and the startup check already refuses a CLI that cannot start. | §5.4; [code] `repo_test.go` |
+| S8 | **An acquisition whose result is in doubt still hands back its lock.** `AcquireLock` returns a handle on every result except a `Refused` with no error whose read-back does not show our own nonce (someone else's lock; amended 2026-10-25, A10, after A3) and a failure before the upload starts; when the result is in doubt it returns the handle *and* the error. The caller's defer releases its own handle on every exit path, after the settle wait when the acquisition was in doubt (S17). Separately, each acquisition is entered in a process-wide register before its upload starts, which only the coordinator reads (S15). Release reports a **typed outcome** (§5.5), so the helper never says it removed a lock it found absent or foreign. | Leave acquisition as it is: keeps the §1.4 leak, and a signal during the upload would leak exactly as today. Releasing through the register on the normal path too (round 1's fix): in a test that holds a lock with `AcquireLock` and then calls `SetHead` in the same process (`TestSetHeadRefusesWhenLockHeld`), `SetHead`'s defer would remove the other holder's lock. A "CLI never started" exemption: the transport cannot tell it from an in-doubt upload error, and the startup check already refuses a CLI that cannot start. | §5.4; [code] `repo_test.go` |
 | S9 | **All three entry points are covered**: the push path, `--set-head`, and the read paths (fetch, `list`, `--version`). The read paths hold no lock: they stop the child and exit. | Push only: `--set-head` holds the same lock. | [code] |
 | S10 | **The shutdown release retries the whole nonce-checked release** until it reaches a final outcome or the cap, pausing 2 s between attempts. **Each release CLI call is bounded at 15 s from start to the end of its output**, so one hung call cannot use the whole cap: on the coordinator's instance the output drain after exit is bounded at 2 s, not `waitDelay`'s 30 s. A transport error, a killed or timed-out call, or a download that failed is retried. Contents that downloaded and did not parse (`unreadable`) are final and are not retried: they need a person. Each attempt re-reads the lock first, so a retry after a `Trash` that did land finds nothing. This covers a CLI startup collision with a push the user starts right after the kill (§5.8), a passing network blip, and a call killed by a stray signal. | A retry only on the SQLite "database is locked" signature: narrower, but that signature is the only failure it would cover. No retry: one collision would leak the lock this fix exists to release. | [record] design A8: startups collide, and the loser never reaches the network |
 | S11 | **Exit code 128 + the first signal's number** (SIGINT 130, SIGTERM 143, SIGHUP 129), on both platforms (`os.Interrupt` counts as 2), whatever the release outcome. stderr says which. Who sees it: git, and only when git outlived the helper (`kill` to the helper alone). When git dies of the same signal, a script sees git's or `timeout`'s code, and systemd marks the unit failed for its timeout; neither reads the helper's. | Exit 1: loses which signal it was. 0 after a successful release: the push did not complete. | Shell convention; [inference] git's and systemd's reporting |
-| S12 | **The normal-path release is unchanged.** One attempt on the caller's own handle, failures warned (the `loop` defer's documented contract). The one addition: an in-doubt handle waits out S17's settle first. | Adding S10's retry there too: a behaviour change outside this fix. A possible follow-up. | [code] `loop` defer comment |
+| S12 | **The normal-path release is unchanged.** One attempt on each handle the caller's own acquisitions returned (`loop` releases any others first; amended 2026-10-25, A8), failures warned (the `loop` defer's documented contract). The one addition: an in-doubt handle waits out S17's settle first. | Adding S10's retry there too: a behaviour change outside this fix. A possible follow-up. | [code] `loop` defer comment |
 | S13 | **`CLI.run` is reworked to own its child.** It starts the child with **one** pipe the helper creates, given to the child as both stdout and stderr, so callers still read one merged stream as `CombinedOutput` gives today (`Stat` finds `Node not found` in it, and every error message quotes it). A reader goroutine starts with the child and drains the pipe while it runs, so a large output never fills the pipe. The process's exit (`Wait`) is observed apart from the drain: after exit, the reader is given up to `waitDelay` to reach EOF, as today, with today's warning when that runs out (2 s on the coordinator's instance, S10). `run` records the child as in flight and keeps its process handle for S5's stop. Every `CLI` method still goes through `run`, so no call site changes. | `exec.CommandContext`: it kills on cancel, but its `Wait` still blocks on the pipe drain, so exit and drain stay tied. Keeping `CombinedOutput`: no handle, and the 30 s drain lands inside the cap. | [code] `cli.go` `run`, `waitDelay` |
 | S14 | **One process-wide gate in `internal/transport`** covers every `*CLI` the process creates: `run()`'s, `runSetHead()`'s, and `EnforceCertified`'s calls through them. The coordinator's release instance, made by its own constructor, is the only exemption. Everything that instance writes to stderr (`run`'s drain warning, `Traced`'s `gpb: downloaded` line) goes through the coordinator's non-blocking writer (S6), not straight to `os.Stderr`. It does not repeat `EnforceCertified`: this process already certified the CLI on its PATH at startup, and nothing changes PATH. The gate shuts only on a signal; tests that shut it get a test-only way to reopen it. | A gate per instance: `run()` and `runSetHead()` each build their own CLI, so a signal during the version check would be missed. Re-certifying the release instance: one more CLI startup inside the collision window S10 worries about. | [code] `main.go` |
-| S15 | **The register lives in `internal/repo`**, process-wide, and **only the coordinator reads it.** `AcquireLock` enters each acquisition after its staging file is written and before its upload starts. An entry leaves on a `Refused` with no error, and on a final release outcome from either path. The coordinator reads it through a `repo` function. It never holds a mutex across a CLI call, so the coordinator and a normal-path release never deadlock. `run()` clears it when it returns with no signal received, so a *failed* normal release or a test that never released leaves nothing for a later in-process `run()`. Tests of the coordinator also reset it; no test in `internal/repo` or `cmd` runs in parallel [code: both packages say so]. | A register in `cmd`: `AcquireLock` cannot reach it, and its failure paths drop the nonce. A register threaded through `SetHead`/`AcquireLock`: wider API change for the same effect, though `loop` and `SetHead` change anyway to keep an in-doubt handle; process-wide state in `repo` is the price of not threading it. | [code] `lock.go`, `sethead.go` |
+| S15 | **The register lives in `internal/repo`**, process-wide, and **only the coordinator reads it.** `AcquireLock` enters each acquisition after its staging file is written and before its upload starts. An entry leaves on a `Refused` with no error whose read-back does not show our own nonce (A3), and on a final release outcome from either path (amended 2026-10-25, A10). The coordinator reads it through a `repo` function. It never holds a mutex across a CLI call, so the coordinator and a normal-path release never deadlock. `run()` clears it when it returns with no signal received, so a *failed* normal release or a test that never released leaves nothing for a later in-process `run()`. Tests of the coordinator also reset it; no test in `internal/repo` or `cmd` runs in parallel [code: both packages say so]. | A register in `cmd`: `AcquireLock` cannot reach it, and its failure paths drop the nonce. A register threaded through `SetHead`/`AcquireLock`: wider API change for the same effect, though `loop` and `SetHead` change anyway to keep an in-doubt handle; process-wide state in `repo` is the price of not threading it. | [code] `lock.go`, `sethead.go` |
 | S16 | **A failed protocol write is remembered, and `loop` then exits 1, not 0.** `loop` checks each `Flush` itself (a `bufio.Writer` keeps its first write error), and flushes once more before it returns, so `run()`'s deferred `Flush` can no longer hide a failure behind a 0. Release takes the normal path. A broken stdout does not start the coordinator: the next step after a status write is the stdin read, which returns EOF at once when git is gone, and then the defer releases. | Starting the coordinator on a failed write: it would only bound the normal release, which S12 keeps as it is. Exit 0: reports success for a session git never finished. | [code] `loop`; §1.3 |
 | S17 | **A settle wait of 5 s before reading the lock**, on the shutdown path whenever a lock is registered, and on the normal path whenever the acquisition was in doubt. A request a killed or failed child had already sent can still be applied by the server after the child ends. The wait lets it land first: a late lock upload is then seen and removed, and a late ref write lands before anyone else can take the lock. Applied whenever a lock is registered, not only when a write was seen in flight: a child that died of the same signal can finish before the coordinator looks, and then nothing was in flight to see. Not applied when the child's exit was never confirmed (S5): nothing is released then. The settle is a package variable, set to zero package-wide by tests that do not test it, so the existing in-doubt failure tests do not each gain 5 s. | No wait: a late-landing lock upload would be read as absent, then appear, and leak while the helper said none was there. A wait only after a write seen in flight: misses the child that died first. A longer wait: costs every signalled push for a delay nobody has measured. | [inference]; [untested] U7 |
 | S18 | **No shortcut for a Windows console close.** It runs the normal sequence, safety waits included. The system ends the process 5 s after the event, which is almost always before the release, so the lock usually stays, exactly as today, and its manual remedy applies. | Skip the grace and the settle to fit 5 s (round 1's fix): that releases while the child or its last request may still be landing, against the second anti-goal, to save a case that rarely finishes anyway. | [doc] Microsoft: close timeout 5000 ms |
@@ -239,8 +249,10 @@ calls `CreateExclusive`:
   asserts no handle comes back. It becomes: an error, and a handle that is in doubt, not held.
 
 `loop` and `SetHead` keep the handle whenever one comes back, error or not, and their defers
-release that handle and nothing else: after S17's settle wait if it is in doubt, then one attempt
-(S12). That way an in-doubt acquisition is covered on the normal exit path too, one of the two
+release it: after S17's settle wait if it is in doubt, then one attempt (S12). `loop` also
+releases any other handle its session's acquisitions returned, and releases those first, so that
+an in-doubt one settles while the kept lock still blocks the name. Every one of these releases is
+nonce-first (amended 2026-10-25, A8). That way an in-doubt acquisition is covered on the normal exit path too, one of the two
 behaviour changes outside signals (§3). A final outcome from either path (removed, absent,
 foreign, unreadable) takes the entry out of the register; *failed* leaves it, so the coordinator
 can try again if a signal follows.
@@ -288,8 +300,9 @@ starts `git-remote-proton:`, like `warn`.
 - **When a push batch was interrupted:** that the push did not finish; that some of its remote
   changes may have landed while git was told nothing (statuses go out only after the whole batch,
   §1.3); and that re-running the push starts from the remote's real state.
-- **When `--set-head` was interrupted:** that `HEAD` may or may not have changed, and that
-  re-running the same `--set-head` settles it.
+- **When `--set-head` was interrupted after its HEAD upload began:** that `HEAD` may or may not
+  have changed, and that re-running the same `--set-head` settles it. When it was interrupted
+  earlier, only the lock lines are printed (amended 2026-10-25, A9).
 - **The read paths** (fetch, `list`, `--version`) hold no lock: the no-lock line only.
 - **A later signal:** that it was received and the check is still running (S7).
 - **Cut short by the system** (a Windows console close ends the process 5 s after the event): no
@@ -382,15 +395,17 @@ today. New tests run with `-count=1` (brief-checklist rule 5).
 **Layer 1: units (Fake transport, `internal/repo`).**
 - The lock is registered before `CreateExclusive` is called (a Fake hook looks at the register
   during the call), and not at all when staging fails.
-- Each §5.4 result: `Refused` with no error returns no handle, leaves no entry, and makes exactly
-  today's calls (its read-back of the holder's lock, pinned by a call count). `Committed` with our
+- Each §5.4 result: `Refused` with no error returns no handle and leaves no entry, unless its read-back shows our own
+  nonce (A3: an in-doubt handle, kept registered; amended 2026-10-25, A10). Either way it makes
+  exactly today's calls (its read-back of the holder's lock, pinned by a call count). `Committed` with our
   nonce returns a held handle. An error from `CreateExclusive`, `Ambiguous` with and without an
   error, an unrecognised outcome, a read-back error, an unparseable read-back and a foreign
   read-back each return the error *and* an in-doubt handle, and keep the entry.
   `TestAcquireLockFailsClosedOnUnrecognisedOutcome` is updated to that contract (§5.4); it is the
   only existing test that changes. Tests that do not exercise the settle set it to zero
   package-wide.
-- `SetHead` and `loop` release their own handle and nothing else: `TestSetHeadRefusesWhenLockHeld`
+- `SetHead` and `loop` release only handles their own acquisitions returned (`loop` releases all of
+  them; amended 2026-10-25, A8): `TestSetHeadRefusesWhenLockHeld`
   passes unchanged. An in-doubt handle waits out the settle before its one release attempt; a
   Fake that lands `.lock` after `CreateExclusive` returned its error, inside that wait, ends
   *removed*.
@@ -465,7 +480,8 @@ the `windows-latest` CI log that W1 and W2 **ran**. If they skipped there, that 
 Craig, not absorbed. The Unix cases run in the Linux CI legs and in the WSL distro.
 
 Existing tests stay green, apart from the one contract change named in Layer 1. On the paths no
-signal reaches, the CLI-call counts stay the same (anti-goal 3), except S8's in-doubt paths.
+signal reaches, the CLI-call counts stay the same (anti-goal 3), except S8's in-doubt paths and the other
+exceptions anti-goal 3 lists (amended 2026-10-25, A11).
 
 ## 7. Documentation to change
 
