@@ -1373,15 +1373,19 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   final outcome uses the rest of the cap, which runs from the first signal (the child stop and the
   settle come out of it), and any later lock reports *not attempted* [code]. The register normally holds
   one lock: a helper process has one repo address and so one `.lock` path, and git sends one
-  `list for-push` per session [inference]. A second entry exists only while a second acquisition
-  of that same path is in progress in the same session, or after it ended in doubt, because
-  `AcquireLock` enters the register before its upload and leaves it only on a refusal or a final
-  release outcome [code]; that takes a session git does not produce [inference]. A second
-  acquisition that reaches the server while the first lock is held is refused [A6 for the
-  refusal], and one that ends in doubt cannot have overwritten the held `.lock`, which
-  `CreateExclusive` uploads with the `skip` strategy [code; A6]. Such a second handle never
-  replaces the one `loop` holds, so the held lock is still released on the normal path [code;
-  test `TestLoop_SecondListForPushKeepsTheHeldLock`]. The first signal prints a catch line (which
+  `list for-push` per session [inference]. A second entry can exist only through a second
+  acquisition of that same path in the same session: while it is in progress, and afterwards if
+  it ended in doubt or succeeded (it can succeed only if the first `.lock` was removed by hand
+  meanwhile), because `AcquireLock` enters the register before its upload and leaves it only on
+  a refusal or a final release outcome [code]; that takes a session git does not produce
+  [inference]. A second acquisition that reaches the server while the first lock is held is
+  refused [A6 for the refusal], and one that ends in doubt cannot have overwritten the held
+  `.lock`, which `CreateExclusive` uploads with the `skip` strategy [code; A6]. `loop` keeps the
+  handle it holds when the second one ended in doubt, so the held lock is still released on the
+  normal path, and takes the second handle only when that acquisition succeeded, because the
+  first `.lock` is then already gone [code, derived; tests
+  `TestLoop_SecondListForPushKeepsTheHeldLock` and
+  `TestLoop_SecondListForPushSucceedingIsAdopted`]. The first signal prints a catch line (which
   signal; with a lock
   registered, that the push or `--set-head` is stopping and the lock is being checked, that this
   takes about a minute, that no other push or `--set-head` should start nor the lock be removed

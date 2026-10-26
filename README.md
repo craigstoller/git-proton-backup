@@ -492,9 +492,11 @@ download them; you don't need this tool, or even a Windows machine, to get your 
       another, and a lock whose release never reaches a final outcome uses the rest of the 60 s
       cap, so any later lock reports *not attempted*. The helper normally holds one lock: it has one
       repo address and so one `.lock` path, and git sends one `list for-push` per session. A
-      second try at that path shows up here only while it is under way in the same session, or
-      if it ended in doubt, and that takes a session git does not produce. Such a second try
-      never replaces the lock the helper already holds, so that lock is still released.
+      second try at that path can show up here only in a session git does not produce: while it
+      is under way, or afterwards if it ended in doubt or succeeded (it can succeed only if the
+      first lock was removed by hand meanwhile). If it ended in doubt, it does not replace the
+      lock the helper already holds, so that lock is still released; if it succeeded, the new
+      lock is the one released.
   - Anything that gives the helper no signal it can catch still leaves the lock: SIGKILL, the
     OOM killer and power loss; under systemd, `KillMode=mixed` or `process`; and SIGQUIT, which
     keeps Go's goroutine dump on purpose. On Windows that means Git Bash's `kill -TERM` and
