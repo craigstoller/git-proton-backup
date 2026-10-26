@@ -381,6 +381,53 @@ func TestLoop_SecondListForPushKeepsTheHeldLock(t *testing.T) {
 	}
 }
 
+// heldLockClearedTransport wraps a Fake so that the held .lock is removed just
+// before the SECOND upload of it, as an operator clearing it by hand would, and
+// the upload then goes through normally. locks counts the lock uploads.
+type heldLockClearedTransport struct {
+	*transport.Fake
+	locks int
+}
+
+func (c *heldLockClearedTransport) CreateExclusive(p, local string) (transport.Outcome, error) {
+	if strings.HasSuffix(p, "/"+repo.LockName) {
+		c.locks++
+		if c.locks == 2 {
+			delete(c.Fake.Files, p)
+		}
+	}
+	return c.Fake.CreateExclusive(p, local)
+}
+
+// TestLoop_SecondListForPushSucceedingIsAdopted is the other half of the test
+// above: a second "list for-push" whose acquisition SUCCEEDS. That is possible
+// only if the held .lock is gone (here: cleared by hand), so the handle that
+// replaces the held one loses nothing, and it is the one that must be released.
+// Keeping the first handle instead would read the second lock's nonce at exit,
+// call it foreign, and leave the second lock on the remote with a clean exit.
+func TestLoop_SecondListForPushSucceedingIsAdopted(t *testing.T) {
+	repo.ResetRegister()
+	t.Cleanup(repo.ResetRegister)
+	ft := transport.NewFake()
+	const root = "/my-files/r"
+	tr := &heldLockClearedTransport{Fake: ft}
+	in := bufio.NewScanner(strings.NewReader("list for-push\nlist for-push\n"))
+	out := bufio.NewWriter(&bytes.Buffer{})
+
+	var got int
+	stderr := captureStderr(t, func() { got = loop(tr, root, ".", in, out) })
+
+	if tr.locks != 2 {
+		t.Errorf("lock uploads = %d, want 2: the session did not reach the second acquisition", tr.locks)
+	}
+	if got != 0 {
+		t.Errorf("loop() = %d, want 0: both acquisitions succeeded; stderr:\n%s", got, stderr)
+	}
+	if _, ok := ft.Files[root+"/"+repo.LockName]; ok {
+		t.Errorf("the second lock must be released on exit: %s/%s is still present", root, repo.LockName)
+	}
+}
+
 // TestLoop_CleanSessionStillExitsZero guards the other direction of the two
 // tests above: a session whose writes all succeed is still a 0, and its output
 // still reaches the writer. Each command's own flush() delivers it; loop's

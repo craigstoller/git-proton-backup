@@ -524,12 +524,16 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 			// without us knowing. Keep it either way, so the release defer
 			// settles and removes it; the session still fails on the error.
 			//
-			// But never in place of a handle already held: git sends one list
-			// for-push per session, and a second acquisition that ends in doubt
-			// would otherwise replace the held lock, whose release then reads its
-			// nonce, reports it foreign, and leaves the held lock on the remote.
-			// The in-doubt second handle stays in the register for a shutdown.
-			if l != nil && lock == nil {
+			// But an in-doubt handle never replaces one already held: git sends
+			// one list for-push per session, and a second acquisition that ends
+			// in doubt would otherwise replace the held lock, whose release then
+			// reads its nonce, reports it foreign, and leaves the held lock on
+			// the remote. The in-doubt second handle stays in the register for a
+			// shutdown. A second acquisition that SUCCEEDED is adopted: the name
+			// was free, so the first .lock must already be gone, and releasing
+			// the first handle instead would find the second nonce and leave the
+			// second lock behind.
+			if l != nil && (lock == nil || err == nil) {
 				lock = l
 			}
 			if err != nil {
