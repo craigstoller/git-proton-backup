@@ -629,12 +629,20 @@ path (a fetch or a plain `list` must never bring anything into existence) and ne
    v6.11. A lock whose acquisition ended in doubt (the upload's result was lost) is released by
    that `defer` too, after a 5 s settle wait, because it may have landed. And a signal ends the
    process without running deferred functions, so a catchable one is handled by a shutdown
-   coordinator instead: a bounded, nonce-checked attempt, never a guarantee. It starts on SIGINT,
-   SIGTERM and SIGHUP on Linux, and on console Ctrl-C and Ctrl-Break on Windows (a console close
-   starts it too, but Windows ends the process 5 s later, usually before the release). It stops
-   the CLI child in flight, waits out the settle, releases through its own CLI instance, prints
-   one outcome per lock (removed, absent, foreign, unreadable, failed or not attempted) and exits
-   128 + the signal's number, at most 62 s after the first signal. **What cannot be caught still
+   coordinator instead: a bounded, nonce-checked attempt, never a guarantee, for a push and for a
+   `--set-head` run alike [code]. It starts on SIGINT, SIGTERM and SIGHUP on Linux, each unless
+   it was already ignored when the helper started (`nohup`, a background job): such a signal
+   starts nothing and prints nothing, and the lock is released only if the push then ends
+   normally [code]. On Windows it starts on console Ctrl-C and Ctrl-Break. A console close starts
+   it too, but Windows ends the process 5 s later [doc] and the sequence waits its 5 s settle
+   before the first release call [code], so the release cannot begin in time: the lock is left,
+   unless the push's own release, already in flight, removes it first, and no result line is
+   printed. The coordinator stops the CLI child in flight, waits out the
+   settle, releases through its own CLI instance, retrying a failed call until each lock reaches
+   an outcome or the cap, prints one outcome per lock (removed, absent, foreign, unreadable,
+   failed or not attempted) and exits 128 + the signal's number, at most 62 s after the first
+   signal; that bounds the process, not the lock's removal, which only the result line reports
+   [code]. **What cannot be caught still
    leaks:** SIGKILL, the OOM killer and power loss; on Windows, Git Bash's `kill`,
    `Stop-Process`, `taskkill /F`, a logoff or shutdown, and a Task Scheduler stop (assumed); under
    systemd, `KillMode=mixed` or `process`; and SIGQUIT, by choice. Ctrl-C in Git Bash's own
@@ -1186,7 +1194,7 @@ named the problem with no way out.
 | List pagination failure | Fatal; a truncated listing must never look like a complete one |
 | Unsupported git option (`--atomic`, `--force-with-lease`, shallow, filter) | Explicit rejection naming the option |
 | Quota, rate limit, oversized pack | Distinct messages; no silent truncation |
-| Local disk full, permissions, cancellation, timeout | Reported distinctly. **Cancellation** by a signal the helper can catch (SIGINT, SIGTERM or SIGHUP on Linux; console Ctrl-C or Ctrl-Break on Windows; v6.11) stops the CLI call in flight, makes a bounded, nonce-checked release of the remote lock, prints one outcome per lock on stderr, and exits **128 + n**, n being the first signal's number (SIGINT 130, SIGTERM 143, SIGHUP 129; Windows Ctrl-C and Ctrl-Break both 130), whatever the release outcome. A kill the helper cannot catch leaves the lock (Concurrency posture, item 5) |
+| Local disk full, permissions, cancellation, timeout | Reported distinctly. **Cancellation** by a signal the helper can catch (SIGINT, SIGTERM or SIGHUP on Linux, each unless it was ignored when the helper started; console Ctrl-C or Ctrl-Break on Windows; v6.11) stops the CLI call in flight, makes a bounded, nonce-checked release of the remote lock, prints one outcome per lock on stderr, and exits **128 + n**, n being the first signal's number (SIGINT 130, SIGTERM 143, SIGHUP 129; Windows Ctrl-C and Ctrl-Break both 130), whatever the release outcome. A kill the helper cannot catch leaves the lock (Concurrency posture, item 5) |
 | Network failure mid-transfer | Partial discarded, never indexed; retry re-downloads whole |
 
 **Never trust `claimedDigests.sha1`** — Proton flags it `sha1Verified: false`, and the CLI's own auto-skip depends on it, which is exactly why mutable writes are verified by read-back.
@@ -1260,34 +1268,44 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   and releases every lock in a process-wide register through its own CLI instance, retrying until
   each reaches a final outcome or the cap (S10, S15). It prints the outcome per lock and exits 128
   + the signal's number (S11). With no signal, `run()` stops the notifications and clears the
-  register, and nothing else changes. A broken stdout does not start the coordinator: `loop`
-  records the failed write, reads EOF from the dead git, releases on the normal path and exits 1
-  (S16). [code]
+  register, and nothing else changes. A broken stdout does not start the coordinator. The helper
+  notices a dead git only when git's end of the pipes closes, which the operating system does
+  when git exits [inference from P5, P8]; git owns both pipes, so a git that stays alive but
+  stops reading would not be noticed (spec §3 sets noticing git's death while a batch runs
+  aside as a non-goal). `loop` then takes one of three paths, and each releases on the normal
+  path: a batch git never finished sending (no terminating blank line) is refused before any
+  remote read or write, and `loop` exits 1 (the truncated-batch fix, PR #16); a batch already
+  received runs to its end, its status writes fail, and `loop` exits 1 (S16); with no batch in
+  progress, `loop` reads a clean EOF and exits 0. [code]
 - **What can and cannot be caught.** The release is a bounded attempt, never a guarantee.
+  "Starts the bounded release" names the route, not the result; a [measured Pn] row measured a
+  probe program, not the helper.
 
   | How the push is ended | Platform | After this change | Basis |
   |---|---|---|---|
-  | Ctrl-C or Ctrl-Break in a console window (Windows Terminal, conhost) | Windows | **Releases** | [measured P4] Ctrl-Break; Ctrl-C [doc]; under a real `git push`, [untested] (U9) |
+  | Ctrl-C or Ctrl-Break in a console window (Windows Terminal, conhost) | Windows | **Starts the bounded release** | Ctrl-Break: [measured P4] on a probe program, and the helper's tests W1 and W2 send it to the helper directly [code]. Ctrl-C: [doc], Go delivers both as `os.Interrupt`; no probe or test has sent it. Under a real `git push`, neither: [untested] (U9) |
   | Ctrl-C in Git Bash's own mintty window | Windows | Assumed to leak | [untested]; P1 and P2 suggest MSYS delivers no console event to native programs [inference] |
-  | Console window closed, or Task Manager's End task | Windows | Usually leaks, as before: the normal sequence runs (S18), and the system's 5 s ends the process first | [doc], [estimate] |
+  | Console window closed, or Task Manager's End task | Windows | Leaks, as before, unless the push's own release, already in flight, removes the lock first: the normal sequence runs (S18), its first release call comes only after the 5 s settle, and the system ends the process 5 s after the event; no result line is printed | The 5 s: [doc]. The sequence: [code]. That the lock is left follows from the two [derived] |
   | Logoff or shutdown of an interactive session | Windows | Leaks | [doc]: Windows sends those events only to services |
   | `Stop-Process`, `taskkill /F`, a process-tree kill | Windows | Leaks | [measured P3] Stop-Process; the rest [inference] |
   | Git Bash `kill`, MSYS `timeout` | Windows | Leaks: on a probe program, Git Bash's `kill -TERM` and `kill -HUP` ended it without its handler running, and `kill -INT` had no effect; the helper is taken to behave the same | Git Bash `kill`: [measured P1, P2], on a probe program, not on the helper; the helper [inference]. MSYS `timeout`: [untested] |
   | A harness tool timeout (Stage 5's S1, `exit 143`) | Windows | Leaks, if the kill came through Git Bash | The gate record says only that the runner harness's tool timeout killed the push (`exit 143`, SIGTERM) [record]; that it came through Git Bash, whose `kill` P1 and P2 measured, is [inference] |
   | Task Scheduler's stop or time limit | Windows | Assumed to leak | [untested] (U4) |
-  | `kill -TERM`, `-INT` or `-HUP` to the helper alone | Linux | **Releases**; the helper stops its CLI child first | [measured P6] |
-  | Ctrl-C or a hangup in a terminal | Linux | **Releases** | [inference from P6, P7] |
-  | GNU `timeout` without `--foreground` | Linux | **Releases** | [measured P7] |
-  | systemd stop or start timeout, `KillMode=control-group` (the default) | Linux | **Releases** if done within `TimeoutStopSec=` | [measured P10]; [doc] |
+  | `kill -TERM`, `-INT` or `-HUP` to the helper alone | Linux | **Starts the bounded release**; the helper stops its CLI child first | [measured P6] |
+  | Ctrl-C or a hangup in a terminal | Linux | **Starts the bounded release** | [inference from P6, P7] |
+  | GNU `timeout` without `--foreground` | Linux | **Starts the bounded release** | [measured P7] |
+  | systemd stop or start timeout, `KillMode=control-group` (the default) | Linux | **Starts the bounded release**, which can finish only within `TimeoutStopSec=` | [measured P10]; [doc] |
   | systemd `KillMode=mixed` or `process` | Linux | Leaks: the helper gets only the final SIGKILL | [measured P10b] mixed; [doc] |
-  | git dies mid-push, so the helper's stdout breaks | Linux | **Releases** and exits 1 (S16); SIGPIPE used to kill the helper with the lock held | [measured P8] |
-  | The same | Windows | Already released; now exits 1, not 0 | [measured P5] |
+  | SIGINT, SIGTERM or SIGHUP already ignored when the helper started (`nohup`, a background job) | Linux | Starts nothing and prints nothing: the push goes on, and the normal exit path releases the lock if the push ends normally | [code]: `shutdownSignals` leaves it out. [measured P9]: `signal.Ignored` reports it, on a probe program |
+  | git dies mid-push, so the helper's stdout breaks | Linux | **Takes the normal release path** and exits 1 (S16); SIGPIPE used to kill the helper with the lock held | [measured P8] |
+  | The same | Windows | Took the normal release path already; now exits 1, not 0 | [measured P5] |
   | SIGKILL, the OOM killer, power loss | Both | Leaks | none |
   | SIGQUIT | Linux | Leaks, deliberately (S2) | decision |
 
-- **Rulings S1–S12 and S14–S18 (2026-10-24, copied from the spec).** Craig handed every choice to
-  the agent ("Skip the questions and go with your recommendations", 21:46 PT) and approved the
-  spec, and with it these rulings, at 23:08 PT. S13 is in v6.10.
+- **Rulings S1–S12 and S14–S18 (2026-10-24, condensed from the spec, whose §4 holds the full
+  text).** Craig handed every choice to the agent ("Skip the questions and go with your
+  recommendations", 21:46 PT) and approved the spec, and with it these rulings, at 23:08 PT. S13
+  is in v6.10.
 
   | | Ruled (each: the agent's recommendation, approved by Craig 2026-10-24) | Not taken |
   |---|---|---|
@@ -1303,13 +1321,13 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   | S10 | The shutdown release retries the whole nonce-checked release until a final outcome or the cap, pausing 2 s between attempts. Each release CLI call is bounded at 15 s from start to the end of its output, with the post-exit drain bounded at 2 s. A transport error, a killed or timed-out call or a failed download is retried; contents that downloaded and did not parse (*unreadable*) are final | A retry only on the SQLite "database is locked" signature: it covers only that one failure. No retry: one CLI startup collision would leak the lock this change exists to release |
   | S11 | Exit code 128 + the first signal's number (SIGINT 130, SIGTERM 143, SIGHUP 129), on both platforms (`os.Interrupt` counts as 2), whatever the release outcome; stderr says which | Exit 1: it loses which signal it was. Exit 0 after a successful release: the push did not complete |
   | S12 | The normal-path release is unchanged: one attempt on the caller's own handle, failures warned. The one addition: an in-doubt handle waits out S17's settle first | S10's retry there too: a behaviour change outside this fix, left as a possible follow-up |
-  | S14 | One process-wide gate in `internal/transport` covers every `*CLI` the process creates; the coordinator's release instance is the only exemption, and what it writes to stderr goes through the coordinator's non-blocking writer. It does not repeat `EnforceCertified`, which this process already ran | A gate per instance: `run()` and `runSetHead()` each build their own CLI, so a signal during the version check would be missed. Re-certifying the release instance: one more CLI startup inside the collision window S10 worries about |
+  | S14 | One process-wide gate in `internal/transport` covers every `*CLI` the process creates; the coordinator's release instance is the only exemption, and what it writes to stderr goes through the coordinator's non-blocking writer. It does not repeat `EnforceCertified`: `run()` installs the coordinator before the version check, so a signal during that check reaches a coordinator whose release instance was never certified. That is safe because the register stays empty until `AcquireLock`, which runs after certification on the push and `--set-head` paths alike, and the coordinator builds the release instance only when the register holds a lock [code] | A gate per instance: `run()` and `runSetHead()` each build their own CLI, so a signal during the version check would be missed. Re-certifying the release instance: one more CLI startup inside the collision window S10 worries about |
   | S15 | The register lives in `internal/repo`, process-wide, and only the coordinator reads it. An acquisition enters it after its staging file is written and before its upload starts; it leaves on a `Refused` with no error and on a final release outcome. No mutex is held across a CLI call. `run()` clears it when it returns with no signal | A register in `cmd`: `AcquireLock` cannot reach it, and its failure paths drop the nonce. A register threaded through `SetHead` and `AcquireLock`: a wider API change for the same effect |
-  | S16 | A failed protocol write is remembered, and `loop` then exits 1, not 0: it checks each `Flush` itself and flushes once more before it returns. Release takes the normal path | Starting the coordinator on a failed write: it would only bound the normal release, which S12 keeps as it is. Exit 0: reports success for a session git never finished |
+  | S16 | A failed protocol write is remembered, and `loop` then exits 1, not 0: it checks each `Flush` itself and flushes once more before it returns. Release takes the normal path. Git's death is noticed only when git's end of the pipes closes: a batch git never finished sending is refused and `loop` exits 1, a batch already received runs to its end and exits 1 on the failed writes, and with no batch in progress a clean EOF exits 0 [code] | Starting the coordinator on a failed write: it would only bound the normal release, which S12 keeps as it is. Exit 0: reports success for a session git never finished |
   | S17 | A 5 s settle before reading the lock, on the shutdown path whenever a lock is registered and on the normal path whenever the acquisition was in doubt: a request a killed or failed child had already sent can still be applied by the server after the child ends. Not applied when the child's exit was never confirmed, because nothing is released then | No wait: a late lock upload would be read as absent, then appear and leak. A wait only after a write seen in flight: it misses a child that died first. A longer wait: it delays every signalled push for a gap nobody has measured |
-  | S18 | No shortcut for a Windows console close: it runs the normal sequence, safety waits included. The system ends the process 5 s after the event, almost always before the release, so the lock usually stays, as before | Skip the grace and the settle to fit 5 s: that releases while the child or its last request may still be landing, to save a case that rarely finishes anyway |
+  | S18 | No shortcut for a Windows console close: it runs the normal sequence, safety waits included. The system ends the process 5 s after the event [doc] and the first release call comes only after the 5 s settle [code], so the release cannot begin in time and the lock stays, as before, unless the push's own release, already in flight, removes it first | Skip the grace and the settle to fit 5 s: that releases while the child or its last request may still be landing, to save a case that rarely finishes anyway |
 
-  The S6 row is the text Craig approved. As shipped, the worst case from the first signal to exit
+  The S6 row condenses the text Craig approved. As shipped, the worst case from the first signal to exit
   is 62 s, not 60 s (Shipped values, below) [code].
 
 - **Execution ruling (2026-10-25, Craig's call, relayed 12:09 PT).** The spec's non-goals set one
@@ -1329,8 +1347,10 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   variables, so tests shrink them. **The worst case from the first signal to exit is 62 s** [code,
   derived]: the cap fires at 60 s, then the kill of release calls gets up to `outcomeWait` (1 s)
   and the result lines up to `outcomeWait` (1 s). That supersedes the spec's S6 phrase "a 60 s cap
-  from the first signal to exit", which left those two seconds out. A test pins the bound as cap +
-  2 × `outcomeWait` at shrunk values; the real constants were not run end to end. The 75 s
+  from the first signal to exit", which left those two seconds out. The 62 s bounds how long the helper lives after the first
+  signal, not whether the lock is gone: only a result line says that, and two situations print
+  none (below) [code]. A test pins the bound as cap + 2 × `outcomeWait` at shrunk values; the
+  real constants were not run end to end. The 75 s
   `TimeoutStopSec=` below is the spec's: it chose 75 s against its 60 s cap, a 15 s margin
   [agent's recommendation]. Against the shipped 62 s the margin is 13 s [code, derived].
   A release call is killed 13 s after it starts (the 15 s bound less its 2 s drain), with its whole
@@ -1339,29 +1359,42 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   only the child is.
 - **Outcomes and messages.** A release attempt ends in one of: *removed* (`.lock` held our nonce
   and `Trash` committed), *absent* (no `.lock`: our upload never landed, or it was already
-  removed), *foreign* (another nonce; left alone), *unreadable* (present but did not parse; not
-  removed, not retried), *failed* (a transport error, a killed or timed-out call, or a `Trash`
-  that did not commit; retried until the cap). *Not attempted* is a per-lock state the
+  removed, for instance by this push's own release finishing as the signal arrived), *foreign*
+  (another nonce; left alone), *unreadable* (present but did not parse; not removed, not
+  retried), *failed* (a transport error, a killed or timed-out call, or a `Trash` that did not
+  commit; retried until the cap). *Not attempted* is a per-lock state the
   coordinator reports when no release ran: the in-flight child's exit was never confirmed, or the
   cap came first. Locks are released one after another, so a lock whose release never reaches a
-  final outcome uses the whole cap and any later lock reports *not attempted*; the helper holds
-  one lock at a time in practice. The first signal prints a catch line (which signal; with a lock
+  final outcome uses the rest of the cap, which runs from the first signal (the child stop and the
+  settle come out of it), and any later lock reports *not attempted* [code]. The register can hold
+  only one lock: a helper process has one repo address and so one `.lock` path, `loop` keeps one
+  handle, and a second acquisition of that path is refused while the first is held [code; A6 for
+  the refusal]. The first signal prints a catch line (which signal; with a lock
   registered, that the push or `--set-head` is stopping and the lock is being checked, that this
   takes about a minute, that no other push or `--set-head` should start nor the lock be removed
   by hand until the result line, and that `kill -9` or `Stop-Process` abandons the check). Then
   comes one result line per lock: its path, its nonce and the outcome in words, with the manual
   remedy, worded for after the fact, on *failed* and *not attempted*. If the catch line said a
-  lock was being checked and the register is empty by the time the coordinator reads it (an
-  acquisition refused in between), one result line says no lock of ours remains registered and
-  there is nothing to release. A push interrupted mid-batch
+  lock was being checked and the register is empty by the time the coordinator reads it, one
+  result line says no lock of ours remains registered and there is nothing to release. That is
+  possible only when a CLI call returned just before the gate shut and its caller then
+  unregistered the lock between the catch line and the snapshot: a refused acquisition, or this
+  push's own normal release completing. A call still in flight when the gate shuts parks and
+  cannot unregister [code]. A push interrupted mid-batch
   also says it did not finish and that some of its remote changes may have landed while git was
   told nothing; an interrupted `--set-head` says `HEAD` may or may not have changed. On Windows a
   Ctrl-C and a Ctrl-Break both print SIGINT, and a console close prints SIGTERM. The exact wording
   is in `shutdown.go`. [code]
-- **When no result line arrives.** A Windows console close ends the process 5 s after the event,
-  usually before the release, so the line never comes and the lock is either gone or still there
-  (one `Trash` call removes it [inference]). And when stderr is blocked or gone, the coordinator's writer drops what it cannot write and the
-  helper waits at most 1 s for it; the release itself does not wait on stderr. [code]
+- **When no result line arrives.** A Windows console close ends the process 5 s after the event
+  [doc]. With a lock registered, the sequence stops any child in flight (its grace is up to 5 s)
+  and then waits its 5 s settle before the first release call [code], so the release cannot begin
+  in time and the line never comes. A release is up to four CLI calls (`Stat` and a download to
+  read the lock, then `Trash`, which `Stat`s first and then trashes [code]), and the lock goes only
+  with the last, so it is never half-removed: it is either gone or still there [inference, spec
+  §5.6]. It is gone only if a release already in flight, the push's own, finished first; check the
+  remote either way. And when stderr is blocked or gone, the coordinator's writer drops what it
+  cannot write and the helper waits at most 1 s for it; the release itself does not wait on
+  stderr. [code]
 - **Why releasing mid-batch is safe, and what stays at risk.** Stopping between any two remote
   calls, or killing the call in flight, leaves a state a crash leaves today, and this document
   already defines each: an orphan pack or a pack with no `.idx` (phase 3); some refs moved and
@@ -1381,6 +1414,14 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   to kill a tree. The only grandchild ever seen (Stage 2.1's `waitDelay` hang) appeared after the
   child had finished its work [record, inference]. (3) Every uncatchable kill in the table still
   leaks. A Ctrl-Break typed during a Windows release can kill a release call, which S10 retries.
+  (4) Each retry in `releaseAll` runs the nonce-checked read-then-trash again, so a shutdown can
+  open several of item 6's check-then-act windows inside the cap where the normal path opens
+  one [code]. Under residual (1), a `Trash` the killed call had already sent could land after a
+  retry's nonce check, and the retry's trash would then remove a lock another writer had taken
+  in between; that needs a late landing and a new acquirer within seconds [inference]. (5) A
+  signal ends the process with `os.Exit`, so no deferred cleanup runs: a staging temp folder, a
+  download temp folder and a local `git pack-objects` child that was building a pack can be
+  left behind, as they are today [code]; spec §3 sets that aside as a non-goal.
 - **What callers must do** (spec §5.8; the Linux unattended spec is to carry these in full).
   systemd: keep `KillMode=control-group` (the default), because `mixed` reaches the helper only
   with SIGKILL [measured P10b], and keep `TimeoutStopSec=` at 75 s or more (the default 90 s is
@@ -1388,11 +1429,13 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   is still releasing [measured P11], so a script that starts the next push of the same repo
   straight away meets the old lock (`repo is locked`) and fails, unretried, until the release ends.
   To wait for the helper, read the push's stderr through a pipe whose reader sits outside the
-  time limit (`timeout 2h git push … 2>&1 | logger`, with `pipefail`) [measured P11b]; a reader
-  inside the limit dies with git and nothing waits [inference from P7]. That git hands the helper
-  its stderr and keeps its stdin and stdout as its own pipes is [source read] (U8), from git
-  v2.55.0, read 2026-10-25: `transport-helper.c:142-149` sets `helper->in = -1` and
-  `helper->out = -1` (pipes), `helper->err = 0` (the helper inherits git's stderr),
+  time limit (`timeout 2h git push … 2>&1 | logger`, with `pipefail`) [inference from P11b and
+  U8: P11b measured `sh -c 'probe …' | cat` on stdout, not a git pipeline]; a reader inside the
+  limit dies with git and nothing waits [inference from P7]. That git hands the helper its stderr
+  and keeps its stdin and stdout as its own pipes is [source read: upstream git v2.55.0, read
+  2026-10-25; Git for Windows' fork not read] (U8): `transport-helper.c:142-149` sets
+  `helper->in = -1` and `helper->out = -1` (pipes), `helper->err = 0` (the helper inherits git's
+  stderr),
   `git_cmd = 1` and `silent_exec_failure = 1`, and does not set `clean_on_exit`; and
   `run-command.c`'s `cleanup_children`, which git runs at exit and from its SIGINT, SIGHUP,
   SIGTERM, SIGQUIT and SIGPIPE handlers (`sigchain_push_common`), kills only children registered
@@ -1401,8 +1444,9 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   `timeout --kill-after` fires only while the command it watches is running, and git has exited at
   the first signal, so it never fires and the helper's own cap is its only bound [measured P11;
   inference]. A script sees git's exit code or `timeout`'s 124, not the helper's (S11). The
-  lock-held message can appear for a few seconds after a signal, while the old helper is still
-  releasing; its manual remedy applies only once no push for that repo is running.
+  lock-held message can appear for as long as the old helper is still releasing, up to 62 s after
+  the first signal [code, derived]; its manual remedy applies only once no push for that repo is
+  running.
 - **No signal, no change.** The exit codes, messages and CLI calls on every path that ended
   without a signal are as before, with two exceptions on paths that already fail: an in-doubt
   acquisition now gets a release attempt after the settle wait (S8, S17), and a session whose
@@ -1429,20 +1473,24 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   [inference]: on Linux a terminal Ctrl-C typed after the prompt returns does not reach the
   helper. U6 [untested]: Ctrl-C in Git Bash's mintty window. U7 [untested]: how long after a
   killed request the server can still apply it, and whether a release child in its own Windows
-  process group behaves normally. U8 [source read], git v2.55.0, 2026-10-25: git gives the helper
-  pipes for its stdin and stdout and its own stderr, and does not register it for clean-on-exit
-  (What callers must do, above). U9 [untested]: a real `git push` on Windows stopped by a Ctrl-C
-  or Ctrl-Break typed in its console, end to end; P4, W1 and W2 all send the event to the helper
-  directly. git v2.55.0 does not register its remote helper for clean-on-exit (U8), so git's own
-  exit should not end the helper [source read + inference]. The Windows release gate's
-  kill-mid-push check must therefore run under a real `git push`, with the key typed by hand,
-  and record whether the result line appeared.
+  process group behaves normally. U8 [source read: upstream git v2.55.0, read 2026-10-25; Git for
+  Windows' fork not read]: git gives the helper pipes for its stdin and stdout and its own stderr,
+  and does not register it for clean-on-exit (What callers must do, above). U9 [untested]: a real
+  `git push` on Windows stopped by a Ctrl-C or Ctrl-Break typed in its console, end to end; P4, W1
+  and W2 all send the event to the helper directly, and none of them sends Ctrl-C. Upstream git
+  v2.55.0 does not register its remote helper for clean-on-exit (U8), so git's own exit should not
+  end the helper there [source read + inference; Git for Windows' fork not read]. The agent
+  recommends that the Windows release gate's kill-mid-push check run under a real `git push`, with
+  the key typed by hand, and record whether the result line appeared. Spec §8 also allows
+  `GenerateConsoleCtrlEvent`, so this departs from the approved spec until Craig rules on amending
+  §8 [agent's recommendation].
 - **Release.** The change ships in the next helper release under `docs/releasing.md`. `.go` files
   changed, so a stand-in is not eligible and both formal live gates run, each adding one live
   check on its own scratch remote: kill a push mid-upload by that platform's catchable route
-  (Linux: SIGTERM to the push's process group; Windows, per U9: Ctrl-C or Ctrl-Break typed by
-  hand in the console of a real `git push`, where spec §8 also allows Ctrl-Break by
-  `GenerateConsoleCtrlEvent`, which leaves git out), then confirm `.lock` is gone and the next
+  (Linux: SIGTERM to the push's process group; Windows: spec §8 allows Ctrl-Break by
+  `GenerateConsoleCtrlEvent`, which leaves git out, and the agent recommends instead, per U9,
+  Ctrl-C or Ctrl-Break typed by hand in the console of a real `git push`, pending Craig's ruling
+  on amending §8), then confirm `.lock` is gone and the next
   push succeeds. That check is the first evidence for U1–U3 and weak evidence for U7. The CLI
   pin does not move. The version number is left to release time; 0.11.0 is the agent's
   suggestion.
