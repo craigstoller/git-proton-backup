@@ -197,7 +197,12 @@ func TestAcquireLockRegistersBeforeTheUpload(t *testing.T) {
 	cleanRegister(t)
 	f := transport.NewFake()
 	var seen []*Lock
-	tr := hookCreateTransport{Fake: f, hook: func() { seen = RegisteredLocks() }}
+	var inDoubtDuring bool
+	tr := hookCreateTransport{Fake: f, hook: func() {
+		seen = RegisteredLocks()
+		// Read now: the flag clears once the read-back proves the lock ours.
+		inDoubtDuring = len(seen) == 1 && seen[0].InDoubt()
+	}}
 
 	l, err := AcquireLock(tr, sigRoot)
 	if err != nil {
@@ -205,6 +210,9 @@ func TestAcquireLockRegistersBeforeTheUpload(t *testing.T) {
 	}
 	if len(seen) != 1 {
 		t.Fatalf("the register held %d locks when the upload began, want 1", len(seen))
+	}
+	if !inDoubtDuring {
+		t.Error("the lock registered during the upload must be marked in doubt: nothing yet proves the upload landed")
 	}
 	if seen[0].Path() != sigLock {
 		t.Errorf("registered path = %q, want %q", seen[0].Path(), sigLock)

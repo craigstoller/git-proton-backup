@@ -16,8 +16,8 @@ import (
 
 // --- WaitDelay: the grandchild-holds-the-pipe hang -------------------------
 //
-// These tests drive run()'s WaitDelay behaviour against a REAL process tree,
-// hermetically: the test binary re-execs ITSELF as the stand-in
+// These tests drive run()'s drain bound (waitDelay) against a REAL process
+// tree, hermetically: the test binary re-execs ITSELF as the stand-in
 // "proton-drive" (the standard os/exec helper-process technique). No Proton
 // CLI is invoked, nothing touches the network, and no account is involved.
 //
@@ -486,8 +486,8 @@ func teardownHelper() {
 	os.Remove(helperRelease)
 }
 
-// shortWaitDelay installs a test-scale WaitDelay and restores the production
-// value afterwards.
+// shortWaitDelay installs a test-scale waitDelay, run's post-exit drain bound,
+// and restores the production value afterwards.
 func shortWaitDelay(t *testing.T, d time.Duration) {
 	t.Helper()
 	prev := waitDelay
@@ -517,9 +517,9 @@ func TestRunAbandonsAPipeHeldOpenByAGrandchild(t *testing.T) {
 	if !errors.Is(err, exec.ErrWaitDelay) {
 		t.Fatalf("want exec.ErrWaitDelay after the delay fires, got %v (after %s)", err, elapsed)
 	}
-	// The carve-out every caller depends on: the command SUCCEEDED. os/exec
-	// substitutes ErrWaitDelay for a nil error only on a successful exit, so
-	// the exit code must still be the real one.
+	// The carve-out every caller depends on: the command SUCCEEDED. run
+	// substitutes ErrWaitDelay only for an exit 0 whose drain ran out, so the
+	// exit code must still be the real one.
 	if code != 0 {
 		t.Errorf("want exit code 0 alongside ErrWaitDelay, got %d", code)
 	}

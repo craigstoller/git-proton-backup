@@ -151,6 +151,12 @@ func startHelper(t *testing.T, opts helperOpts) *helperRun {
 	if !opts.Production {
 		env = append(env, shrinkEnv+"=1")
 	}
+	// A -race binary sleeps atexit_sleep_ms (1 s by default) at every exit, the
+	// helper's and each shim call's, which E13's and E17's bounds cannot absorb;
+	// only -race binaries read GORACE, and a GORACE the caller set is kept.
+	if _, ok := os.LookupEnv("GORACE"); !ok {
+		env = append(env, "GORACE=atexit_sleep_ms=0")
+	}
 	cmd.Env = append(env, opts.Env...)
 	if opts.OwnGroup {
 		setOwnProcessGroup(cmd)

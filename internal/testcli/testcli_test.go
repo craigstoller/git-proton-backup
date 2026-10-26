@@ -194,9 +194,10 @@ func TestRunBlocksBeforeTheSkipDecisionUntilTheStopFile(t *testing.T) {
 		done <- result{code, out}
 	}()
 	// An upload that would be skipped (Refused) still blocks first.
+	readyFile := filepath.Join(ready, "ready-upload-leaf.txt-0")
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		if _, err := os.Stat(filepath.Join(ready, "ready-upload-leaf.txt-0")); err == nil {
+		if _, err := os.Stat(readyFile); err == nil {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -208,6 +209,17 @@ func TestRunBlocksBeforeTheSkipDecisionUntilTheStopFile(t *testing.T) {
 	case r := <-done:
 		t.Fatalf("the blocked call returned %d, %q before the stop file", r.code, r.out)
 	case <-time.After(300 * time.Millisecond):
+	}
+	// The harness's assertNoShimLeft reads <tree>/.pids: with no record there it
+	// would pass on nothing. The blocked run's pid, from its ready file, must be
+	// recorded while it is blocked.
+	b, err := os.ReadFile(readyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pidRecord := filepath.Join(tree, PidsDir, strings.TrimSpace(string(b)))
+	if _, err := os.Stat(pidRecord); err != nil {
+		t.Errorf("a blocked run must record its pid as %s: %v", pidRecord, err)
 	}
 	if err := os.WriteFile(filepath.Join(ready, StopFile), nil, 0o644); err != nil {
 		t.Fatal(err)
@@ -222,6 +234,10 @@ func TestRunBlocksBeforeTheSkipDecisionUntilTheStopFile(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(target); string(b) != "theirs" {
 		t.Fatalf("target = %q, want it untouched", b)
+	}
+	// A run the stop file ended returned normally, so its record is gone.
+	if _, err := os.Stat(pidRecord); !os.IsNotExist(err) {
+		t.Errorf("%s is still there after the run returned (stat err %v)", pidRecord, err)
 	}
 }
 

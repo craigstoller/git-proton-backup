@@ -583,8 +583,14 @@ func TestReleaseCLIKillsACallAtItsBound(t *testing.T) {
 	g := newGateTest(t, roleHang, true)
 	releaseCallTimeout, releaseDrain = time.Second, 300*time.Millisecond
 	c := NewReleaseCLI(helperExe, io.Discard)
-	var exitedAt time.Time
+	var exitedAt, startedAt time.Time
 	testHookExited = func(int) { exitedAt = time.Now() }
+	real := startCmd
+	startCmd = func(cmd *exec.Cmd) error {
+		err := real(cmd)
+		startedAt = time.Now()
+		return err
+	}
 
 	start := time.Now()
 	r := within(t, g.run(c), 1500*time.Millisecond, "a hung release call")
@@ -593,6 +599,22 @@ func TestReleaseCLIKillsACallAtItsBound(t *testing.T) {
 	}
 	if killed := exitedAt.Sub(start); killed < 600*time.Millisecond {
 		t.Errorf("the child's exit was observed %s in; the kill must wait for callTimeout - drain (700ms)", killed)
+	}
+	// And no later than that: a kill at callTimeout (1 s) would also pass the
+	// lower bound. The timer cannot fire early, so such a kill is seen at 1 s or
+	// later, 300 ms past 700 ms; a kill at 700 ms is seen within a few ms, under
+	// -race too (the race runtime's exit sleep does not apply to a killed child).
+	// 250 ms splits the two with room for a loaded runner. A start that itself
+	// returns after 700 ms (Windows scans a freshly copied executable on its first
+	// run) is killed as soon as it returns, so the bound counts from the later of
+	// the two.
+	due := start.Add(700 * time.Millisecond)
+	if startedAt.After(due) {
+		due = startedAt
+	}
+	if late := exitedAt.Sub(due); late > 250*time.Millisecond {
+		t.Errorf("the child's exit was observed %s in, %s after the kill was due: the kill must come at "+
+			"callTimeout - drain (700ms), not at callTimeout", exitedAt.Sub(start), late)
 	}
 }
 

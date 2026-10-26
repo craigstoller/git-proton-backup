@@ -318,7 +318,8 @@ func TestLoop_InDoubtAcquisitionIsReleasedOnExit(t *testing.T) {
 
 // TestLoop_CleanSessionStillExitsZero guards the other direction of the two
 // tests above: a session whose writes all succeed is still a 0, and its output
-// still reaches the writer now that loop's own final flush is what delivers it.
+// still reaches the writer. Each command's own flush() delivers it; loop's
+// final flush, in its defer, only checks once more for a failed write.
 func TestLoop_CleanSessionStillExitsZero(t *testing.T) {
 	for _, tc := range []struct {
 		name, script string

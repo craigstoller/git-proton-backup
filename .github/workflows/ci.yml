@@ -79,6 +79,14 @@ jobs:
         # against transport.Fake, and the few that need real git plumbing build
         # a throwaway repo under t.TempDir(). Nothing here contacts Proton.
         run: go test -count=1 ./...
+      - name: Signal cases W1, W2, verbose (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        # The step above prints one "ok" for the package whether W1 and W2
+        # passed or skipped (they skip, naming the reason, when no console is
+        # attached). Spec §6 needs this log to show PASS, not SKIP. A skip does
+        # not fail the job: whether it should is Craig's call.
+        run: go test -count=1 -run '^TestSignal_W' -v ./cmd/git-remote-proton/
       - name: gofmt (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
