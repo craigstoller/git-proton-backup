@@ -30,13 +30,13 @@
   Linux the kills the helper cannot catch still leave it: SIGKILL, the OOM killer, and systemd's
   `KillMode=mixed` or `process`. The kill that orphaned a lock in the Stage 5 gate, a tool timeout
   that probably reached the push through Git Bash on Windows, is among those that still leak. Two
-  related changes: a lock whose acquisition ended in doubt (the upload's result was lost, or it
-  was reported refused but the lock there carries the helper's own nonce) is now released on the
-  normal exit path too, after a 5 s wait in case the upload lands late, as is every other lock
-  handle the session was given, and a session whose writes to git failed (git died, or its pipe
-  broke) now exits 1. It exited 0 on Windows, and on Linux SIGPIPE killed the helper with the
-  lock held. The README's honest limits list what each platform covers and the manual remedy; the
-  v2 design is now v6.11.
+  related changes: a lock whose acquisition ended in doubt (the upload's result was lost, or the
+  upload was reported refused but the lock there carries the nonce that same attempt uploaded,
+  which is untested) is now released on the normal exit path too, after a 5 s wait in case the
+  upload lands late (any other lock the session took is released on exit as well, without that
+  wait), and a session whose writes to git failed (git died, or its pipe broke) now exits 1. It
+  exited 0 on Windows, and on Linux SIGPIPE killed the helper with the lock held. The README's
+  honest limits list what each platform covers and the manual remedy; the v2 design is now v6.11.
 
 ## 0.10.0 — 2026-10-21
 
