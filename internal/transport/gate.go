@@ -14,11 +14,12 @@ import (
 //
 // When the helper is signalled, the shutdown coordinator must know that
 // nothing of ours can still reach the remote before it releases the lock. So
-// it shuts this gate, after which no *CLI starts a child (S14), and stops the
-// one child that may already be running (StopInFlight, S5). Then it releases
-// through its own instance, NewReleaseCLI's, the gate's one exemption: its
-// children run in their own process group (S7), each call is bounded (S10),
-// and KillReleaseCalls ends any still running at the cap.
+// it shuts this gate, after which no *CLI starts a child (S14), and stops every
+// child already in flight (StopInFlight, S5): the record is a set, though the
+// protocol goroutine runs one call at a time. Then it releases through its own
+// instance, NewReleaseCLI's, the gate's one exemption: its children run in
+// their own process group (S7), each call is bounded (S10), and
+// KillReleaseCalls ends any still running at the cap.
 //
 // ONE mutex, gateMu, guards everything below together: the shut flag, the
 // reopen channel, release admission, and both in-flight sets. That is what
@@ -64,24 +65,34 @@ var (
 var startCmd = (*exec.Cmd).Start
 
 // flight is one call's entry in an in-flight set, from just before its start
-// to just after its drain. proc and exitSeen are guarded by gateMu.
+// to just after its drain. proc, exitSeen and endedBy are guarded by gateMu.
 type flight struct {
 	release  bool
+	bound    time.Duration // a release call's bound, which killAtBound names
 	proc     *os.Process   // nil until the start has returned
 	exited   chan struct{} // closed once the child's exit is observed, or when no child started
 	exitSeen bool          // exited has been closed
+	endedBy  string        // why the helper signalled the child, if it did; run names it in the error
 }
 
+// Why the helper ended a child, as run's error words it ("proton CLI call
+// killed " + reason). killAtBound gives a third, naming the call's bound.
+const (
+	endedByShutdown = "by the shutdown"     // StopInFlight, or a gated start that returned after ShutGate
+	endedByCap      = "by the shutdown cap" // KillReleaseCalls, or a release start that returned after it
+)
+
 // admit is the gate. It returns a new record for the call, already in its
-// set, or the channel a gated call must park on, or errReleaseClosed.
-func admit(release bool) (*flight, <-chan struct{}, error) {
+// set, or the channel a gated call must park on, or errReleaseClosed. bound is
+// a release call's bound, for the record.
+func admit(release bool, bound time.Duration) (*flight, <-chan struct{}, error) {
 	gateMu.Lock()
 	defer gateMu.Unlock()
 	if release {
 		if releaseClosed {
 			return nil, nil, errReleaseClosed
 		}
-		f := &flight{release: true, exited: make(chan struct{})}
+		f := &flight{release: true, bound: bound, exited: make(chan struct{})}
 		releaseInFlight[f] = struct{}{}
 		return f, nil, nil
 	}
@@ -101,23 +112,37 @@ func (f *flight) fill(p *os.Process) {
 	gateMu.Lock()
 	defer gateMu.Unlock()
 	f.proc = p
-	if (f.release && releaseClosed) || (!f.release && gateShut) {
-		f.kill()
+	switch {
+	case f.release && releaseClosed:
+		f.kill(endedByCap)
+	case !f.release && gateShut:
+		f.kill(endedByShutdown)
 	}
 }
 
-// kill ends the child, a release child with its whole group. The caller holds
-// gateMu. It does nothing before the start has returned (fill kills then, if
-// it must) and nothing once the exit was observed: a release child's group is
-// signalled by number, and after the exit that number may already be free.
-func (f *flight) kill() {
+// kill ends the child, a release child with its whole group, and records why
+// (the first reason recorded stands), so run can report the call as killed and
+// not as a failure of the CLI's own. The caller holds gateMu. It does nothing
+// before the start has returned (fill kills then, if it must) and nothing once
+// the exit was observed: a release child's group is signalled by number, and
+// after the exit that number may already be free.
+func (f *flight) kill(why string) {
 	if f.proc == nil || f.exitSeen {
 		return
 	}
+	f.note(why)
 	if f.release {
 		killGroup(f.proc)
 	} else {
 		f.proc.Kill()
+	}
+}
+
+// note records why the helper signalled the child, unless a reason is already
+// recorded. The caller holds gateMu.
+func (f *flight) note(why string) {
+	if f.endedBy == "" {
+		f.endedBy = why
 	}
 }
 
@@ -132,15 +157,18 @@ func (f *flight) kill() {
 func (f *flight) killAtBound() {
 	gateMu.Lock()
 	defer gateMu.Unlock()
-	f.kill()
+	f.kill("at its " + f.bound.String() + " bound")
 }
 
-// exit records that the child's exit was observed, or that no child started.
-func (f *flight) exit() {
+// exit records that the child's exit was observed, or that no child started,
+// and returns why the helper signalled the child ("" if it did not). Nothing
+// can be recorded after it: kill does nothing once the exit is seen.
+func (f *flight) exit() string {
 	gateMu.Lock()
 	defer gateMu.Unlock()
 	f.exitSeen = true
 	close(f.exited)
+	return f.endedBy
 }
 
 // leave removes the record once the call's result is ready. It returns the
@@ -213,6 +241,7 @@ func StopInFlight(grace, term, confirm time.Duration) bool {
 		gateMu.Lock()
 		for _, f := range left {
 			if f.proc != nil && !f.exitSeen && terminate(f.proc) {
+				f.note(endedByShutdown)
 				sent = true
 			}
 		}
@@ -224,7 +253,7 @@ func StopInFlight(grace, term, confirm time.Duration) bool {
 	if len(left) > 0 {
 		gateMu.Lock()
 		for _, f := range left {
-			f.kill()
+			f.kill(endedByShutdown)
 		}
 		gateMu.Unlock()
 		left = waitExits(left, confirm)
@@ -244,7 +273,7 @@ func KillReleaseCalls(within time.Duration) {
 	snap := make([]*flight, 0, len(releaseInFlight))
 	for f := range releaseInFlight {
 		snap = append(snap, f)
-		f.kill()
+		f.kill(endedByCap)
 	}
 	gateMu.Unlock()
 	waitExits(snap, within)

@@ -109,6 +109,30 @@ func (g *gateTest) run(c *CLI, args ...string) <-chan runResult {
 	return ch
 }
 
+// do runs fn, a CLI method call, on its own goroutine and returns the channel
+// its error arrives on. Like run, the cleanup waits for it.
+func (g *gateTest) do(fn func() error) <-chan error {
+	ch := make(chan error, 1)
+	g.runs.Add(1)
+	go func() {
+		defer g.runs.Done()
+		ch <- fn()
+	}()
+	return ch
+}
+
+// errWithin waits up to d for a do call's error.
+func errWithin(t *testing.T, ch <-chan error, d time.Duration, what string) error {
+	t.Helper()
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(d):
+		t.Fatalf("%s: the call had not returned after %s", what, d)
+		return nil
+	}
+}
+
 // blockStarts makes every start wait at the startCmd seam until unblock is
 // called (the cleanup calls it too). entered receives once per start that
 // reached the seam, so a test knows a call is between reserving its record
@@ -570,6 +594,64 @@ func TestReleaseCLIKillsACallAtItsBound(t *testing.T) {
 	if killed := exitedAt.Sub(start); killed < 600*time.Millisecond {
 		t.Errorf("the child's exit was observed %s in; the kill must wait for callTimeout - drain (700ms)", killed)
 	}
+}
+
+// wantKilledError checks the error of a CLI call whose child the helper killed:
+// it names why, it is not reported as a start failure (that sends a person to
+// check their PATH), it quotes no empty output, and it still wraps the child's
+// *exec.ExitError, which is what EnforceCertified's never-started test reads.
+func wantKilledError(t *testing.T, err error, why string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("a call whose child was killed must return an error")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "did not start") {
+		t.Errorf("error = %q: a child that ran and was killed must not read as a CLI that did not start", msg)
+	}
+	if !strings.Contains(msg, "proton CLI call killed "+why) {
+		t.Errorf("error = %q, want it to say %q", msg, "proton CLI call killed "+why)
+	}
+	if strings.Contains(msg, "failed: :") {
+		t.Errorf("error = %q: an empty output must not leave an empty quote in the message", msg)
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Errorf("error = %q: it must still wrap the child's *exec.ExitError", msg)
+	}
+}
+
+// RED. A release call killed at its bound says so. Stat's info call is the one
+// killed with hang; with trash-hang, Trash's Stat succeeds and its trash call is
+// killed, with no output for the message to quote.
+func TestReleaseCallKilledAtItsBoundSaysSo(t *testing.T) {
+	for _, tc := range []struct {
+		name, role string
+		call       func(*CLI) error
+	}{
+		{"Stat", roleHang, func(c *CLI) error { _, _, err := c.Stat("/my-files/r/.lock"); return err }},
+		{"Trash", roleTrashHang, func(c *CLI) error { _, err := c.Trash("/my-files/r/.lock"); return err }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newGateTest(t, tc.role, true)
+			releaseCallTimeout, releaseDrain = time.Second, 300*time.Millisecond
+			c := NewReleaseCLI(helperExe, io.Discard)
+			err := errWithin(t, g.do(func() error { return tc.call(c) }), 5*time.Second, "a hung release call")
+			wantKilledError(t, err, "at its 1s bound")
+		})
+	}
+}
+
+// RED. A release call killed by KillReleaseCalls, at the shutdown cap, says so.
+// The production bounds stay, so only the cap's kill can end the call.
+func TestReleaseCallKilledByTheShutdownCapSaysSo(t *testing.T) {
+	g := newGateTest(t, roleHang, true)
+	c := NewReleaseCLI(helperExe, io.Discard)
+	ch := g.do(func() error { _, _, err := c.Stat("/my-files/r/.lock"); return err })
+	g.waitMarkers("started", 1)
+
+	KillReleaseCalls(2 * time.Second)
+	wantKilledError(t, errWithin(t, ch, 5*time.Second, "a release call killed at the cap"), "by the shutdown cap")
 }
 
 // RED. KillReleaseCalls kills a running release child and waits for it to be

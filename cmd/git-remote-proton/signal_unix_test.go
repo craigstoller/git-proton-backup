@@ -360,7 +360,7 @@ func TestSignal_E7_SetHeadDuringItsHEADUpload(t *testing.T) {
 		t.Errorf("%s/HEAD exists after its upload was killed before the write (stat: %v); stderr:\n%s", harnessRoot, err, stderr)
 	}
 	assertNoShimLeft(t, h.Tree)
-	catch := linePrefix + "received SIGTERM: stopping --set-head and checking the remote lock, which takes up to a minute"
+	catch := linePrefix + "received SIGTERM: stopping --set-head and checking the remote lock, which takes about a minute"
 	if !strings.Contains(stderr, catch) {
 		t.Errorf("stderr lacks the catch line %q:\n%s", catch, stderr)
 	}

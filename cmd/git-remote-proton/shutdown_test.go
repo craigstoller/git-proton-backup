@@ -769,6 +769,41 @@ func TestShutdown_UnconfirmedExitIsNotAttempted(t *testing.T) {
 	}
 }
 
+// RED. The catch line's form is chosen from the register when the signal
+// lands, the result lines from the snapshot taken later. AcquireLock's Refused
+// arm takes its entry out between the two, so a catch line that said "until the
+// result line below" must still be followed by one. The stopper seam stands in
+// for that arm: it empties the register after the catch line and before the
+// snapshot.
+func TestShutdown_LockGoneBeforeTheSnapshotStillGetsAResultLine(t *testing.T) {
+	f := newShutdownFixture(t)
+	f.holdLock(t)
+	stopInFlight = func(_, _, _ time.Duration) bool {
+		repo.ResetRegister()
+		return true
+	}
+
+	newCoordinator().trigger(syscall.SIGTERM)
+
+	if code := f.exits.wait(t, 5*time.Second); code != 143 {
+		t.Errorf("exit code = %d, want 143 (128 + SIGTERM)", code)
+	}
+	if n := f.rt.total(); n != 0 {
+		t.Errorf("%d release calls, want none: the snapshot held no lock", n)
+	}
+	out := f.stderr.String()
+	_, ci := lineWith(out, "received SIGTERM", "checking the remote lock", "Until the result line below")
+	_, ri := lineWith(out, "no lock of ours remains registered; nothing to release")
+	if ci < 0 {
+		t.Fatalf("stderr = %q: want the lock-holding catch line", out)
+	}
+	if ri < 0 || ri < ci {
+		t.Errorf("stderr = %q: a lock-holding catch line must be followed by a result line, "+
+			"here that no lock of ours remains registered", out)
+	}
+	assertPrefixed(t, out)
+}
+
 func TestShutdown_SecondSignalIsNotedAndIgnored(t *testing.T) {
 	f := newShutdownFixture(t)
 	l := f.holdLock(t)

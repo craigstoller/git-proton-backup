@@ -553,7 +553,7 @@ const (
 // pushCatch is how the catch line for sig (its Unix name) begins when a push
 // holds, or may hold, the lock.
 func pushCatch(sig string) string {
-	return linePrefix + "received " + sig + ": stopping the push and checking the remote lock, which takes up to a minute"
+	return linePrefix + "received " + sig + ": stopping the push and checking the remote lock, which takes about a minute"
 }
 
 // noLockCatch is the whole catch line for sig (its Unix name) when no lock is

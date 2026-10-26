@@ -76,8 +76,9 @@ func NewCLI(exe string) *CLI {
 // whether the remote is quiet needs to know; the drain can lag it by as long as
 // a grandchild holds the pipe open.
 //
-// Error contract (unchanged from CombinedOutput with WaitDelay set):
-//   - the child could not be started: code -1 and the start error;
+// Error contract (CombinedOutput's with WaitDelay set, plus the killed case):
+//   - the child could not be started: code -1 and the start error, unwrapped
+//     (EnforceCertified's never-started test reads it as it is);
 //   - the child exited 0 and the drain finished: nil error;
 //   - the child exited 0 but the drain ran out: the output read so far, code 0
 //     and exec.ErrWaitDelay (the command SUCCEEDED; every caller branches on
@@ -85,7 +86,12 @@ func NewCLI(exe string) *CLI {
 //     warning on stderr so a recurrence is diagnosable instead of invisible —
 //     stderr, never stdout: stdout is protocol-only;
 //   - the child exited non-zero: an *exec.ExitError, whether or not the drain
-//     finished, and no warning.
+//     finished, and no warning;
+//   - the child ran and the helper killed it (a release call at its bound or
+//     at the shutdown cap, a gated call stopped by the shutdown): the child's
+//     code (-1 on Unix, where it died of a signal; 1 on Windows, the code
+//     Kill's TerminateProcess gives) and an error naming why, "proton CLI call
+//     killed at its 15s bound: signal: killed", wrapping the *exec.ExitError.
 //
 // The gate (gate.go) wraps all of that. A gated call made after ShutGate
 // starts no child and parks, and so does one whose result arrives after it; a
@@ -95,7 +101,7 @@ func NewCLI(exe string) *CLI {
 // and KillReleaseCalls wait on the exit, never on the drain.
 func (c *CLI) run(args ...string) (string, int, error) {
 	// The gate comes first: a call it parks creates no pipe and starts no child.
-	f, park, err := admit(c.release)
+	f, park, err := admit(c.release, c.callTimeout)
 	if park != nil {
 		return parked(park)
 	}
@@ -144,7 +150,7 @@ func (c *CLI) run(args ...string) (string, int, error) {
 	// With stdio all *os.File there are no copy goroutines inside os/exec, so
 	// Wait returns when the PROCESS exits, whatever still holds the pipe.
 	werr := cmd.Wait()
-	f.exit()
+	killedBy := f.exit()
 	if bound != nil {
 		bound.Stop() // a callback already running finds the exit recorded and does nothing
 	}
@@ -160,6 +166,12 @@ func (c *CLI) run(args ...string) (string, int, error) {
 	}
 
 	err = werr
+	if werr != nil && killedBy != "" {
+		// The child ran and we ended it. Said so, so a caller's message does not
+		// read as the CLI's own failure, or, with Unix's -1 for a signalled
+		// child, as a CLI that never started. %w keeps the *exec.ExitError.
+		err = fmt.Errorf("proton CLI call killed %s: %w", killedBy, werr)
+	}
 	if !drained && werr == nil {
 		// The command itself SUCCEEDED: only the drain ran out. This is the
 		// exec.ErrWaitDelay carve-out documented above, now produced here.
@@ -325,14 +337,18 @@ const notFoundSignature = "Node not found"
 
 func (c *CLI) Stat(p string) (Node, bool, error) {
 	out, code, err := c.run("filesystem", "info", p, "--json")
-	if code == -1 {
-		// code == -1 only when run's nil-ProcessState guard fired: the CLI
-		// executable itself never started (not on PATH, permission denied,
-		// ...). That is a transport failure, not a confirmed absence.
+	if code == -1 && !ran(err) {
+		// code -1 with no *exec.ExitError: the CLI executable itself never
+		// started (not on PATH, permission denied, ...), or the gate started no
+		// child. That is a transport failure, not a confirmed absence.
 		// Folding it into (_, false, nil) would silently read "the CLI is
 		// broken" as "this path does not exist" — fail-open, not
 		// fail-closed. A CLI that actually ran and reported not-found still
-		// returns (_, false, nil); that part of the contract is unchanged.
+		// returns (_, false, nil); that part of the contract is unchanged. A
+		// child that ran and died of a signal also has code -1 on Unix (a
+		// release call killed at its bound, say), but it carries an ExitError:
+		// it is a failed call, reported below with run's reason, and never
+		// "did not start", which would send a person to check their PATH.
 		return Node{}, false, fmt.Errorf("proton CLI did not start: %w", err)
 	}
 	if code != 0 {
@@ -348,16 +364,38 @@ func (c *CLI) Stat(p string) (Node, bool, error) {
 		// Preserve the underlying error per the transport convention List and
 		// EnsureDir already follow: dropping c.run's err here would break the
 		// %w chain a caller might inspect.
-		if err != nil {
-			return Node{}, false, fmt.Errorf("info %s failed: %s: %w", p, strings.TrimSpace(bound(out, 200)), err)
-		}
-		return Node{}, false, fmt.Errorf("info %s failed: %s", p, strings.TrimSpace(bound(out, 200)))
+		return Node{}, false, failedCall("info "+p, strings.TrimSpace(bound(out, 200)), err)
 	}
 	n, err := parseNodeJSON([]byte(out))
 	if err != nil {
 		return Node{}, false, fmt.Errorf("unparseable info for %s: %w", p, err)
 	}
 	return n, true, nil
+}
+
+// ran reports whether err came from a child that started: a non-zero exit and
+// a kill both carry the child's *exec.ExitError, and a start failure (an
+// *exec.Error, a PathError, the gate's own refusal) never does. It is the
+// partition EnforceCertified's never-started test uses.
+func ran(err error) bool {
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr)
+}
+
+// failedCall is the error for a CLI call that did not exit 0: what failed, the
+// CLI's output as the caller trimmed it, and run's error. An empty output is
+// left out rather than quoted as nothing: a killed call usually wrote none,
+// and "trash p failed: : signal: killed" reads as a fault in the message.
+func failedCall(what, out string, err error) error {
+	switch {
+	case out != "" && err != nil:
+		return fmt.Errorf("%s failed: %s: %w", what, out, err)
+	case out != "":
+		return fmt.Errorf("%s failed: %s", what, out)
+	case err != nil:
+		return fmt.Errorf("%s failed: %w", what, err)
+	}
+	return fmt.Errorf("%s failed", what)
 }
 
 func (c *CLI) List(p string) ([]Node, error) {
@@ -412,10 +450,7 @@ func (c *CLI) ReadTo(p, localDir string) error {
 	}
 	out, code, err := c.run("filesystem", "download", p, localDir)
 	if code != 0 {
-		if err != nil {
-			return fmt.Errorf("download %s failed: %s: %w", p, strings.TrimSpace(out), err)
-		}
-		return fmt.Errorf("download %s failed: %s", p, strings.TrimSpace(out))
+		return failedCall("download "+p, strings.TrimSpace(out), err)
 	}
 	return nil
 }
@@ -490,9 +525,11 @@ func (c *CLI) EnsureDir(p string) error {
 // createOut is create-folder's own trimmed output, already captured by the
 // caller; it is quoted here, never re-derived.
 //
-// Classification, in order: code == -1 (mirrors Stat's own code==-1 guard,
-// above) -> the CLI executable itself never started for THIS re-observation
-// call, a distinct transport failure, never folded into "not found" or
+// Classification, in order: code == -1 with no *exec.ExitError (mirrors Stat's
+// own never-started guard, above; a child killed by a signal also has -1 on
+// Unix, but it ran, and falls through to the undetermined arm) -> the CLI
+// executable itself never started for THIS re-observation call, a distinct
+// transport failure, never folded into "not found" or
 // "undetermined" (review round 4, M5 — the original version discarded the
 // exit code entirely and would have misdiagnosed this as one of those two);
 // code == 0 AND the raw output parses as a folder node -> resolved, proceed
@@ -509,7 +546,7 @@ func (c *CLI) EnsureDir(p string) error {
 // quoting both as undetermined.
 func (c *CLI) reobserveEnsureDirContradiction(p, createOut string) error {
 	infoOut, infoCode, infoErr := c.run("filesystem", "info", p, "--json")
-	if infoCode == -1 {
+	if infoCode == -1 && !ran(infoErr) {
 		return fmt.Errorf("contradiction creating folder %s could not be re-observed: the "+
 			"Proton CLI did not start for the follow-up info call: %v (original create-folder "+
 			"output: %q)", p, infoErr, bound(createOut, 200))
@@ -684,10 +721,7 @@ func (c *CLI) Trash(p string) (Outcome, error) {
 	}
 	out, code, err := c.run("filesystem", "trash", p, "--json")
 	if code != 0 {
-		if err != nil {
-			return Ambiguous, fmt.Errorf("trash %s failed: %s: %w", p, strings.TrimSpace(out), err)
-		}
-		return Ambiguous, fmt.Errorf("trash %s failed: %s", p, strings.TrimSpace(out))
+		return Ambiguous, failedCall("trash "+p, strings.TrimSpace(out), err)
 	}
 	return parseTrashResult(out)
 }

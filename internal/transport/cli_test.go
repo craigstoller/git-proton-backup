@@ -95,6 +95,11 @@ const (
 	roleShortSleep         = "short-sleep"
 	roleHangWithGrandchild = "hang-with-grandchild"
 
+	// trash-hang answers `filesystem info` with a file node and exits 0, and
+	// hangs like hang on every other call: a Trash whose Stat succeeds and
+	// whose trash call is the one killed.
+	roleTrashHang = "trash-hang"
+
 	// helperGrandchildEnv, set to any value, makes the hang role write a
 	// "grandchild" marker instead of "started": roleHangWithGrandchild's child
 	// is told apart from its parent by the marker's name.
@@ -150,6 +155,8 @@ func TestMain(m *testing.M) {
 		runShortSleepRole()
 	case roleHangWithGrandchild:
 		runHangWithGrandchildRole()
+	case roleTrashHang:
+		runTrashHangRole()
 	}
 	if err := setupHelper(); err != nil {
 		fmt.Fprintln(os.Stderr, "helper setup:", err)
@@ -332,6 +339,17 @@ func runHangWithGrandchildRole() {
 	}
 	writeMarker("started")
 	runLingerRole()
+}
+
+// runTrashHangRole answers an info call (os.Args: exe, filesystem, info, path,
+// --json) with a file node, so Trash's Stat finds the target, and hangs on any
+// other call. It never returns.
+func runTrashHangRole() {
+	if len(os.Args) > 2 && os.Args[1] == "filesystem" && os.Args[2] == "info" {
+		fmt.Println(`{"uid":"u1","name":{"value":".lock"},"type":"file"}`)
+		os.Exit(0)
+	}
+	runHangRole(false)
 }
 
 // ensureDirStep is one scripted response: raw combined output plus exit code.

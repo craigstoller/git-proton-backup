@@ -164,10 +164,11 @@ type coordinator struct {
 
 	// Set once, by the first trigger, before any goroutine that reads them
 	// starts.
-	first    os.Signal
-	cfg      shutdownConfig
-	capTimer *time.Timer
-	out      *lineQueue
+	first     os.Signal
+	cfg       shutdownConfig
+	capTimer  *time.Timer
+	out       *lineQueue
+	catchHeld bool // the catch line took the lock-holding form, which promises a result line
 
 	// ending is the one flag the release checks before each attempt: the cap
 	// fired, or the final step began. No attempt starts once it is set.
@@ -347,7 +348,8 @@ func (c *coordinator) trigger(s os.Signal) {
 	// that returns now parks; warn is quiet; then say what is happening.
 	transport.ShutGate()
 	silenced.Store(true)
-	q.add(catchLine(s, c.mode, len(repo.RegisteredLocks()) > 0))
+	c.catchHeld = len(repo.RegisteredLocks()) > 0
+	q.add(catchLine(s, c.mode, c.catchHeld))
 
 	c.bg.Add(2)
 	go func() {
@@ -567,7 +569,7 @@ func catchLine(s os.Signal, m opMode, holdsLock bool) string {
 	if m == modeSetHead {
 		op = "--set-head"
 	}
-	return fmt.Sprintf("%sreceived %s: stopping %s and checking the remote lock, which takes up to "+
+	return fmt.Sprintf("%sreceived %s: stopping %s and checking the remote lock, which takes about "+
 		"a minute. Until the result line below, do not start another push or --set-head on this "+
 		"repo, and do not remove the lock by hand; kill -9 or Stop-Process abandons the check and "+
 		"may leave the lock in place\n", linePrefix, signalName(s), op)
@@ -575,7 +577,7 @@ func catchLine(s os.Signal, m opMode, holdsLock bool) string {
 
 func stillRunningLine(s os.Signal) string {
 	return fmt.Sprintf("%sreceived %s while already stopping: ignored; the shutdown, and any lock "+
-		"check, is still running and ends within a minute of the first signal\n", linePrefix, signalName(s))
+		"check, is still running and ends about a minute after the first signal\n", linePrefix, signalName(s))
 }
 
 const (
@@ -584,13 +586,21 @@ const (
 		"batch; re-running the push starts from the remote's real state\n"
 	setHeadInterruptedLine = linePrefix + "--set-head was interrupted: HEAD may or may not have " +
 		"changed; re-running the same --set-head settles it\n"
+	// noLockLeftLine is the result when the catch line took the lock-holding
+	// form and the snapshot came back empty: the register's one entry left it
+	// in between (AcquireLock's Refused arm, say).
+	noLockLeftLine = linePrefix + "no lock of ours remains registered; nothing to release\n"
 )
 
 // resultLinesLocked builds the result: a line on the interrupted operation, then
-// one line per lock in the snapshot. Nothing when the snapshot is empty: the
-// catch line already said there was no lock.
+// one line per lock in the snapshot. When the snapshot is empty, nothing if the
+// catch line already said there was no lock, and otherwise the one line that
+// answers its "until the result line below".
 func (c *coordinator) resultLinesLocked() []string {
 	if len(c.states) == 0 {
+		if c.catchHeld {
+			return []string{noLockLeftLine}
+		}
 		return nil
 	}
 	var lines []string
