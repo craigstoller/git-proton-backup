@@ -494,9 +494,14 @@ download them; you don't need this tool, or even a Windows machine, to get your 
       repo address and so one `.lock` path, and git sends one `list for-push` per session. A
       second try at that path can show up here only in a session git does not produce: while it
       is under way, or afterwards if it ended in doubt or succeeded (it can succeed only if the
-      first lock was removed by hand meanwhile). If it ended in doubt, it does not replace the
-      lock the helper already holds, so that lock is still released; if it succeeded, the new
-      lock is the one released.
+      first lock was removed by hand meanwhile). The helper releases every lock handle it was
+      given, the one it did not keep first. If the second try ended in doubt, it does not replace
+      the lock the helper already holds, so both are released and the held lock is still removed;
+      if it succeeded, the new lock is the one held and the old handle is released too, which
+      finds nothing of its own and changes nothing. A second try whose upload was reported refused
+      but whose lock carries this helper's own nonce (possible only if the Proton CLI retried an
+      upload that had already landed, which nothing has tested) is treated as ours and in doubt,
+      and released the same way.
   - Anything that gives the helper no signal it can catch still leaves the lock: SIGKILL, the
     OOM killer and power loss; under systemd, `KillMode=mixed` or `process`; and SIGQUIT, which
     keeps Go's goroutine dump on purpose. On Windows that means Git Bash's `kill -TERM` and

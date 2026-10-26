@@ -1321,13 +1321,13 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   | S5 | The in-flight child gets 5 s to exit on its own; then, on Unix, SIGTERM and 3 s; then a kill and up to 2 s more. Release waits for the operating system to confirm the exit (not the output drain). If no exit is confirmed, nothing is released and each registered lock is reported *not attempted* | Kill at once: it cuts a ref write that was about to land. Never kill: a stuck child blocks the release forever. Treat "kill delivered" as enough: a child in an uninterruptible wait has not stopped |
   | S6 | A cap from the first signal to exit, on its own timer: 60 s, after which it kills any release child, gives the result lines up to 1 s, and exits. The coordinator never waits on stderr: every line goes out from a separate goroutine | No cap: a release stuck on the stall that got the push killed would hang until SIGKILL, silently. 30 s: too tight for the release's own timings |
   | S7 | Further signals are noted on stderr and otherwise ignored; the cap bounds the wait, and SIGKILL stays the way to stop at once. Release-phase CLI children start in their own process group (Unix `Setpgid`; Windows `CREATE_NEW_PROCESS_GROUP`, which disables Ctrl-C for them), so a later Ctrl-C in the same window does not kill them. A typed Ctrl-Break still reaches every process on the console [doc], so it can kill a release call, and S10 retries it. On Unix a release call that runs out its bound is killed with its whole group | A second signal abandons the release: on Windows every later Ctrl-C typed in that console reaches the helper even after git has died, so tidying a prompt line would abort the release. A per-platform rule: two behaviours to document |
-  | S8 | An acquisition whose result is in doubt still hands back its lock. `AcquireLock` returns a handle on every result except a `Refused` with no error and a failure before the upload starts; in doubt, it returns the handle and the error, and the caller's defer releases it after the settle. Each acquisition is also entered in a process-wide register before its upload starts, read only by the coordinator. Release reports a typed outcome, so the helper never says it removed a lock it found absent or foreign | Leave acquisition as it was: keeps the leak, and a signal during the upload would leak as before. Release through the register on the normal path too: a test that holds a lock with `AcquireLock` and then calls `SetHead` in one process would have `SetHead`'s defer remove the other holder's lock. A "CLI never started" exemption: the transport cannot tell it from an in-doubt upload error |
+  | S8 | An acquisition whose result is in doubt still hands back its lock. `AcquireLock` returns a handle on every result except a `Refused` with no error (unless its read-back shows our own nonce: A3) and a failure before the upload starts; in doubt, it returns the handle and the error, and the caller's defer releases it after the settle. Each acquisition is also entered in a process-wide register before its upload starts, read only by the coordinator. Release reports a typed outcome, so the helper never says it removed a lock it found absent or foreign | Leave acquisition as it was: keeps the leak, and a signal during the upload would leak as before. Release through the register on the normal path too: a test that holds a lock with `AcquireLock` and then calls `SetHead` in one process would have `SetHead`'s defer remove the other holder's lock. A "CLI never started" exemption: the transport cannot tell it from an in-doubt upload error |
   | S9 | All three entry points: push, `--set-head`, and the read paths (fetch, `list`, `--version`), which hold no lock and only stop the child and exit | Push only: `--set-head` holds the same lock |
   | S10 | The shutdown release retries the whole nonce-checked release until a final outcome or the cap, pausing 2 s between attempts. Each release CLI call is bounded at 15 s from start to the end of its output, with the post-exit drain bounded at 2 s. A transport error, a killed or timed-out call or a failed download is retried; contents that downloaded and did not parse (*unreadable*) are final | A retry only on the SQLite "database is locked" signature: it covers only that one failure. No retry: one CLI startup collision would leak the lock this change exists to release |
   | S11 | Exit code 128 + the first signal's number (SIGINT 130, SIGTERM 143, SIGHUP 129), on both platforms (`os.Interrupt` counts as 2), whatever the release outcome; stderr says which | Exit 1: it loses which signal it was. Exit 0 after a successful release: the push did not complete |
   | S12 | The normal-path release is unchanged: one attempt on the caller's own handle, failures warned. The one addition: an in-doubt handle waits out S17's settle first | S10's retry there too: a behaviour change outside this fix, left as a possible follow-up |
   | S14 | One process-wide gate in `internal/transport` covers every `*CLI` the process creates; the coordinator's release instance is the only exemption, and what it writes to stderr goes through the coordinator's non-blocking writer. It does not repeat `EnforceCertified`: `run()` installs the coordinator before the version check, so a signal during that check reaches a coordinator whose release instance was never certified. That is safe because the register stays empty until `AcquireLock`, which runs after certification on the push and `--set-head` paths alike, and the coordinator builds the release instance only when the register holds a lock [code] | A gate per instance: `run()` and `runSetHead()` each build their own CLI, so a signal during the version check would be missed. Re-certifying the release instance: one more CLI startup inside the collision window S10 worries about |
-  | S15 | The register lives in `internal/repo`, process-wide, and only the coordinator reads it. An acquisition enters it after its staging file is written and before its upload starts; it leaves on a `Refused` with no error and on a final release outcome. No mutex is held across a CLI call. `run()` clears it when it returns with no signal | A register in `cmd`: `AcquireLock` cannot reach it, and its failure paths drop the nonce. A register threaded through `SetHead` and `AcquireLock`: a wider API change for the same effect |
+  | S15 | The register lives in `internal/repo`, process-wide, and only the coordinator reads it. An acquisition enters it after its staging file is written and before its upload starts; it leaves on a `Refused` with no error (unless its read-back shows our own nonce: A3) and on a final release outcome. No mutex is held across a CLI call. `run()` clears it when it returns with no signal | A register in `cmd`: `AcquireLock` cannot reach it, and its failure paths drop the nonce. A register threaded through `SetHead` and `AcquireLock`: a wider API change for the same effect |
   | S16 | A failed protocol write is remembered, and `loop` then exits 1, not 0: it checks each `Flush` itself and flushes once more before it returns. Release takes the normal path. Git's death is noticed only when git's end of the pipes closes: a batch git never finished sending is refused and `loop` exits 1, a batch already received runs to its end and exits 1 on the failed writes, and with no batch in progress a clean EOF exits 0 [code] | Starting the coordinator on a failed write: it would only bound the normal release, which S12 keeps as it is. Exit 0: reports success for a session git never finished |
   | S17 | A 5 s settle before reading the lock, on the shutdown path whenever a lock is registered and on the normal path whenever the acquisition was in doubt: a request a killed or failed child had already sent can still be applied by the server after the child ends. Not applied when the child's exit was never confirmed, because nothing is released then | No wait: a late lock upload would be read as absent, then appear and leak. A wait only after a write seen in flight: it misses a child that died first. A longer wait: it delays every signalled push for a gap nobody has measured |
   | S18 | No shortcut for a Windows console close: it runs the normal sequence, safety waits included. The system ends the process 5 s after the event [doc] and the first release call comes only after the 5 s settle [code], so the release cannot begin in time and the lock stays, as before, unless the push's own release, already in flight, removes it first | Skip the grace and the settle to fit 5 s: that releases while the child or its last request may still be landing, to save a case that rarely finishes anyway |
@@ -1387,15 +1387,29 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   it ended in doubt or succeeded (it can succeed only if the first `.lock` was removed by hand
   meanwhile), because `AcquireLock` enters the register before its upload and leaves it only on
   a refusal or a final release outcome [code]; that takes a session git does not produce
-  [inference]. A second acquisition that reaches the server while the first lock is held is
-  refused [A6 for the refusal], and one that ends in doubt cannot have overwritten the held
-  `.lock`, which `CreateExclusive` uploads with the `skip` strategy [code; A6]. `loop` keeps the
-  handle it holds when the second one ended in doubt, so the held lock is still released on the
-  normal path, and takes the second handle only when that acquisition succeeded, because the
-  first `.lock` is then already gone [code, derived; tests
-  `TestLoop_SecondListForPushKeepsTheHeldLock` and
-  `TestLoop_SecondListForPushSucceedingIsAdopted`]. The first signal prints a catch line (which
-  signal; with a lock
+  [inference]. A refusal leaves the register only when its diagnostic read-back does not show
+  this push's own nonce. If it does (A3; possible only if the CLI retried an upload whose first
+  attempt had landed [untested]), `AcquireLock` keeps the handle, in doubt and still registered,
+  and returns an error saying the upload was reported refused but the lock carries this push's
+  own nonce, so it is treated as ours; the exit path or the coordinator then releases it. The
+  calls are the ones a refusal already made, the read-back and nothing more [code; test
+  `TestAcquireLockRefusedThatShowsOurOwnNonceKeepsTheHandle`]. A second acquisition that reaches
+  the server while the first lock is held is refused [A6 for the refusal], and one that ends in
+  doubt cannot have overwritten the held `.lock`, which `CreateExclusive` uploads with the `skip`
+  strategy [code; A6]. `loop` keeps the handle it holds as its held lock when the second one
+  ended in doubt, and takes the second handle only when that acquisition succeeded, because the
+  first `.lock` is then already gone. It releases every handle it was given either way. The one
+  it did not keep goes on a list of strays that the exit path releases first, while the held lock
+  still blocks the name, and the held lock second, each release nonce-first, so a stray whose
+  lock is another handle's or is already gone changes nothing on the remote and only leaves the
+  register. That closes the one cell the adoption rule alone left open: a second acquisition that
+  ended in doubt after its upload landed (the held `.lock` having been cleared by hand), whose
+  handle a normal exit would have dropped unreleased. The list is `loop`'s own, not the register,
+  so S8's rule that the normal path never reads the register stands [code, derived; tests
+  `TestLoop_SecondListForPushKeepsTheHeldLock`, `TestLoop_SecondListForPushSucceedingIsAdopted`,
+  `TestLoop_SecondListForPushSucceedingLeavesTheRegisterEmpty` and
+  `TestLoop_SecondInDoubtAcquisitionThatLandedIsReleased`]. The first signal prints a catch line
+  (which signal; with a lock
   registered, that the push or `--set-head` is stopping and the lock is being checked, that this
   takes about a minute, that no other push or `--set-head` should start nor the lock be removed
   by hand until the result line, and that `kill -9` or `Stop-Process` abandons the check). Then
@@ -1408,7 +1422,12 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   push's own normal release completing. A call still in flight when the gate shuts parks and
   cannot unregister [code]. A push interrupted mid-batch
   also says it did not finish and that some of its remote changes may have landed while git was
-  told nothing; an interrupted `--set-head` says `HEAD` may or may not have changed. On Windows a
+  told nothing; an interrupted `--set-head` says `HEAD` may or may not have changed, but only once
+  the upload that writes `HEAD` has started. `UpdateHEAD` tells the coordinator just before that
+  call, as the push line needs its batch to have started, so a signal during the lock, the branch
+  checks or the `HEAD` read leaves `HEAD` alone and prints no such line [code; tests
+  `TestShutdown_SetHeadLineOnlyAfterHEADWriteStarted` and
+  `TestRun_WiresAndClearsTheHEADWriteHook`]. On Windows a
   Ctrl-C and a Ctrl-Break both print SIGINT, and a console close prints SIGTERM. The exact wording
   is in `shutdown.go`. [code]
 - **When no result line arrives.** A Windows console close ends the process 5 s after the event
