@@ -366,12 +366,14 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 	}
 	defer func() {
 		// Strays first, so that an in-doubt stray settles and reads while the
-		// held lock still blocks the name: its upload, if it lands late, is
-		// refused against the held lock (CreateExclusive uploads with the skip
-		// strategy) rather than replacing it. Every release is nonce-first, so a
-		// stray whose lock is not on the remote, or belongs to another handle, is
-		// a no-op (absent or foreign) that only takes its register entry out.
-		// Same warning shape as the held lock's, below.
+		// held lock still blocks the name: an upload of the stray's that lands
+		// late is refused then (CreateExclusive uploads with the skip strategy).
+		// Released the other way round, the held lock would be gone first, and a
+		// late upload could take the free name after the stray's read, with
+		// nothing left to release it. Every release is nonce-first, so a stray
+		// whose lock is not on the remote, or belongs to another handle, is a
+		// no-op (absent or foreign) that only takes its register entry out. Same
+		// warning shape as the held lock's, below.
 		for _, s := range strays {
 			if err := s.Release(); err != nil {
 				warn(err)
@@ -546,14 +548,14 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 			// without us knowing. Keep it either way, so the release defer
 			// settles and removes it; the session still fails on the error.
 			//
-			// But an in-doubt handle never replaces one already held: git sends
-			// one list for-push per session, and a second acquisition that ends
-			// in doubt would otherwise replace the held lock, whose release then
-			// reads its nonce, reports it foreign, and leaves the held lock on
-			// the remote. A second acquisition that SUCCEEDED is adopted: the name
-			// was free, so the first .lock must already be gone, and releasing
-			// the first handle instead would find the second nonce and leave the
-			// second lock behind.
+			// Which handle is kept as lock decides the release order: strays
+			// first, then lock. git sends one list for-push per session. A second
+			// acquisition that ends in doubt stays a stray and the held handle
+			// stays lock, so the in-doubt stray settles and reads while the held
+			// lock still blocks the name. A second acquisition that SUCCEEDED
+			// becomes lock: the name was free, so the first .lock must already be
+			// gone, and the first handle, now a stray, finds the second nonce on
+			// release (foreign) and only leaves the register.
 			//
 			// Whichever handle is not kept as lock is not dropped: it joins
 			// strays, and the release defer releases it before the held lock

@@ -138,11 +138,21 @@ func (r refusedCreateTransport) CreateExclusive(p, local string) (transport.Outc
 // attempt had already landed, so the retry found the name taken by our own body.
 type refusedAfterLandingTransport struct {
 	*transport.Fake
+	// onRead, when non-nil, runs at the start of every ReadTo: the diagnostic
+	// read-back is the one moment a test can look at the register mid-acquisition.
+	onRead func()
 }
 
 func (r refusedAfterLandingTransport) CreateExclusive(p, local string) (transport.Outcome, error) {
 	r.Fake.CreateExclusive(p, local)
 	return transport.Refused, nil
+}
+
+func (r refusedAfterLandingTransport) ReadTo(p, local string) error {
+	if r.onRead != nil {
+		r.onRead()
+	}
+	return r.Fake.ReadTo(p, local)
 }
 
 // hookCreateTransport runs hook at the start of CreateExclusive, then writes.
@@ -326,13 +336,23 @@ func TestAcquireLockRefusedMakesTodaysCallsAndNoHandle(t *testing.T) {
 // [untested]). The handle is kept, in doubt, and stays registered, so the
 // normal defer and the coordinator can release it. The calls are exactly the
 // ones a refusal already makes: nothing is added to find this out.
+//
+// The entry must also be registered DURING the diagnostic read, not only after
+// it: a signal that lands in that read has to find this attempt, and an
+// implementation that unregistered before the read and registered again after
+// it would pass every check on the final state.
 func TestAcquireLockRefusedThatShowsOurOwnNonceKeepsTheHandle(t *testing.T) {
 	cleanRegister(t)
 	replaceSettle(t, func() {})
 	f := transport.NewFake()
-	c := &callLogTransport{Transport: refusedAfterLandingTransport{f}}
+	var seenDuringRead [][]*Lock
+	c := &callLogTransport{Transport: refusedAfterLandingTransport{
+		Fake:   f,
+		onRead: func() { seenDuringRead = append(seenDuringRead, RegisteredLocks()) },
+	}}
 
 	l, err := AcquireLock(c, sigRoot)
+	readsDuringAcquire := len(seenDuringRead)
 
 	if l == nil {
 		t.Fatal("the lock on the remote carries our nonce: the handle must be kept so it can be released")
@@ -343,11 +363,18 @@ func TestAcquireLockRefusedThatShowsOurOwnNonceKeepsTheHandle(t *testing.T) {
 	if err == nil {
 		t.Fatal("a refused acquisition must still be an error")
 	}
-	if !strings.Contains(err.Error(), "own nonce") {
-		t.Errorf("error = %v, want it to say the lock carries this push's own nonce", err)
+	if !strings.Contains(err.Error(), "the nonce this acquisition uploaded") {
+		t.Errorf("error = %v, want it to say the lock carries the nonce this acquisition uploaded", err)
 	}
 	if !registeredHas(l) {
 		t.Error("the kept handle must stay registered, so the coordinator can release it")
+	}
+	if readsDuringAcquire != 1 {
+		t.Fatalf("the diagnostic read ran %d times during the acquisition, want 1", readsDuringAcquire)
+	}
+	if during := seenDuringRead[0]; len(during) != 1 || during[0] != l {
+		t.Errorf("the register held %d locks during the diagnostic read, want exactly this attempt: "+
+			"a signal in that read must find it", len(during))
 	}
 	if want := []string{"CreateExclusive", "Stat", "ReadTo"}; !reflect.DeepEqual(c.calls, want) {
 		t.Errorf("calls = %v, want exactly today's %v", c.calls, want)

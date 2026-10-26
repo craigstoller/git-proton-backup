@@ -99,10 +99,11 @@ func WriteHEAD(t transport.Transport, root, branch string) (transport.Outcome, e
 }
 
 // OnHEADWrite, when non-nil, is called by UpdateHEAD immediately before the
-// upload that writes HEAD. The helper's shutdown coordinator sets it so that it
-// can tell "--set-head was interrupted before HEAD's upload began" (HEAD is
-// untouched) from "during or after it" (HEAD may or may not have changed). Set
-// and cleared on the main goroutine only, outside any UpdateHEAD call.
+// upload that writes HEAD. The helper's run() points it at its shutdown
+// coordinator so that the coordinator can tell "--set-head was interrupted
+// before HEAD's upload began" (HEAD is untouched) from "during or after it"
+// (HEAD may or may not have changed). Set and cleared on the main goroutine
+// only, outside any UpdateHEAD call.
 var OnHEADWrite func()
 
 // UpdateHEAD points HEAD at branch, OVERWRITING any existing symref — the

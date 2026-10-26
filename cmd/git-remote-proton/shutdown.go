@@ -282,7 +282,9 @@ func (c *coordinator) batchDone() {
 
 // headWriteStarted records that the upload that writes HEAD is about to start.
 // Until then a --set-head shutdown has not touched HEAD, and says nothing about
-// it (§5.6).
+// it (§5.6). A signal that lands between UpdateHEAD's Stat and this call can
+// still make the line print, conservatively: the call fires after the gate has
+// shut, and the CLI call that would write HEAD then parks at the gate.
 func (c *coordinator) headWriteStarted() {
 	if c == nil {
 		return

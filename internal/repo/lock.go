@@ -179,10 +179,18 @@ func AcquireLock(t transport.Transport, root string) (*Lock, error) {
 		// coordinator that found this entry during the read would see a
 		// foreign nonce and leave the other holder's lock alone. Either
 		// order is safe; this one lets the own-nonce case keep its entry.
+		//
+		// The order has one visible effect, on the signal path only: a signal
+		// that lands during a refusal's read of ANOTHER holder's lock now finds
+		// this entry registered, so it gets the lock-holding catch line, the
+		// settle and a foreign result line, where it used to get the no-lock
+		// line and a prompt exit. That is truthful (an attempt was registered
+		// at that moment), and E14 covers the same outcome. With no signal the
+		// calls and messages are byte-identical.
 		held, presence, _ := readLock(t, p)
 		if presence == lockPresent && held.Nonce == nonce {
 			return l, fmt.Errorf("lock upload for %s was reported refused, but the lock there carries "+
-				"this push's own nonce %s; treating it as ours and in doubt", p, nonce)
+				"the nonce this acquisition uploaded (%s); treating it as ours and in doubt", p, nonce)
 		}
 		unregister(l)
 		switch presence {
