@@ -17,16 +17,16 @@
   failed call, prints what it found for each lock (removed, absent, foreign, unreadable, failed
   or not attempted) and exits with 128 plus the signal number, within 62 s of the first signal at
   worst. Under systemd that needs `KillMode=control-group` and `TimeoutStopSec=` of 75 s or more.
-  On Windows only Ctrl-C and Ctrl-Break in a console window are covered. Git Bash's `kill`,
-  `Stop-Process`, a Task Scheduler stop and SIGKILL still leave the lock, and a closed console
-  window almost always does too. The kill that orphaned a lock in the Stage 5 gate, a tool
-  timeout that probably reached the push through Git Bash on Windows, is among those that still
-  leak. Two
-  related changes: a lock whose acquisition ended in doubt (the upload's result was lost) is now
-  released on the normal exit path too, and a session whose writes to git failed (git died, or
-  its pipe broke) now exits 1. It exited 0 on Windows, and on Linux SIGPIPE killed the helper
-  with the lock held. The README's honest limits list what each platform covers and the manual
-  remedy; the v2 design is now v6.11.
+  On Windows only Ctrl-C and Ctrl-Break in a console window are covered: Git Bash's `kill`,
+  `Stop-Process` and a Task Scheduler stop still leave the lock, and a closed console window
+  almost always does too. On Linux the kills the helper cannot catch still leave it: SIGKILL,
+  the OOM killer, and systemd's `KillMode=mixed` or `process`. The kill that orphaned a lock in
+  the Stage 5 gate, a tool timeout that probably reached the push through Git Bash on Windows, is
+  among those that still leak. Two related changes: a lock whose acquisition ended in doubt (the
+  upload's result was lost) is now released on the normal exit path too, and a session whose
+  writes to git failed (git died, or its pipe broke) now exits 1. It exited 0 on Windows, and on
+  Linux SIGPIPE killed the helper with the lock held. The README's honest limits list what each
+  platform covers and the manual remedy; the v2 design is now v6.11.
 
 ## 0.10.0 — 2026-10-21
 
