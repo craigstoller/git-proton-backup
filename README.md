@@ -438,7 +438,8 @@ download them; you don't need this tool, or even a Windows machine, to get your 
     `timeout` or systemd. Ctrl-C and a closed terminal are expected to start it through the same
     signals; neither has been run in a terminal. A signal that was already ignored when the helper
     started, such as SIGHUP under `nohup`, starts nothing and prints nothing: the push carries on,
-    and the lock is released only if it ends normally. Under systemd the attempt needs
+    and the lock is then released only when the helper exits in the ordinary way, however the
+    push ends (a failed push included), not by the signal. Under systemd the attempt needs
     `KillMode=control-group` (the default) and `TimeoutStopSec=` of 75 s or more. The 75 s is the
     design's recommendation: 15 s over the 60 s cap, and 13 s over the 62 s worst case below, which
     has not been run end to end at full length.
@@ -489,16 +490,19 @@ download them; you don't need this tool, or even a Windows machine, to get your 
       it had exited (removing the lock then could race that call's own write) or because the
       time limit came first. The line gives the manual remedy. Locks are released one after
       another, and a lock whose release never reaches a final outcome uses the rest of the 60 s
-      cap, so any later lock reports *not attempted*. A helper process takes one lock: it has one
-      repo address and so one `.lock` path, and a second try at that path is refused while the
-      first lock is held.
+      cap, so any later lock reports *not attempted*. The helper normally holds one lock: it has one
+      repo address and so one `.lock` path, and git sends one `list for-push` per session. A
+      second try at that path shows up here only while it is under way in the same session, or
+      if it ended in doubt, and that takes a session git does not produce. Such a second try
+      never replaces the lock the helper already holds, so that lock is still released.
   - Anything that gives the helper no signal it can catch still leaves the lock: SIGKILL, the
     OOM killer and power loss; under systemd, `KillMode=mixed` or `process`; and SIGQUIT, which
     keeps Go's goroutine dump on purpose. On Windows that means Git Bash's `kill -TERM` and
     `kill -HUP` (a `kill -INT` does nothing to a native Windows program) and `Stop-Process`,
     all measured on a probe program, not on the helper; `taskkill /F`, inferred to act like
     `Stop-Process`; logoff and shutdown, which Windows sends only to services; and a Task
-    Scheduler stop or time limit, assumed and untested. Ctrl-C in Git Bash's own window is also
+    Scheduler stop or time limit, inferred to end the process without a console event, and
+    untested. Ctrl-C in Git Bash's own window is also
     assumed to leave the lock, and untested. The one leak on record, an agent tool's timeout
     that killed a push on Windows ([Stage 5 gate](docs/research/gates/stage5-gate.md), S1),
     probably belongs in this group: the gate record says only that the tool's timeout killed the

@@ -26,7 +26,7 @@
   been run under a real `git push`. A closed console window starts the release too, but Windows
   ends the process 5 s later and the release waits 5 s before its first call, so the lock stays
   unless the push's own release was already finishing, and no result line is printed. Git Bash's
-  `kill` and `Stop-Process` still leave the lock, and a Task Scheduler stop is expected to. On
+  `kill` and `Stop-Process` still leave the lock, and a Task Scheduler stop is expected to (untested). On
   Linux the kills the helper cannot catch still leave it: SIGKILL, the OOM killer, and systemd's
   `KillMode=mixed` or `process`. The kill that orphaned a lock in the Stage 5 gate, a tool timeout
   that probably reached the push through Git Bash on Windows, is among those that still leak. Two
