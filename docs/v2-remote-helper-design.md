@@ -1354,6 +1354,15 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   source-read, U9 is added, and E20 joins §6's table; A7 the Windows gate check runs under a real
   `git push`, typed by hand. Options not taken: each passage as approved on 2026-10-24 (the spec
   marks each changed passage). All seven were the agent's recommendations.
+- **Review questions (2026-10-25, Craig's call, the same instruction; each was the agent's
+  recommendation).** Q1, the settle-based premise (S4, S17): no change; the live gates are the
+  first evidence. Q2, retrying after an ambiguous `Trash`: kept and documented as residual (4);
+  not taken, treating an ambiguous `Trash` as final. Q3, gate assertions: each release gate's
+  kill-mid-push check also checks the final ref values and object availability, including a kill
+  during ref publication (see Release below). Q4, a committed `Trash` reported *failed* when its
+  drain outlasts the cap's wait: accepted, *failed* meaning not confirmed in time. Q5, the
+  `--set-head` line only after HEAD's upload started: done. Q6, `loop` reading on after a failed
+  write (S16): no change. Q7, every handle `loop` was given is released: done.
 - **Shipped values (the code is authoritative).** `shutdownCap` 60 s, `childGrace` 5 s,
   `childTerm` 3 s, `childConfirm` 2 s, `retryPause` 2 s and `outcomeWait` 1 s are in
   `cmd/git-remote-proton/shutdown.go`; the release call bound (15 s) and its drain (2 s) are in
@@ -1540,7 +1549,8 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   console of a real `git push`, per U9 and spec §8 as amended 2026-10-25 (A7, Craig's call); a
   helper started by git does not lead its own console group, so `GenerateConsoleCtrlEvent`,
   which W1/W2 use, cannot target it [inference]), then confirm `.lock` is gone and the next
-  push succeeds. That check is the first evidence for U1–U3 and weak evidence for U7. The CLI
+  push succeeds, and that the remote's refs and objects are what the interrupted push and the next
+  one should have left (Q3). That check is the first evidence for U1–U3 and weak evidence for U7. The CLI
   pin does not move. The version number is left to release time; 0.11.0 is the agent's
   suggestion.
 - **Companions.** The README's honest limits gain a bullet on what happens to the lock when a
