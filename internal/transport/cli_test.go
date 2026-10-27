@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/craigstoller/git-proton-backup/internal/testtrap"
 )
 
 // --- WaitDelay: the grandchild-holds-the-pipe hang -------------------------
@@ -100,6 +102,16 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	// Ahead of every role dispatch: a copy of this binary named proton-drive in
+	// the trap dir (internal/testtrap, rule 12 in
+	// docs/research/gates/brief-checklist.md) re-executes this TestMain and must
+	// exit before anything else runs. It is the stand-in a lookup of
+	// "proton-drive" finds first, so a test that resolves the CLI without a shim
+	// (TestContractCLI's NewCLI("") under GPB_LIVE_ACCOUNT=1 aside) never reaches
+	// a real, signed-in CLI further along PATH.
+	if testtrap.Active() {
+		os.Exit(testtrap.Run(os.Stderr))
+	}
 	switch os.Getenv(helperEnv) {
 	case roleCLI, roleCLIClean:
 		runHelperRole(os.Getenv(helperEnv))
@@ -114,13 +126,67 @@ func TestMain(m *testing.M) {
 	case roleEnvEcho:
 		runEnvEchoRole()
 	}
+	// After the role switch, whose roles exit early and would otherwise leak a
+	// directory each. GPB_LIVE_ACCOUNT=1 is the one run that wants the real CLI
+	// (TestContractCLI's live half), so it installs no trap.
+	trapDir := ""
+	if os.Getenv(liveEnv) != "1" {
+		dir, err := testtrap.Install()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "testtrap.Install:", err)
+			os.Exit(2)
+		}
+		trapDir = dir
+	}
 	if err := setupHelper(); err != nil {
 		fmt.Fprintln(os.Stderr, "helper setup:", err)
 		os.Exit(2)
 	}
 	code := m.Run()
 	teardownHelper()
+	// Explicit, because defers do not run on os.Exit. The error is ignored: a
+	// Windows file lock held by a lingering child must not fail the run.
+	if trapDir != "" {
+		os.RemoveAll(trapDir)
+	}
 	os.Exit(code)
+}
+
+// TestNoShimMeansTheTrap pins this package's half of rule 12: a lookup of
+// "proton-drive" that no test shim answers reaches the trap TestMain
+// installed, never a real CLI. Without it a TestMain that quietly stopped
+// calling Install would pass every other test in the package. Version folds
+// the CLI's combined output into its error, so the trap's message shows there.
+func TestNoShimMeansTheTrap(t *testing.T) {
+	if os.Getenv(liveEnv) == "1" {
+		t.Skip("GPB_LIVE_ACCOUNT=1: no trap is installed on a live run")
+	}
+	v, err := NewCLI("").Version()
+	if err == nil {
+		t.Fatalf("Version() = %q with no shim placed, want an error from the trap", v)
+	}
+	if !strings.Contains(err.Error(), testtrap.Message) {
+		t.Fatalf("Version() error = %q, want it to contain the trap message %q", err.Error(), testtrap.Message)
+	}
+}
+
+// TestTrapWinsOverARoleVariable pins the order in TestMain: the trap check
+// runs ahead of the role switch. With a stand-in role variable set and no shim
+// placed, the trap must still be the trap. Were the role switch first, the trap
+// would answer as the certified stand-in and Version() would succeed against a
+// proton-drive that is not there.
+func TestTrapWinsOverARoleVariable(t *testing.T) {
+	if os.Getenv(liveEnv) == "1" {
+		t.Skip("GPB_LIVE_ACCOUNT=1: no trap is installed on a live run")
+	}
+	t.Setenv(helperEnv, roleCertified)
+	v, err := NewCLI("").Version()
+	if err == nil {
+		t.Fatalf("Version() = %q: the trap answered as a stand-in; the Active check must come first", v)
+	}
+	if !strings.Contains(err.Error(), testtrap.Message) {
+		t.Fatalf("Version() error = %q, want it to contain the trap message %q", err.Error(), testtrap.Message)
+	}
 }
 
 // runHelperRole is the stand-in proton-drive. It never returns.

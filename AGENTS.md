@@ -15,3 +15,4 @@ Keep this file short; it is loaded into agent context. Routing and hard guardrai
 - `docs/releasing.md` is the canonical release procedure. Follow it in order; its steps exist because skipping them has already gone wrong once.
 - `.superpowers/` and `.claude/` are untracked agent working files, not canonical docs. Never cite them as source of truth.
 - Feature work uses dated spec/plan pairs under `docs/superpowers/`; read the spec before executing its plan.
+- A hermetic test run (`go test`, Pester) must never resolve a real `proton-drive`; on a Mac with a signed-in CLI, see `docs/research/gates/brief-checklist.md` rule 12. Rule-10 audits of a staged CLI are not hermetic runs.
