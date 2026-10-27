@@ -12,3 +12,10 @@
 # same reason.
 go.mod text eol=lf
 go.sum text eol=lf
+
+# The pinned Unicode data files are inputs whose SHA-256s are recorded in the
+# generated tables and in canon_test.go (spec section 3, "The tables"). They
+# must come out of every checkout with exactly their committed bytes, so no
+# line-ending or other text conversion may touch them: a Windows checkout with
+# core.autocrlf=true would otherwise rewrite LF to CRLF and break the checksums.
+internal/repo/unicodedata/** -text
