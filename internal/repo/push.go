@@ -331,13 +331,15 @@ func Push(t transport.Transport, root, gitDir string,
 
 	// Case-variant creates (spec §5, D2(a), Amendment A1). Proton keeps
 	// refs/heads/main and refs/heads/Main side by side, but a Windows clone of
-	// such a remote mishandles the pair silently (spec F13). So a CREATE, a
-	// valid non-delete whose dst is absent from the PRE-BATCH advertised set
-	// (isCreate), is refused when a prefix of it is spelled differently from,
-	// but folds equal to, a prefix of another ref in the set it would join
-	// (caseConflicts; Unicode simple case folding at the pinned version,
-	// unicodeVersion, not Go's own tables). This applies on every platform,
-	// by the precedent of the Windows device names (windowsReserved,
+	// such a remote mishandles the pair silently (spec F13), and a Mac clone
+	// mishandles that pair and an NFC name beside its NFD twin alike (spec
+	// 2026-10-27, section 3). So a CREATE, a valid non-delete whose dst is
+	// absent from the PRE-BATCH advertised set (isCreate), is refused when a
+	// prefix of it is spelled differently from, but shares caseKey or canonKey
+	// with, a prefix of another ref in the set it would join (caseConflicts;
+	// Unicode simple case folding and canonical decomposition at the pinned
+	// version, unicodeVersion, not Go's own tables). This applies on every
+	// platform, by the precedent of the Windows device names (windowsReserved,
 	// marker.go): a repo stays usable from every machine, whichever one
 	// pushed first. Updates and replacements (a same-batch
 	// delete and recreate of a name already on the remote) are never refused,
@@ -349,10 +351,12 @@ func Push(t transport.Transport, root, gitDir string,
 	// valid flags (so a create the D/F loop refused is not in the set), and
 	// before phase 3, so a refused create costs no pack.
 	//
-	// A case-changing rename (delete Main, create MAIN) is refused WHOLE (A1):
-	// when this rule refuses a create X, every still-valid same-batch delete
-	// of a ref the pre-batch remote holds whose full name folds equal to X is
-	// refused too, so the rename is not half-applied. Two deletes are spared:
+	// A case-changing rename (delete Main, create MAIN) is refused WHOLE (A1),
+	// and so is a normalisation-changing one (delete an NFC name, create its
+	// NFD twin; A2): when this rule refuses a create X, every still-valid
+	// same-batch delete of a ref the pre-batch remote holds whose full name
+	// shares caseKey or canonKey with X is refused too, so the rename is not
+	// half-applied. Two deletes are spared:
 	// one of a name the remote does not hold, which is a no-op, not half of a
 	// rename; and the delete half of a replacement (the batch also writes that
 	// name), which A1 never refuses. Only this rule's refusals trigger the
@@ -372,7 +376,9 @@ func Push(t transport.Transport, root, gitDir string,
 	// The D/F preflight needs no re-run for a kept ref: a create above or
 	// beneath it either shares its spelling where it differs from X, and so
 	// conflicts with X here in the same pass, or lies above or beneath X too,
-	// and already met X in the D/F preflight.
+	// and already met X in the D/F preflight. That holds under either
+	// relation, because each key of a prefix is the same prefix of the key of
+	// the whole name ('/' is a starter that both keys keep).
 	for {
 		caseSet := batchFinalSet(remote, ups, valid, isDelete)
 		var candidates []string
@@ -396,14 +402,26 @@ func Push(t transport.Transport, root, gitDir string,
 				refused = append(refused, u.Dst)
 			}
 		}
-		// A delete that folds equal to several refused creates names the
-		// smallest, so its text does not depend on batch order either.
+		// The refused creates, indexed by each key, each index keeping its
+		// smallest create. A delete pairs with byCase[caseKey(D)] and
+		// byCanon[canonKey(D)], whichever exist, and names the smaller, so
+		// its text depends neither on batch order nor on which key matched.
 		sort.Strings(refused)
-		renameTo := map[string]string{}
+		byCase, byCanon := map[string]string{}, map[string]string{}
 		for _, x := range refused {
-			if _, ok := renameTo[caseKey(x)]; !ok {
-				renameTo[caseKey(x)] = x
+			if _, ok := byCase[caseKey(x)]; !ok {
+				byCase[caseKey(x)] = x
 			}
+			if _, ok := byCanon[canonKey(x)]; !ok {
+				byCanon[canonKey(x)] = x
+			}
+		}
+		pairedCreate := func(d string) (string, bool) {
+			x, ok := byCase[caseKey(d)]
+			if y, canon := byCanon[canonKey(d)]; canon && (!ok || y < x) {
+				return y, true
+			}
+			return x, ok
 		}
 		// rewritten: every name a still-valid non-delete writes, so a delete
 		// of one of them is half of a replacement.
@@ -420,9 +438,15 @@ func Push(t transport.Transport, root, gitDir string,
 			if _, held := remote[u.Dst]; !held || rewritten[u.Dst] {
 				continue
 			}
-			if x, ok := renameTo[caseKey(u.Dst)]; ok {
+			if x, ok := pairedCreate(u.Dst); ok {
+				// Both spellings again in %+q form, as formatItem shows them:
+				// a normalisation-changing rename's two names display alike.
+				kind := "normalisation-changing"
+				if caseKey(u.Dst) == caseKey(x) {
+					kind = "case-changing"
+				}
 				fail(j, fmt.Sprintf("%s: delete refused because it pairs with the refused "+
-					"case-changing rename to %s; the rename was not applied", u.Dst, x))
+					"%s rename to %s (%+q to %+q); the rename was not applied", u.Dst, kind, x, u.Dst, x))
 				valid[j] = false
 			}
 		}
@@ -604,10 +628,10 @@ func Push(t transport.Transport, root, gitDir string,
 		// recreate) are never re-checked: they add no spelling the remote
 		// lacked, and refusing one after its own delete committed would
 		// destroy the ref it replaces. One residual needs a race or a
-		// transport fault: a case-changing rename that passed phase 2, because
-		// its conflicting variant was also being deleted, can still lose the
-		// renamed-away ref if that variant's delete fails. The README's honest
-		// limits say so.
+		// transport fault: a case- or normalisation-changing rename that passed
+		// phase 2, because its conflicting variant was also being deleted, can
+		// still lose the renamed-away ref if that variant's delete fails. The
+		// README's honest limits say so.
 		//
 		// The refusal names the delete it depended on (spec §5): the message
 		// is caseConflictMessage's, with failedDeleteClause appended for each

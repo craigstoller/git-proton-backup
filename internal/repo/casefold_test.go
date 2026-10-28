@@ -299,9 +299,10 @@ func TestRefPrefixes(t *testing.T) {
 	}
 }
 
-// RED (compile failure). The three shapes spec F13 found a Windows clone
-// mishandling: two leaves, a leaf against a directory prefix, and two
-// directory prefixes. Each names its Ref and the (Ours, Theirs) pair.
+// GUARD for the macOS port (RED, compile failure, when D2 added it). The
+// three shapes spec F13 found a Windows clone mishandling: two leaves, a leaf
+// against a directory prefix, and two directory prefixes. Each names its Ref,
+// the (Ours, Theirs) pair and the relation, letter case.
 func TestCaseConflictsShapes(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -310,11 +311,11 @@ func TestCaseConflictsShapes(t *testing.T) {
 		want  caseConflict
 	}{
 		{"two leaves", "refs/heads/main", "refs/heads/Main",
-			caseConflict{Ref: "refs/heads/Main", Ours: "heads/main", Theirs: "heads/Main"}},
+			caseConflict{Ref: "refs/heads/Main", Ours: "heads/main", Theirs: "heads/Main", Rel: relCase}},
 		{"leaf against directory", "refs/heads/feat", "refs/heads/Feat/x",
-			caseConflict{Ref: "refs/heads/Feat/x", Ours: "heads/feat", Theirs: "heads/Feat"}},
+			caseConflict{Ref: "refs/heads/Feat/x", Ours: "heads/feat", Theirs: "heads/Feat", Rel: relCase}},
 		{"two directories", "refs/heads/grp/a", "refs/heads/Grp/b",
-			caseConflict{Ref: "refs/heads/Grp/b", Ours: "heads/grp", Theirs: "heads/Grp"}},
+			caseConflict{Ref: "refs/heads/Grp/b", Ours: "heads/grp", Theirs: "heads/Grp", Rel: relCase}},
 	}
 	for _, c := range cases {
 		set := map[string]bool{c.cand: true, c.other: true}
@@ -326,18 +327,187 @@ func TestCaseConflictsShapes(t *testing.T) {
 	}
 }
 
-// RED (compile failure). One create against two refs, each conflicting at
-// its own prefix: the message names both, sorted, each with its own pair.
+// RED (assertion: the old text, "conflicts by letter case with ... a Windows
+// clone", matched none of the three). One create against two refs, each
+// conflicting at its own prefix: the message names both, sorted, each with
+// its own pair, the relation that matched, and both spellings in Go's
+// ASCII-only quoted form, %+q (spec 2026-10-27, section 3, "What the user
+// sees"). The harm clause follows the relations: any case match harms Windows
+// and Mac clones, a canonical-only match harms Mac clones alone.
 func TestCaseConflictMessageNamesEachRefWithItsOwnPair(t *testing.T) {
-	const dst = "refs/heads/Grp/a"
-	set := map[string]bool{dst: true, "refs/heads/grp/b": true, "refs/heads/GRP": true}
-	got := caseConflictMessage(dst, caseConflicts(set, []string{dst})[dst])
-	want := "refs/heads/Grp/a conflicts by letter case with " +
-		"refs/heads/GRP (heads/Grp vs heads/GRP), refs/heads/grp/b (heads/Grp vs heads/grp): " +
-		"a Windows clone would mishandle the pair (README, Honest limits), " +
-		"so this create is refused on every platform"
-	if got != want {
-		t.Errorf("message:\n got %q\nwant %q", got, want)
+	cases := []struct {
+		name   string
+		dst    string
+		others []string
+		want   string
+	}{
+		{"letter case", "refs/heads/Grp/a", []string{"refs/heads/grp/b", "refs/heads/GRP"},
+			"refs/heads/Grp/a conflicts with " +
+				`refs/heads/GRP (heads/Grp vs heads/GRP, by letter case: "heads/Grp" vs "heads/GRP"), ` +
+				`refs/heads/grp/b (heads/Grp vs heads/grp, by letter case: "heads/Grp" vs "heads/grp"): ` +
+				"a Windows or Mac clone would mishandle the pair (README, Honest limits), " +
+				"so this create is refused on every platform"},
+		{"normalisation only", "refs/heads/caf\u00e9", []string{"refs/heads/cafe\u0301"},
+			"refs/heads/caf\u00e9 conflicts with " +
+				"refs/heads/cafe\u0301 (heads/caf\u00e9 vs heads/cafe\u0301, by Unicode normalisation: " +
+				`"heads/caf\u00e9" vs "heads/cafe\u0301"): ` +
+				"a Mac clone would mishandle the pair (README, Honest limits), " +
+				"so this create is refused on every platform"},
+		{"both relations, one ref each", "refs/heads/Caf\u00e9", []string{"refs/heads/caf\u00e9", "refs/heads/cafe\u0301"},
+			"refs/heads/Caf\u00e9 conflicts with " +
+				"refs/heads/cafe\u0301 (heads/Caf\u00e9 vs heads/cafe\u0301, by Unicode normalisation: " +
+				`"heads/Caf\u00e9" vs "heads/cafe\u0301"), ` +
+				"refs/heads/caf\u00e9 (heads/Caf\u00e9 vs heads/caf\u00e9, by letter case: " +
+				`"heads/Caf\u00e9" vs "heads/caf\u00e9"): ` +
+				"a Windows or Mac clone would mishandle the pair (README, Honest limits), " +
+				"so this create is refused on every platform"},
+	}
+	for _, c := range cases {
+		set := map[string]bool{c.dst: true}
+		for _, o := range c.others {
+			set[o] = true
+		}
+		if got := caseConflictMessage(c.dst, caseConflicts(set, []string{c.dst})[c.dst]); got != c.want {
+			t.Errorf("%s: message:\n got %+q\nwant %+q", c.name, got, c.want)
+		}
+	}
+
+	// M29: NFC and NFD spellings display identically, so the message must
+	// carry each in an escaped ASCII form, and the two forms must differ:
+	// finding both distinct ASCII forms below is what shows they render
+	// apart. Plain %q leaves the combining mark raw, so a %q build fails here
+	// (measured by mutation when this test was written).
+	const nfcRef, nfdRef = "refs/heads/caf\u00e9", "refs/heads/cafe\u0301"
+	set := map[string]bool{nfcRef: true, nfdRef: true}
+	msg := caseConflictMessage(nfcRef, caseConflicts(set, []string{nfcRef})[nfcRef])
+	nfcForm, nfdForm := `"heads/caf\u00e9"`, `"heads/cafe\u0301"`
+	for _, form := range []string{nfcForm, nfdForm} {
+		if !strings.Contains(msg, form) {
+			t.Errorf("the message must contain the escaped ASCII spelling %s, got %+q", form, msg)
+		}
+	}
+}
+
+// RED (assertion: caseConflicts found no pair, since only caseKey was
+// indexed). An NFC spelling beside its NFD twin shares canonKey but not
+// caseKey, so the pair conflicts by the canonical relation (spec 2026-10-27,
+// section 3, "The rule"): two leaves, caf U+00E9 against cafe U+0301, and
+// two directories, grp-U+00E9/a against grp-e U+0301/b, each reported at
+// the shallowest differing prefix, in both directions.
+func TestCaseConflictsFindsNormalisationPairs(t *testing.T) {
+	cases := []struct {
+		name     string
+		a, b     string
+		atA, atB string // the prefix of a, and of b, that the pair names
+	}{
+		{"two leaves", "refs/heads/caf\u00e9", "refs/heads/cafe\u0301", "heads/caf\u00e9", "heads/cafe\u0301"},
+		{"two directories", "refs/heads/grp-\u00e9/a", "refs/heads/grp-e\u0301/b", "heads/grp-\u00e9", "heads/grp-e\u0301"},
+	}
+	for _, c := range cases {
+		set := map[string]bool{c.a: true, c.b: true}
+		got := caseConflicts(set, []string{c.a, c.b})
+		want := map[string][]caseConflict{
+			c.a: {{Ref: c.b, Ours: c.atA, Theirs: c.atB, Rel: relCanon}},
+			c.b: {{Ref: c.a, Ours: c.atB, Theirs: c.atA, Rel: relCanon}},
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: caseConflicts = %+v, want %+v", c.name, got, want)
+		}
+	}
+}
+
+// RED (assertion: no pair found). The pair recorded for a ref is the
+// shallowest under either relation. grp-e U+0301/Main against grp-U+00E9/main
+// first differs at the heads/grp-... directory, where only the canonical
+// relation holds; the deeper leaves differ by both case and normalisation.
+// So the record is the directory pair, by Unicode normalisation.
+func TestCaseConflictsReportsTheShallowestPairUnderEitherRelation(t *testing.T) {
+	const cand, other = "refs/heads/grp-e\u0301/Main", "refs/heads/grp-\u00e9/main"
+	set := map[string]bool{cand: true, other: true}
+	got := caseConflicts(set, []string{cand})
+	want := map[string][]caseConflict{
+		cand: {{Ref: other, Ours: "heads/grp-e\u0301", Theirs: "heads/grp-\u00e9", Rel: relCanon}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("caseConflicts = %+v, want %+v", got, want)
+	}
+}
+
+// GUARD (it passes once Rel exists and case matches carry relCase; an
+// implementation that checked the canonical index first would fail it). A
+// pair that matches both relations is reported once, as a case match: at
+// equal depth the case index is checked before the canonical one.
+func TestCaseConflictsPrefersCaseAtEqualDepth(t *testing.T) {
+	for _, pair := range [][2]string{
+		{"refs/heads/Main", "refs/heads/main"},
+		{"refs/heads/Caf\u00e9", "refs/heads/caf\u00e9"},
+	} {
+		cand, other := pair[0], pair[1]
+		if canonKey(cand) != canonKey(other) {
+			t.Fatalf("fixture: %+q and %+q must share canonKey too", cand, other)
+		}
+		set := map[string]bool{cand: true, other: true}
+		got := caseConflicts(set, []string{cand})
+		want := map[string][]caseConflict{
+			cand: {{Ref: other, Ours: cand[len("refs/"):], Theirs: other[len("refs/"):], Rel: relCase}},
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("caseConflicts(%+q against %+q) = %+v, want %+v", cand, other, got, want)
+		}
+	}
+}
+
+// RED (assertion: acuteIota had no entry, and ypogAcute only its case pair).
+// The spec's iota strings (section 3, "The rule") as branch names: a U+03B9
+// U+0301 and a U+0345 U+0301 share caseKey only (decomposition reorders the
+// second's marks); a U+0345 U+0301 and a U+0301 U+03B9 share canonKey only;
+// a U+03B9 U+0301 and a U+0301 U+03B9 share neither, so the pairwise check,
+// with no transitive closure, does not pair them.
+func TestCaseConflictsIotaPairsByTheirRelation(t *testing.T) {
+	const (
+		iotaAcute = "refs/heads/a\u03B9\u0301" // a, GREEK SMALL LETTER IOTA, COMBINING ACUTE ACCENT
+		ypogAcute = "refs/heads/a\u0345\u0301" // a, COMBINING GREEK YPOGEGRAMMENI, COMBINING ACUTE ACCENT
+		acuteIota = "refs/heads/a\u0301\u03B9" // a, COMBINING ACUTE ACCENT, GREEK SMALL LETTER IOTA
+	)
+	set := map[string]bool{iotaAcute: true, ypogAcute: true, acuteIota: true}
+	got := caseConflicts(set, []string{iotaAcute, ypogAcute, acuteIota})
+	short := func(ref string) string { return ref[len("refs/"):] }
+	want := map[string][]caseConflict{
+		iotaAcute: {{Ref: ypogAcute, Ours: short(iotaAcute), Theirs: short(ypogAcute), Rel: relCase}},
+		ypogAcute: { // sorted by Ref: U+0301 (CC 81) sorts before U+03B9 (CE B9)
+			{Ref: acuteIota, Ours: short(ypogAcute), Theirs: short(acuteIota), Rel: relCanon},
+			{Ref: iotaAcute, Ours: short(ypogAcute), Theirs: short(iotaAcute), Rel: relCase},
+		},
+		acuteIota: {{Ref: ypogAcute, Ours: short(acuteIota), Theirs: short(ypogAcute), Rel: relCanon}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("caseConflicts:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+// GUARD (Review Focus 1: ref names holding invalid UTF-8, which git accepts).
+// Neither key decodes an invalid byte to U+FFFD, so two refs that differ only
+// in which invalid byte they hold never conflict, under either relation,
+// while a case variant around the same invalid byte still does. Nor is a
+// mark reordered across an invalid byte: x U+0301 0xFF U+0327 and x U+0327
+// 0xFF U+0301 hold the same marks on opposite sides of it, and stay apart.
+// Nothing panics.
+func TestCaseConflictsKeepsInvalidBytesDistinct(t *testing.T) {
+	refs := []string{
+		"refs/heads/a\xffb", "refs/heads/a\xfeb", "refs/heads/A\xffb",
+		"refs/heads/x\u0301\xff\u0327", "refs/heads/x\u0327\xff\u0301",
+	}
+	set := map[string]bool{}
+	for _, r := range refs {
+		set[r] = true
+	}
+	got := caseConflicts(set, refs)
+	want := map[string][]caseConflict{
+		"refs/heads/a\xffb": {{Ref: "refs/heads/A\xffb", Ours: "heads/a\xffb", Theirs: "heads/A\xffb", Rel: relCase}},
+		"refs/heads/A\xffb": {{Ref: "refs/heads/a\xffb", Ours: "heads/A\xffb", Theirs: "heads/a\xffb", Rel: relCase}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("caseConflicts:\n got %+v\nwant %+v", got, want)
 	}
 }
 

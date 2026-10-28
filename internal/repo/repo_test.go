@@ -2226,15 +2226,17 @@ func assertNoPack(t *testing.T, f *transport.Fake) {
 	}
 }
 
-// assertCaseRefused checks that r is refused by the case rule with a reason
-// that begins with prefix.
+// assertCaseRefused checks that r is refused by the create rule, under either
+// relation (letter case or Unicode normalisation), with a reason that begins
+// with prefix. It prints with %+q, so an NFC and an NFD spelling, which
+// display identically, show apart in a failure.
 func assertCaseRefused(t *testing.T, r Result, prefix string) {
 	t.Helper()
 	if r.OK {
-		t.Fatalf("%s must be refused, got %+v", r.Ref, r)
+		t.Fatalf("%+q must be refused, got %+v", r.Ref, r)
 	}
 	if !strings.HasPrefix(r.Err, prefix) {
-		t.Errorf("%s: refusal must begin %q, got %q", r.Ref, prefix, r.Err)
+		t.Errorf("%+q: refusal must begin %+q, got %+q", r.Ref, prefix, r.Err)
 	}
 }
 
@@ -2251,7 +2253,8 @@ func TestPushRefusesACaseVariantCreateBesideAnExistingRef(t *testing.T) {
 	if len(res) != 1 || res[0].OK {
 		t.Fatalf("a case-variant create must be refused, got %+v", res)
 	}
-	for _, want := range []string{"refs/heads/main", "conflicts by letter case"} {
+	for _, want := range []string{"refs/heads/main", "conflicts with", "by letter case",
+		"a Windows or Mac clone would mishandle the pair"} {
 		if !strings.Contains(res[0].Err, want) {
 			t.Errorf("refusal must contain %q, got %q", want, res[0].Err)
 		}
@@ -2276,8 +2279,8 @@ func TestPushRefusesBothSameBatchCaseVariantCreates(t *testing.T) {
 	if len(res) != 2 {
 		t.Fatalf("want 2 results, got %+v", res)
 	}
-	assertCaseRefused(t, res[0], "refs/heads/main conflicts by letter case with refs/heads/Main (")
-	assertCaseRefused(t, res[1], "refs/heads/Main conflicts by letter case with refs/heads/main (")
+	assertCaseRefused(t, res[0], "refs/heads/main conflicts with refs/heads/Main (")
+	assertCaseRefused(t, res[1], "refs/heads/Main conflicts with refs/heads/main (")
 	assertNoPack(t, f)
 	assertCaseRemote(t, f, map[string]string{})
 }
@@ -2302,7 +2305,7 @@ func TestPushCaseVariantRefusalIsPerCreateNotPerBatch(t *testing.T) {
 	if !res[0].OK {
 		t.Fatalf("the update of the existing ref must succeed, got %+v", res[0])
 	}
-	assertCaseRefused(t, res[1], "refs/heads/Main conflicts by letter case with refs/heads/main (")
+	assertCaseRefused(t, res[1], "refs/heads/Main conflicts with refs/heads/main (")
 	if packs, idxs := countPackFiles(f, "/r"); packs != 1 || idxs != 1 {
 		t.Errorf("the update must still cost exactly one pack, got pack=%d idx=%d", packs, idxs)
 	}
@@ -2328,10 +2331,10 @@ func TestPushRefusesFileDirAndDirDirCaseVariants(t *testing.T) {
 	if len(res) != 2 {
 		t.Fatalf("want 2 results, got %+v", res)
 	}
-	assertCaseRefused(t, res[0],
-		"refs/heads/Feat/x conflicts by letter case with refs/heads/feat (heads/Feat vs heads/feat): ")
-	assertCaseRefused(t, res[1],
-		"refs/heads/Grp/b conflicts by letter case with refs/heads/grp/a (heads/Grp vs heads/grp): ")
+	assertCaseRefused(t, res[0], "refs/heads/Feat/x conflicts with refs/heads/feat "+
+		`(heads/Feat vs heads/feat, by letter case: "heads/Feat" vs "heads/feat"): `)
+	assertCaseRefused(t, res[1], "refs/heads/Grp/b conflicts with refs/heads/grp/a "+
+		`(heads/Grp vs heads/grp, by letter case: "heads/Grp" vs "heads/grp"): `)
 	assertNoPack(t, f)
 	assertCaseRemote(t, f, seeded)
 }
@@ -2350,8 +2353,8 @@ func TestPushRefusesANonASCIICaseVariant(t *testing.T) {
 	if len(res) != 1 {
 		t.Fatalf("want 1 result, got %+v", res)
 	}
-	assertCaseRefused(t, res[0],
-		"refs/heads/über conflicts by letter case with refs/heads/Über (heads/über vs heads/Über): ")
+	assertCaseRefused(t, res[0], "refs/heads/über conflicts with refs/heads/Über "+
+		`(heads/über vs heads/Über, by letter case: "heads/\u00fcber" vs "heads/\u00dcber"): `)
 	assertNoPack(t, f)
 	assertCaseRemote(t, f, seeded)
 }
@@ -2369,8 +2372,8 @@ func TestPushCaseRuleCoversTags(t *testing.T) {
 	if len(res) != 1 {
 		t.Fatalf("want 1 result, got %+v", res)
 	}
-	assertCaseRefused(t, res[0],
-		"refs/tags/release-1 conflicts by letter case with refs/tags/Release-1 (tags/release-1 vs tags/Release-1): ")
+	assertCaseRefused(t, res[0], "refs/tags/release-1 conflicts with refs/tags/Release-1 "+
+		`(tags/release-1 vs tags/Release-1, by letter case: "tags/release-1" vs "tags/Release-1"): `)
 	assertNoPack(t, f)
 	assertCaseRemote(t, f, seeded)
 }
@@ -2452,15 +2455,15 @@ func TestPushExistingDirectoryPairBlocksNewChildren(t *testing.T) {
 	if len(res) != 1 {
 		t.Fatalf("want 1 result, got %+v", res)
 	}
-	assertCaseRefused(t, res[0],
-		"refs/heads/feat/c conflicts by letter case with refs/heads/Feat/a (heads/feat vs heads/Feat): ")
+	assertCaseRefused(t, res[0], "refs/heads/feat/c conflicts with refs/heads/Feat/a "+
+		`(heads/feat vs heads/Feat, by letter case: "heads/feat" vs "heads/Feat"): `)
 
 	res = Push(f, "/r", gitDir, []protocol.RefUpdate{{Src: c2, Dst: "refs/heads/Feat/d"}}, remote, nil)
 	if len(res) != 1 {
 		t.Fatalf("want 1 result, got %+v", res)
 	}
-	assertCaseRefused(t, res[0],
-		"refs/heads/Feat/d conflicts by letter case with refs/heads/feat/b (heads/Feat vs heads/feat): ")
+	assertCaseRefused(t, res[0], "refs/heads/Feat/d conflicts with refs/heads/feat/b "+
+		`(heads/Feat vs heads/feat, by letter case: "heads/Feat" vs "heads/feat"): `)
 	assertNoPack(t, f)
 	assertCaseRemote(t, f, seeded)
 }
@@ -2491,12 +2494,13 @@ func TestPushCaseChangingRenameIsRefusedWhole(t *testing.T) {
 		}
 	}
 	const wantDel = "refs/heads/Main: delete refused because it pairs with the refused " +
-		"case-changing rename to refs/heads/MAIN; the rename was not applied"
+		`case-changing rename to refs/heads/MAIN ("refs/heads/Main" to "refs/heads/MAIN"); ` +
+		"the rename was not applied"
 	if res[0].Err != wantDel {
 		t.Errorf("delete refusal:\n got %q\nwant %q", res[0].Err, wantDel)
 	}
-	assertCaseRefused(t, res[1],
-		"refs/heads/MAIN conflicts by letter case with refs/heads/main (heads/MAIN vs heads/main): ")
+	assertCaseRefused(t, res[1], "refs/heads/MAIN conflicts with refs/heads/main "+
+		`(heads/MAIN vs heads/main, by letter case: "heads/MAIN" vs "heads/main"): `)
 	assertNoPack(t, f)
 	assertCaseRemote(t, f, seeded)
 }
@@ -2538,15 +2542,16 @@ func TestPushRenameRefusalsReachAFixedPoint(t *testing.T) {
 	// Which pass refused what, through the reasons each one gives.
 	for i, x := range []string{"refs/heads/FOO/A", "refs/heads/FOO/B"} {
 		want := ups[i].Dst + ": delete refused because it pairs with the refused " +
-			"case-changing rename to " + x + "; the rename was not applied"
+			"case-changing rename to " + x + ` ("` + ups[i].Dst + `" to "` + x + `"); ` +
+			"the rename was not applied"
 		if res[i].Err != want {
 			t.Errorf("result %d:\n got %q\nwant %q", i, res[i].Err, want)
 		}
 	}
-	assertCaseRefused(t, res[2],
-		"refs/heads/FOO/A conflicts by letter case with refs/heads/FOO/a (heads/FOO/A vs heads/FOO/a): ")
-	assertCaseRefused(t, res[3],
-		"refs/heads/FOO/B conflicts by letter case with refs/heads/Foo/a (heads/FOO vs heads/Foo): ")
+	assertCaseRefused(t, res[2], "refs/heads/FOO/A conflicts with refs/heads/FOO/a "+
+		`(heads/FOO/A vs heads/FOO/a, by letter case: "heads/FOO/A" vs "heads/FOO/a"): `)
+	assertCaseRefused(t, res[3], "refs/heads/FOO/B conflicts with refs/heads/Foo/a "+
+		`(heads/FOO vs heads/Foo, by letter case: "heads/FOO" vs "heads/Foo"): `)
 }
 
 // TestPushCaseRefusalTextIsOrderIndependent is RED (Review Focus 5): the
@@ -2638,8 +2643,8 @@ func TestPushPhase5RefusesACreateWhoseVariantDeleteFailed(t *testing.T) {
 	if res[0].OK {
 		t.Errorf("the delete of refs/heads/feat must fail in phase 4, got %+v", res[0])
 	}
-	const wantCreate = "refs/heads/Feat/x conflicts by letter case with refs/heads/feat " +
-		"(heads/Feat vs heads/feat): "
+	const wantCreate = "refs/heads/Feat/x conflicts with refs/heads/feat " +
+		`(heads/Feat vs heads/feat, by letter case: "heads/Feat" vs "heads/feat"): `
 	if res[1].OK || !strings.HasPrefix(res[1].Err, wantCreate) {
 		t.Errorf("the create must be refused in phase 5, naming refs/heads/feat:\n got %+v\nwant Err beginning %q",
 			res[1], wantCreate)
@@ -2743,8 +2748,10 @@ func TestPushPhase5NamesEveryFailedDeleteItDependedOn(t *testing.T) {
 	if res[0].OK || res[1].OK {
 		t.Errorf("both deletes must fail in phase 4, got %+v", res)
 	}
-	const want = "refs/heads/Feat/x conflicts by letter case with refs/heads/fEAT (heads/Feat vs heads/fEAT), " +
-		"refs/heads/feat (heads/Feat vs heads/feat): a Windows clone would mishandle the pair (README, " +
+	const want = "refs/heads/Feat/x conflicts with " +
+		`refs/heads/fEAT (heads/Feat vs heads/fEAT, by letter case: "heads/Feat" vs "heads/fEAT"), ` +
+		`refs/heads/feat (heads/Feat vs heads/feat, by letter case: "heads/Feat" vs "heads/feat"): ` +
+		"a Windows or Mac clone would mishandle the pair (README, " +
 		"Honest limits), so this create is refused on every platform " +
 		"(the same-batch deletes of refs/heads/fEAT and refs/heads/feat did not commit)"
 	if res[2].OK || res[2].Err != want {
@@ -2797,8 +2804,8 @@ func TestPushRenameWholeSparesADeleteOfAnAbsentName(t *testing.T) {
 	if !res[0].OK {
 		t.Errorf("the delete of the absent refs/heads/Main is a no-op and must succeed, got %+v", res[0])
 	}
-	assertCaseRefused(t, res[1],
-		"refs/heads/Main conflicts by letter case with refs/heads/main (heads/Main vs heads/main): ")
+	assertCaseRefused(t, res[1], "refs/heads/Main conflicts with refs/heads/main "+
+		`(heads/Main vs heads/main, by letter case: "heads/Main" vs "heads/main"): `)
 	if !res[2].OK {
 		t.Errorf("the delete of the absent refs/heads/mAIN is a no-op and must succeed, got %+v", res[2])
 	}
@@ -2832,8 +2839,9 @@ func TestPushRenameWholeSparesAReplacementsDelete(t *testing.T) {
 	if !res[1].OK {
 		t.Errorf("the recreate half of the replacement must land, got %+v", res[1])
 	}
-	assertCaseRefused(t, res[2], "refs/heads/MAIN conflicts by letter case with refs/heads/Main "+
-		"(heads/MAIN vs heads/Main), refs/heads/main (heads/MAIN vs heads/main): ")
+	assertCaseRefused(t, res[2], "refs/heads/MAIN conflicts with "+
+		`refs/heads/Main (heads/MAIN vs heads/Main, by letter case: "heads/MAIN" vs "heads/Main"), `+
+		`refs/heads/main (heads/MAIN vs heads/main, by letter case: "heads/MAIN" vs "heads/main"): `)
 	assertCaseRemote(t, f, map[string]string{"refs/heads/main": c1, "refs/heads/Main": c2})
 }
 
@@ -2871,7 +2879,8 @@ func TestPushRenameDeleteNamesTheSmallestRefusedCreate(t *testing.T) {
 	}
 	perms := [][]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}}
 	const wantDel = "refs/heads/Main: delete refused because it pairs with the refused " +
-		"case-changing rename to refs/heads/MAIN; the rename was not applied"
+		`case-changing rename to refs/heads/MAIN ("refs/heads/Main" to "refs/heads/MAIN"); ` +
+		"the rename was not applied"
 
 	for _, p := range perms {
 		seeded := map[string]string{"refs/heads/main": c1, "refs/heads/Main": c1}
@@ -2922,16 +2931,317 @@ func TestPushCreateBeneathAKeptRefIsRefusedInTheSamePass(t *testing.T) {
 		t.Fatalf("want 3 results, got %+v", res)
 	}
 	const wantDel = "refs/heads/Main: delete refused because it pairs with the refused " +
-		"case-changing rename to refs/heads/MAIN; the rename was not applied"
+		`case-changing rename to refs/heads/MAIN ("refs/heads/Main" to "refs/heads/MAIN"); ` +
+		"the rename was not applied"
 	if res[0].OK || res[0].Err != wantDel {
 		t.Errorf("delete refusal:\n got %+v\nwant Err %q", res[0], wantDel)
 	}
-	assertCaseRefused(t, res[1], "refs/heads/MAIN conflicts by letter case with refs/heads/Main/x "+
-		"(heads/MAIN vs heads/Main), refs/heads/main (heads/MAIN vs heads/main): ")
-	assertCaseRefused(t, res[2], "refs/heads/Main/x conflicts by letter case with refs/heads/MAIN "+
-		"(heads/Main vs heads/MAIN), refs/heads/main (heads/Main vs heads/main): ")
+	assertCaseRefused(t, res[1], "refs/heads/MAIN conflicts with "+
+		`refs/heads/Main/x (heads/MAIN vs heads/Main, by letter case: "heads/MAIN" vs "heads/Main"), `+
+		`refs/heads/main (heads/MAIN vs heads/main, by letter case: "heads/MAIN" vs "heads/main"): `)
+	assertCaseRefused(t, res[2], "refs/heads/Main/x conflicts with "+
+		`refs/heads/MAIN (heads/Main vs heads/MAIN, by letter case: "heads/Main" vs "heads/MAIN"), `+
+		`refs/heads/main (heads/Main vs heads/main, by letter case: "heads/Main" vs "heads/main"): `)
 	assertNoPack(t, f)
 	assertCaseRemote(t, f, seeded)
+}
+
+// ---- Canonical equivalence in the create rule (spec 2026-10-27, section 3) --
+//
+// The create rule takes a second relation beside letter case: two prefix
+// spellings that share canonKey (canonical decomposition, then simple
+// folding) conflict too, on every platform. An NFC name and its NFD twin
+// display identically, so each refusal shows both spellings in Go's
+// ASCII-only %+q form. In the Go source below, a raw character is written
+// as an escape in a double-quoted string, and the %+q form a message prints
+// is written in a backquoted raw string, so its backslash-u is ASCII text,
+// with the lowercase hex strconv prints.
+
+// TestPushRefusesAnNFDCreateBesideNFC is RED (assertion: the create was
+// accepted, since only caseKey was checked). With caf U+00E9 (NFC) on the
+// remote, a create of cafe U+0301 (NFD) is refused in phase 2, by Unicode
+// normalisation, naming a Mac clone as the harm: it costs no pack and the
+// remote is unchanged.
+func TestPushRefusesAnNFDCreateBesideNFC(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{"refs/heads/main": c1, "refs/heads/caf\u00e9": c1}
+	f, remote := seedCaseRemote(t, seeded)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	res := Push(f, "/r", gitDir, []protocol.RefUpdate{{Src: c2, Dst: "refs/heads/cafe\u0301"}}, remote, nil)
+	if len(res) != 1 {
+		t.Fatalf("want 1 result, got %+v", res)
+	}
+	const want = "refs/heads/cafe\u0301 conflicts with refs/heads/caf\u00e9 " +
+		"(heads/cafe\u0301 vs heads/caf\u00e9, by Unicode normalisation: " +
+		`"heads/cafe\u0301" vs "heads/caf\u00e9"): ` +
+		"a Mac clone would mishandle the pair (README, Honest limits), " +
+		"so this create is refused on every platform"
+	if res[0].OK || res[0].Err != want {
+		t.Errorf("an NFD create beside its NFC twin must be refused:\n got %+v\nwant Err %+q", res[0], want)
+	}
+	assertNoPack(t, f)
+	assertCaseRemote(t, f, seeded)
+}
+
+// TestPushRefusesANewRefUnderANormalisationDirectoryPair is RED (assertion:
+// the create was accepted). The directory shape: with grp-U+00E9/a on the
+// remote, a create of grp-e U+0301/b would put the NFD spelling of the
+// directory beside its NFC spelling, so it is refused at the directory
+// prefix. The exact-spelling D/F preflight passes it, so the create rule is
+// what refuses it.
+func TestPushRefusesANewRefUnderANormalisationDirectoryPair(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{"refs/heads/main": c1, "refs/heads/grp-\u00e9/a": c1}
+	f, remote := seedCaseRemote(t, seeded)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	res := Push(f, "/r", gitDir, []protocol.RefUpdate{{Src: c2, Dst: "refs/heads/grp-e\u0301/b"}}, remote, nil)
+	if len(res) != 1 {
+		t.Fatalf("want 1 result, got %+v", res)
+	}
+	const want = "refs/heads/grp-e\u0301/b conflicts with refs/heads/grp-\u00e9/a " +
+		"(heads/grp-e\u0301 vs heads/grp-\u00e9, by Unicode normalisation: " +
+		`"heads/grp-e\u0301" vs "heads/grp-\u00e9"): ` +
+		"a Mac clone would mishandle the pair (README, Honest limits), " +
+		"so this create is refused on every platform"
+	if res[0].OK || res[0].Err != want {
+		t.Errorf("a create under the NFD spelling of an NFC directory must be refused:\n got %+v\nwant Err %+q",
+			res[0], want)
+	}
+	assertNoPack(t, f)
+	assertCaseRemote(t, f, seeded)
+}
+
+// TestPushNormalisationChangingRenameIsRefusedWhole is RED (assertion: both
+// halves were accepted). A composition-changing rename is refused whole
+// exactly as a case-changing one is (A1, A2). The remote holds main, caf
+// U+00E9 and CAF U+00C9, all NFC; the batch renames CAF U+00C9 to CAFE
+// U+0301 (delete one, create the other). The create is refused against caf
+// U+00E9 by Unicode normalisation; the delete pairs with it by canonKey, not
+// caseKey, so it is refused as a normalisation-changing rename, and CAF
+// U+00C9 survives.
+func TestPushNormalisationChangingRenameIsRefusedWhole(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+	seeded := map[string]string{
+		"refs/heads/main": c1, "refs/heads/caf\u00e9": c1, "refs/heads/CAF\u00c9": c2,
+	}
+	f, remote := seedCaseRemote(t, seeded)
+	c3 := commitOnPushRepo(t, gitDir, "c.txt", "three")
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/CAF\u00c9"},
+		{Src: c3, Dst: "refs/heads/CAFE\u0301"},
+	}
+	res := Push(f, "/r", gitDir, ups, remote, nil)
+	if len(res) != 2 || res[0].OK || res[1].OK {
+		t.Fatalf("a normalisation-changing rename beside a variant must be refused whole, got %+v", res)
+	}
+	if !strings.Contains(res[0].Err, "normalisation-changing rename") {
+		t.Errorf("the delete's refusal must contain %q, got %+q", "normalisation-changing rename", res[0].Err)
+	}
+	const wantDel = "refs/heads/CAF\u00c9: delete refused because it pairs with the refused " +
+		"normalisation-changing rename to refs/heads/CAFE\u0301 " +
+		`("refs/heads/CAF\u00c9" to "refs/heads/CAFE\u0301"); the rename was not applied`
+	if res[0].Err != wantDel {
+		t.Errorf("delete refusal:\n got %+q\nwant %+q", res[0].Err, wantDel)
+	}
+	const wantCreate = "refs/heads/CAFE\u0301 conflicts with refs/heads/caf\u00e9 " +
+		"(heads/CAFE\u0301 vs heads/caf\u00e9, by Unicode normalisation: " +
+		`"heads/CAFE\u0301" vs "heads/caf\u00e9"): ` +
+		"a Mac clone would mishandle the pair (README, Honest limits), " +
+		"so this create is refused on every platform"
+	if res[1].Err != wantCreate {
+		t.Errorf("create refusal:\n got %+q\nwant %+q", res[1].Err, wantCreate)
+	}
+	assertNoPack(t, f)
+	assertCaseRemote(t, f, seeded)
+}
+
+// TestPushRenameDeletePairsWithTheSmallestCreateUnderEitherKey is RED
+// (assertion: the canonical create a U+0301 U+03B9 was accepted, and the
+// delete named the case create instead). A delete pairs with a refused
+// create under either key, and names the smallest such create whichever key
+// matched, so the text does not depend on which index found it (spec
+// section 3; Review Focus 5). The remote holds main, the delete's ref D = a
+// U+0345 U+0301, and E = A U+0345 U+0301, which shares caseKey with one
+// create and canonKey with the other, so both creates are refused against
+// it. Two batches, each in all six orders:
+//   - creates a U+0301 U+03B9 (canonKey of D) and a U+03B9 U+0301 (caseKey of
+//     D): the canonical one is smaller (U+0301 is CC 81, U+03B9 CE B9), so
+//     the delete names it, as a normalisation-changing rename;
+//   - creates a U+0301 U+03B9 and A U+03B9 U+0301 (caseKey of D): the case
+//     one is smaller ('A' sorts before 'a'), so the delete names it, as a
+//     case-changing rename. This half fails a canon-first lookup, the first
+//     half a case-first one.
+func TestPushRenameDeletePairsWithTheSmallestCreateUnderEitherKey(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+	const (
+		del  = "refs/heads/a\u0345\u0301"
+		pair = "refs/heads/A\u0345\u0301"
+	)
+	perms := [][]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}}
+	for _, tc := range []struct {
+		name    string
+		creates [2]string
+		wantDel string
+	}{
+		{"the canonical create is smaller",
+			[2]string{"refs/heads/a\u0301\u03B9", "refs/heads/a\u03B9\u0301"},
+			"refs/heads/a\u0345\u0301: delete refused because it pairs with the refused " +
+				"normalisation-changing rename to refs/heads/a\u0301\u03B9 " +
+				`("refs/heads/a\u0345\u0301" to "refs/heads/a\u0301\u03b9"); the rename was not applied`},
+		{"the case create is smaller",
+			[2]string{"refs/heads/a\u0301\u03B9", "refs/heads/A\u03B9\u0301"},
+			"refs/heads/a\u0345\u0301: delete refused because it pairs with the refused " +
+				"case-changing rename to refs/heads/A\u03B9\u0301 " +
+				`("refs/heads/a\u0345\u0301" to "refs/heads/A\u03b9\u0301"); the rename was not applied`},
+	} {
+		entries := []protocol.RefUpdate{
+			{Src: "", Dst: del},
+			{Src: c2, Dst: tc.creates[0]},
+			{Src: c2, Dst: tc.creates[1]},
+		}
+		for _, p := range perms {
+			seeded := map[string]string{"refs/heads/main": c1, del: c1, pair: c1}
+			f, remote := seedCaseRemote(t, seeded)
+			ups := make([]protocol.RefUpdate, len(p))
+			for i, k := range p {
+				ups[i] = entries[k]
+			}
+			res := Push(f, "/r", gitDir, ups, remote, nil)
+			if len(res) != len(ups) {
+				t.Fatalf("%s, order %v: want %d results, got %+v", tc.name, p, len(ups), res)
+			}
+			for i, r := range res {
+				if r.OK {
+					t.Fatalf("%s, order %v: %+q must be refused, got %+v", tc.name, p, ups[i].Dst, res)
+				}
+				if ups[i].Src == "" && r.Err != tc.wantDel {
+					t.Errorf("%s, order %v: delete refusal:\n got %+q\nwant %+q", tc.name, p, r.Err, tc.wantDel)
+				}
+			}
+			assertNoPack(t, f)
+			assertCaseRemote(t, f, seeded)
+		}
+	}
+}
+
+// TestPushPhase5RefusesACreateWhoseCanonicalVariantDeleteFailed is RED
+// (assertion: the create landed in phase 5), the canonical-only twin of
+// TestPushPhase5RefusesACreateWhoseVariantDeleteFailed. Phase 2 clears the
+// create cafe U+0301/x only because the same batch deletes caf U+00E9, and
+// that delete then fails in phase 4. Phase 5's re-check, which shares
+// caseConflicts and caseConflictMessage with phase 2, refuses the create by
+// Unicode normalisation before ensureRefParents, naming the delete it
+// depended on, so no folder is left behind.
+func TestPushPhase5RefusesACreateWhoseCanonicalVariantDeleteFailed(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{"refs/heads/main": c1, "refs/heads/caf\u00e9": c1}
+	f, remote := seedCaseRemote(t, seeded)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/caf\u00e9"},
+		{Src: c2, Dst: "refs/heads/cafe\u0301/x"},
+	}
+	tr := trashFailsForTransport{Fake: f, path: "/r/refs/heads/caf\u00e9"}
+	res := Push(tr, "/r", gitDir, ups, remote, nil)
+	if len(res) != 2 {
+		t.Fatalf("want 2 results, got %+v", res)
+	}
+	if res[0].OK {
+		t.Errorf("the delete of refs/heads/caf U+00E9 must fail in phase 4, got %+v", res[0])
+	}
+	const want = "refs/heads/cafe\u0301/x conflicts with refs/heads/caf\u00e9 " +
+		"(heads/cafe\u0301 vs heads/caf\u00e9, by Unicode normalisation: " +
+		`"heads/cafe\u0301" vs "heads/caf\u00e9"): ` +
+		"a Mac clone would mishandle the pair (README, Honest limits), " +
+		"so this create is refused on every platform " +
+		"(the same-batch delete of refs/heads/caf\u00e9 did not commit)"
+	if res[1].OK || res[1].Err != want {
+		t.Errorf("the create must be refused in phase 5:\n got %+v\nwant Err %+q", res[1], want)
+	}
+	if f.Dirs["/r/refs/heads/cafe\u0301"] {
+		t.Error("a create refused in phase 5 must leave no parent folder: the re-check runs before ensureRefParents")
+	}
+	if _, ok := f.Files["/r/refs/heads/cafe\u0301/x"]; ok {
+		t.Error("the refused create must not be written")
+	}
+	assertCaseRemote(t, f, seeded)
+	if packs, idxs := countPackFiles(f, "/r"); packs != 1 || idxs != 1 {
+		t.Errorf("phase 3 uploads the create's pack before phase 5 refuses it, so exactly one "+
+			"unreferenced pack must remain, got pack=%d idx=%d", packs, idxs)
+	}
+}
+
+// TestPushNormalisationRefusalTextIsOrderIndependent is RED (assertion: the
+// NFD create was accepted). The three-create batch caf U+00E9 (NFC), cafe
+// U+0301 (NFD) and Caf U+00E9 in all six orders: every create is refused,
+// each naming the other two with the relation each pair matches, and each
+// destination's text is byte-identical whatever the batch order (Review
+// Focus 5). The NFD create matches both others by Unicode normalisation
+// only, so its harm clause names a Mac clone alone; the other two each have
+// a case match, so theirs name Windows and Mac.
+func TestPushNormalisationRefusalTextIsOrderIndependent(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	const (
+		nfc   = "refs/heads/caf\u00e9"
+		nfd   = "refs/heads/cafe\u0301"
+		upper = "refs/heads/Caf\u00e9"
+	)
+	names := []string{nfc, nfd, upper}
+	const tail = " (README, Honest limits), so this create is refused on every platform"
+	want := map[string]string{
+		nfc: nfc + " conflicts with " +
+			upper + " (heads/caf\u00e9 vs heads/Caf\u00e9, by letter case: " +
+			`"heads/caf\u00e9" vs "heads/Caf\u00e9"), ` +
+			nfd + " (heads/caf\u00e9 vs heads/cafe\u0301, by Unicode normalisation: " +
+			`"heads/caf\u00e9" vs "heads/cafe\u0301"): ` +
+			"a Windows or Mac clone would mishandle the pair" + tail,
+		nfd: nfd + " conflicts with " +
+			upper + " (heads/cafe\u0301 vs heads/Caf\u00e9, by Unicode normalisation: " +
+			`"heads/cafe\u0301" vs "heads/Caf\u00e9"), ` +
+			nfc + " (heads/cafe\u0301 vs heads/caf\u00e9, by Unicode normalisation: " +
+			`"heads/cafe\u0301" vs "heads/caf\u00e9"): ` +
+			"a Mac clone would mishandle the pair" + tail,
+		upper: upper + " conflicts with " +
+			nfd + " (heads/Caf\u00e9 vs heads/cafe\u0301, by Unicode normalisation: " +
+			`"heads/Caf\u00e9" vs "heads/cafe\u0301"), ` +
+			nfc + " (heads/Caf\u00e9 vs heads/caf\u00e9, by letter case: " +
+			`"heads/Caf\u00e9" vs "heads/caf\u00e9"): ` +
+			"a Windows or Mac clone would mishandle the pair" + tail,
+	}
+	perms := [][]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}}
+	for _, p := range perms {
+		f, remote := seedCaseRemote(t, nil)
+		ups := make([]protocol.RefUpdate, len(p))
+		for i, k := range p {
+			ups[i] = protocol.RefUpdate{Src: c1, Dst: names[k]}
+		}
+		res := Push(f, "/r", gitDir, ups, remote, nil)
+		if len(res) != len(ups) {
+			t.Fatalf("order %v: want %d results, got %+v", p, len(ups), res)
+		}
+		for i, r := range res {
+			if r.OK || r.Err == "" {
+				t.Fatalf("order %v: %+q must be refused with a reason, got %+v", p, ups[i].Dst, r)
+			}
+			if r.Err != want[ups[i].Dst] {
+				t.Errorf("order %v: %+q's refusal:\n got %+q\nwant %+q", p, ups[i].Dst, r.Err, want[ups[i].Dst])
+			}
+		}
+		assertNoPack(t, f)
+		assertCaseRemote(t, f, map[string]string{})
+	}
 }
 
 // TestPushOtherNamespaceRequiresForce covers the design's conservative
