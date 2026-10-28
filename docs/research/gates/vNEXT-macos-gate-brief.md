@@ -23,7 +23,11 @@ counts as BLOCKED, and the expected output, written here before the run.
 **`vNEXT` is a placeholder** for the release that carries the macOS port, whose version Craig has
 not named. When he names it, this file is renamed to `docs/research/gates/<tag>-macos-gate-brief.md`
 and every `vNEXT` in it, in prose and in code alike, is replaced with that tag by one scripted
-substitution (see "How this file is edited"). Remote root names carry it, so they change with it.
+substitution (see "How this file is edited"). The same script renames
+`docs/research/gates/vNEXT-composition-refusal-steps.md` likewise and rewrites the two other files
+that name these by path, `docs/releasing.md` and `docs/README.md`; afterwards `git grep vNEXT`
+must find the old names only in dated records (the plan), which keep them [inference: as at the
+anchor]. Remote root names carry it, so they change with it.
 v0.10.0, the current release, keeps its own name throughout: Part A builds it as the "before"
 helper that step 5.5 needs.
 
@@ -54,6 +58,11 @@ from rule 6, is stated at C.5, as the v0.10.0 briefs made it.
   it is prep and changes nothing in the release. *Brief author's call:* a setup failure in Part C
   that comes before any account write (a sign-in that does not complete, say) is fixed and retried
   inside `gate-a1`, as the v0.10.0 briefs retried keyring setup; anything from step 0 on is not.
+  Step 0's git-version STOP comes first in its script, before anything is read or recorded;
+  whether step 0 then runs again inside `gate-a1`, after Craig's ruling on that git, is his call
+  (Question 6). In-step re-firings Craig orders are not retries: 6.1 (the screen was not locked),
+  6.2 (permission granted, or the `abandon` agent) and 6.3 ((b) not exercised). Each is recorded
+  with its count; none follows a BLOCK.
 - **The composition refusal on the other platforms.** The release's Windows and Linux gates carry
   the steps in `docs/research/gates/vNEXT-composition-refusal-steps.md` (O5(d)).
 
@@ -102,7 +111,9 @@ escaped view below. Literal backslash-u sequences appear only in the section "St
 prints", and a common tool fault decodes them into raw characters when a file is saved (the plan's
 self-review notes, round 3, record it). So the file is changed only by script (Python, building
 each backslash from `chr(92)`), never by an editor tool, and is grepped afterwards: every
-backslash-u in it must still be one. The renaming of `vNEXT` is such a script.
+backslash-u in it must still be one. The renaming of `vNEXT` is such a script; it renames this
+file and the steps file, rewrites `docs/releasing.md` and `docs/README.md`, and is followed by a
+`git grep vNEXT`.
 
 **R7 and this gate.** R7 refuses, on a Mac `files` clone, an update whose tracking ref aliases the
 tracking ref of a delete in the same push, even when neither tracking ref is local; a create in
@@ -113,9 +124,10 @@ the Mac the delete then lands and the update is refused with string 12's text [c
 push, the pair being gone [inference]. Section 6
 has no such push: its repair (5.10) runs from a `reftable` clone, which the Mac rules do not reach,
 and section 3's repair says to avoid a delete push from a Mac `files` clone. So no step here
-provokes R7, and it is listed under "Not covered live". If a runner meets string 12 anyway, that
-is the expected outcome above, recorded, not a BLOCK. *Brief author's call:* adding an R7 step is
-Craig's decision (Question 2).
+provokes R7, and it is listed under "Not covered live". If a runner meets string 12 anyway, it is
+recorded and checked against `[r7-not-provoked]`; the step is still judged on its own pass
+conditions, so string 12 in place of a step's expected output is BLOCKED. *Brief author's call:*
+adding an R7 step is Craig's decision (Question 2).
 
 ---
 
@@ -154,9 +166,13 @@ that others depend on comes first.
 6. **Hold Command Line Tools and Xcode updates until the gate has run?** Default: yes; step 0 STOPs
    on any git but `git version 2.54.0 (Apple Git-157)`. Reason: M24, PM1 and R7 were measured on
    that git.
-7. **`caffeinate -is` for the whole gate?** Default: yes, held from C.0 to 7.0, not only for step 6,
-   which still needs mains power. Reason: rule 9's harm, a push killed mid-flight leaving an orphaned
-   lock, applies to a Mac that sleeps mid-push at any step.
+7. **`caffeinate -is` for the whole gate, and who holds it?** Default: yes, held from the end of
+   C.0 to 7.0, not only for step 6, which still needs mains power; Craig holds it, running
+   `kit/awake.sh` in a Terminal window of his own, and `gx.sh` refuses (a STOP) any gate script from
+   C.2 to step 6 while it is not running. Reason: rule 9's harm, a push killed mid-flight leaving an
+   orphaned lock, applies to a Mac that sleeps mid-push at any step; and a runner's background
+   command is killed at the harness's bound (two hours at most on Craig's machines), well short of
+   the gate, so the runner cannot hold it.
 8. **Notification permission (6.2).** Default: if macOS asks, allowing it is his decision, made at
    the prompt; the brief records the prompt and what the run did before it. Reason: it is a system
    setting.
@@ -175,6 +191,12 @@ that others depend on comes first.
     them equal to the lines C.3 quotes from the README at the anchor; a difference is a STOP for
     adjudication. Reason: the gate tests the install the README gives, and no runner runs README
     lines this brief has not quoted.
+13. **A C.2 STOP: hold, or run step 7?** Default: hold. Nothing is cleaned and the PC's tasks stay
+    paused until Craig rules whether the tag's brief stands as written for the files C.2 lists. If
+    it stands, the gate goes on at C.3; if not, step 7 runs (C.2 says what it does then) and the
+    Mac gate is retried at a later release. Reason: nothing has reached the account at C.2; a brief
+    at a tag cannot be re-anchored, since the gate runs the tag's brief and tags never move; and
+    step 7 deletes Part A's build, which a gate that goes on still needs.
 
 ---
 
@@ -192,7 +214,7 @@ that others depend on comes first.
 | Mac | MacBook Air, Apple Silicon, macOS 27.2 build 26B123, APFS case-insensitive; `/usr/bin/git` is `git version 2.54.0 (Apple Git-157)`, exec-path `/Applications/Xcode.app/Contents/Developer/usr/libexec/git-core` (176 entries, no `git-remote-proton*`); go1.27.0 at `~/sdk/go1.27.0/bin/go`, not on PATH; `/bin/bash` 3.2.57; `/usr/bin/python3` 3.9.6; `hostname` prints `mac.lan` [measured 2026-10-27] |
 | Mac state today | `~/.local/bin` holds `agy` and `claude` only; no `git-remote-proton` or `proton-drive` in it, in `/opt/homebrew/bin` or in `/usr/local/bin`; M7's three default folders absent; `~/gpbmac` absent; on battery [measured 2026-10-27] |
 | Mac global git config | sets `init.defaultBranch`, `core.excludesFile` and `core.hooksPath` (Craig's chaining hooks), and no `fetch.*`, `push.*`, `remote.*` or `url.*` key [measured 2026-10-27, names only] |
-| PC | Windows, PowerShell 7.6.7, Git for Windows 2.55.0.windows.3, `proton-drive` at `C:\Users\craig\Tools\proton-drive.exe`, the helper at `%LOCALAPPDATA%\Programs\git-proton-backup\git-remote-proton.exe`, tasks `ProjectsBackupDaily` and `ProtonCliDriftCheck` at `\` [record `v0.10.0-linux-gate-brief.md`, measured there 2026-10-16]. W.B.0 re-checks them |
+| PC | Windows, PowerShell 7.6.7, Git for Windows 2.55.0.windows.3, `proton-drive` at `C:\Users\craig\Tools\proton-drive.exe`, the helper at `%LOCALAPPDATA%\Programs\git-proton-backup\git-remote-proton.exe`, tasks `ProjectsBackupDaily` and `ProtonCliDriftCheck` at `\` [record `v0.10.0-linux-gate-brief.md`, measured there 2026-10-16]; `gh`, signed in to GitHub (W.C.2's draft check needs it). W.B.0 re-checks them, `gh auth status` included |
 | Main checkouts | Mac `~/Projects/_Tools/git-proton-backup`; PC `C:\Users\craig\Projects\_Tools\git-proton-backup` |
 | Runs | `probe-a1` (a re-run, on Craig's word only, is `probe-a2`), and `gate-a1`, the only gate run (the retry rule). SUF is the attempt, `a1` |
 | Mac scratch | `~/gpbmac/`: `extract.py`, `kit/`, `scripts/`, `cli/` (the feed-verified CLI), `v010-build/` (Part A), `run.txt`, and one folder per run holding `env.sh`, `cache/`, `log/`, `out/`, `snap/`, `refsets/`, `relay/` and the run's repositories; the gate run also holds the tag's clone `git-proton-backup-vNEXT` (`$SRC`, C.3) and the keep-awake's `caffeinate.pid` |
@@ -250,7 +272,8 @@ that others depend on comes first.
   - **One `.lock` file per lock session.** The gate's pushes, Mac and PC, and its one
     `--set-head` make **39** before step 6: step 3 makes 4, step 4 makes 4, 5.0 makes 2, 5.1 2,
     5.2 1, 5.3 7, 5.4 2, 5.5 1, 5.8 4, 5.9.1 3, 5.9.2 1, 5.9.3 2, 5.10 2 and 5.11 4. Step 6 adds
-    2 for each firing of its succeeding agent (one expected) and none for its failing ones.
+    2 for each firing of its succeeding agent (one expected; a re-fire or a `runs = 2` adds two
+    more each, 6.4) and none for its failing ones.
   - **Four ref files from deletes:** `topic-m` and `topic-w` (step 4), the NFC `cafe` (5.8, from
     the PC) and the NFD `cafe` (5.10) [code `internal/repo/push.go`, phase 4].
   - **19 folders from step 2's contract table:** its 17 per-test roots, plus `trash-empty` and
@@ -326,15 +349,18 @@ consecutive log lines. In an entry, `<OID>` matches any 40 lower-case hex digits
   record, logout or trash) runs with at least 10 minutes: a snapshot alone can wait twice 60 s
   for trash lag. A snapshot the harness kills leaves no file under its label.
 - **go test's own deadline.** Step 2's `go test` passes `-timeout 40m` and `-count=1` (rule 5).
-- **The Mac stays awake.** The runner holds the keep-awake, `kit/awake.sh`, as a background
-  command of its own from C.0 to 7.0 (Question 7). It records its pid in the run folder and then
-  becomes `/usr/bin/caffeinate -is -t 43200` under that pid, so the Mac cannot idle-sleep
-  mid-push at any step. Step 0, 6.0 and 6.1 check that one process by its recorded pid
-  (`awake_ok`), never any other `caffeinate` on the Mac, and step 6 also needs mains power, where
-  `-s` takes effect (spec, "Facts": `man caffeinate`) [measured 2026-10-28: a bash script that
-  writes `$$` and then `exec`s `caffeinate` keeps that pid, which is the background command's
-  `$!`; `ps -o comm=` prints `/usr/bin/caffeinate` for it, and `pmset -g assertions` lists it as
-  `pid <n>(caffeinate)`].
+- **The Mac stays awake.** Craig holds the keep-awake, `kit/awake.sh`, in a Terminal window of
+  his own from the end of C.0 to 7.0 (Question 7): not a runner's background command, which a
+  harness kills at its bound. It records its pid and start time in the run folder and then becomes
+  `/usr/bin/caffeinate -is -t 172800` under that pid (48 hours, longer than the gate [inference]),
+  so the Mac cannot idle-sleep mid-push at any step. `gx.sh` checks that one process by its
+  recorded pid (`awake_ok`), never any other `caffeinate` on the Mac, before every gate script from
+  C.2 to step 6, and refuses to start one while it is down (exit 3, a STOP: nothing ran; Craig
+  restarts it and the script is run); step 0, 6.0 and 6.1 check it again. Step 6 also needs mains
+  power, where `-s` takes effect (spec, "Facts": `man caffeinate`) [measured 2026-10-28: a bash
+  script that writes `$$` and then `exec`s `caffeinate` keeps that pid, which is the starting
+  command's `$!`; `ps -o comm=` prints `/usr/bin/caffeinate` for it, and `pmset -g assertions`
+  lists it as `pid <n>(caffeinate)`].
 - **No hermetic test run is part of this gate.** From C.3 on, a real, signed-in `proton-drive` is
   on the gate's PATH, so a hermetic `go test` or Pester run on this Mac would be rule 12's case: it
   must not resolve the real CLI, which means a PATH without `~/.local/bin` (rule 12). Step 2 is the
@@ -355,6 +381,13 @@ is not known in advance. Re-enabling them is Craig's, only when the PC's unpause
   below;
 - a command is killed.
 
+A script's `EXIT 0` is not a pass by itself: every listed pass condition is checked, by the script
+where it says so and otherwise by the runner from the printed lines (counts of `ADDED` and
+`CHANGED` rows, say). A push a step needs refused that exits 0 has written, so its script records
+the remote and stops at once (`unrefused` in `lib.sh`), before any later write in the step builds on
+it; a refusal whose text differs is a failed check (`bad`), and the script goes on to record the
+rest of the step's evidence.
+
 On a BLOCK the runner reports the verbatim output (its escaped view where it holds non-ASCII), and
 patches nothing: no code, config, account or machine state, no re-run of a push, no new sign-in.
 It runs step 7 (cleanup) and then stops for Craig. Under the retry rule there is no second gate
@@ -370,7 +403,8 @@ briefs' rule.*
 - **The restore-floor warnings** (string 16) are expected absent: Apple's git 2.54.0 passes the
   floor probe (M11). The first form is BLOCKED. The second is recorded the first time (most likely
   the probe's 10 s timeout), and a second occurrence in the run is BLOCKED: `d5_check` in `lib.sh`
-  applies that rule wherever a script checks for them, the v0.10.0 briefs' rule. Where a pass
+  applies that rule to every push `logged` runs and to 6.1's scheduled run, the v0.10.0 briefs'
+  rule. Where a pass
   condition counts `git-remote-proton:` lines, that recorded first sighting adds one to the count.
 
 **A trashed row that outlives the re-takes** is printed by `kit compare` as `TRASHED, STILL
@@ -597,17 +631,11 @@ Proton Drive CLI cli-drive@0.9.0+75612299
 [login-first]
 You need to login first
 
-# The scheduled-push wrapper's own lines (scripts/macos/gpb-v2-push.sh:110-112, 204, 221, 238, 247, 261).
+# The scheduled-push wrapper's own lines (scripts/macos/gpb-v2-push.sh:110-112, 221, 247, 261).
 [wrapper-ok]
 gpb-v2-push: git push proton-v2 --all: exit 0
 gpb-v2-push: git push proton-v2 --tags: exit 0
 gpb-v2-push: done: <ENV:LDREPO> -> proton-v2
-
-[wrapper-expired]
-gpb-v2-push: git push proton-fail --all ran past 1s and was killed
-
-[wrapper-124]
-gpb-v2-push: git push proton-fail --all: exit 124
 
 [marker-lock]
 the push was killed; if the next push reports that this repository is locked by this Mac, that lock is the killed push's: remove it as that message says (README, scheduled use)
@@ -738,6 +766,10 @@ README_HELPER_SHA=5e9dcd5eb538cd14a3fb007b1887db027a5c06bd440bf706d239bd916d7c7b
 README_CLI_SHA=929dfd5a2fb73e5f1cce65f85f1ba8f21dccdc45cab22a5438e5daa2c80c49f0
 fail=0
 bad() { echo "CHECK FAILED: $*"; fail=1; }
+# unrefused <remote root> <label>: a push the step needs refused exited 0, so it wrote. The remote
+# is recorded (kit snapshot <label>-unrefused) and the script ends BLOCKED at once, before any later
+# write in it builds on that state (rule 4).
+unrefused() { echo "BLOCKED: the push was not refused, so it wrote; the remote is recorded and this script stops"; kit snapshot "$2-unrefused" "$1" -r; exit 1; }
 kit() { /usr/bin/python3 -I "$GM/kit/gpbkit.py" "$@"; }
 have() { local t r=0; for t in "$@"; do command -v "$t" >/dev/null 2>&1 || { echo "missing tool $t"; r=1; }; done; return $r; }
 # gate_identity <repo>: the repository-scoped gate identity, for any repository the gate commits in
@@ -750,8 +782,13 @@ exact_bytes() { git -C "$1" config core.precomposeunicode false; }
 # commit_in <repo> <file> <line> <message>: appends a line to a file and commits it (real content).
 commit_in() { printf '%s\n' "$3" >> "$1/$2" && git -C "$1" add "$2" && git -C "$1" commit -q -m "gate: $4"; }
 # logged <name> <command...>: the command's stdout and stderr go to $G/out/<name>.txt, its escaped
-# view is printed, and rc (its exit code) and L (the log) are set.
-logged() { L="$G/out/$1.txt"; shift; "$@" >"$L" 2>&1; rc=$?; kit esc "$L"; }
+# view is printed, and rc (its exit code) and L (the log) are set. A git push's log then goes
+# through d5_check (string 16), so every push the gate makes counts toward its sightings.
+logged() {
+  L="$G/out/$1.txt"; shift; "$@" >"$L" 2>&1; rc=$?; kit esc "$L"
+  case " $* " in *" git "*" push "*) d5_check "$L" ;; esac
+  return 0
+}
 # refs_of <repo> <file>: every local ref, raw bytes, for a before/after comparison with cmp.
 refs_of() { git -C "$1" for-each-ref --format='%(objectname) %(refname)' > "$2"; }
 # m7: M7's three default folders, one line each; returns 1 if any exists.
@@ -762,16 +799,38 @@ m7() {
   done
   return $r
 }
-# kc_item: 0 when the CLI's Keychain item exists (M5); prints nothing secret (no -w, no -g).
-kc_item() { /usr/bin/security find-generic-password -s ch.proton.drive/drive-sdk-cli >/dev/null 2>&1; }
+# kc_item: the CLI's Keychain item (M5), queried without printing anything secret (no -w, no -g).
+# Status 0: present; 1: absent, security's item-not-found exit, 44 [measured 2026-10-28, a query
+# for a name that does not exist]; 2: the query itself failed (its exit printed), which no caller
+# may read as absent.
+kc_item() {
+  local r; /usr/bin/security find-generic-password -s ch.proton.drive/drive-sdk-cli >/dev/null 2>&1; r=$?
+  case "$r" in 0) return 0 ;; 44) return 1 ;; *) echo "KEYCHAIN QUERY FAILED: security exit $r"; return 2 ;; esac
+}
+# kc_expect present|absent <failure text>: prints the item's state, and calls bad with the text
+# when the state is not the expected one; a failed query is a failed check either way.
+kc_expect() {
+  local k; kc_item; k=$?
+  case "$k" in
+    0) echo "Keychain item ch.proton.drive/drive-sdk-cli: PRESENT" ;;
+    1) echo "Keychain item ch.proton.drive/drive-sdk-cli: absent" ;;
+    *) bad "the Keychain query failed, so the item's state is unknown ($2)"; return 2 ;;
+  esac
+  if [ "$1" = present ] && [ "$k" != 0 ]; then bad "$2"; return 1; fi
+  if [ "$1" = absent ] && [ "$k" != 1 ]; then bad "$2"; return 1; fi
+  return 0
+}
 # upload_one <local file> <remote folder> <name>: one CLI upload that never overwrites (-f skip),
-# its summary read as the helper reads it, the merged output as JSON (cli.go:58, 393-395); true
-# only for (transferred, skipped, failed) = (1, 0, 0) and exit 0.
+# its summary read as the helper reads it, the merged output as JSON (cli.go:58, 393-395). Status
+# 0 only for (transferred, skipped, failed) = (1, 0, 0) and exit 0; 3 for (0, 1, 0) and exit 0 (the
+# name was taken, so the CLI matched it to an existing one); 1 for anything else.
 upload_one() {
-  local u
+  local u s
   proton-drive filesystem upload -f skip --json "$1" "$2" > "$G/out/$3.json" 2>&1; u=$?
   kit esc "$G/out/$3.json"; echo "upload: exit $u"
-  /usr/bin/python3 -I -c 'import json,sys; s=json.load(open(sys.argv[1])); t=(s.get("transferredItems"), s.get("skippedItems"), s.get("failedItems")); print("upload counts (transferred, skipped, failed):", t); sys.exit(0 if t == (1, 0, 0) else 1)' "$G/out/$3.json" && [ "$u" = 0 ]
+  /usr/bin/python3 -I -c 'import json,sys; s=json.load(open(sys.argv[1])); t=(s.get("transferredItems"), s.get("skippedItems"), s.get("failedItems")); print("upload counts (transferred, skipped, failed):", t); sys.exit(0 if t == (1, 0, 0) else 3 if t == (0, 1, 0) else 1)' "$G/out/$3.json"; s=$?
+  [ "$u" = 0 ] || return 1
+  return "$s"
 }
 # d5_check <log>: string 16 in a push's output. The first form (this git cannot restore) is a
 # failed check; the second (could not check) is recorded the first time in the run and a failed
@@ -791,13 +850,16 @@ v010() {
 }
 # locked: whether the console session's screen is locked, as macOS reports it (step 6).
 locked() { /usr/sbin/ioreg -n Root -d1 -a | /usr/bin/plutil -extract IOConsoleUsers.0.CGSSessionScreenIsLocked raw -o - - 2>/dev/null || echo "no (key absent)"; }
-# fire <agent> <seconds>: step 6's firing of one gate agent. Moves its old logs aside, bootstraps
-# its plist, waits for its real StartInterval firing (at most 600 s: two intervals), then for its
-# run to end (at most <seconds>), waits for launchd to report it not running, and boots it out at
-# once, so no second firing can start. Prints both logs in the escaped view. Returns 1 when it did
-# not fire, or did not end, in time.
+# fire <agent> <seconds> [linger]: step 6's firing of one gate agent. Moves its old logs aside,
+# bootstraps its plist, waits for its real StartInterval firing (at most 600 s: two intervals),
+# then for its run to end (at most <seconds>), waits for launchd to report it not running, waits
+# <linger> seconds more if given (6.2: a notification the run started is not cut short), prints
+# launchd's state, runs and last exit, and boots it out. The interval counts from the bootstrap,
+# not from the run's end (launchd.plist(5): "every N seconds"), so a run ending near a boundary
+# can be followed by a second firing before the bootout: `runs = 2` in the printed lines shows it.
+# Prints both logs in the escaped view. Returns 1 when it did not fire, or did not end, in time.
 fire() {
-  local n="$1" limit="$2" dom lbl o e t0 t1 k
+  local n="$1" limit="$2" linger="${3:-0}" dom lbl o e t0 t1 k
   dom="gui/$(id -u)"; lbl="gpbmac.$RUN.$n"; o="$G/launchd/logs/$n.out.log"; e="$G/launchd/logs/$n.err.log"
   [ -f "$G/launchd/$n.plist" ] || { echo "BLOCKED: no plist $G/launchd/$n.plist"; return 1; }
   for k in 1 2 3 4 5 6 7 8 9; do [ -e "$o.$k" ] || break; done
@@ -822,18 +884,19 @@ fire() {
     sleep 5
   done
   for k in 1 2 3 4 5 6 7 8 9 10 11 12; do launchctl print "$dom/$lbl" 2>/dev/null | grep -q 'state = running' || break; sleep 5; done
+  if [ "$linger" -gt 0 ]; then echo "the run has ended; waiting $linger s before the bootout"; sleep "$linger"; fi
   launchctl print "$dom/$lbl" 2>&1 | grep -E 'state =|runs =|last exit'
   launchctl bootout "$dom/$lbl"; echo "bootout $lbl: exit $?"
   echo "== $n.out.log"; kit esc "$o"; echo "== $n.err.log"; kit esc "$e"
   return 0
 }
-# awake_ok: the keep-awake C.0 started (kit/awake.sh) still runs, checked by the pid it recorded
-# alone, never by name, so no other caffeinate on the Mac counts. Sets AWAKE_PID.
+# awake_ok: the keep-awake Craig started at C.0 (kit/awake.sh) still runs, checked by the pid it
+# recorded alone, never by name, so no other caffeinate on the Mac counts. Sets AWAKE_PID.
 awake_ok() {
   AWAKE_PID=$(/bin/cat "$G/caffeinate.pid" 2>/dev/null)
   case "$AWAKE_PID" in ''|*[!0-9]*) echo "keep-awake: no pid recorded in $G/caffeinate.pid"; return 1 ;; esac
   local c; c=$(/bin/ps -p "$AWAKE_PID" -o comm= 2>/dev/null)
-  if [ "$c" = /usr/bin/caffeinate ]; then echo "keep-awake: pid $AWAKE_PID, /usr/bin/caffeinate, running"; return 0; fi
+  if [ "$c" = /usr/bin/caffeinate ]; then echo "keep-awake: pid $AWAKE_PID, /usr/bin/caffeinate, running since $(/bin/cat "$G/caffeinate.started" 2>/dev/null)"; return 0; fi
   echo "keep-awake: pid $AWAKE_PID is not running caffeinate now: [$c]"; return 1
 }
 # strays <ERE>: for each process whose command line matches, its pid and program path only (never
@@ -851,7 +914,9 @@ cd "$G" || exit 2
 # gx.sh <script> [names...]: runs ~/gpbmac/scripts/<script>.sh for the current run
 # (~/gpbmac/run.txt), handing it the run's name and then any further arguments, which must be plain
 # names. Its output, stderr merged, is shown and appended to <run>/log/<script>.txt as it arrives,
-# with STARTED and EXIT lines in <run>/log/runs.txt. Usage:  /bin/bash ~/gpbmac/kit/gx.sh <script>
+# with STARTED and EXIT lines in <run>/log/runs.txt. For the gate run, a script from C.2 to step 6
+# is refused (exit 3, a STOP) while the keep-awake is not running. Usage:
+#   /bin/bash ~/gpbmac/kit/gx.sh <script>
 set -u
 GM="$HOME/gpbmac"
 n="${1:-}"
@@ -864,6 +929,16 @@ RUN=$(/bin/cat "$GM/run.txt" 2>/dev/null) || { echo "BLOCKED: no current run ($G
 G="$GM/$RUN"
 if [ ! -d "$G/log" ]; then echo "BLOCKED: no run folder $G/log"; exit 2; fi
 t() { /bin/date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+# The gate run's scripts from C.2 to step 6 start only while Craig's keep-awake runs; step 7's
+# never wait on it, since cleanup runs on every exit path.
+case "$RUN:$n" in
+  gate-a1:c[2-5]*|gate-a1:s[0-6]*)
+    if ! /bin/bash -c '. "$1/kit/lib.sh" "$2" >/dev/null && awake_ok' gx "$GM" "$RUN"; then
+      echo "STOPPED $n at $(t): the keep-awake is not running" >> "$G/log/runs.txt"
+      echo "STOP: the keep-awake is not running. Craig restarts it in his own window (/bin/bash ~/gpbmac/kit/awake.sh gate-a1), then this script is run; nothing ran."
+      exit 3
+    fi ;;
+esac
 echo "STARTED $n${*:+ $*} at $(t)" >> "$G/log/runs.txt"
 echo "=== $n${*:+ $*}, run $RUN, started $(t)" >> "$G/log/$n.txt"
 /bin/bash "$s" "$RUN" "$@" 2>&1 | /usr/bin/tee -a "$G/log/$n.txt"
@@ -919,15 +994,17 @@ printf '%s\n' "$RUN" > "$GM/run.txt" || exit 1
 echo "RUN STARTED: $RUN ($G) at $(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')"
 ```
 
-The keep-awake, which the runner starts at C.0 as a background command of its own and stops after
-7.0 (Question 7):
+The keep-awake, which **Craig types** at the end of C.0 in a Terminal window of his own and leaves
+open until 7.0, when he presses Ctrl-C in it (Question 7):
 
 ```bash
 # file: mac:kit/awake.sh
-# awake.sh gate-a1: the gate's keep-awake, from C.0 to 7.0. It records its own pid in the run
-# folder, then becomes /usr/bin/caffeinate -is -t 43200 under that pid (exec), so the pid is the
-# background command's $!. lib.sh's awake_ok checks that one process by that pid, never any other
-# caffeinate on the Mac. Usage:  /bin/bash ~/gpbmac/kit/awake.sh gate-a1
+# awake.sh gate-a1: the gate's keep-awake, from the end of C.0 to 7.0, run by Craig in a Terminal
+# window of his own (never a runner's background command, which a harness kills at its bound). It
+# records its own pid and start time in the run folder, then becomes /usr/bin/caffeinate -is
+# -t 172800 under that pid (exec): 48 hours, longer than the gate [inference]; Ctrl-C ends it.
+# lib.sh's awake_ok checks that one process by that pid, never any other caffeinate on the Mac.
+# Usage:  /bin/bash ~/gpbmac/kit/awake.sh gate-a1
 set -u
 case "${1:-}" in gate-a1) ;; *) echo "awake: gate-a1 only"; exit 2 ;; esac
 G="$HOME/gpbmac/$1"
@@ -938,8 +1015,9 @@ if [ -n "$old" ] && [ "$(/bin/ps -p "$old" -o comm= 2>/dev/null)" = /usr/bin/caf
 fi
 [ -z "$old" ] || echo "keep-awake: the earlier pid $old no longer runs caffeinate (recorded)"
 echo "$$" > "$G/caffeinate.pid" || exit 1
-echo "keep-awake: pid $$, /usr/bin/caffeinate -is -t 43200, from $(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')"
-exec /usr/bin/caffeinate -is -t 43200
+/bin/date -u '+%Y-%m-%dT%H:%M:%SZ' > "$G/caffeinate.started" || exit 1
+echo "keep-awake: pid $$, /usr/bin/caffeinate -is -t 172800, from $(/bin/cat "$G/caffeinate.started"); leave this window open until 7.0"
+exec /usr/bin/caffeinate -is -t 172800
 ```
 
 Step 6.3's sampler filter, which the sampler runs on each `ps` snapshot:
@@ -1067,8 +1145,11 @@ def now():
 
 
 def cli(args):
-    p = subprocess.run([os.environ.get("PD") or "proton-drive"] + args,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        p = subprocess.run([os.environ.get("PD") or "proton-drive"] + args,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        raise Blocked("no proton-drive to run (%s): no CLI is installed" % (os.environ.get("PD") or "proton-drive on PATH"))
     return (p.returncode, p.stdout.decode("utf-8", "surrogateescape"),
             p.stderr.decode("utf-8", "surrogateescape"))
 
@@ -1538,10 +1619,10 @@ def live_subtree(path):
 
 def c_trashgr():
     made = [x for x in (read_roots() or []) if x["name"] == "GitRemotes" and x["how"] == "created-by-2.0"]
-    top = live_named("/my-files", "GitRemotes")
     if not made:
         print("GitRemotes: this run did not create it (no created-by-2.0 record), so it stays")
         return 0
+    top = live_named("/my-files", "GitRemotes")
     if len(top) != 1 or top[0]["uid"] != made[0]["uid"]:
         print("GitRemotes: its live uid is not the recorded %s, so it is not trashed (STOP for Craig)" % made[0]["uid"])
         return 1
@@ -1569,58 +1650,88 @@ def c_trashgr():
     return 0 if code == 0 else 1
 
 
-def c_pushtree(samples, outlog):
-    # Step 6.3: from the sampler's lines ("HH:MM:SS pid pgid ppid command"), every recorded process
-    # of each scheduled push to proton-fail: the git push itself, every process in its process group,
-    # and every process that had one of those as its parent. Exit 0: a push the wrapper killed at its
-    # bound ("ran past" in the agent's out log) had a git-remote-proton or proton-drive process in its
-    # tree, and nothing of any push still runs. Exit 3: no such push, so (b) was not exercised.
-    # Exit 1: a process still runs, or the sampler saw no push.
-    killed = set(re.findall(r"gpb-v2-push: git push proton-fail (--all|--tags) ran past [^ ]+ and was killed",
-                            "\n".join(read_lines(outlog))))
+def c_pushtree(samples, outlog, errlog):
+    # Step 6.3, from the sampler's lines ("<epoch seconds> pid pgid ppid command", every sample of
+    # every pid kept) and the hang agent's two logs. A push is a git push to proton-fail the sampler
+    # saw. It must lead its own process group (the wrapper's set -m), or BLOCKED. Its tree is every
+    # process in that group and every descendant by parent, over all samples. A push the wrapper
+    # logs as killed at its bound counts as reaped only when its tree held a git-remote-proton or
+    # proton-drive process still seen within 0.5 s of the bound (counted from the push's first
+    # sample) or later, and the error log holds string 14 exactly once for each push that was not
+    # killed: a killed push's helper that still printed string 14 was not stopped by the kill.
+    # Exit 0: a push reaped so, and nothing of any push still runs. Exit 3: (b) not exercised (no
+    # push reaped so, or string 14 from a killed push). Exit 1: BLOCKED (no push seen, a push not
+    # leading its group, a process still running, or a push not killed that printed no string 14).
+    out = "\n".join(read_lines(outlog))
+    killed = set(re.findall(r"gpb-v2-push: git push proton-fail (--all|--tags) ran past [0-9]+s and was killed", out))
+    ended = set(re.findall(r"gpb-v2-push: git push proton-fail (--all|--tags): exit [0-9]+", out))
+    bounds = [int(b) for b in re.findall(r"gpb-v2-push: git push proton-fail --[a-z]+ ran past ([0-9]+)s and was killed", out)]
+    bound = max(bounds) if bounds else 0
+    n14 = len([l for l in read_lines(errlog) if l.startswith("git-remote-proton: parent folder ")])
     procs = {}
     for l in read_lines(samples):
         p = l.split(None, 4)
-        if len(p) == 5 and p[1].isdigit() and p[2].isdigit():
-            procs.setdefault(p[1], (p[2], p[3], p[4]))
-    roots = []
-    for pid, (g, pp, c) in procs.items():
-        m = re.search(r"(^|/)git -C [^ ]+ push proton-fail (--all|--tags)$", c)
-        if m:
-            roots.append((pid, m.group(2)))
+        if len(p) == 5 and re.match(r"^[0-9]+([.][0-9]+)?$", p[0]) and p[1].isdigit() and p[2].isdigit() and p[3].isdigit():
+            procs.setdefault(p[1], []).append((float(p[0]), p[2], p[3], p[4]))
+    root_re = r"(^|/)git -C [^ ]+ push proton-fail (--all|--tags)$"
+    tool_re = r"(^|/)(git-remote-proton|proton-drive)( |$)"
+    roots, blocked = [], []
+    for pid, ss in procs.items():
+        hits = [s for s in ss if re.search(root_re, s[3])]
+        if hits:
+            roots.append((pid, re.search(root_re, hits[0][3]).group(2), min(s[0] for s in hits)))
+            if any(s[1] != pid for s in hits):
+                blocked.append("the push %s (pid %s) did not lead a process group of its own under launchd" % (
+                    roots[-1][1], pid))
     alive, exercised = 0, False
-    for root, flag in sorted(roots, key=lambda x: int(x[0])):
-        group = procs[root][0]
+    for root, flag, t0 in sorted(roots, key=lambda x: int(x[0])):
         tree, grew = {root}, True
         while grew:
             grew = False
-            for pid, (g, pp, c) in procs.items():
-                if pid not in tree and (pp in tree or g == group):
+            for pid, ss in procs.items():
+                if pid not in tree and any(s[2] in tree or s[1] == root for s in ss):
                     tree.add(pid)
                     grew = True
-        tools = [q for q in tree if re.search(r"(^|/)(git-remote-proton|proton-drive)( |$)", procs[q][2])]
-        clis = [q for q in tools if re.search(r"(^|/)proton-drive( |$)", procs[q][2])]
+        tools = [q for q in tree if any(re.search(tool_re, s[3]) for s in procs[q])]
+        clis = [q for q in tools if any(re.search(r"(^|/)proton-drive( |$)", s[3]) for s in procs[q])]
+        last = max([max(s[0] for s in procs[q]) for q in tools] or [t0 - 1])
         was_killed = flag in killed
-        print("PUSH %s (pid %s, pgid %s): %s; %d process(es); helper or CLI seen: %d (the CLI itself: %d)" % (
-            flag, root, group, "killed at its bound" if was_killed else "ended inside its bound",
-            len(tree), len(tools), len(clis)))
+        at_bound = was_killed and bool(tools) and last >= t0 + bound - 0.5
+        print("PUSH %s (pid %s, its own group: %s): %s; %d process(es); helper or CLI seen: %d (the CLI itself: %d)" % (
+            flag, root, "yes" if all(s[1] == root for s in procs[root] if re.search(root_re, s[3])) else "NO",
+            "killed at its bound" if was_killed else "ended inside its bound", len(tree), len(tools), len(clis)))
+        if was_killed:
+            print("  helper or CLI last seen %+.2f s after the push's first sample (bound %d s; within 0.5 s counts): %s" % (
+                last - t0, bound, "ALIVE AT THE BOUND" if at_bound else "NOT ALIVE AT THE BOUND"))
         for pid in sorted(tree, key=int):
-            g, pp, c = procs[pid]
+            t, g, pp, c = procs[pid][-1]
             now_ = subprocess.run(["/bin/ps", "-p", pid, "-o", "pgid=,command="],
                                   stdout=subprocess.PIPE).stdout.decode("utf-8", "surrogateescape").strip()
             running = bool(now_) and now_.split(None, 1)[0] == g
             alive += 1 if running else 0
-            print("  pid %s pgid %s ppid %s%s %s  NOW: %s" % (pid, g, pp, "" if g == group else " (OTHER GROUP)",
-                                                           esc(c), ("RUNNING " + esc(now_)) if running else "gone"))
-        exercised = exercised or (was_killed and bool(tools))
+            print("  pid %s pgid %s ppid %s%s %s  (%d sample(s), last %+.2f s)  NOW: %s" % (
+                pid, g, pp, "" if g == root else " (OTHER GROUP)", esc(c), len(procs[pid]), t - t0,
+                ("RUNNING " + esc(now_)) if running else "gone"))
+        exercised = exercised or at_bound
+    want14 = len(ended) - len(killed & ended)
+    print("STRING 14: %d line(s) in %s; pushes ended: %d, killed at the bound: %d, so %d expected" % (
+        n14, os.path.basename(errlog), len(ended), len(killed & ended), want14))
     print("PUSH TREE: %d push root(s), %d still running; killed at the bound: %s" % (
         len(roots), alive, ", ".join(sorted(killed)) or "none"))
-    if not roots or alive:
+    for b in blocked:
+        print("BLOCKED: " + b)
+    if not roots or alive or blocked:
         return 1
-    if not exercised:
-        print("(b) NOT EXERCISED: no push killed at its bound had a git-remote-proton or proton-drive process in its tree")
+    if n14 < want14:
+        print("BLOCKED: a push that was not killed did not print string 14 (the missing-parent refusal)")
+        return 1
+    if n14 > want14:
+        print("(b) NOT EXERCISED: a push the wrapper logs as killed still printed string 14, so the kill did not stop its helper")
         return 3
-    print("(b) EXERCISED: a push killed at its bound had the helper or the CLI in its tree, and nothing is left")
+    if not exercised:
+        print("(b) NOT EXERCISED: no push killed at its bound had a git-remote-proton or proton-drive process alive at the bound")
+        return 3
+    print("(b) EXERCISED: a push killed at its bound had the helper or the CLI alive at the bound, it printed no string 14, and nothing is left")
     return 0
 
 
@@ -1690,7 +1801,7 @@ def c_readme(path, outdir, want_helper, want_cli):
 
 
 COMMANDS = {
-    "pushtree": (2, c_pushtree), "readme": (4, c_readme),
+    "pushtree": (3, c_pushtree), "readme": (4, c_readme),
     "names": (1, c_names), "info": (1, c_info), "absentnode": (1, c_absentnode),
     "esc": (1, c_esc), "expect": (2, c_expect), "absent": (2, c_absent), "helperlines": (1, c_helperlines),
     "refshow": (1, c_refshow), "refcmp": (2, c_refcmp), "relay": (1, c_relay),
@@ -1729,8 +1840,8 @@ session that made them.
 
 ## Part A: prep with no account, the v0.10.0 build (section 6, "Prep, before tagging, with no account")
 
-**When:** before the sign-in probe, and before the tag, so that a failure is found before any gate
-state is held (section 6).
+**When:** after the merge and the version's renaming, like Part B, and before the sign-in probe and
+the tag, so that a failure is found before any gate state is held (section 6).
 
 **What it is for.** Step 5.5 runs v0.10.0's helper on the Mac, and v0.10.0 shipped no macOS
 binary. Section 6 says to build it from a fresh clone of the `v0.10.0` tag with section 1's recipe
@@ -1747,8 +1858,8 @@ mkdir -p ~/gpbmac
 ```
 
 **Pass:** the fetch exits 0, the commit is printed (record it), and the extractor passes (see "The
-Mac's extractor"). The `RELAY value brief <blob>` line is kept for B.0, where the PC compares its
-own. If `~/gpbmac` already exists with a `v010-build` in it, A.1 BLOCKs.
+Mac's extractor"). B.0 fetches and extracts again and relays that blob, which the PC compares with
+its own. If `~/gpbmac` already exists with a `v010-build` in it, A.1 BLOCKs.
 
 **A.1 The build:** `/bin/bash ~/gpbmac/kit/gx.sh a1-v010-build` is not possible yet (no run is
 started), so this one script runs directly: `/bin/bash ~/gpbmac/scripts/a1-v010-build.sh`.
@@ -1824,9 +1935,13 @@ decision made on every path.
 
 ### B.0 Prep, on both machines
 
-**Mac:** start the probe's run, then the prep script.
+**Mac:** A.0's fetch and extraction again (so the Mac's blob is the one the PC extracts now), then
+the probe's run, then the prep script.
 
 ```bash
+/usr/bin/git -C ~/Projects/_Tools/git-proton-backup fetch origin
+/usr/bin/git -C ~/Projects/_Tools/git-proton-backup rev-parse refs/remotes/origin/main
+/usr/bin/python3 -I ~/gpbmac/extract.py refs/remotes/origin/main docs/research/gates/vNEXT-macos-gate-brief.md
 /bin/bash ~/gpbmac/kit/start-run.sh probe 1   # a re-run of the probe, on Craig's word only, takes 2
 /bin/bash ~/gpbmac/kit/gx.sh p0-prep
 ```
@@ -1854,9 +1969,11 @@ echo "probe CLI SHA-512:                                            $GOT"
 if xattr -p com.apple.quarantine "$CLI" >/dev/null 2>&1; then bad "the probe CLI carries com.apple.quarantine"; else echo "quarantine attribute on the probe CLI: none"; fi
 codesign -dv "$CLI" 2>&1 | grep -E '^(Identifier|Authority|TeamIdentifier)='
 echo "proton-drive on the probe PATH: [$(command -v proton-drive || true)]"
-[ -z "$(command -v proton-drive)" ] || bad "a proton-drive is on the probe's PATH"
+for x in "$HOME/.local/bin" /opt/homebrew/bin /usr/local/bin; do
+  for f in proton-drive git-remote-proton; do [ -e "$x/$f" ] && bad "$x/$f exists (C.3 and step 0 would refuse it later)"; done
+done
 m7 || bad "an M7 default folder exists"
-if kc_item; then bad "the CLI's Keychain item already exists"; else echo "Keychain item ch.proton.drive/drive-sdk-cli: absent"; fi
+kc_expect absent "the CLI's Keychain item already exists"
 echo "probe cache folder: $PROTON_DRIVE_CACHE_DIR, entries: [$(ls -A "$PROTON_DRIVE_CACHE_DIR")]"
 echo "variables inherited by a probe script: ${INHERITED:-none}"
 [ -z "$INHERITED" ] || bad "GPB_, PROTON_DRIVE_, GIT_CONFIG or object-placement GIT_ variables reach the scripts"
@@ -1864,7 +1981,9 @@ if [ "$fail" = 0 ]; then echo "PREP: PASS"; else echo "PREP: BLOCKED"; fi
 exit "$fail"
 ```
 
-`$M2` is `lib.sh`'s constant, M2's value from the spec. **Pass:** `RUN STARTED: probe-a1 ...`, then
+`$M2` is `lib.sh`'s constant, M2's value from the spec. **Pass:** the fetch exits 0, the commit is
+recorded, the extractor's `SELF-CHECK ... YES` and its `RELAY value brief <blob>` (relayed to the
+PC, whose W.B.0 blob must equal it), `RUN STARTED: probe-a1 ...`, then
 `PREP: PASS` and `EXIT p0-prep = 0`, which means:
 
 - the drift script on `origin/main` holds `$CertifiedMacArm64Sha512` equal to M2's value, and the
@@ -1872,8 +1991,41 @@ exit "$fail"
   STOP for Craig;
 - no quarantine attribute (M2: a `curl` download carries none), and `codesign` prints Proton's
   Developer ID (M3); record it;
-- no `proton-drive` on the probe's PATH, no M7 default folder, no Keychain item, an empty probe
-  cache folder, and no inherited variable.
+- no `proton-drive` on the probe's PATH, and neither `proton-drive` nor `git-remote-proton` in
+  `~/.local/bin`, `/opt/homebrew/bin` or `/usr/local/bin` (the probe's PATH holds none of them, so
+  it checks them by name); no M7 default folder, no Keychain item, an empty probe cache folder, and
+  no inherited variable.
+
+**The screen-lock reading's positive control** (no account):
+`/bin/bash ~/gpbmac/kit/gx.sh p0-lockcheck`. Step 6.1 judges a locked screen by `lib.sh`'s
+`locked`, whose key is measured absent on an unlocked screen and untested on a locked one; this
+tests it before the tag, so a
+reading that never works is found while the brief can still change. When the script says so,
+Craig locks the screen (Ctrl-Cmd-Q), waits about 30 seconds, and unlocks it.
+
+```bash
+# file: mac:scripts/p0-lockcheck.sh
+# B.0: the positive control for step 6's screen-lock reading (lib.sh's locked), with no account.
+# It reads the key every 5 s for 60 s while Craig locks the screen and unlocks it again.
+. "$HOME/gpbmac/kit/lib.sh" "$1" || exit 2
+echo "before (unlocked): $(locked)"
+echo "Craig: lock the screen now (Ctrl-Cmd-Q), wait about 30 s, then unlock it"
+seen=0
+for k in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  sleep 5; v=$(locked); echo "t+$((k * 5)) s: $v"
+  if [ "$v" = true ]; then seen=$((seen + 1)); fi
+done
+echo "after (unlocked again): $(locked)"
+echo "readings of true while locked: $seen of 12"
+if [ "$seen" -gt 0 ]; then echo "LOCK READING: WORKS"; exit 0; fi
+echo "LOCK READING: NEVER TRUE (STOP for Craig before the tag: step 6.1 needs another way to read the lock)"
+exit 3
+```
+
+**Pass:** `before (unlocked): no (key absent)` [measured 2026-10-27 on an unlocked screen],
+some readings `true` while Craig had the screen locked, `after ...: no (key absent)`, and `LOCK
+READING: WORKS`. `NEVER TRUE`: STOP for Craig before the tag; the brief's lock reading is
+revised first.
 
 **PC:** W.B.0, which extracts the brief on the PC and compares its blob with the Mac's. Then W.B.1
 and W.B.2.
@@ -1899,7 +2051,7 @@ stores that line:
 # B.3, first half: no Keychain item and none of M7's default folders, before any sign-in.
 . "$HOME/gpbmac/kit/lib.sh" "$1" || exit 2
 m7 || bad "an M7 default folder exists"
-if kc_item; then bad "the CLI's Keychain item exists before the sign-in"; else echo "Keychain item ch.proton.drive/drive-sdk-cli: absent"; fi
+kc_expect absent "the CLI's Keychain item exists before the sign-in"
 echo "probe cache folder entries: [$(ls -A "$PROTON_DRIVE_CACHE_DIR")]"
 [ -z "$(ls -A "$PROTON_DRIVE_CACHE_DIR")" ] || bad "the probe cache folder is not empty"
 if [ "$fail" = 0 ]; then echo "ASSERT: PASS (Craig may sign in)"; else echo "ASSERT: BLOCKED"; fi
@@ -1944,7 +2096,7 @@ uid=$(/usr/bin/python3 -I -c 'import json,sys; j=json.load(open(sys.argv[1])); p
 pc=$(kit getval pcroot)
 echo "Mac root uid: [$uid]   PC baseline uid: [$pc]"
 [ -n "$uid" ] && [ "$uid" = "$pc" ] || bad "the Mac's /my-files is not the folder the PC's baseline names"
-if kc_item; then echo "Keychain item ch.proton.drive/drive-sdk-cli: PRESENT"; else bad "no Keychain item after the sign-in"; fi
+kc_expect present "no Keychain item after the sign-in"
 echo "== the probe cache folder, every file"
 find "$PROTON_DRIVE_CACHE_DIR" -type f | sort | sed "s|^$PROTON_DRIVE_CACHE_DIR/|  |"
 [ -n "$(find "$PROTON_DRIVE_CACHE_DIR" -type f)" ] || bad "the probe cache folder holds no file"
@@ -1975,16 +2127,18 @@ echo "auth logout: exit $lrc"
 logged p6-after "$PD" filesystem info /my-files --json; prc=$rc
 echo "post-logout info: exit $prc (expected nonzero)"
 kit expect "$L" login-first || bad "the post-logout info did not say 'You need to login first'"
-if kc_item; then echo "KEYCHAIN ITEM REMAINS (Craig deletes it: see below)"; fail=1; else echo "Keychain item ch.proton.drive/drive-sdk-cli: gone"; fi
-if [ "$lrc" = 0 ] && [ "$prc" != 0 ] && ! kc_item; then echo "logged out, item gone, $(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$G/logout.state"; fi
+kc_expect absent "the Keychain item remains (Craig deletes it: see below)"
+if [ "$fail" = 0 ] && [ "$lrc" = 0 ] && [ "$prc" != 0 ]; then echo "logged out, item absent, $(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$G/logout.state"; echo "logout recorded"; else echo "no logout recorded (a check above failed)"; fi
 if [ "$fail" = 0 ]; then echo "STEP 6 (Mac): PASS"; else echo "STEP 6 (Mac): NOT CLEAN"; fi
 echo "HANDOFF -> PC: W.B.6"
 exit "$fail"
 ```
 
 **Pass:** `auth logout: exit 0` (record its output), the post-logout info nonzero with
-`EXPECT login-first: FOUND`, and `Keychain item ...: gone` (the Linux probe's step 6 shape
-[record `v0.10.0-linux-gate.md`]).
+`EXPECT login-first: FOUND`, `Keychain item ...: absent` and `logout recorded` (the Linux
+probe's step 6 shape [record `v0.10.0-linux-gate.md`]). `logout.state` is written only when every
+check passed; a Keychain query that fails (`KEYCHAIN QUERY FAILED`) is a failed check, never an
+absent item.
 
 **If the logout failed, or the item remains:** Craig deletes it locally, in his own Terminal
 (section 6 step 6), and the runner records that and re-runs the check. **Craig types:**
@@ -2006,13 +2160,27 @@ exit "$fail"
 . "$HOME/gpbmac/kit/lib.sh" "$1" || exit 2
 logged p6-recheck "${PD:-proton-drive}" filesystem info /my-files --json
 kit expect "$L" login-first || bad "the CLI still has a session"
-if kc_item; then bad "the Keychain item still exists"; else echo "Keychain item: gone"; fi
+kc_expect absent "the Keychain item still exists"
 if [ "$fail" = 0 ]; then echo "fallback delete (Craig), item gone, $(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$G/logout.state"; echo "RECHECK: PASS"; else echo "RECHECK: BLOCKED (STOP for Craig)"; fi
 exit "$fail"
 ```
 
 **If no sign-in ever completed at B.3:** the logout's output is recorded and not judged; Craig says
-so, and the runner writes `$G/logout.state` with his words and the time.
+so, and the runner runs `/bin/bash ~/gpbmac/kit/gx.sh p6-nosignin`, which checks that there is no
+session and no item and then records that, in fixed words.
+
+```bash
+# file: mac:scripts/p6-nosignin.sh
+# B.6, on Craig's word that no sign-in ever completed at B.3: the probe CLI has no session and the
+# Keychain item is absent; only then does logout.state record it.
+. "$HOME/gpbmac/kit/lib.sh" "$1" || exit 2
+if [ -s "$G/logout.state" ]; then echo "a logout is already recorded: $(cat "$G/logout.state")"; exit 0; fi
+logged p6-nosignin "$PD" filesystem info /my-files --json
+kit expect "$L" login-first || bad "the CLI has a session: this is not the no-sign-in case"
+kc_expect absent "the Keychain item exists: this is not the no-sign-in case"
+if [ "$fail" = 0 ]; then echo "no session: Craig reports that no sign-in completed at B.3; no session, item absent, $(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$G/logout.state"; echo "NO SIGN-IN: RECORDED"; else echo "NO SIGN-IN: BLOCKED (STOP for Craig)"; fi
+exit "$fail"
+```
 
 ### B.7 On the Mac: delete the probe folder; then the PC decides the unpause
 
@@ -2030,7 +2198,7 @@ rm -rf -- "$PROTON_DRIVE_CACHE_DIR"
 if [ -e "$PROTON_DRIVE_CACHE_DIR" ]; then echo "BLOCKED: $PROTON_DRIVE_CACHE_DIR still exists"; exit 1; fi
 echo "probe folder deleted"
 m7 || bad "an M7 default folder exists"
-if kc_item; then bad "the Keychain item exists"; fi
+kc_expect absent "the Keychain item exists"
 if [ "$fail" = 0 ]; then echo "STEP 7 (Mac): PASS"; else echo "STEP 7 (Mac): BLOCKED"; fi
 echo "HANDOFF -> PC: W.B.7"
 exit "$fail"
@@ -2072,11 +2240,19 @@ blobs are equal. From here on every script is the tag's. A brief blob that diffe
 probe's is recorded: the brief may have been revised between the probe and the tag, and the tag's
 governs.
 
-**Then the runner starts the keep-awake as a background command of its own,** `/bin/bash
-~/gpbmac/kit/awake.sh gate-a1` (Question 7), and keeps it until 7.0. It prints `keep-awake: pid
-<n>, ...`, records that pid in `~/gpbmac/gate-a1/caffeinate.pid` and becomes
-`/usr/bin/caffeinate -is -t 43200` under it, so `<n>` is the background command's `$!`. Step 0,
-6.0 and 6.1 check that one process by that pid (`awake_ok`).
+**Then Craig starts the keep-awake** (Question 7). **Craig types,** in a new Terminal window of his
+own, which he leaves open until 7.0:
+
+```bash
+/bin/bash ~/gpbmac/kit/awake.sh gate-a1
+```
+
+It prints `keep-awake: pid <n>, ...`, records that pid and its start time in `~/gpbmac/gate-a1/`
+and becomes `/usr/bin/caffeinate -is -t 172800` under that pid. It starts here, not earlier: the
+run folder it records into, and the tag's `awake.sh`, exist only once C.0 has run. From C.2 to step
+6, `gx.sh` starts no gate script while that pid is not running caffeinate (a STOP, exit 3:
+nothing ran; Craig runs the line again in his window, and the script is run). The runner never
+holds it: a background command is killed at the harness's bound.
 
 ### C.1 Pause the PC's tasks for the whole gate, and take the Windows baseline (W.C.1)
 
@@ -2098,11 +2274,11 @@ tagc=$(git -C "$MAIN" rev-parse --verify "$TAG^{commit}") || { echo "BLOCKED: no
 echo "tag commit: $tagc"
 if git -C "$MAIN" cat-file -e "$A^{commit}"; then echo "anchor present: yes"; else bad "the anchor commit is missing from the main checkout"; fi
 if git -C "$MAIN" merge-base --is-ancestor "$A" "$tagc"; then echo "anchor is an ancestor of the tag: yes"; else echo "anchor is an ancestor of the tag: no (recorded; a squash merge gives this, and the count below is what counts)"; fi
-changed=$(git -C "$MAIN" diff --name-only "$A" "$tagc" -- internal cmd go.mod go.sum scripts/macos .gitattributes .github/workflows/release.yml) || bad "git diff failed"
+changed=$(git -C "$MAIN" diff --name-only "$A" "$tagc" -- internal cmd go.mod go.sum scripts/macos scripts/Test-ProtonCliDrift.ps1 .gitattributes .github/workflows/release.yml) || bad "git diff failed"
 n=$(printf '%s\n' "$changed" | grep -c .)
 echo "files the brief quotes or relies on, changed between the anchor and the tag: $n"
 printf '%s\n' "$changed" | grep . | sed 's/^/  CHANGED SINCE THE ANCHOR: /'
-[ "$n" = 0 ] || bad "STOP for adjudication before any account write: the brief is re-anchored first"
+[ "$n" = 0 ] || bad "a file this brief quotes or relies on changed: Craig rules whether this tag's brief stands as written (Question 13)"
 echo "== the two documents the brief cites by step and rule (read, not counted; a change means re-reading what the brief cites)"
 git -C "$MAIN" diff --stat "$A" "$tagc" -- docs/releasing.md docs/research/gates/brief-checklist.md
 echo "== every other file changed since the anchor (recorded, not judged)"
@@ -2118,15 +2294,26 @@ else
   echo yes > "$G/v010-needs-uncertified"
   echo "CLI PIN MOVED SINCE v0.10.0: YES (step 5.5 runs v0.10.0's commands alone with GPB_UNCERTIFIED_CLI=1)"
 fi
-if [ "$fail" = 0 ]; then echo "C.2 (Mac): PASS"; else echo "C.2 (Mac): STOP"; fi
-exit "$fail"
+if [ "$fail" = 0 ]; then echo "C.2 (Mac): PASS"; exit 0; fi
+echo "C.2 (Mac): STOP before any account write; it holds, nothing cleaned, until Craig rules (Question 13)"
+exit 3
 ```
 
 **Pass:** `anchor present: yes`, `files the brief quotes or relies on, changed between the anchor
 and the tag: 0` (the count is what is judged), and `C.2 (Mac): PASS`. The count covers the code and
-the files whose text the brief quotes (the wrapper and plist under `scripts/macos`, the release
-workflow). **A listed file:** STOP for adjudication before any account write; this STOP runs step
-7, where only 7.6 and 7.8 have anything to do.
+the files whose text the brief quotes (the wrapper and plist under `scripts/macos`, the drift
+script's `$CertifiedMacArm64Sha512`, the release workflow).
+
+**A listed file, or any other failed check:** `C.2 (Mac): STOP` (exit 3), before any account write.
+It holds (Question 13): nothing is cleaned, and the PC's tasks stay paused, until Craig rules
+whether this tag's brief stands as written. It cannot be re-anchored: the gate runs the tag's
+brief (C.0), and tags never move (`docs/releasing.md`). If it stands, the gate goes on at C.3; if
+not, step 7 runs and the Mac gate is retried at a later release (the retry rule). Step 7 then has
+no CLI and no root record, and does this: 7.0 finds no writer; 7.1 prints `NO ROOT RECORD` and
+`GitRemotes: this run did not create it`; 7.2's listings print `BLOCKED: no proton-drive to run`
+and say why each comparison is skipped; 7.3 records `no session`; 7.4 deletes Part A's build; 7.5
+checks M7; 7.6 runs the Windows check; 7.7 deletes the empty cache folder; 7.8 decides the
+unpause.
 
 *Brief author's call:* `docs/releasing.md` and `brief-checklist.md` are not in the count, because
 the brief cites them by step and rule rather than quoting them. Their diff is printed, and a
@@ -2145,10 +2332,10 @@ macOS install lines with this brief's quote themselves.
 
 **The pin.** At the anchor the pin is v0.10.0's [measured 2026-10-28: no diff in `cli.go` from
 `v0.10.0` to `0faada8`], so `CLI PIN MOVED SINCE v0.10.0: no` is expected. A release that moved it would also change
-`internal/transport/cli.go`, which the count above lists, so this brief would be re-anchored
-first; the re-anchored brief keeps section 6's rule, which the script already carries: v0.10.0's
-helper refuses the new certified CLI, so its commands run with `GPB_UNCERTIFIED_CLI=1`, recorded
-as such [code `cmd/git-remote-proton/main.go:31` at `v0.10.0`; spec section 6, step 5.5].
+`internal/transport/cli.go`, which the count above lists, so C.2 would STOP for Craig's ruling
+(Question 13). The script already carries section 6's rule for that case: v0.10.0's helper
+refuses the new certified CLI, so its commands run with `GPB_UNCERTIFIED_CLI=1`, recorded as
+such [code `cmd/git-remote-proton/main.go:31` at `v0.10.0`; spec section 6, step 5.5].
 `GPB_UNCERTIFIED_CLI=1` is never set for the gated helper.
 
 ### C.3 Build and install with the README's own lines, read at the tag (Mac)
@@ -2292,7 +2479,7 @@ record (a sign-in URL stripped of its query string and fragment). Then the runne
 . "$HOME/gpbmac/kit/lib.sh" "$1" || exit 2
 proton-drive filesystem info /my-files --json > "$G/out/c4-info.json" 2> "$G/out/c4-info.err"; rc=$?
 echo "read-only info: exit $rc"; kit esc "$G/out/c4-info.err"; [ "$rc" = 0 ] || bad "the read-only info failed"
-if kc_item; then echo "Keychain item ch.proton.drive/drive-sdk-cli: PRESENT"; else bad "no Keychain item"; fi
+kc_expect present "no Keychain item"
 echo "== the gate cache folder"; find "$PROTON_DRIVE_CACHE_DIR" -type f | sort | sed "s|^$PROTON_DRIVE_CACHE_DIR/|  |"
 [ -n "$(find "$PROTON_DRIVE_CACHE_DIR" -type f)" ] || bad "the gate cache folder holds no file"
 m7 || bad "an M7 default folder exists"
@@ -2317,6 +2504,9 @@ probes found no trash enumeration; 0.9.0 listed zero rows from an emptied trash)
 `/trash` snapshot here is supplementary: one that fails or shows none of the gate's items is
 recorded, not BLOCKED.
 
+When C.3 to C.5 are done (the trash decided), the runner tells the PC session `HANDOFF -> PC: W.0`
+(row 12 of Part W's table).
+
 ---
 
 ## Part D: the gate (section 6, "Gate content", steps 0 to 7)
@@ -2333,8 +2523,11 @@ boundary, and the draft still a draft), then `HANDOFF -> MAC: step 0`. **Then th
 
 ```bash
 # file: mac:scripts/s0-pre.sh
-# Step 0: section 6's preconditions, and the rule 1 baseline.
+# Step 0: section 6's preconditions, and the rule 1 baseline. The git version comes first: another
+# git is a STOP before anything is read or recorded (Question 6).
 . "$HOME/gpbmac/kit/lib.sh" "$1" || exit 2
+echo "git: $(git --version)"
+if [ "$(git --version)" != "git version 2.54.0 (Apple Git-157)" ]; then echo "STOP for adjudication: the git is not the 2.54.0 this brief measured (nothing recorded)"; exit 3; fi
 have curl shasum xattr codesign security launchctl osascript pgrep caffeinate pmset plutil cksum od ioreg || bad "missing tool(s), named above"
 echo "variables inherited by a gate script: ${INHERITED:-none}"
 [ -z "$INHERITED" ] || bad "GPB_, PROTON_DRIVE_, GIT_CONFIG or object-placement GIT_ variables reach gate scripts"
@@ -2344,8 +2537,6 @@ type -a git-remote-proton proton-drive git
 [ "$(type -ap proton-drive)" = "$HOME/.local/bin/proton-drive" ] || bad "proton-drive does not resolve to exactly one path, the certified CLI"
 ep=$(git --exec-path); echo "git --exec-path: $ep"
 if ls "$ep" | grep -q '^git-remote-proton'; then ls -la "$ep"/git-remote-proton*; bad "a git-remote-proton sits in git's exec-path, which git searches before PATH"; fi
-echo "git: $(git --version)"
-[ "$(git --version)" = "git version 2.54.0 (Apple Git-157)" ] || bad "the git is not the 2.54.0 this brief measured: STOP for adjudication"
 GOT=$(shasum -a 512 < "$HOME/.local/bin/proton-drive" | cut -d' ' -f1)
 CONST=$(tr -d '\r' < "$SRC/scripts/Test-ProtonCliDrift.ps1" | grep -oE "^[$]CertifiedMacArm64Sha512[[:space:]]*=[[:space:]]*'[0-9a-f]{128}'[[:space:]]*$" | grep -oE '[0-9a-f]{128}')
 echo "installed CLI SHA-512:                     $GOT"
@@ -2371,13 +2562,13 @@ echo "Mac root uid: [$uid]   PC gate baseline uid: [$pc]"
 [ -n "$uid" ] && [ "$uid" = "$pc" ] || bad "the Mac's /my-files is not the folder the PC's baseline names"
 [ -n "$(find "$PROTON_DRIVE_CACHE_DIR" -type f)" ] || bad "the gate cache folder holds no file"
 m7 || bad "an M7 default folder exists"
-if kc_item; then echo "Keychain item: present"; else bad "no Keychain item"; fi
+kc_expect present "no Keychain item"
 curl -fsS -o /dev/null -w 'network: Proton feed HTTP %{http_code}\n' https://proton.me/download/drive/cli/version.json || bad "no network: the Proton feed did not answer"
 echo "== the tag's contract-test untouchables (six expected)"
 grep -E '^[[:space:]]+"(GitBackups|Sensitive Project Sources|Project Repo Bundles|ChatGPT Export Text Backup|Tax Documents|Archive)":[[:space:]]+true,' "$SRC/internal/transport/contract_test.go" | tee "$G/out/0-untouchables.txt"
 [ "$(wc -l < "$G/out/0-untouchables.txt" | tr -d ' ')" = 6 ] || bad "the tag's contract test does not list the six untouchables"
 echo "== power, recorded here and required at step 6: $(pmset -g batt | head -1)"
-awake_ok || bad "the keep-awake is not running (the runner starts it at C.0)"
+awake_ok || bad "the keep-awake is not running (Craig starts it at C.0)"
 kit absentnode "$ABSENT" || bad "the never-created parent of step 6 exists"
 kit roots-start || bad "the ownership record could not be started"
 kit snapshot myfiles-0 /my-files || bad "the /my-files baseline (rule 1)"
@@ -2399,8 +2590,10 @@ all of section 6's step 0 list.
   cli-drive@0.9.0+75612299)`).
 - `go version -m` shows the tag's commit as `vcs.revision` and `vcs.modified=false` (M27). Record
   the helper's SHA-256.
-- `git version 2.54.0 (Apple Git-157)`. Another version is recorded and is a STOP for adjudication
-  before any account write: M24, PM1 and R7 were measured on 2.54.0.
+- `git version 2.54.0 (Apple Git-157)`, the script's first check. Another version stops it at
+  once (exit 3, `STOP for adjudication ... (nothing recorded)`), before any account read, root
+  record or baseline: M24, PM1 and R7 were measured on 2.54.0. Whether step 0 then runs again is
+  Craig's call (the retry rule, Question 6).
 - The configuration list holds no `file:` origin outside `.git/config` (system and global are off).
 - The gate cache folder is in use (it holds the session's files) and M7's defaults are absent;
   this is re-checked after step 6 (6.5).
@@ -2568,7 +2761,6 @@ git -C smoke remote add proton-v2 "proton::$SMOKE" || exit 1
 echo "local main: $(git -C smoke rev-parse main)"
 logged 3a-push git -C smoke push -u proton-v2 main
 echo "push: exit $rc"; [ "$rc" = 0 ] || exit "$rc"
-d5_check "$L"
 kit helperlines "$L"
 kit roots-update || bad "the ownership record"
 exit "$fail"
@@ -2847,7 +3039,7 @@ helper, naming both and the relation, with no ref or pack written.** First the M
 # withheld N2.
 . "$HOME/gpbmac/kit/lib.sh" "$1" || exit 2
 logged 5-1-mac git -C nfd push proton-v2 "main:refs/heads/$NFD"
-echo "push main:<the NFD cafe>: exit $rc (expected 1: refused)"; [ "$rc" = 1 ] || bad "the push did not exit 1"
+echo "push main:<the NFD cafe>: exit $rc (expected 1: refused)"; [ "$rc" = 0 ] && unrefused "$NFDR" nfd-5-1-mac; [ "$rc" = 1 ] || bad "the push did not exit 1"
 kit expect "$L" nfd-create || bad "the refusal's text"
 kit helperlines "$L"
 echo "refs/heads (Mac view): $(kit names "$NFDR/refs/heads")"
@@ -2889,7 +3081,7 @@ exit "$fail"
 . "$HOME/gpbmac/kit/lib.sh" "$1" || exit 2
 . "$G/nfd-commits.sh"
 logged 5-2-mixed git -C nfd push proton-v2 main "main:refs/heads/$NFD"
-echo "push: exit $rc (expected 1: main lands, the NFD create is refused)"; [ "$rc" = 1 ] || bad "the push did not exit 1"
+echo "push: exit $rc (expected 1: main lands, the NFD create is refused)"; [ "$rc" = 0 ] && unrefused "$NFDR" nfd-5-2-mixed; [ "$rc" = 1 ] || bad "the push did not exit 1"
 kit expect "$L" nfd-create || bad "the refusal's text"
 git ls-remote "proton::$NFDR" > "$G/out/5-2-ls.txt" && kit esc "$G/out/5-2-ls.txt"
 grep -q "^$N2"$'\t'"refs/heads/main$" "$G/out/5-2-ls.txt" || bad "main is not at N2"
@@ -2921,13 +3113,13 @@ commit_in case c.txt 'case 2, withheld' 'case C2' || exit 1
 C2=$(git -C case rev-parse main); echo "C2 (local main, withheld): $C2"
 kit snapshot case-0 "$CASER" -r || exit 1
 logged 5-3-Main git -C case push proton-v2 main:refs/heads/Main
-echo "push main:refs/heads/Main: exit $rc (expected 1)"; [ "$rc" = 1 ] || bad "not refused"
+echo "push main:refs/heads/Main: exit $rc (expected 1)"; [ "$rc" = 0 ] && unrefused "$CASER" case-Main; [ "$rc" = 1 ] || bad "not refused"
 kit expect "$L" case-Main || bad "the refusal's text"
 echo "refs/heads (Mac view): $(kit names "$CASER/refs/heads")"
 kit snapshot case-1 "$CASER" -r || exit 1
 kit compare case-0 case-1 --none || bad "the refused create changed the remote"
 logged 5-3-mixed git -C case push proton-v2 main main:refs/heads/Main
-echo "mixed push: exit $rc (expected 1: main lands, Main is refused)"; [ "$rc" = 1 ] || bad "not 1"
+echo "mixed push: exit $rc (expected 1: main lands, Main is refused)"; [ "$rc" = 0 ] && unrefused "$CASER" case-mixed; [ "$rc" = 1 ] || bad "not 1"
 kit expect "$L" case-Main || bad "the refusal's text"
 kit snapshot case-2 "$CASER" -r || exit 1
 kit compare case-1 case-2
@@ -2949,7 +3141,7 @@ echo "push feat: exit $rc"; [ "$rc" = 0 ] || exit "$rc"
 kit snapshot case-3a "$CASER" -r || exit 1
 kit compare case-2 case-3a
 logged 5-3-Featx git -C case push proton-v2 main:refs/heads/Feat/x
-echo "push Feat/x: exit $rc (expected 1)"; [ "$rc" = 1 ] || bad "not refused"
+echo "push Feat/x: exit $rc (expected 1)"; [ "$rc" = 0 ] && unrefused "$CASER" case-Featx; [ "$rc" = 1 ] || bad "not refused"
 kit expect "$L" case-Featx || bad "the refusal's text"
 echo "refs/heads (Mac view): $(kit names "$CASER/refs/heads")"
 kit snapshot case-3b "$CASER" -r || exit 1
@@ -2975,7 +3167,7 @@ kit expect "$L" warn-case || bad "the pair warning"
 kit snapshot case-4b "$CASER" -r || exit 1
 kit compare case-4a case-4b
 logged 5-3-MAIN git -C case push proton-v2 main:refs/heads/MAIN
-echo "push MAIN: exit $rc (expected 1)"; [ "$rc" = 1 ] || bad "not refused"
+echo "push MAIN: exit $rc (expected 1)"; [ "$rc" = 0 ] && unrefused "$CASER" case-MAIN; [ "$rc" = 1 ] || bad "not refused"
 kit expect "$L" warn-case || bad "the pair warning"
 kit expect "$L" case-MAIN || bad "the refusal's text"
 echo "refs/heads (Mac view): $(kit names "$CASER/refs/heads")"
@@ -3026,7 +3218,9 @@ D="$G/nfd-upload"
 if [ -e "$D" ]; then echo "BLOCKED: $D already exists"; exit 1; fi
 mkdir "$D" && printf '%s\n' "$N2" > "$D/$NFD" || exit 1
 for f in "$D"/*; do echo "fixture name bytes: $(hexof "$(basename "$f")")"; done
-upload_one "$D/$NFD" "$NFDR/refs/heads" 5-4-upload || { echo "BLOCKED: the upload did not report exactly one item transferred"; exit 1; }
+upload_one "$D/$NFD" "$NFDR/refs/heads" 5-4-upload; u=$?
+if [ "$u" = 3 ]; then echo "refs/heads (Mac view): $(kit names "$NFDR/refs/heads")"; echo "STOP for Craig: the CLI skipped the NFD name as already present, so it matched it to the NFC member (it normalised the name [untested until now])"; exit 3; fi
+[ "$u" = 0 ] || { echo "BLOCKED: the upload did not report exactly one item transferred"; exit 1; }
 echo "refs/heads (Mac view): $(kit names "$NFDR/refs/heads")"
 kit snapshot nfd-4a "$NFDR" -r || exit 1
 kit compare nfd-2 nfd-4a
@@ -3038,7 +3232,7 @@ kit compare nfd-4a nfd-4b
 commit_in nfd n.txt 'nfd 3, withheld' 'nfd N3' || exit 1
 echo "N3 (local main, withheld): $(git -C nfd rev-parse main)"
 logged 5-4-third git -C nfd push proton-v2 "main:refs/heads/$CAP"
-echo "push main:<Cafe>: exit $rc (expected 1)"; [ "$rc" = 1 ] || bad "not refused"
+echo "push main:<Cafe>: exit $rc (expected 1)"; [ "$rc" = 0 ] && unrefused "$NFDR" nfd-third; [ "$rc" = 1 ] || bad "not refused"
 kit expect "$L" warn-nfd || bad "the pair warning"
 kit expect "$L" third-spelling || bad "the refusal's text"
 kit snapshot nfd-4c "$NFDR" -r || exit 1
@@ -3052,7 +3246,9 @@ exit "$fail"
   written, M12), `upload counts ... (1, 0, 0)`, `upload: exit 0`, and `refs/heads (Mac view):
   cafe<U+0301> caf<U+00E9> main`. **If the view shows no `cafe<U+0301>`**, the CLI normalised the
   name on the way up [untested]: STOP for Craig, since 5.5 to 5.7 and 5.9.1 then cannot run as
-  written. The comparison shows exactly `ADDED .../refs/heads/cafe<U+0301>`.
+  written. The likeliest form of that, `upload counts ... (0, 1, 0)` (skipped as already present),
+  makes the script print the view and stop with that STOP (exit 3); any other count is BLOCKED.
+  The comparison shows exactly `ADDED .../refs/heads/cafe<U+0301>`.
 - `side`: exit 0, `EXPECT warn-nfd: FOUND` (the pair, NFD first, both object IDs, both `%+q`
   forms, `by Unicode normalisation`), and exactly `ADDED .../refs/heads/side`. D2's ruling that a
   remote holding a pair still takes pushes to its other refs stands.
@@ -3297,7 +3493,7 @@ git -C mp1-clone switch -q "$NFC" && commit_in mp1-clone p.txt 'mp1 2, the NFC u
 M2C=$(git -C mp1-clone rev-parse HEAD); echo "M2 (the clone's NFC update, withheld): $M2C"
 printf 'M1=%s\nM2C=%s\n' "$M1" "$M2C" > "$G/mp1-commits.sh"
 logged 5-9-1-push git -C mp1-clone push proton-v2 "$NFC" side
-echo "push the NFC update and side: exit $rc (expected 1: the update refused, side lands)"; [ "$rc" = 1 ] || bad "not 1"
+echo "push the NFC update and side: exit $rc (expected 1: the update refused, side lands)"; [ "$rc" = 0 ] && unrefused "$MP1R" mp1; [ "$rc" = 1 ] || bad "not 1"
 kit expect "$L" warn-nfd || bad "the pair warning"
 kit expect "$L" mac-remote-half || bad "the refusal's text"
 git ls-remote "proton::$MP1R" > "$G/out/5-9-1-ls.txt" && kit esc "$G/out/5-9-1-ls.txt"
@@ -3326,7 +3522,7 @@ holding its stale NFC tracking ref: `gx.sh s5-9-2`.
 exact_bytes ren-clone
 refs_of ren-clone "$G/out/5-9-2-before.txt"
 logged 5-9-2-push git -C ren-clone push proton-v2 ":refs/heads/$NFD"
-echo "push the delete of the NFD cafe: exit $rc (expected 1: refused)"; [ "$rc" = 1 ] || bad "not refused"
+echo "push the delete of the NFD cafe: exit $rc (expected 1: refused)"; [ "$rc" = 0 ] && unrefused "$RENR" ren; [ "$rc" = 1 ] || bad "not refused"
 kit expect "$L" mac-part3 || bad "the refusal's text"
 refs_of ren-clone "$G/out/5-9-2-after.txt"
 if cmp -s "$G/out/5-9-2-before.txt" "$G/out/5-9-2-after.txt"; then echo "local refs: unchanged, byte for byte"; else bad "a local ref changed"; fi
@@ -3364,7 +3560,7 @@ commit_in mp3-clone q.txt 'mp3 2, withheld' 'mp3 P2' || exit 1
 git -C mp3-clone for-each-ref --format='%(objectname) %(refname)' > "$G/out/5-9-3-refs.txt"; kit esc "$G/out/5-9-3-refs.txt"
 kit snapshot mp3-1 "$MP3R" -r || exit 1
 logged 5-9-3-push git -C mp3-clone push proton-v2 "main:refs/heads/$NFD"
-echo "push the NFD create: exit $rc (expected 1: refused)"; [ "$rc" = 1 ] || bad "not refused"
+echo "push the NFD create: exit $rc (expected 1: refused)"; [ "$rc" = 0 ] && unrefused "$MP3R" mp3; [ "$rc" = 1 ] || bad "not refused"
 kit expect "$L" mac-local-half || bad "the refusal's text"
 kit snapshot mp3-2 "$MP3R" -r || exit 1
 kit compare mp3-1 mp3-2 --none || bad "the refused create changed the remote"
@@ -3472,7 +3668,7 @@ echo "local NFC cafe branch at: $(git -C r1-clone rev-parse "refs/heads/$NFC")  
 refs_of r1-clone "$G/out/5-11-before.txt"; kit esc "$G/out/5-11-before.txt"
 kit snapshot r1-1 "$R1R" -r || exit 1
 logged 5-11-push git -C r1-clone push --all proton-v2
-echo "push --all: exit $rc (expected nonzero: refused at list for-push)"; [ "$rc" != 0 ] || bad "the push was not refused"
+echo "push --all: exit $rc (expected nonzero: refused at list for-push)"; [ "$rc" = 0 ] && unrefused "$R1R" r1; [ "$rc" != 0 ] || bad "the push was not refused"
 kit expect "$L" push-r1 || bad "the refusal's text"
 refs_of r1-clone "$G/out/5-11-after.txt"
 if cmp -s "$G/out/5-11-before.txt" "$G/out/5-11-after.txt"; then echo "local refs: unchanged, byte for byte"; else bad "a local ref changed"; fi
@@ -3542,11 +3738,12 @@ succeeding agent, two failing agents fire for real, each by its `StartInterval`:
   fallback is `AbandonProcessGroup` set to true (the `abandon` agent), and the record says which
   configuration showed the banner.
 - **(b) the reaping.** The `hang` agent's pushes run past a 1-second bound, so the wrapper's
-  watchdog ends each push's process group, under real launchd, while the real CLI is running. A
-  sampler records the processes of the gate wrapper's process trees, nothing else, and afterwards
-  a push killed at its bound must have had the helper or the CLI in its tree, and none of it may
-  be left. The check is named exactly: `kit pushtree` on the sampler's lines and the agent's log,
-  then `strays 'proton-drive|git-remote-proton|gpb-v2-push'`, which prints the pid and program of
+  watchdog ends each push's process group, under real launchd, while the helper or the CLI is
+  running. A sampler records the processes of the gate wrapper's process trees, nothing else, and
+  afterwards a push killed at its bound must have led its own group and had the helper or the CLI
+  alive at the bound in its tree, its helper must not have printed string 14 (a kill that did not
+  land lets it finish), and none of it may be left. The check is named exactly: `kit pushtree` on
+  the sampler's lines and the agent's two logs, then `strays 'proton-drive|git-remote-proton|gpb-v2-push'`, which prints the pid and program of
   each process whose command line matches, and must print nothing. A run that never shows a
   killed push's helper or CLI is "(b) not exercised", a STOP for Craig, never a PASS
   (Question 4).
@@ -3567,7 +3764,11 @@ anyway, it exits with the parent refusal, not 124, and (b) is recorded as not ex
 produced on purpose; a real hang (a Keychain prompt) cannot be.
 
 **The gate's plist** is the README's example (`scripts/macos/gpb-v2-push.plist.example`) with
-section 4's two changes, the cache folder and the interval, and the gate's paths:
+section 4's two changes, the cache folder and the interval, and the gate's paths. It runs the
+tag's wrapper where the tag's clone holds it, not a copy installed in `~/.local/bin` as the README
+installs it: the sampler tells the gate's wrapper from Craig's own by its path, and the wrapper
+never reads its own path [code: no `$0` or `BASH_SOURCE` in `gpb-v2-push.sh`]. The README's
+install line and a plist in `~/Library/LaunchAgents` are listed under "Not covered live".
 
 - `StartInterval` 300 instead of the daily `StartCalendarInterval`;
 - `PROTON_DRIVE_CACHE_DIR` set to the gate cache folder, so that the CLI the wrapper starts uses
@@ -3590,7 +3791,7 @@ the failure marker stays at its default folder, `~/Library/Logs`, as the README'
 it, and 7.7 removes this gate's markers by name. `GPB_NOTIFY` is not set: the default notification
 is what is tested.
 
-**6.0 Ready.** The keep-awake the runner started at C.0 must still run, checked by its recorded
+**6.0 Ready.** The keep-awake Craig started at C.0 must still run, checked by its recorded
 pid, and Craig confirms the Mac is on mains power with its lid open, where `-s` takes effect. Then
 `gx.sh s6-0-ready`.
 
@@ -3602,7 +3803,7 @@ pid, and Craig confirms the Mac is on mains power with its lid open, where `-s` 
 if [ -e "$G/launchd" ] || [ -e ld ]; then echo "BLOCKED: $G/launchd or $G/ld already exists"; exit 1; fi
 P=$(pmset -g batt | head -1); echo "power: $P"
 case "$P" in *"'AC Power'"*) echo "mains power: yes" ;; *) bad "the Mac is not on mains power (section 6 step 6)" ;; esac
-if awake_ok; then pmset -g assertions | grep -E "pid $AWAKE_PID[(]caffeinate[)]"; else bad "the keep-awake is not running (the runner started it at C.0)"; fi
+if awake_ok; then pmset -g assertions | grep -E "pid $AWAKE_PID[(]caffeinate[)]"; else bad "the keep-awake is not running (Craig started it at C.0)"; fi
 mkdir -p "$G/launchd/logs" || exit 1
 for x in /opt/homebrew/bin/git /usr/local/bin/git; do [ -e "$x" ] && bad "$x exists: the wrapper's default GPB_PATH would run it, not the git step 0 checked"; done
 gate_repo ld && commit_in ld l.txt 'launchd 1' 'ld 1' || exit 1
@@ -3653,11 +3854,14 @@ mk abandon proton-fail '' yes || bad "the abandon plist"
 mk hang proton-fail 1 no || bad "the hang plist"
 for r in proton-v2 proton-fail; do
   s=$(printf '%s\n%s' "$LDREPO" "$r" | cksum | sed 's/ .*//')
-  m="$HOME/Library/Logs/gpb-v2-push.$s.failed"; printf '%s\n' "$m" > "$G/launchd/marker-$r.txt"
-  if [ -e "$m" ]; then bad "a marker already exists: $m"; else echo "marker for $r (absent now): $m"; fi
+  m="$HOME/Library/Logs/gpb-v2-push.$s.failed"
+  if [ -e "$m" ]; then bad "a marker already exists: $m (not recorded, so 7.7 never removes it)"
+  else printf '%s\n' "$m" > "$G/launchd/marker-$r.txt"; echo "marker for $r (absent now, recorded): $m"; fi
 done
 echo "== the README example's keys, for the record"; plutil -p "$SRC/scripts/macos/gpb-v2-push.plist.example"
 echo "== the ok plist"; plutil -p "$G/launchd/ok.plist"
+echo "== Craig's global git configuration, key names only, which step 6's runs use (Question 5)"
+env -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_NOSYSTEM git config --global --name-only --list | sort -u
 kit absentnode "$ABSENT" || bad "the never-created parent exists"
 for n in ok fail abandon hang; do launchctl print "gui/$(id -u)/gpbmac.$RUN.$n" >/dev/null 2>&1 && bad "gpbmac.$RUN.$n is already loaded"; done
 if [ "$fail" = 0 ]; then echo "6.0: READY"; else echo "6.0: BLOCKED"; fi
@@ -3679,13 +3883,32 @@ script ends.
 ```bash
 # file: mac:scripts/s6-1-ok.sh
 # Step 6.1: the ok agent, fired by its 300 s StartInterval with the screen locked; both pushes
-# succeed; then the remote's ref set equals the repository's branches and tags.
+# succeed; then the remote's ref set equals the repository's branches and tags. "gx.sh s6-1-ok
+# refire" (on Craig's word, 6.1's re-fire) first commits on ld's main and makes one new branch,
+# so the re-fire has something to push.
 . "$HOME/gpbmac/kit/lib.sh" "$1" || exit 2
 LDREPO=$(cat "$G/launchd/repo.txt"); export LDREPO
+mode="${2:-first}"
+case "$mode" in first|refire) ;; *) echo "BLOCKED: mode $mode (first or refire)"; exit 1 ;; esac
 awake_ok || { echo "BLOCKED: the keep-awake is not running"; exit 1; }
+if [ "$mode" = refire ]; then
+  [ -e "$G/launchd/logs/ok.out.log" ] || { echo "BLOCKED: no earlier ok firing to re-fire after"; exit 1; }
+  k=1; while git -C ld rev-parse -q --verify "refs/heads/topic-ld-r$k" >/dev/null; do k=$((k + 1)); done
+  b="topic-ld-r$k"
+  commit_in ld l.txt "launchd re-fire $k" "ld re-fire $k" && git -C ld branch "$b" || exit 1
+  echo "re-fire $k: main now at $(git -C ld rev-parse main); new branch $b"
+fi
 echo "waiting 60 s for Craig to lock the screen"; sleep 60
 fire ok 1800 || { echo "BLOCKED: section 6 step 6's bound (two intervals to fire, 30 minutes to finish)"; exit 1; }
 kit expect "$G/launchd/logs/ok.out.log" wrapper-ok || bad "the wrapper did not log both pushes succeeding"
+e="$G/launchd/logs/ok.err.log"
+if [ "$mode" = first ]; then
+  for r in main topic-ld; do grep -qE "[[]new branch[]] +$r -> $r" "$e" || bad "no [new branch] line for $r"; done
+  grep -qE '[[]new tag[]] +ld-v1 -> ld-v1' "$e" || bad "no [new tag] line for ld-v1"
+else
+  grep -qE '^ +[0-9a-f]+[.][.][0-9a-f]+ +main -> main' "$e" || bad "no fast-forward line for main"
+  grep -qE "[[]new branch[]] +$b -> $b" "$e" || bad "no [new branch] line for $b"
+fi
 kit helperlines "$G/launchd/logs/ok.err.log"
 d5_check "$G/launchd/logs/ok.err.log"
 m=$(cat "$G/launchd/marker-proton-v2.txt"); if [ -e "$m" ]; then bad "the succeeding run left a marker"; else echo "marker for proton-v2: absent"; fi
@@ -3707,26 +3930,32 @@ exit "$fail"
 - `FIRED <n> s after the bootstrap` with `n` at most 600 (the firing came from the schedule: the
   script never kickstarts it), and the screen-lock lines read `true` at the bootstrap and at the
   firing. A `no (key absent)` there means the screen was not locked [measured 2026-10-27: the key
-  is absent on an unlocked screen; its presence when locked is untested]: recorded, and Craig
-  decides whether 6.1 is re-fired with the screen locked.
-- The run ended within 30 minutes; `launchctl print` shows `last exit code = 0`; the bootout
-  exits 0.
+  is absent on an unlocked screen; B.0's positive control reads it on a locked one]: recorded, and
+  Craig decides whether 6.1 is re-fired with the screen locked, by `gx.sh s6-1-ok refire`, which
+  gives the re-fire a new commit on `main` and a new branch to push.
+- The run ended within 30 minutes; `launchctl print` shows `last exit code = 0` and `runs = 1`;
+  the bootout exits 0. `runs = 2` (a second firing before the bootout) is recorded, and adds two
+  `.lock` files to the tally.
 - `EXPECT wrapper-ok: FOUND` (both pushes exit 0 and the `done:` line, the repository named by its
   physical path); the error log holds git's `[new branch]` lines for `main` and `topic-ld` and
-  `[new tag]` for `ld-v1`, no `git-remote-proton:` line, and neither D5 warning (a first "could not
-  check" is recorded, `d5_check`); no marker.
-- `REFSET ld-6-local == ld-6-remote: EQUAL (3 ref(s))`: the remote holds exactly the repository's
-  branches and tags, so a push that sent less than everything cannot pass.
+  `[new tag]` for `ld-v1` (on a re-fire: a fast-forward line for `main` and one `[new branch]` line
+  for its `topic-ld-r<k>`), each checked by the script; no `git-remote-proton:` line, and neither
+  D5 warning (a first "could not check" is recorded, `d5_check`); no marker.
+- `REFSET ld-6-local == ld-6-remote: EQUAL (3 ref(s))`, one more for each re-fire's branch: the
+  remote holds exactly the repository's branches and tags, so a push that sent less than
+  everything cannot pass.
 - The gate cache folder holds files the scheduled run wrote, and M7's defaults are absent.
 - `RECORDED: .../vNEXT-mac-launchd-a1`.
 - **Craig's report**, recorded verbatim: no Keychain prompt and no other dialog on the screen when
   he unlocked it. A prompt is BLOCKED.
 
 `NOT FIRED` or `NOT FINISHED`: BLOCKED, the agent already booted out by `fire`. A second firing
-cannot start: `fire` boots the agent out within about a minute of its run ending, well inside the
-next 300 s interval; a run longer than 300 s makes launchd skip the firings it overlaps
-(`launchd.plist(5)`: "If the job is running during an interval firing, that interval firing will
-likewise be missed") [doc]. Each further firing would add two `.lock` files to the tally.
+can start before the bootout: the interval counts from the bootstrap (`launchd.plist(5)`: the
+key "causes the job to be started every N seconds") [doc], and `fire` boots the agent out up to
+about a minute after its run ends, so a run that ends near a 300 s boundary can be followed by
+another firing; a run longer than 300 s makes launchd skip the firings it overlaps ("If the job is
+running during an interval firing, that interval firing will likewise be missed") [doc]. `fire`
+prints `runs =` just before the bootout; each firing adds two `.lock` files to the tally.
 
 **6.2 A failing agent: the banner, and the permission.** Craig unlocks the screen and watches it;
 the runner runs `gx.sh s6-2-fail` in the background.
@@ -3740,12 +3969,13 @@ LDREPO=$(cat "$G/launchd/repo.txt"); export LDREPO
 agent="${2:-fail}"
 case "$agent" in fail|abandon) ;; *) echo "BLOCKED: agent $agent"; exit 1 ;; esac
 echo "agent: $agent; screen locked now: $(locked) (Craig watches an unlocked screen)"
-fire "$agent" 600 || { echo "BLOCKED: the $agent agent did not fire or end in time"; exit 1; }
+fire "$agent" 600 30 || { echo "BLOCKED: the $agent agent did not fire or end in time"; exit 1; }
 o="$G/launchd/logs/$agent.out.log"; e="$G/launchd/logs/$agent.err.log"
 grep -E 'gpb-v2-push: git push proton-fail --(all|tags): exit [1-9]' "$o" || bad "the wrapper did not log two failed pushes"
 kit expect "$e" parent-absent || bad "the helper's missing-parent refusal"
 m=$(cat "$G/launchd/marker-proton-fail.txt")
 if [ -f "$m" ]; then echo "== the marker $m"; kit esc "$m"; cp "$m" "$G/launchd/marker-after-$agent.txt"; else bad "no marker at $m"; fi
+if [ "$m" -nt "$G/launchd/$agent.stamp" ]; then echo "marker written by this firing: yes"; else bad "the marker was not written by this firing"; fi
 grep -q '^failed: git push proton-fail --all (exit ' "$m" && grep -q '^failed: git push proton-fail --tags (exit ' "$m" || bad "the marker does not name both failed pushes"
 kit absentnode "$ABSENT" || bad "the missing parent exists now"
 echo "Craig: did a banner from git-proton-backup appear, with what text? Did macOS ask to allow notifications? Is it in Notification Center?"
@@ -3755,8 +3985,11 @@ exit "$fail"
 
 **Pass (the run):** the agent fired within 600 s and ended; the out log shows both pushes failing
 with a nonzero code (`launchctl print` shows the wrapper's `last exit code`, the first push's
-code); `EXPECT parent-absent: FOUND` in the error log (string 14); the marker names the
-repository, the remote and both failed pushes; the missing parent is still absent.
+code); `EXPECT parent-absent: FOUND` in the error log (string 14); `marker written by this firing:
+yes` (a re-run cannot pass on an earlier run's marker), and the marker names the repository, the
+remote and both failed pushes; the missing parent is still absent. `fire` waits 30 s after the run
+has ended before the bootout, so a notification the run started is not cut short by it
+[inference: untested whether a bootout reaches `osascript`'s own group].
 
 **Craig's observations, recorded verbatim (a, c):** whether a banner titled `git-proton-backup`
 appeared, and its text (expected: `git-proton-backup: push failed for <repository> (proton-fail).
@@ -3787,16 +4020,32 @@ process group one of those leads. The wrapper starts each push and its watchdog 
 each in a group of its own [code `gpb-v2-push.sh:184-196`], so a push's helper and CLI are
 followed by parent and by group, under any program name, and a process whose parent has died is
 still followed through its group while anything of the firing runs. The filter runs before
-anything is written.
+anything is written. Each sample carries its time to a hundredth of a second, and every sample of
+every process is kept.
+
+**What tells a kill that landed from one that did not.** The wrapper logs `ran past 1s and was
+killed`, and exit 124, whenever its watchdog's timer ran out, whatever the group kill then did,
+and its timing is the same either way [code `gpb-v2-push.sh:186-210`]. The helper has no signal
+handling, so a kill that lands stops it before it can print string 14; a kill that does not land
+lets it finish, printing string 14 [inference from the code: no `signal.` use in `main.go` or
+`cli.go`]. So `kit pushtree` counts a killed push as reaped only when all of these hold: the push
+leads its own process group (the watchdog's kill is a group kill, so a push that does not is
+BLOCKED); its tree held the helper or the CLI, still seen within 0.5 s of the bound, counted from
+the push's first sample, or later; and the error log holds string 14 exactly once for each push
+that was not killed, none for a killed one. A killed push whose helper still printed string 14 is
+"(b) not exercised": the kill did not stop it.
 
 ```bash
 # file: mac:scripts/s6-sampler.sh
-# Step 6.3's sampler: five times a second, the pid, pgid, ppid and command of each process in the
-# gate wrapper's process trees (kit/tree.awk), and of no other process; the filter runs before
-# anything is written. The groups tree members lead are remembered while anything of the trees
-# runs, and forgotten once nothing does. It stops when 6.3 leaves its stop file, or after two hours.
+# Step 6.3's sampler: five times a second, the time (epoch seconds, to 0.01 s), pid, pgid, ppid and
+# command of each process in the gate wrapper's process trees (kit/tree.awk), and of no other
+# process; the filter runs before anything is written. The groups tree members lead are
+# remembered while anything of the trees runs, and forgotten once nothing does. An earlier
+# firing's samples are moved aside first. It stops when 6.3 leaves its stop file, or after two hours.
 . "$HOME/gpbmac/kit/lib.sh" "$1" || exit 2
 S="$G/launchd/samples.txt"; K="$G/launchd/sample-groups.txt"; W="$SRC/scripts/macos/gpb-v2-push.sh"
+for k in 1 2 3 4 5 6 7 8 9; do [ -e "$S.$k" ] || break; done
+if [ -e "$S" ]; then mv "$S" "$S.$k" && echo "an earlier firing's samples moved aside: $S.$k"; fi
 rm -f "$G/launchd/stop-sampler"; : > "$K"
 end=$(( $(/bin/date +%s) + 7200 ))
 echo "sampler started; writing $S; following $W"
@@ -3804,7 +4053,7 @@ while [ ! -e "$G/launchd/stop-sampler" ] && [ "$(/bin/date +%s)" -lt "$end" ]; d
   : > "$K.new"
   /bin/ps -axo pid=,pgid=,ppid=,command= | TREE_WRAP="$W" /usr/bin/awk -v known="$(/usr/bin/tr '\n' ' ' < "$K")" -v pgout="$K.new" -f "$HOME/gpbmac/kit/tree.awk" > "$G/launchd/sample.tmp" || { echo "BLOCKED: tree.awk failed"; exit 1; }
   if [ -s "$G/launchd/sample.tmp" ]; then
-    t=$(/bin/date +%H:%M:%S)
+    t=$(/usr/bin/perl -MTime::HiRes=time -e 'printf "%.2f", time')
     /usr/bin/sed "s/^ */$t /" "$G/launchd/sample.tmp" >> "$S"
     /usr/bin/sort -u "$K" "$K.new" > "$K.tmp" && mv "$K.tmp" "$K"
   else
@@ -3812,33 +4061,35 @@ while [ ! -e "$G/launchd/stop-sampler" ] && [ "$(/bin/date +%s)" -lt "$end" ]; d
   fi
   sleep 0.2
 done
-rm -f "$K.new" "$K.tmp" "$G/launchd/sample.tmp"
+rm -f "$K" "$K.new" "$K.tmp" "$G/launchd/sample.tmp"
 if [ -f "$S" ]; then echo "sampler stopped: $(wc -l < "$S" | tr -d ' ') line(s)"; else echo "sampler stopped: 0 line(s), nothing of a gate wrapper seen"; fi
 ```
 
 ```bash
 # file: mac:scripts/s6-3-hang.sh
 # Step 6.3: the hang agent's pushes run past a 1 s bound, and the wrapper's watchdog ends each
-# push's process group under real launchd. PASS needs a push killed at its bound whose tree held
-# the helper or the CLI, and nothing of any push still running. A run that never shows that is
-# (b) not exercised: a STOP for Craig (exit 3), never a PASS.
+# push's process group under real launchd. PASS needs a push killed at its bound, leading its own
+# group, whose tree held the helper or the CLI alive at the bound, with no string 14 from it (the
+# kill stopped it), and nothing of any push still running. A run that never shows that is (b) not
+# exercised: a STOP for Craig (exit 3), never a PASS.
 . "$HOME/gpbmac/kit/lib.sh" "$1" || exit 2
 LDREPO=$(cat "$G/launchd/repo.txt"); export LDREPO
 pgrep -f 's6-sampler[.]sh' >/dev/null || { echo "BLOCKED: the sampler is not running"; exit 1; }
 fire hang 600 || { echo "BLOCKED: the hang agent did not fire or end in time"; exit 1; }
 sleep 15; : > "$G/launchd/stop-sampler"; sleep 2
-o="$G/launchd/logs/hang.out.log"
+o="$G/launchd/logs/hang.out.log"; e="$G/launchd/logs/hang.err.log"
 grep -E 'gpb-v2-push: git push proton-fail --(all|tags)( ran past|: exit)' "$o"
 killed=$(grep -c 'gpb-v2-push: git push proton-fail --[a-z]* ran past 1s and was killed' "$o")
 echo "pushes killed at their bound: $killed"
-kit expect "$o" wrapper-expired || echo "(recorded) the --all push was not killed at its bound"
-kit expect "$o" wrapper-124 || echo "(recorded) the --all push did not count as exit 124"
+echo "the --all push: 'ran past' lines $(grep -c 'gpb-v2-push: git push proton-fail --all ran past 1s and was killed' "$o"), 'exit 124' lines $(grep -c 'gpb-v2-push: git push proton-fail --all: exit 124' "$o") (recorded)"
+echo "string 14 lines in hang.err.log: $(grep -c '^git-remote-proton: parent folder ' "$e") (one for each push not killed, none from a killed push; kit pushtree judges)"
 m=$(cat "$G/launchd/marker-proton-fail.txt"); echo "== the marker"; kit esc "$m"
+if [ "$m" -nt "$G/launchd/hang.stamp" ]; then echo "marker written by this firing: yes"; else bad "the marker was not written by this firing"; fi
 if [ "$killed" -gt 0 ]; then kit expect "$m" marker-lock || bad "a push was killed, and the marker lacks the killed-push sentence"; fi
 echo "== every recorded process of the two pushes"
-kit pushtree "$G/launchd/samples.txt" "$o"; t=$?
+kit pushtree "$G/launchd/samples.txt" "$o" "$e"; t=$?
 notex=0
-case "$t" in 0) ;; 3) notex=1 ;; *) bad "a process of a push is still running, or the sampler saw no push" ;; esac
+case "$t" in 0) ;; 3) notex=1 ;; *) bad "kit pushtree BLOCKED (its lines above say why)" ;; esac
 echo "== stray processes now (pid and program of each command line matching proton-drive|git-remote-proton|gpb-v2-push): none expected"
 if strays 'proton-drive|git-remote-proton|gpb-v2-push'; then bad "a stray process is running"; else echo "(none)"; fi
 kit absentnode "$ABSENT" || bad "the missing parent exists now"
@@ -3851,28 +4102,37 @@ echo "6.3: PASS"
 
 - At least one push killed at its bound (`pushes killed at their bound:` 1 or 2; the wrapper logs
   `ran past 1s and was killed` and exit 124 for it [code `gpb-v2-push.sh:198-210`]), and `kit
-  pushtree` showing, for such a push, `helper or CLI seen:` 1 or more, then `(b) EXERCISED`: the
-  push's tree held a `git-remote-proton` or `proton-drive` process, and it is gone. Record every
-  line, and record whether `the CLI itself` was among them (a `proton-drive` process).
-- `PUSH TREE: <n> push root(s), 0 still running`, with n 1 or 2: the `--all` push, and the
-  `--tags` push when the sampler saw it; `kit pushtree` needs at least one. A process of a tree in
-  another process group is marked `(OTHER GROUP)`: a finding to record even when it is gone; one
-  still running is BLOCKED.
-- With a push killed, `EXPECT marker-lock: FOUND` [code `gpb-v2-push.sh:221`]. No lock can be left
-  here (the pushes take none), so the sentence's case does not arise; it is checked for its text.
+  pushtree` showing, for such a push, `its own group: yes`, `helper or CLI seen:` 1 or more and
+  `ALIVE AT THE BOUND`. Record every line, and record whether `the CLI itself` was among them (a
+  `proton-drive` process).
+- `STRING 14: <n> line(s) in hang.err.log; pushes ended: 2, killed at the bound: <k>, so <2-k>
+  expected`, with n equal to 2 - k, as the script's own `string 14 lines` count shows. More means
+  a killed push's helper still refused, so the kill did not stop it: `(b) NOT EXERCISED`. Fewer
+  means a push that was not killed ended without the missing-parent refusal: BLOCKED.
+- Then `(b) EXERCISED`, and `PUSH TREE: <n> push root(s), 0 still running`, with n 1 or 2: the
+  `--all` push, and the `--tags` push when the sampler saw it; `kit pushtree` needs at least one.
+  A process of a tree in another process group is marked `(OTHER GROUP)`: a finding to record
+  even when it is gone; one still running is BLOCKED. A push that does not lead its own group is
+  BLOCKED.
+- `marker written by this firing: yes`, and with a push killed, `EXPECT marker-lock: FOUND` [code
+  `gpb-v2-push.sh:221`]. No lock can be left here (the pushes take none), so the sentence's case
+  does not arise; it is checked for its text.
 - `strays` prints nothing, then `(none)`: no stray `proton-drive`, `git-remote-proton` or wrapper
   process.
 - Craig reports whether a second banner appeared (recorded).
 
 **(b) not exercised.** A push that ends inside its bound exits nonzero with string 14; that is not a
-BLOCK, and `wrapper-expired` and `wrapper-124` for the `--all` push are recorded either way. But
-when no push was killed at its bound with the helper or the CLI in its tree, the script ends `6.3:
-(b) NOT EXERCISED: STOP for Craig` (exit 3), never PASS, and Craig decides whether 6.3 is fired
-again (Question 4).
+BLOCK, and the `--all` push's `ran past` and `exit 124` counts are recorded either way. But when
+no push was reaped as above, the script ends `6.3: (b) NOT EXERCISED: STOP for Craig` (exit 3),
+never PASS, and Craig decides whether 6.3 is fired again (Question 4). A re-firing is judged on
+its own evidence alone: the sampler moves the earlier samples aside (`samples.txt.<k>`), `fire`
+moves the earlier logs aside, and the marker must be newer than this firing's stamp.
 
-**6.4 The launchd step's `.lock` count.** The `ok` agent's firing made two lock sessions, `--all`
-and `--tags`; the failing agents made none. A second `ok` firing, which `runs = 2` in its
-`launchctl print` lines would show, adds two.
+**6.4 The launchd step's `.lock` count.** Each `ok` firing made two lock sessions, `--all` and
+`--tags`: the first, any re-fire (`s6-1-ok refire`), and any second firing a `runs = 2` line shows.
+Count them from `fire`'s `FIRED` lines in `log/s6-1-ok.txt` and its `runs =` lines. The failing
+agents made none. A re-fire is a fresh bootstrap after a bootout, so its `runs` counts from 1 again
+[inference].
 
 **6.5 Step 0's re-check, after step 6:** `gx.sh s6-5-after`.
 
@@ -3916,7 +4176,7 @@ runner goes on to the next, except that nothing is trashed or deleted while a wr
 | 7.0 writers | always | none |
 | 7.1 trash | `roots.tsv` exists (step 0's checks passed), and each root passes `vet` and its uid check | `NO ROOT RECORD`, `NOT RECORDED`, `ALREADY GONE` or `NOT TRASHED` |
 | 7.2 row set and tally | always lists; compares only against a baseline that exists | each missing comparison says why |
-| 7.3 logout | the gate run's `env.sh` exists and the CLI is installed | `7.3 SKIPPED` |
+| 7.3 logout | always; with no CLI installed, or no sign-in ever completed, it records `no session` after checking there is none | no record (a check failed): B.6's fallback |
 | 7.4 v0.10.0 build, 7.5 M7 | always | none |
 | 7.6 Windows check | always (W.7.6) | none |
 | 7.7 cache folder and markers | 7.3 recorded a logout | `7.7 KEPT`, and the PC's tasks stay paused until a logout is recorded |
@@ -3933,21 +4193,23 @@ for n in ok fail abandon hang; do
   if launchctl print "gui/$(id -u)/gpbmac.$RUN.$n" >/dev/null 2>&1; then launchctl bootout "gui/$(id -u)/gpbmac.$RUN.$n"; echo "booted out gpbmac.$RUN.$n: exit $?"; else echo "gpbmac.$RUN.$n: not loaded"; fi
 done
 if [ -d "$G/launchd" ]; then : > "$G/launchd/stop-sampler"; fi
-WP='proton-drive|git-remote-proton|gpb-v2-push|git( -C [^ ]+)? (push|fetch|clone) '
+WP='proton-drive|git-remote-proton|gpb-v2-push|git( -C [^ ]+)? (push|fetch|clone) |[.]test( |$)'
 for k in 1 2 3 4 5 6 7 8 9 10 11 12; do
   strays "$WP" >/dev/null || break
   echo "waiting for a writer to finish (check $k of 12):"; strays "$WP"; sleep 10
 done
 if strays "$WP"; then echo "MAC WRITERS: RUNNING (wait, then run 7.0 again; trash and delete nothing meanwhile)"; exit 1; fi
 echo "MAC WRITERS: NONE"
+echo "HANDOFF -> PC: W.7.0"
 ```
 
 **Pass:** `MAC WRITERS: NONE`, and W.7.0's `WINDOWS WRITERS: NONE`. Neither: wait and run 7.0
 again; nothing is trashed or deleted meanwhile. A writer is listed by pid and program only.
-Then the runner stops its keep-awake background command (held since C.0) and checks that one pid:
-`/bin/ps -p "$(/bin/cat ~/gpbmac/gate-a1/caffeinate.pid)" -o pid=,comm=; echo "ps: exit $?"`. It
-must print only `ps: exit 1`. A line naming `/usr/bin/caffeinate` means the stop reached only the
-command's outer shell: the runner ends that pid with `kill <pid>` and checks again.
+Then Craig presses Ctrl-C in the keep-awake's window (held since C.0), and the runner checks that
+one pid: `/bin/ps -p "$(/bin/cat ~/gpbmac/gate-a1/caffeinate.pid)" -o pid=,comm=; echo "ps: exit
+$?"`. It must print only `ps: exit 1`. A line naming `/usr/bin/caffeinate` means it still runs:
+Craig ends it in its window (or with `kill <pid>`) and the runner checks again. Step 7's scripts
+never wait on it: cleanup runs on every exit path, keep-awake or not.
 
 **7.1 Trash the gate's subtrees, verify-before-trash (rule 3).** First the enumeration, read-only:
 `gx.sh s7-1a-enumerate`.
@@ -3979,10 +4241,12 @@ in the escaped view):
 | `mp1` | `caf<U+00E9>`, `main`, `side` | none | 2 (M1, M2) |
 | `mp3` | `main` | none | 1 |
 | `r1` | `caf<U+00E9>`, `main` | none | 1 |
-| `launchd` | `main`, `topic-ld` | `ld-v1` | 1 or 2 (the `--all` push, and the tag object's) |
+| `launchd` | `main`, `topic-ld`, and each 6.1 re-fire's `topic-ld-r<k>` | `ld-v1` | 2 (the `--all` push's, and the `--tags` push's tag object, which no branch reaches), plus 1 for each re-fire |
 | `contract-mac` | empty after a step 2 that passed; after a step-2 BLOCK, `TestContractCLI_*` folders and their contents, gate debris that goes with the root | | |
 
-A root missing from the record was never created: nothing to trash. `VET ...: ONLY GATE
+A root missing from the record was never created: nothing to trash. **After a BLOCK,** a root
+that passes `vet` and holds a subset of its row (the refs and pack pairs of the steps that ran, by
+their logs) is trashed like a complete one; anything else is a STOP. `VET ...: ONLY GATE
 ARTIFACTS` is the kit's check that no row lies outside these shapes; the table is the runner's,
 by eye. A `LIVE LOCK` line is this gate's own (a push killed mid-flight); record it, and it goes
 with its root. **A `FOREIGN` row, or a subtree that differs from its row of the table:** STOP for
@@ -4040,7 +4304,7 @@ kit snapshot trash-final /trash && kit compare trash-0 trash-final || echo "TRAS
   recorded. Anything else is BLOCKED, and cleanup goes on.
 - `casprobe`: `NO DIFFERENCE` against step 0 (supplementary: `contract-mac` came and went).
 - **The tally:** each `ADDED` row of the trash comparison classified against "Confinement"'s
-  classes (41 `.lock` files with one `ok` firing, four ref files, 19 contract folders, eleven roots
+  classes (39 `.lock` files plus 2 for each `ok` firing that 6.4 counts, four ref files, 19 contract folders, eleven roots
   and their descendants, `GitRemotes` if 2.0 made it), counted by class and type. A `REMOVED` row
   means someone restored or emptied an item during the gate: reported verbatim. If the trash cannot
   be listed, the tally is those classes, checked against what Craig sees in the web UI (C.5).
@@ -4049,21 +4313,33 @@ kit snapshot trash-final /trash && kit compare trash-0 trash-final || echo "TRAS
 
 ```bash
 # file: mac:scripts/s7-3-logout.sh
-# Step 7.3: auth logout; the CLI then has no session, and the Keychain item is gone.
+# Step 7.3: auth logout; the CLI then has no session, and the Keychain item is absent. With no CLI
+# installed, or no sign-in ever completed (no "EXIT c4-check = 0"), it records "no session".
 . "$HOME/gpbmac/kit/lib.sh" "$1" || exit 2
-if [ ! -x "$HOME/.local/bin/proton-drive" ]; then echo "7.3 SKIPPED: no CLI was installed (C.3 did not get that far), so there is no session"; exit 0; fi
+now=$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')
+if [ -s "$G/logout.state" ]; then echo "a logout is already recorded: $(cat "$G/logout.state")"; exit 0; fi
+if [ ! -x "$HOME/.local/bin/proton-drive" ]; then
+  kc_expect absent "a Keychain item exists, though no CLI was installed"
+  if [ "$fail" = 0 ]; then echo "no session: no CLI was installed (C.3 did not get that far), item absent, $now" > "$G/logout.state"; echo "7.3: no session (recorded)"; fi
+  exit "$fail"
+fi
 logged 7-3-logout proton-drive auth logout; lrc=$rc
 echo "auth logout: exit $lrc"
 logged 7-3-after proton-drive filesystem info /my-files --json; prc=$rc
 echo "post-logout info: exit $prc (expected nonzero)"
 kit expect "$L" login-first || bad "the CLI still has a session"
-if kc_item; then echo "KEYCHAIN ITEM REMAINS (Craig deletes it: B.6's fallback)"; fail=1; else echo "Keychain item ch.proton.drive/drive-sdk-cli: gone"; fi
-if [ "$lrc" = 0 ] && [ "$prc" != 0 ] && ! kc_item; then echo "logged out, item gone, $(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$G/logout.state"; fi
+kc_expect absent "the Keychain item remains (Craig deletes it: B.6's fallback)"
+if [ "$fail" = 0 ] && [ "$prc" != 0 ] && [ "$lrc" = 0 ]; then echo "logged out, item absent, $now" > "$G/logout.state"; echo "logout recorded"
+elif [ "$fail" = 0 ] && [ "$prc" != 0 ] && ! grep -q '^EXIT c4-check = 0 ' "$G/log/runs.txt" 2>/dev/null; then
+  echo "no session: no sign-in ever completed (no EXIT c4-check = 0); auth logout exit $lrc, no session, item absent, $now" > "$G/logout.state"; echo "7.3: no session (recorded)"
+else echo "no logout recorded (see above)"; fi
 exit "$fail"
 ```
 
-**Pass:** `auth logout: exit 0`, `EXPECT login-first: FOUND`, `... gone`. Otherwise B.6's
-fallback: Craig types the `security delete-generic-password` line, and the runner runs `gx.sh
+**Pass:** `auth logout: exit 0`, `EXPECT login-first: FOUND`, `... absent` and `logout recorded`;
+or, after a stop before C.3's install or before any sign-in completed, `7.3: no session
+(recorded)`, which needs the CLI's "log in first" (when one is installed) and no item. Otherwise
+B.6's fallback: Craig types the `security delete-generic-password` line, and the runner runs `gx.sh
 p6-recheck`, which writes `logout.state` for this run when the item is gone and the CLI has no
 session. *Brief author's call:* the cache folder stays until a logout is recorded, since it holds
 the session's local state.
@@ -4111,11 +4387,15 @@ in `launchd/marker-after-*.txt` and the logs). `7.7 KEPT`: STOP for Craig.
 **7.8 The unpause:** W.7.8's `Test-UnpauseCondition`, on the PC. Re-enabling is Craig's.
 
 **What stays.** The installed helper and CLI in `~/.local/bin` (C.3), and `~/gpbmac` (Question 11),
-which then holds exactly: the kit and scripts; the feed-verified CLI copy in `cli/`; and each run
-folder's logs and command outputs, snapshots, ref sets, relays, ownership record, the gate's local
-repositories (`r1-clone` among them, with 5.11's stale ref still in it, and `r1-rt`) and the
+which then holds, by kind: the kit and scripts; the feed-verified CLI copy in `cli/`; and in each
+run folder, the logs and command outputs, snapshots, ref sets, relays, ownership record, the gate's
+local repositories (`r1-clone` among them, with 5.11's stale ref still in it, and `r1-rt`) and the
 tag's clone, the README lines C.3 ran (`readme/`), the launchd step's plists, logs, marker copies
-and `samples.txt`. Those hold account metadata: the names, uids and times of `/my-files`'
+and samples (`samples.txt`, and `samples.txt.<k>` after a re-fire), and small state files: `env.sh`,
+`gitconfig-global`, `caffeinate.pid` and `caffeinate.started`, `logout.state`, `installed.txt`, the
+`*-commits.sh` commit records, `v010-needs-uncertified`, `d5-unknown.txt`, and in `launchd/` the
+stamps, `repo.txt`, the `marker-*.txt` path records and `stop-sampler`. None of the small files
+holds a secret (paths, process and commit ids, times). Those hold account metadata: the names, uids and times of `/my-files`'
 top-level rows (Craig's own among them), of `/my-files/_cas-probe`, of `/trash` and of the gate's
 roots, and the command lines of the processes in the gate wrapper's trees (the sampler keeps
 nothing else). They hold no session token, password or Keychain secret: the CLI's session state
@@ -4155,8 +4435,8 @@ account) and the escaped view apply here unchanged. Every PC block starts by dot
 | 8 | | W.B.7 unpause decision | (the probe ends; the tag is made) |
 | 9 | C.0 | W.C.0 | each side's `RELAY value brief <blob>` |
 | 10 | | W.C.1 pause, baseline | PC to Mac: `RELAY value pcroot <uid>` |
-| 11 | C.2 | W.C.2 | |
-| 12 | C.3, C.4, C.5 | | |
+| 11 | C.2 | W.C.2 | `HANDOFF -> MAC: C.3` |
+| 12 | C.3, C.4, C.5 | | `HANDOFF -> PC: W.0` |
 | 13 | | W.0 | `HANDOFF -> MAC: step 0` |
 | 14 | steps 0, 1, 2.0 to 2.2 | | `HANDOFF -> PC: W.2` |
 | 15 | | W.2 | `HANDOFF -> MAC: step 3` |
@@ -4172,14 +4452,18 @@ account) and the escaped view apply here unchanged. Every PC block starts by dot
 | 25 | 5.8a | | `HANDOFF -> PC: W.5.8` |
 | 26 | | W.5.8 | `HANDOFF -> MAC: 5.8b` |
 | 27 | 5.8b to 5.11, step 6 | (idle; nothing of the PC's runs the CLI meanwhile) | |
-| 28 | 7.0 | W.7.0 | both `... WRITERS: NONE` |
+| 28 | 7.0 | W.7.0 | `HANDOFF -> PC: W.7.0`; both `... WRITERS: NONE`; `HANDOFF -> MAC: 7.1` |
 | 29 | 7.1 to 7.5 | | `HANDOFF -> PC: W.7.6` |
 | 30 | | W.7.6 | `HANDOFF -> MAC: 7.7` |
 | 31 | 7.7 | | `HANDOFF -> PC: W.7.8` |
 | 32 | | W.7.8 unpause decision | (the gate ends) |
 
 A step 7 after a BLOCK follows the same rows from 28 on. The PC session stays open from row 1 to
-row 8, and from row 9 to row 32: section 6 needs it live through 5.5 and 5.8.
+row 8, and from row 9 to row 32: section 6 needs it live through 5.5 and 5.8. If either session
+ends mid-gate anyway, a new one resumes from the files (dot-source the kit; `run.txt` names
+`gate-a1`; the relays and the ledger are in the run folder): its next row is the table's next, and
+nothing is re-run. A Mac session's background commands end with it: a push killed that way is a
+BLOCK (rule 9).
 
 ### The PC's extractor and kit
 
@@ -4453,7 +4737,10 @@ function Show-TaskTimes {
 function Test-NoWriters {
     $w = @(Get-Process -Name git-remote-proton, proton-drive -ErrorAction SilentlyContinue)
     $w | ForEach-Object { "  $($_.ProcessName) $($_.Id) started $($_.StartTime)" }
-    "WINDOWS WRITERS: $(if ($w.Count) { 'RUNNING (wait, then check again)' } else { 'NONE' })"
+    # A git push, fetch or clone that has not reached the helper yet; its pid alone is printed.
+    $g = @(Get-CimInstance Win32_Process -Filter "Name = 'git.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match ' (push|fetch|clone)( |$)' })
+    $g | ForEach-Object { "  git.exe $($_.ProcessId) (a push, fetch or clone)" }
+    "WINDOWS WRITERS: $(if ($w.Count -or $g.Count) { 'RUNNING (wait, then check again)' } else { 'NONE' })"
 }
 # Section 6 step 0: the helper git resolves on Windows is the draft exe's bytes (the Linux kit's
 # Test-WindowsHelper). It SETS this process's PATH to a fresh shell's; -Require throws on NO.
@@ -4486,8 +4773,9 @@ function Test-GpbEnv {
 }
 # The release is still a draft (section 6: it stays unpublished until this gate ends).
 function Test-Draft {
-    $j = @(gh release view $Tag --repo craigstoller/git-proton-backup --json isDraft,tagName --jq '.isDraft, .tagName' 2>&1 | ForEach-Object { "$_" })
-    "release ${Tag}: $($j -join ' ')"
+    $j = @(gh release view $Tag --repo craigstoller/git-proton-backup --json isDraft,tagName --jq '.isDraft, .tagName' 2>&1 | ForEach-Object { "$_" }); $c = $LASTEXITCODE
+    "release ${Tag}: $($j -join ' ') (gh exit $c)"
+    if ($c -ne 0) { throw "BLOCKED: gh release view failed (exit $c); is gh signed in (gh auth status)?" }
     if ($j.Count -lt 1 -or $j[0] -cne 'true') { throw "BLOCKED: release $Tag is not a draft (section 6 holds it unpublished until this gate ends)" }
 }
 
@@ -4577,12 +4865,14 @@ Start-GateRun probe 1   # a re-run of the probe, on Craig's word only, takes 2
 . C:\gpbmac\kit\pc-kit.ps1
 Test-GpbEnv
 & proton-drive --version; git --version; Get-Command proton-drive, git, gh | Format-Table Name, Source
+gh auth status; "gh auth: exit $LASTEXITCODE"
 ```
 
 **Pass:** the extractor passes; its `RELAY value brief <blob>` equals the Mac's (Craig compares the
 two); `RUN STARTED: probe-a1 ...`; `ENV check done: 0 SET line(s).`; the CLI prints
 `Proton Drive CLI cli-drive@0.9.0+75612299`, git `git version 2.55.0.windows.3` [record, measured
-2026-10-16; another version is recorded]; the three commands resolve.
+2026-10-16; another version is recorded]; the three commands resolve; `gh auth: exit 0` (a draft
+release is visible only to a signed-in collaborator [inference], so W.C.2's `Test-Draft` needs it).
 
 **W.B.1 Pause both tasks and wait for any run in flight** (section 6 probe step 1):
 
@@ -4693,9 +4983,10 @@ $side = Get-Content -LiteralPath "$G\stage\git-remote-proton.exe.sha256" -Raw
 "draft exe SHA-256: $exe"
 "sidecar == '<sha256>  git-remote-proton.exe': $($side -ceq "$exe  git-remote-proton.exe")"
 Test-WindowsHelper
+'HANDOFF -> MAC: C.3 (give it only after WINDOWS HELPER IS THE DRAFT: YES above)'
 ```
 
-**Pass:** `release vNEXT: true vNEXT`; the download exits 0; the sidecar line is `True` (the sidecar
+**Pass:** `release vNEXT: true vNEXT (gh exit 0)`; the download exits 0; the sidecar line is `True` (the sidecar
 has no trailing newline [code `.github/workflows/release.yml`, Checksum step]); and `WINDOWS HELPER
 IS THE DRAFT: YES`, its one line showing `git-remote-proton vNEXT (certified CLI:
 cli-drive@0.9.0+75612299)`. **`NO`:** this release's Windows gate installs the draft helper, and
@@ -4870,6 +5161,7 @@ Test-Expect w-5-5-fetch warn-nfd
 git -C $x switch -q -c nfdmove proton-v2/main; Assert-Exit 'switch -c nfdmove'
 "start (proton-v2/main, N2): $(git -C $x rev-parse HEAD)"
 "remote NFD member before: $(git -C $x rev-parse "refs/remotes/proton-v2/$NFD")"
+if ((git -C $x rev-parse "refs/remotes/proton-v2/$NFD") -cne (git -C $x rev-parse HEAD)) { throw 'BLOCKED: the NFD member was not at the start commit' }
 Add-Content -LiteralPath (Join-Path $x 'n.txt') -Value 'nfd W3, the NFD member moved from Windows'
 git -C $x commit -q -am 'gate: nfd W3'; Assert-Exit 'commit W3'
 $w3 = git -C $x rev-parse HEAD; "W3: $w3"
@@ -4932,6 +5224,7 @@ create meets no other spelling.
 ```powershell
 . C:\gpbmac\kit\pc-kit.ps1
 Test-NoWriters
+'HANDOFF -> MAC: 7.1 (give it only after WINDOWS WRITERS: NONE above)'
 ```
 
 **Pass:** `WINDOWS WRITERS: NONE`; otherwise wait and check again.
@@ -5002,12 +5295,13 @@ Each is marked *Brief author's call* where it applies, with its reason, and each
 Craig may overturn, not his ruling (the weightiest are "Questions for Craig"). They sit in: the
 gate's place (a setup retry); "R7 and this gate"; the extractors; the escaped view; `start-run.sh`
 (git configuration); the Mac kit; relays; W.B.1 and W.B.7 (the task pause, re-enabling); C.2 (the
-two documents); C.3 (`-e` and go1.27.0 for the README's lines, the kept binaries); B.3 and B.6
-(a sign-in retry, Craig's
+two documents; the hold, Question 13); C.3 (`-e` and go1.27.0 for the README's lines, the kept
+binaries); B.0 (the lock reading's positive control); B.3 and B.6 (a sign-in retry, Craig's
 fallback delete); step 5's remotes, 5.0 (NC), 5.4 (the third spelling), 5.5 (5.6's clone first),
 5.10 (the recovery) and 5.11 (its place, `r1-clone` left with its stale ref); step 6 (the
-failing agents, the plists' folder) and its sampler's filter (`kit/tree.awk`); step 7 (sub-step preconditions, `vet`, what stays); C.5 (rule 6); the PC kit;
-and step 0 (git 2.54.0).
+failing agents, the plists' folder, 6.2's 30 s before the bootout, 6.3's evidence of a landed
+kill) and its sampler's filter (`kit/tree.awk`); step 7 (sub-step preconditions, `vet`, what
+stays); C.5 (rule 6); the PC kit; and step 0 (git 2.54.0).
 
 ## Not covered live by this gate
 
@@ -5036,6 +5330,68 @@ and step 0 (git 2.54.0).
   300 s `StartInterval` so the wait is bounded.
 - **A real hang:** step 6.3 produces one with a short bound on a read-only push; a Keychain prompt
   on a locked screen is caught only as 6.1's bound.
+- **The wrapper as the README installs it:** its `install -m 0755` line into `~/.local/bin`, and a
+  plist loaded from `~/Library/LaunchAgents`; step 6 runs the tag's wrapper from the tag's clone
+  and loads its plists from the run folder (step 6, "The gate's plist").
+- **A successful run removing an earlier failure marker:** the `ok` agent's marker never exists
+  before its run, and 7.7 removes the failing agents' markers by hand.
 - **`caffeinate` on a locked screen** (section 6: untested): recorded, not judged.
 - **Intel Macs, darwin/amd64, and any Mac but this one** (MD1, MD8).
 - **Two machines pushing one repository** (O2(b) excludes it): step 4's clones never push back.
+
+## Review record
+
+Multi-model review, round 1, 2026-10-28 (Codex, Gemini, DeepSeek, Kimi), on `7d27ae3`. Applied:
+
+- B1: 6.3 needs no string 14 from a killed push, its push leading its own group, its helper or CLI
+  alive at the bound; every sample kept, timed to 0.01 s; `samples.txt` rotated per firing.
+- Found in verifying B1: a re-fired 6.3 is judged on its own firing's samples, logs and marker.
+- B2 (R-b): Craig holds the keep-awake in his own window; `gx.sh` STOPs a gate script while it is
+  down; `-t 172800`; Question 7.
+- B3: `logout.state` only after every check passed; `kc_item` three-valued, `kc_expect`.
+- B4: no-session records at B.6 (`p6-nosignin`) and 7.3; `cli()` BLOCKED without a CLI; `trashgr`
+  reads its record first; C.2 says what step 7 does after it.
+- Found in verifying B4: a C.2 STOP holds for Craig's ruling (Question 13); a brief at a tag
+  cannot be re-anchored.
+- B5: B.0's lock-reading positive control; `s6-1-ok refire`; the tally counts every `ok` firing.
+- B6: what `EXIT 0` means, in BLOCKED; W.5.5 checks its start commit.
+- B7: `unrefused` stops a script whose push was not refused.
+- B8: the writer checks see a PC `git` push and a Mac test binary.
+- B9: a marker path is recorded only when no marker is there.
+- B10, B27: the retry rule names the in-step re-firings; step 0's git check comes first, a STOP.
+- B11: string 12 met in place of a step's output is BLOCKED.
+- B12: 7.1 trashes a BLOCKed gate's partial roots.
+- B13: a second firing can start before the bootout; `runs = 1` expected.
+- B15, B16: the wrapper's path, and two uncovered items, under "Not covered live".
+- B20: the renaming's other files named.
+- B21: C.2 counts the drift script.
+- B25: the probe checks the install folders by name.
+- B26: `gh` signed in, checked at W.B.0; `Test-Draft` BLOCKs on a `gh` failure.
+- B31: how a session resumes mid-gate.
+- B34: Part A after the renaming; B.0 extracts again.
+- B35: a skipped NFD upload at 5.4 is a STOP.
+- B36: each failing firing's marker must be its own; 30 s before the bootout.
+- B38: `d5_check` on every logged push; three handoffs added.
+- B39: 6.3 counts the `--all` push's lines instead of `EXPECT`.
+- B40: the `launchd` root holds 2 pack pairs.
+- R-a: the sampler removes its group file; "What stays" by kind.
+
+Already a question, left as Craig's: B37 (Question 5; 6.0 now records the global config's key
+names only), B43 (Question 8; the default stands).
+
+Rejected, so not to be raised again:
+
+- B14: the sampled pushes are refused before git runs `pre-push`, so no hook starts in them.
+- B17: string 3's quote is `push.go:480-481`'s text; string 11 is listed apart.
+- B18: recorded Proton uids fit the relay charset.
+- B19: a wrapper that dies early makes `fire` time out and BLOCK, as it should.
+- B22: the tag's brief governs by design, and C.2 records its changes.
+- B23: `-f skip --json` and its keys are the helper's own upload, used from step 3.
+- B24: 19 is the table's folder trash calls, counted in the code.
+- B28: the helper never advertises a peeled tag; one would make `refcmp` fail closed.
+- B29: any change to the pin line changes `cli.go`, which C.2 counts.
+- B30: the PC kit's entries hold no `<ENV:>`.
+- B32: both cases are handled (5.5a's partial clone; a live lock).
+- B33: `TRASHED, STILL LISTED` is the tested rule, which 5.8 accepts.
+- B41: those checks are read-only or fail closed.
+- B42: no macOS asset ships; the README's download carries no quarantine.
