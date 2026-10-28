@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Example LaunchAgent that backs ONE repository up through the git-remote-proton v2 helper, once a
+  day, by running gpb-v2-push.sh. Make one copy of this file per repository, and push each
+  repository from one machine only.
+
+  Before loading it, replace every /Users/YOU/... path and the label. launchd does not expand ~,
+  starts the job in /, and reads no ~/.zprofile, so every path below is absolute.
+
+  Install:   cp gpb-v2-push.plist.example ~/Library/LaunchAgents/com.example.gpb-v2-push.myrepo.plist
+             launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.gpb-v2-push.myrepo.plist
+  Remove:    launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.example.gpb-v2-push.myrepo.plist
+
+  A daily StartCalendarInterval that the Mac slept through runs on the next wake.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.gpb-v2-push.myrepo</string>
+
+    <!-- The wrapper, the repository and the remote name, all absolute. /bin/bash is the 3.2
+         that macOS ships, which the wrapper is written for. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/YOU/.local/bin/gpb-v2-push.sh</string>
+        <string>/Users/YOU/Projects/myrepo</string>
+        <string>proton-v2</string>
+    </array>
+
+    <!-- Once a day at 03:15. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>15</integer>
+    </dict>
+
+    <!-- The wrapper and git write their output here. Create the folder first if it is missing. -->
+    <key>StandardOutPath</key>
+    <string>/Users/YOU/Library/Logs/gpb-v2-push.myrepo.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOU/Library/Logs/gpb-v2-push.myrepo.err.log</string>
+
+    <!-- Optional environment. The wrapper exports PATH from GPB_PATH, whose default is
+         $HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin. Set
+         GPB_PATH here if git, git-remote-proton or proton-drive live somewhere else. Uncomment
+         PROTON_DRIVE_CACHE_DIR to give the Proton CLI, and so the helper, a cache folder of its
+         own. GPB_PUSH_TIMEOUT is the bound on each push in seconds (default 1800).
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>GPB_PATH</key>
+        <string>/Users/YOU/.local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <key>PROTON_DRIVE_CACHE_DIR</key>
+        <string>/Users/YOU/Library/Caches/gpb-v2-push-myrepo</string>
+        <key>GPB_PUSH_TIMEOUT</key>
+        <string>1800</string>
+    </dict>
+    -->
+</dict>
+</plist>
