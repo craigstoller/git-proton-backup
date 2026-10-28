@@ -3210,3 +3210,61 @@ func TestLoop_ListWithNoRefspecInAPopulatedRepoChecksTagsOnly(t *testing.T) {
 		}
 	})
 }
+
+// TestLoop_ListDuringACloneWithACustomRefspecAlsoUsesTheDefaultMapping is RED
+// (Task 8 fix round 1, finding I1, Ruling T8-2). During `git clone -c
+// remote.origin.fetch=+refs/heads/main:refs/remotes/origin/xyz`, at "list" the
+// new repository holds no refs and its config shows only the -c spec, yet git
+// adds its default mapping on top and writes refs/remotes/origin/* and the
+// tracking HEAD as well (measured 2026-10-27, git 2.54.0). So a remote holding
+// main and head is refused here exactly as without the -c spec.
+func TestLoop_ListDuringACloneWithACustomRefspecAlsoUsesTheDefaultMapping(t *testing.T) {
+	gitDir := macEmptyRepo(t, false)
+	macConfig(t, gitDir, "[remote \"origin\"]\n\turl = proton::/my-files/r\n"+
+		"\tfetch = +refs/heads/main:refs/remotes/origin/xyz\n")
+	ft, root := macRemote(t, map[string]string{"refs/heads/main": toid('1'), "refs/heads/head": toid('2')})
+	code, stdout, stderr := macSession(t, ft, root, gitDir, macEnv("origin"), "list\n\n")
+	if code != 1 {
+		t.Fatalf("loopEnv() = %d, want 1: a clone's -c spec must not hide git's default mapping; stdout=%q stderr=%q",
+			code, stdout, stderr)
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want no ref line", stdout)
+	}
+	want := wantDestRefusalHead + `  refs/remotes/origin/HEAD (from HEAD) and refs/remotes/origin/head (also ` +
+		`written by this fetch, from refs/heads/head) ("refs/remotes/origin/HEAD" vs ` +
+		`"refs/remotes/origin/head"): by letter case` + wantDestRefusalTail
+	if stderr != want {
+		t.Errorf("stderr =\n%q\nwant\n%q", stderr, want)
+	}
+}
+
+// TestLoop_ListOnAMacFilesRepoTheEverydayFetchPasses is a GUARD (Task 8 fix
+// round 1, Ruling T8-3). The ordinary Mac clone: a files repository with the
+// default refspec, its branch, its tracking ref and the symbolic tracking HEAD
+// pointing at it, fetching a newer main and a tag. Nothing collides, so "list"
+// advertises and says nothing; a false positive here would block every Mac
+// fetch.
+func TestLoop_ListOnAMacFilesRepoTheEverydayFetchPasses(t *testing.T) {
+	wt, gitDir := macRepo(t)
+	macConfig(t, gitDir, macOriginDefault)
+	macPackedRefs(t, wt, "refs/remotes/origin/main")
+	macGit(t, wt, "", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+	local := macGit(t, wt, "", "for-each-ref", "--format=%(refname) %(symref)")
+	if want := "refs/heads/main \nrefs/remotes/origin/HEAD refs/remotes/origin/main\nrefs/remotes/origin/main \n"; local != want {
+		t.Fatalf("fixture: local refs = %q, want %q", local, want)
+	}
+	refs := map[string]string{"refs/heads/main": toid('1'), "refs/tags/v1": toid('2')}
+	if refs["refs/heads/main"] == headOf(t, wt) {
+		t.Fatalf("fixture: the remote's main must be a newer commit than the local one")
+	}
+	ft, root := macRemote(t, refs)
+	code, stdout, stderr := macSession(t, ft, root, gitDir, macEnv("origin"), "list\n\n")
+	if code != 0 {
+		t.Fatalf("loopEnv() = %d, want 0: the everyday Mac fetch must pass; stderr=%q", code, stderr)
+	}
+	wantAdvertised(t, stdout, refs)
+	if stderr != "" {
+		t.Errorf("stderr = %q, want nothing", stderr)
+	}
+}

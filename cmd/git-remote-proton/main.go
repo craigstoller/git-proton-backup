@@ -398,9 +398,15 @@ type localState struct {
 //     remote, with pushurl and fetch set, keeps its mapping;
 //   - configured fetch refspecs are parsed, and one the helper does not
 //     model fails the read closed (R4), under "remote config";
-//   - with no fetch refspec, a repository that holds no refs is a clone at
-//     "list" (M28) and gets git's default mapping for remoteName; one that
-//     holds refs gets no specs, because git fetch then writes no ref (PM9).
+//   - a repository that holds no refs is a clone at "list" (M28), and gets
+//     git's default mapping for remoteName ON TOP of the configured specs,
+//     if any. A clone given `-c remote.<name>.fetch=...` shows the helper
+//     only that spec at "list", yet git adds its default mapping and writes
+//     both (Ruling T8-2; measured 2026-10-27, git 2.54.0). An empty
+//     repository that is not a clone but has custom specs is over-refused
+//     by this, which is the safe direction;
+//   - a repository that holds refs gets its configured specs alone, or none
+//     when none are configured, because git fetch then writes no ref (PM9).
 func readLocalState(gitDir, remoteName string) (localState, error) {
 	format, err := readRefFormat(gitDir)
 	if err != nil {
@@ -429,17 +435,19 @@ func readLocalState(gitDir, remoteName string) (localState, error) {
 			st.symrefs[name] = target
 		}
 	}
-	switch {
-	case cfg.URL == "" && cfg.PushURL == "":
+	if cfg.URL == "" && cfg.PushURL == "" {
 		st.anonymous = true
-	case len(cfg.Fetch) > 0:
+		return st, nil
+	}
+	if len(cfg.Fetch) > 0 {
 		specs, err := repo.ParseFetchRefspecs(cfg.Fetch)
 		if err != nil {
 			return localState{}, fmt.Errorf("remote config: %w", err)
 		}
 		st.specs = specs
-	case len(local) == 0:
-		st.specs = repo.DefaultFetchRefspecs(remoteName)
+	}
+	if len(local) == 0 {
+		st.specs = append(st.specs, repo.DefaultFetchRefspecs(remoteName)...)
 	}
 	return st, nil
 }
