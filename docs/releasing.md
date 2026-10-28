@@ -44,6 +44,12 @@ forgotten for the v0.3.x releases. Follow it in order; do not skip or reorder st
    `git-remote-proton.exe.sha256`, `install.ps1`, `git-remote-proton-linux-amd64` and
    `git-remote-proton-linux-amd64.sha256`. No more, no fewer. The Linux binary is a static
    linux/amd64 build (`CGO_ENABLED=0`) cross-built on the same Windows runner.
+   There is no macOS asset, so no release has a per-release macOS gate: on a Mac the helper is
+   built from source at the release tag (README, "Install on macOS (v2)"), and no draft holds Mac
+   bytes to gate. That is the trade MD2(d) of
+   `docs/superpowers/specs/2026-10-27-v2-macos-port-design.md` ruled: a macOS asset would mean a
+   third live gate on almost every release, because a stand-in needs unchanged compiled code
+   ("When adoption may stand in for the live gate", below).
 
 5. **Two live gates run against the draft's bytes: the Windows live gate and the Linux live
    gate.** Each downloads the draft's assets and exercises its own binary
@@ -62,6 +68,20 @@ forgotten for the v0.3.x releases. Follow it in order; do not skip or reorder st
    copy (Craig's ruling, 2026-10-16). If a later gate fails or the release is abandoned after that,
    restoring the rollback copy is part of abandoning the release: pause the scheduled tasks,
    restore and verify the copy, then re-enable them.
+   The release that carries the macOS port takes a third gate once: the macOS live gate (§6 of
+   `docs/superpowers/specs/2026-10-27-v2-macos-port-design.md`; brief
+   `docs/research/gates/vNEXT-macos-gate-brief.md`, renamed when the version is named). Its place
+   follows O5. It runs last, after the Linux and Windows gates and after the draft Windows helper
+   is installed, and never at the same time as another gate, because the gates share the account's
+   baseline, the trash tally and the paused-task window; a paired PC session runs its Windows
+   side, and the draft stays unpublished until it ends. A Mac-only failure does not hold the
+   release: no macOS asset ships, so the Windows and Linux assets publish on their own gates, the
+   README keeps macOS "not yet live-gated", and the next attempt is the whole macOS gate again at
+   a later release, never a stand-in. A defect in shared code that it finds is a defect in the
+   release, under the no-retag rule below. That release's Windows and Linux gate briefs also carry
+   the steps in `docs/research/gates/vNEXT-composition-refusal-steps.md`, so each platform's own
+   binary is shown refusing a pair that differs only by Unicode normalisation (O5(d)). Once a
+   macOS gate has passed, later releases have none.
    Tags are never moved after any artifact has been built from them — if either gate finds a
    defect, the fix ships as a new tag, not a retag. The one alternative is a stand-in, for a
    release that qualifies under "When adoption may stand in for the live gate" below and only on

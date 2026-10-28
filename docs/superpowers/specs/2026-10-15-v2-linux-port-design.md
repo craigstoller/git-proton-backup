@@ -195,6 +195,14 @@ The README gains a Linux prerequisites block, linking Proton's README for the st
 
 ### 5. Case-variant refs
 
+*[Superseding note, 2026-10-27: the macOS port widens this rule. Since design v6.10 two spellings
+also conflict when they are canonically equivalent once case is ignored, which covers the NFC
+against NFD pair this section leaves out of scope, and case folding comes from tables pinned at
+Unicode 17.0.0 rather than from `strings.EqualFold`. A Mac `files` clone also refuses fetches and
+pushes that would confuse a pair. See §3 of
+`docs/superpowers/specs/2026-10-27-v2-macos-port-design.md` and the v6.10 entry of
+`docs/v2-remote-helper-design.md`. The text below is unchanged.]*
+
 **D2** decides whether pushes may create refs that a Windows clone mishandles (F13). The helper
 already refuses Windows device names on every platform for the same reason: "a repo pushed from Linux
 with a ref named refs/heads/aux would be unusable from Windows … Refusing it everywhere keeps a repo

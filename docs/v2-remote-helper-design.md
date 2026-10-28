@@ -1,8 +1,8 @@
 # git-remote-proton — v2 design
 
-**Status:** design v6.9, revised 2026-10-16 for the Linux port (linux/amd64 becomes a supported platform, pushes refuse new case-variant refs, and the git-floor and distro-CLI messages change; v6.8 was revised 2026-10-15 to record selective fetch's minimum git, 2.45.0; v6.7 on 2026-10-10 for the CLI 0.9.0 certification, v6.6 on 2026-08-09 during Stage 6 implementation). v5 was settled after four rounds of Codex + Gemini peer review; v6, v6.1, v6.2 and v6.3 each change exactly one mechanism, and each only because implementation proved the original unimplementable, unenforceable, or worse than what shipped. v6.4 documented Stage 4's shipped additions — the CLI version allowlist and the `--set-head` operation. v6.5 was the largest revision since v5: it re-enabled full hierarchical refs and the other-namespace rule v6.1 had narrowed away, replaced the fetch residue rule with quarantine staging, folded in the gate-sourced UX items, and left one item open — a git-valid-named foreign file with unparseable contents still failed every read against the repo, in both directions, until deleted. v6.6 closes that open question: the fatal-content rule is now **per-operation** — tolerant (skip + note) on the push-direction survey, fatal-with-enumeration on the fetch-direction survey — adds occupancy-aware push refusals (kind-aware, pre-pack) for names the read boundary skipped, adds the create-heal race-window diagnosis for an occupant that appears after advertisement, and pins F1 (directory download) as a verified contract fact. See the revision history.
+**Status:** design v6.10, 2026-10-27, for the macOS port (darwin/arm64 from source, not yet live-gated; canonical equivalents refused too; Mac reads checked; v6.9 on 2026-10-16 for Linux; v6.8 was revised 2026-10-15 to record selective fetch's minimum git, 2.45.0; v6.7 on 2026-10-10 for the CLI 0.9.0 certification, v6.6 on 2026-08-09 during Stage 6 implementation). v5 was settled after four rounds of Codex + Gemini peer review; v6, v6.1, v6.2 and v6.3 each change exactly one mechanism, and each only because implementation proved the original unimplementable, unenforceable, or worse than what shipped. v6.4 documented Stage 4's shipped additions — the CLI version allowlist and the `--set-head` operation. v6.5 was the largest revision since v5: it re-enabled full hierarchical refs and the other-namespace rule v6.1 had narrowed away, replaced the fetch residue rule with quarantine staging, folded in the gate-sourced UX items, and left one item open — a git-valid-named foreign file with unparseable contents still failed every read against the repo, in both directions, until deleted. v6.6 closes that open question: the fatal-content rule is now **per-operation** — tolerant (skip + note) on the push-direction survey, fatal-with-enumeration on the fetch-direction survey — adds occupancy-aware push refusals (kind-aware, pre-pack) for names the read boundary skipped, adds the create-heal race-window diagnosis for an occupant that appears after advertisement, and pins F1 (directory download) as a verified contract fact. See the revision history.
 **Relates to:** [issue #3](https://github.com/craigstoller/git-proton-backup/issues/3).
-**Supported platforms (v6.9):** windows/amd64 and linux/amd64 — a static helper binary on each, driving Proton's glibc linux/x64 CLI on Linux. linux/amd64 was gated live from v0.10.0 ([`docs/research/gates/v0.10.0-linux-gate.md`](research/gates/v0.10.0-linux-gate.md)); later releases are gated per `docs/releasing.md`. Other platforms build from source and are unsupported. Linux design and evidence: [`docs/superpowers/specs/2026-10-15-v2-linux-port-design.md`](superpowers/specs/2026-10-15-v2-linux-port-design.md).
+**Supported platforms (v6.10):** windows/amd64 and linux/amd64 — a static helper binary on each, driving Proton's glibc linux/x64 CLI on Linux. linux/amd64 was gated live from v0.10.0 ([`docs/research/gates/v0.10.0-linux-gate.md`](research/gates/v0.10.0-linux-gate.md)); later releases are gated per `docs/releasing.md`. darwin/arm64 is built from source at a release tag, with no release asset; CI runs the hermetic suite on it; it takes one live gate at the port's release, and later releases' Mac builds and later CLI versions on the Mac are not live-gated. Until that gate passes it is "built from source; the hermetic suite runs on it in CI; not yet live-gated". It is not supported in the sense Windows and Linux are, whose release bytes are gated every release. Other platforms build from source and are unsupported. Linux design and evidence: [`docs/superpowers/specs/2026-10-15-v2-linux-port-design.md`](superpowers/specs/2026-10-15-v2-linux-port-design.md); macOS: [`docs/superpowers/specs/2026-10-27-v2-macos-port-design.md`](superpowers/specs/2026-10-27-v2-macos-port-design.md).
 **Depends on:** [`docs/research/remote-helper-prior-art.md`](research/remote-helper-prior-art.md) — read first; assumed, not repeated.
 **Pinned to:** Proton Drive CLI **`cli-drive@0.9.0+75612299`** (SDK `js@0.22.2+75612299`), certified
 2026-10-10 (`docs/research/gates/cli-0.9.0-certification.md`). Previously `cli-drive@0.8.0+06e8c605`
@@ -38,7 +38,7 @@ git fetch proton-v2
 
 **Non-goals:** multi-machine concurrent pushes; eliminating the CLI dependency; implementing Proton auth; shallow/partial clone.
 
-**Deployment surface, honestly:** `git-remote-proton` **and** `proton-drive` on PATH, an authenticated CLI session, and on Linux a working OS secret store. One prerequisite, installed once — not literally one file. The Linux secret store is a measured requirement, not a guess (v6.9, spec F6 and F8): the CLI hard-requires a D-Bus Secret Service by default and, with no session bus, exits before any network attempt with `Failed to load session from secrets … Cannot autolaunch D-Bus without X11 $DISPLAY` (F6, measured in WSL2), a message the helper passes through intact (F7); the CLI offers a second store, `pass` (`PROTON_DRIVE_CREDENTIALS_STORE=pass`, F8, from Proton's README and changelog; the README also lists `unsafe_file`, "do not use, for testing only"), which reaches the CLI unchanged because the helper sets no `cmd.Env` (pinned by a hermetic test since v6.9). Both are the user's to provide; the helper takes no part in credentials. Unattended Linux use and the `pass` store are not gated.
+**Deployment surface, honestly:** `git-remote-proton` **and** `proton-drive` on PATH, an authenticated CLI session, and on Linux a working OS secret store (on macOS, the logged-in user's login keychain, the CLI's default store, which needs no setup: v6.10, macOS spec M5 and M6). One prerequisite, installed once — not literally one file. The Linux secret store is a measured requirement, not a guess (v6.9, spec F6 and F8): the CLI hard-requires a D-Bus Secret Service by default and, with no session bus, exits before any network attempt with `Failed to load session from secrets … Cannot autolaunch D-Bus without X11 $DISPLAY` (F6, measured in WSL2), a message the helper passes through intact (F7); the CLI offers a second store, `pass` (`PROTON_DRIVE_CREDENTIALS_STORE=pass`, F8, from Proton's README and changelog; the README also lists `unsafe_file`, "do not use, for testing only"), which reaches the CLI unchanged because the helper sets no `cmd.Env` (pinned by a hermetic test since v6.9). Both are the user's to provide; the helper takes no part in credentials. Unattended Linux use and the `pass` store are not gated.
 
 ## Substrate decision
 
@@ -1223,6 +1223,227 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
 
 ## Revision history
 
+**v6.10, 2026-10-27 — macOS port: darwin/arm64 builds from source, the create rule gains canonical equivalence, and a Mac `files` clone refuses what APFS would confuse.**
+
+- **What this records.** The macOS port, specified in
+  `docs/superpowers/specs/2026-10-27-v2-macos-port-design.md` (approved 2026-10-27) and planned in
+  `docs/superpowers/plans/2026-10-27-v2-macos-port.md`. Craig ruled on MD1–MD8, and on the review
+  questions O1–O6, on 2026-10-27, taking every recommended default, and approved Amendments MA1 and
+  MA2 the same day (all copied below). The plan's refinements R1–R6 were put to him that day and
+  not objected to, so they stand as unopposed defaults. R7 and the two limits below were rulings
+  made during implementation; each names the commit that carries it. The evidence is the spec's
+  findings M0–M29 and the plan's PM1–PM9, measured on one Apple Silicon Mac (macOS 27.2, Apple git
+  2.54.0, go1.27.0) unless the spec marks another basis; the probes and their logs are in
+  `docs/research/probes/macos-port/`.
+- **Supported platforms.** windows/amd64 and linux/amd64 are unchanged. darwin/arm64 (MD1(a);
+  Intel out of scope, MD8(a)) is built from source at a release tag (MD2(d)), with the same recipe
+  as `release.yml`'s Linux build (`CGO_ENABLED=0 go build -trimpath -ldflags "-X
+  main.version=<tag>"`). There is no release asset, so `release.yml` and the five-asset list are
+  unchanged and no release gate runs Mac bytes. CI runs the hermetic suite on a `macos-latest`
+  arm64 leg at Go `stable`, with the git-floor probe and a Homebrew fallback (MD3(a)). The port's
+  release takes a one-time macOS live gate (spec §6), run last, after the draft Windows helper and
+  never concurrently with another gate; a Mac-only failure does not hold the release (O5). The
+  docs' status is written in two passes: "built from source; the hermetic suite runs on it in CI;
+  not yet live-gated" until that gate passes, then "live-gated once, at <version>; later releases'
+  Mac builds and later CLI versions on the Mac are not live-gated". The CLI pin is unchanged: the
+  `macos/arm64` build prints the same identity token (M4).
+- **The D2 rule widens to two relations, on every platform (MD6(a2)).** Two prefix spellings
+  conflict when they differ as bytes and either (1) they share `caseKey`, Unicode simple case
+  folding (D2's relation), or (2) they share `canonKey(p) = caseKey(nfd(p))`, full canonical
+  decomposition followed by the same folding, which is Unicode's canonical caseless match with
+  simple folding. Neither relation contains the other (U+0061 U+03B9 U+0301 and U+0061 U+0345
+  U+0301 share only `caseKey`; an NFC/NFD pair shares only `canonKey`), so both are checked,
+  pairwise against the set as before, with no transitive closure. A pair matching both is
+  reported once, as a case match, and each conflicting ref records its shallowest pair, a case
+  match at equal depth.
+  - *Every place the case key decided equivalence takes both:* the `caseConflicts` index used by
+    phase 2 and by phase 5's re-check, and the rename pairing, so a normalisation-changing rename
+    is refused whole as a case-changing one is (A1, A2), its delete naming the smallest refused
+    create whichever key matched.
+  - *What the user sees.* The refusal names each conflicting ref with its prefix pair, the
+    relation ("letter case" or "Unicode normalisation"), and both spellings in `%+q` form
+    (`strconv.QuoteToASCII`), because NFC and NFD display alike and plain `%q` leaves combining
+    marks raw (M29). A case match is said to harm Windows and Mac clones (NTFS and default APFS
+    both ignore case); a canonical-only match, Mac clones (APFS ignores normalisation, NTFS does
+    not).
+  - *Unchanged:* prefixes and the depth argument, create-only (A1), phase 2's fixed point, phase
+    5's re-check before `ensureRefParents`, the uncapped conflict list, skipped refs out of the set,
+    and no override.
+  - *The cost.* Canonical caseless equivalence is Unicode's definition, not a model of APFS or
+    NTFS, so `ᾳ` beside `αι` is refused (Unicode folds U+0345 to `ι`) though no measurement shows a
+    Mac confusing them [inference]. A lone NFD name has no pair, so no two-ref rule sees it; the
+    README states it, with the exact-bytes way to reach it (M15).
+- **One pinned Unicode version for both relations (O1(iv), MA2).** `caseKey` folds by a generated
+  table instead of `unicode.SimpleFold`, so every build refuses the same set whichever Go compiled
+  it, and `nfd` uses generated decomposition and combining-class tables from the same version,
+  17.0.0. The fold table maps each character to its `CaseFolding.txt` target (statuses C and S),
+  so the iota class folds to U+03B9, a starter, rather than to its smallest member U+0345; that
+  changes no class, and it is why `canonKey` needs no second decomposition (M23). The generator
+  (`internal/repo/gen_unicode.go`, kept out of the build and run by `go generate`) reads the
+  committed `UnicodeData.txt`, `CaseFolding.txt` and `NormalizationTest.txt` under
+  `internal/repo/unicodedata/17.0.0/`, checked against SHA-256s it records; `.gitattributes`
+  marks them `-text`. Only moving the pin touches the network, through a separate manual command
+  (`fetch_unicode.go`); Unicode publishes no checksums, so it checks the files' version lines and
+  prints the SHA-256s it saw (MA2). No dependency is added, and go.mod's `go 1.22` floor is
+  unchanged. A containment test on every CI toolchain checks that each `unicode.SimpleFold` orbit,
+  restricted to characters assigned at the pin, lies inside one generated class, so the move
+  loses no refusal a release build made. Moving the pin is a deliberate change with its own
+  review, never a side effect of a Go upgrade.
+- **Reads are checked too (O3(d)).** A pair already on a remote stays (D2), and a Mac `files`
+  clone of one corrupts tracking refs silently (M15, M16). So the protocol arms in
+  `cmd/git-remote-proton/main.go` check what git is about to write, with pure comparisons in
+  `internal/repo/readcheck.go` that use `caseConflicts` and `refPrefixes` and nothing else.
+  - *The warning, on every platform,* at `list` and `list for-push`: when the advertised refs hold
+    a pair under either relation, one stderr warning names each pair once, sorted, with both object
+    IDs, both `%+q` forms and the relation, and points at the README's honest limits. The push
+    arm's own ref scan never warns. Off a Mac it blocks nothing. It is not printed when a Mac
+    refusal or a failed local read is printed instead.
+  - *The Mac refusal at `list`.* On darwin, when git set `GIT_DIR` (read at startup, before
+    `resolveGitDir` defaults it, M25) and `git rev-parse --show-ref-format` reports `files`,
+    `list` answers with an error and advertises nothing, so git writes no ref, when (1) the
+    advertised refs hold a pair, or (2) the refs the fetch could write, taken with the local refs,
+    hold a pair with a destination as a member. The destinations are each advertised ref mapped
+    through the remote's configured fetch refspecs, plus every advertised tag;
+    `remote.<name>.mirror` is not read (MA1). `git ls-remote` inside such a repository is refused
+    the same way, and a clone into a `files` store is refused before any ref is written (M28). A
+    `reftable` repository, or any `list` with `GIT_DIR` unset, gets the warning only. The remedies
+    follow the cause: for (1), repair the remote or clone with `--ref-format=reftable`; for (2),
+    delete the stale local ref by its exact bytes (`git update-ref --stdin`), change the remote's
+    refspecs, or use a `reftable` clone.
+  - *Its local reads fail closed.* The ref format, the remote's configuration and the local ref
+    names; if any read fails, the helper refuses, naming it. They are the only new git processes,
+    and run only on darwin inside a repository.
+  - *What it cannot see:* a refspec given on the command line, `--refmap`, and a command-line
+    `fetch --prune` never reach the helper.
+- **The plan's refinements, R1–R6 (unopposed defaults), and R7.**
+  - *R1:* the Mac refusal also runs at `list for-push`, because an up-to-date push still rewrites
+    the tracking refs of the refs it matches and sends the helper no command for them (PM1). It
+    refuses the session when an advertised ref that the local repository holds by its exact name
+    has a tracking ref conflicting with a local ref spelled differently. Checking every advertised
+    ref instead would lock a clone out as soon as its remote held a pair, against D2's ruling that
+    a pair still takes pushes to its other refs. While such a ref stands, no push from that clone
+    runs. Its residuals: two up-to-date refs whose custom mappings alias each other while neither
+    tracking ref exists yet, and an up-to-date push to a ref from a differently named source given
+    as exact bytes.
+  - *R2:* phase 5 re-checks a Mac update whose remote-half conflict a failed same-batch delete
+    left standing.
+  - *R3:* a D2 refusal caused only by a delete the Mac rule kept carries a Mac message, not
+    "refused on every platform".
+  - *R4:* fetch refspecs must use full `refs/` names; any other form fails the configuration read
+    closed (PM2). A refspec with no destination writes nothing.
+  - *R5:* a URL is anonymous when both `remote.<argv[1]>.url` and `remote.<argv[1]>.pushurl` are
+    unset or empty (PM3, PM4). A push-only remote keeps its fetch mapping, which git uses for
+    tracking refs.
+  - *R6:* the destination model is conservative wherever git's rules are wider. Push tracking refs
+    take every positive mapping and ignore negative refspecs; fetch destinations count every
+    advertised tag, negated or not; a fetch that prunes by configuration (`remote.<name>.prune`,
+    else `fetch.prune`) may delete any local ref under a positive refspec's destination that it
+    does not write, and each such ref is checked; no fetch refspec gives the default mapping only
+    while the repository holds no refs (PM9); `<p>/HEAD` is a destination wherever a positive spec
+    maps `refs/heads/*` to `<p>/*`; and a destination that is a local symbolic ref adds its
+    target. These rest on a reading of git v2.54.0's source, not on a probe, except PM9.
+  - *R7 (Ruling T9-1, a refinement made during implementation, commit `5079dc9`):* on a Mac
+    `files` clone, an update whose tracking ref aliases the tracking ref of a same-batch delete is
+    refused (the push rule's part 1(a)); a create is not. Measured 2026-10-27 on git 2.54.0: with
+    the update listed before the delete in the remote's order, git's post-push delete of the
+    aliasing tracking ref unlinked the one it had just written, and the push exited 0; a create
+    beside such a delete was measured safe. So in a one-push pair repair from a Mac `files` clone,
+    the delete lands and the update is refused, and the update must follow in a later push. (The
+    delete lands only where part 3 lets it, that is, where the clone holds no local ref its
+    tracking ref aliases; otherwise part 3 refuses it too.)
+- **The Mac push rule, in `repo.Push`'s phase 2.** On darwin with the `files` store, the push arm
+  makes the same local reads as `list` (a failed read refuses every update in the batch, naming the
+  read) and passes `repo.PushWithLocal` a `LocalSide`: the local ref names and each pushed
+  destination's tracking refs. `Push` itself still reads no local state; a nil `LocalSide` (off
+  darwin, in a `reftable` repository, and in tests that do not exercise the rule) means the rule
+  does not apply. It refuses per ref, every message through `oneLine`, and every ref it does not
+  refuse proceeds, so a remote holding a pair still takes pushes to its other refs.
+  1. A write is refused when its tracking ref conflicts with a local ref spelled differently or
+     with another write's tracking ref (and, by R7, an update's with a same-batch delete's). An
+     update is also refused when it conflicts with another ref of `batchFinalSet`, so a same-batch
+     delete of the other member clears that half.
+  2. A delete paired with a write part 1 refused is refused with it: the delete half of a
+     replacement, and, for a refused create only, the delete half of a rename to it.
+  3. A delete is refused when its tracking ref conflicts with a local ref spelled differently,
+     because git's post-push delete of that tracking ref can unlink the other ref's loose file and
+     leave it at a stale packed value, with `git fsck` silent (M24).
+
+  The three parts run once over what D2's widened check and A1's pairing leave at their own fixed
+  point, and the whole sequence repeats while they refuse anything, so D2 always speaks first.
+  Off a Mac, in a `reftable` clone, or with no aliasing local ref, no delete is refused, so the
+  repair stays possible from those.
+- **Two limits accepted during implementation.**
+  - *A dangling symbolic local ref* (one whose target does not exist) is invisible to every git ref
+    enumerator (only `git fsck` reports it), so a destination written through it is not seen by
+    the Mac checks (controller ruling T6-2, an accepted limit; commit `d5aafc6`, where
+    `internal/gitcmd`'s test shows git 2.54.0 skipping such a ref silently). The
+    common case, a dangling `refs/remotes/<r>/HEAD` after a prune, is still caught by R6's
+    synthesized `<p>/HEAD` destination, which conflicts with a branch named `head`.
+  - *A repository that holds no refs* (an empty repository, as during a clone) is checked under
+    its configured fetch refspecs plus git's default mapping, because git adds its default mapping
+    to a `-c` fetch refspec during a clone (Ruling T8-2; measured 2026-10-27 on git 2.54.0; commit
+    `24762df`). An empty repository that is not a clone, with custom fetch refspecs, can therefore
+    be over-refused, the safe direction. One instance: a hand-written mirror configuration
+    (`+refs/*:refs/*`, `mirror = true`), fetched while empty from a remote holding `main` and
+    `head` and no pair, is refused through the default mapping's `HEAD` against `head`; real mirror
+    clones are unchanged by this.
+  - The README also lists the other places the checks over-refuse (`ls-remote` inside a Mac
+    `files` repository, advertised tags under `--no-tags` or `tagOpt`, a `--single-branch` or
+    `--depth` clone checked under the default mapping, a bare clone through the synthesized
+    `<remote>/HEAD`) and one place they under-check: a remote defined only in a legacy
+    `$GIT_DIR/remotes/<name>` file is read as anonymous.
+- **Before a Mac adopts a remote (O3(a), O3(b)).** Writers first: every machine that pushes to it
+  runs a release carrying the rule, because an older helper can still write a pair. Then one `git
+  ls-remote proton::<address>` with the new helper, from a folder with no repository above it
+  (M25); the warning is the scan's report.
+- **Credentials and scheduled use (MD4(b), O2(b)).** The helper changes nothing about credentials;
+  on macOS the CLI's default store is the login keychain (M5, M6). Scheduled backups are one
+  LaunchAgent per repository, each repository pushed from one machine.
+  `scripts/macos/gpb-v2-push.sh` runs `push --all` and then `push --tags`, bounds each push at 30
+  minutes by ending its whole process group, and on failure posts a notification and leaves a
+  marker named from the repository's physical path; `scripts/macos/gpb-v2-push.plist.example` runs
+  it daily. The helper gains no environment variable. Not gated: the `pass` and `unsafe_file`
+  stores, SSH sessions, a LaunchDaemon, runs during sleep or dark wake, and a Keychain prompt after
+  a CLI upgrade.
+- **Companions.** CI gains the macOS leg, which also runs the wrapper's offline test, and a
+  generate-and-diff check of the Unicode tables on the Linux `stable` leg (spec §2).
+  `scripts/Test-ProtonCliDrift.ps1` gains a fifth leg, the feed's `macos/arm64` SHA-512 against
+  `$CertifiedMacArm64Sha512` (MD7(b)); that value and the README's macOS CLI line are
+  certification touch points, and `tests/ReadmePins.Tests.ps1` guards the README's macOS URL and
+  SHA-512. Each certification adds offline Mac checks, with no signed-in Mac check (spec §7,
+  O4(a)). `docs/research/gates/brief-checklist.md` gains rule 12, `AGENTS.md` a line, and the shim
+  tests a resolution check, so a hermetic run never resolves a real `proton-drive` (O6(c)).
+- **Release.** A minor bump [inference: a new refusal, and a new platform position]. It changes
+  compiled code, so it takes the formal Windows and Linux gates, which also test the composition
+  refusal on their own binaries (O5), plus the one-time macOS gate.
+- **Rulings (2026-10-27, copied from the spec).** Each is Craig's call, accepting the recommended
+  default; none is an unopposed default.
+
+  | | Ruled | Not taken |
+  |---|---|---|
+  | MD1 | (a) darwin/arm64 only | (b) darwin/amd64 built but ungated; (c) a universal binary |
+  | MD8 | (a) Intel out of scope, ruled with MD1 (the option Craig chose said so) | (b) Rosetta tests on this Mac |
+  | MD2 | (d) build from source at a release tag; live-gated once at the port's release; CI on macOS after that | (a) a darwin-arm64 release asset gated every release; (b) (a) plus Developer ID signing and notarization; (c) a Homebrew tap |
+  | MD3 | (a) one `macos-latest` leg at Go `stable`, with the git-floor probe and a `brew` fallback | (b) a second leg at go.mod's toolchain |
+  | MD4 | (b) gate attended use with the default `keychain` store and one launchd-agent push; `pass`, `unsafe_file`, SSH documented as not gated | (a) attended only (Linux D3(a)); (c) say nothing |
+  | MD5 | (a) the one gate on this Mac, with a pre-gate sign-in probe, a gate-only cache folder and Windows checks; afterwards log out, confirm the Keychain item gone, and sign in fresh for real use | (b) keep the gate session; (c) a CI runner with a session in secrets |
+  | MD6 | (a2) refuse canonically equivalent creates on every platform, with the repo's own tables generated from Unicode's data at one pinned Unicode version, for both decomposition and simple case folding; no dependency, no floor change. *Amended by O1(iv) on 2026-10-27; it first read "with the repo's own table generated from Unicode's data at the standard library's Unicode version".* | (a1) `golang.org/x/text/unicode/norm`; (b) refuse any combining mark (M21); (c) document only, with the `reftable` mitigation |
+  | MD7 | (b) offline macOS checks at each certification, a drift-script leg and a README pin test; confirmed by O4(a) | (a) the full live contract table on the Mac every certification; (c) nothing on the Mac |
+  | O1 | (iv) one pinned Unicode version, 17.0.0 today, for both decomposition and simple case folding, generated from Unicode's data; amends MD6 | (i) one table per toolchain Unicode version, by build tag; (ii) one table at 15.0.0; (iii) one table at 17.0.0 with case folding still from the toolchain |
+  | O2 | (b) one LaunchAgent per repository, each repository pushed from one machine only; MD4(b) stands on this corrected premise | (a) attended pushes only; (c) a Mac counterpart of the PC's scheduled tooling, as its own project |
+  | O3 | (d) the pre-adoption scan, writers first, a warning on every platform when the advertised refs hold a pair, and on a Mac with the `files` ref store a refused fetch | (a) the scan only; (b) the scan and writers first; (c) those plus the warning, with no refusal |
+  | O4 | (a) MD7 as ruled: offline Mac checks only after the port | (b) an attended check on the Mac's own session at each certification and at each transport or credential change |
+  | O5 | all four: the Mac gate last, after the draft Windows helper, never concurrent; a Mac-only failure does not hold the release; a paired PC session runs the Windows side; the Windows and Linux gates test the composition refusal on their own binaries | any of the four left out |
+  | O6 | (c) rule 12, an AGENTS.md line, and a shim-resolution check in the test code | (a) the checklist only; (b) the checklist and AGENTS.md |
+
+- **Amendments MA1 and MA2 (2026-10-27, Craig's calls, each accepting the recommended default;
+  copied from the spec).** Both correct a fact the approved spec stated.
+
+  | | Ruled | Not taken |
+  |---|---|---|
+  | MA1 | `remote.<name>.mirror` is not a fetch-destination source: git uses it for push only [doc: `git help config`, git 2.54.0] | keep reading it, a key git never uses for fetch |
+  | MA2 | the pin-moving fetch checks the files' version lines and records their SHA-256s, and the data is cross-checked by `NormalizationTest.txt` and the containment test; Unicode publishes no checksums | the original "published checksums" check, which cannot be made |
+
 **v6.9, 2026-10-16 — Linux port: linux/amd64 becomes a supported platform, pushes refuse new case-variant refs, and the git-floor and distro-CLI messages change.**
 
 - **What this records.** The Linux port, specified in
@@ -1251,20 +1472,25 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
     [inference]. There is no override variable.
   - *Prefixes and folding.* A ref's prefixes are its component chains from the namespace
     component down (`heads`, `heads/grp`, `heads/grp/a` for `refs/heads/grp/a`). Two spellings
-    conflict when they differ but fold equal under Unicode simple case folding, the equivalence
-    `strings.EqualFold` implements; invalid UTF-8 bytes are copied through unfolded, so distinct
+    conflict when they differ but fold equal under Unicode simple case folding, or, since v6.10,
+    when they are canonically equivalent once case is ignored (they share
+    `caseKey(nfd(p))`); both relations come from one pinned Unicode version, 17.0.0, in tables
+    generated into the repository (see v6.10). *[v6.10 rewrite, 2026-10-27: v6.9 read "fold equal
+    under Unicode simple case folding, the equivalence `strings.EqualFold` implements", which
+    followed the compiling toolchain's Unicode version, and left NFC against NFD out of scope.]*
+    Invalid UTF-8 bytes are copied through unfolded, so distinct
     invalid bytes never compare equal. This covers all three F13 shapes: `main`/`Main` (two
     leaves), `feat`/`Feat/x` (a leaf against a directory prefix) and `grp/a`/`Grp/b` (two
     directory prefixes). NTFS's own `$UpCase` table differs from Unicode simple folding for a
-    handful of characters [inference] and NFC against NFD normalisation (macOS) is out of scope;
-    both are documented limits, not code.
+    handful of characters [inference]; that is a documented limit, not code.
   - *Phase 2 (whole-batch validation).* The check set is the pre-batch advertised refs, minus the
     batch's valid deletes, plus every non-delete still valid after phase 2's other checks (the
     existing `finalSet` algebra). Conflicts are computed as groups over that set, with no
     dependence on iteration order, and every create in a conflicting group is refused, so two
     same-batch creates `main` and `Main` are both refused. The refusal names every conflicting
-    ref, sorted. A case-changing rename is refused whole: when this rule refuses a create, every
-    same-batch delete of an existing ref whose full name folds equal to it is refused too, except
+    ref, sorted. A case-changing rename, and since v6.10 a normalisation-changing one, is refused
+    whole: when this rule refuses a create, every same-batch delete of an existing ref whose full
+    name matches it under either relation is refused too, naming the smallest such create, except
     the delete half of a replacement (the batch also writes that name). A create that phase 2
     refuses for another reason (for example the D/F preflight, or a name a skipped file occupies)
     keeps git's ordinary per-ref behaviour, so its paired delete still commits; the A1
@@ -1288,7 +1514,8 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
     ref whose case variant sits in a skipped file; the pair becomes visible to clones only when
     someone repairs the skipped file. This is the one way a push can lay down half of a pair,
     stated in the README's honest limits rather than closed by putting skipped names in the set.
-  - *The residual (documented, not fixed).* A case-changing rename that passed phase 2 because its
+  - *The residual (documented, not fixed).* A case-changing rename (since v6.10, also a
+    normalisation-changing one) that passed phase 2 because its
     conflicting variant was also being deleted can still lose the renamed-away ref if that
     variant's delete fails in phase 4 (a race or a transport fault, for example a non-v2 rewrite
     of HEAD between phases): phase 5 then refuses the create after the rename's own delete has
@@ -1340,7 +1567,8 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   destroy the very ref a batch was replacing, whenever a sibling delete failed in phase 4. Codex
   then found that refusing a rename's delete in one pass could expose a new conflict, losing a ref
   with no transport fault at all. A1 makes three changes: (1) a create is a name absent from the
-  pre-batch set, so replacements are never refused; (2) a case-changing rename is refused whole;
+  pre-batch set, so replacements are never refused; (2) a case-changing rename is refused whole
+  *[v6.10: so is a normalisation-changing one, under the widened rule]*;
   (3) phase 2 repeats until stable. Not taken: keeping the round-3 definition, and refusing a
   replacement's paired delete in a single pass (the round-1 plan fix). One residual is documented,
   not fixed: a rename can still lose the old name if a sibling delete hits a transport fault
