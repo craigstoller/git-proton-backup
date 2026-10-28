@@ -1,7 +1,7 @@
 # Proton CLI drift check for git-proton-backup (docs/releasing.md: before tagging, before
 # publishing, and weekly between releases).
 #
-# Four legs, each named in the verdict line:
+# Five legs, each named in the verdict line:
 #   1. the proton-drive the helper would spawn (first on PATH unless -Cli is given) has the
 #      bytes Proton's feed advertises for windows/x64 -- drift of what is installed;
 #   2. that CLI's own identity token equals the helper's compiled-in certified token -- the
@@ -13,6 +13,11 @@
 #      an installed Linux CLI (nothing on Windows hashes one). A release with no linux entry is a
 #      MISMATCH (Proton dropped or delayed Linux: worth a certification look); a linux entry
 #      whose SHA-512 is not 128 hex characters is a STOP.
+#   5. the feed's macos/arm64 SHA-512 for that SAME release equals $CertifiedMacArm64Sha512 below,
+#      by the same rules as the fourth leg: it compares the feed with a recorded value and cannot
+#      see a CLI installed on any Mac; a release with no macos/arm64 entry is a MISMATCH (the
+#      README pins a macOS CLI download); an entry whose SHA-512 is not 128 hex characters is a
+#      STOP. A macOS-only difference is never a MATCH.
 #
 # -Helper: the exe whose certified token is authoritative. Use the frozen release CANDIDATE
 #   before tagging or publishing a pin-moving release (the installed helper still carries the
@@ -21,8 +26,8 @@
 # -Cli: defaults to the proton-drive first on PATH, which is the one the helper spawns.
 #
 # Exit codes: 0 MATCH, 1 MISMATCH, 2 STOP (the check itself could not run: the feed was not
-# reachable within 30 s or carries no usable windows/x64 or linux/x64 SHA-512, a parse failed,
-# PATH).
+# reachable within 30 s or carries no usable windows/x64, linux/x64 or macos/arm64 SHA-512, a
+# parse failed, PATH).
 # The one network call is bounded because this script also runs unattended from a weekly
 # scheduled task (docs/releasing.md, "Between releases").
 param(
@@ -38,6 +43,14 @@ $ErrorActionPreference = 'Stop'
 # (docs/releasing.md, "Between releases"). Keep it on one line in single quotes: the Pester
 # tests read it with a regex.
 $CertifiedLinuxX64Sha512 = '3533025ba69ae112b64e3e01fbcc1ad0688136a4043f6cf6a72886967d85fdcd9ec235479c2e113171614be5225bfba93427509a05ca5aa6071d924fa7e91ca8'
+
+# The macos/arm64 SHA-512 of the certified macOS CLI (0.9.0, the semver of the helper's CertifiedCLI;
+# platform macos/arm64, https://proton.me/download/drive/cli/0.9.0/darwin-arm64/proton-drive).
+# Recorded 2026-10-27: the value spec M2 recorded, Proton's live feed for 0.9.0 macos/arm64, and
+# `shasum -a 512` of a fresh download of that URL all agree.
+# Every certification updates this AND the README's macOS CLI line (docs/releasing.md, "Between
+# releases"). Keep it on one line in single quotes: the Pester tests read it with a regex.
+$CertifiedMacArm64Sha512 = '3f4125de5e41dcc7f4e0e07e8d60737aa18f35c6ecc1ba3fce47ea97b331857eefaf88e74671135af57122d4cb5439b817ec528f8df383550ac7810aeaf0217b'
 
 function Stop-Drift([string]$why) { "DRIFT CHECK: STOP ($why)"; exit 2 }
 
@@ -57,8 +70,10 @@ $w = @($m.Releases | ForEach-Object {
     # reads the SAME release the windows leg picked as latest, never another release's entry.
     # Exact platform names: linux/arm64 and linux/x64-musl are other builds.
     $linux = @($r.Files | Where-Object { $_.Platform -in @('linux/x64', 'linux-x64') } | ForEach-Object { [string]$_.Sha512CheckSum })
+    # The same for the release's own macos/arm64 entries (macos/x64 is another build).
+    $mac = @($r.Files | Where-Object { $_.Platform -in @('macos/arm64', 'macos-arm64') } | ForEach-Object { [string]$_.Sha512CheckSum })
     $r.Files | Where-Object { $_.Platform -in @('windows/x64', 'windows-x64') } | ForEach-Object {
-        [pscustomobject]@{ Version = $r.Version; Date = $r.ReleaseDate; Sha512 = ([string]$_.Sha512CheckSum).ToLower(); LinuxSha512 = $linux }
+        [pscustomobject]@{ Version = $r.Version; Date = $r.ReleaseDate; Sha512 = ([string]$_.Sha512CheckSum).ToLower(); LinuxSha512 = $linux; MacSha512 = $mac }
     }
 })
 if ($w.Count -lt 1) { Stop-Drift 'feed malformed or no windows/x64 entry (fail closed)' }
@@ -73,6 +88,10 @@ if ($latest.Sha512 -notmatch '^[0-9a-f]{128}$') { Stop-Drift "feed windows/x64 e
 # the linux leg failing (a MISMATCH below), because Proton dropping or delaying Linux is drift.
 foreach ($l in $latest.LinuxSha512) {
     if ($l -notmatch '^[0-9a-f]{128}$') { Stop-Drift "feed linux/x64 entry for $($latest.Version) has no usable SHA-512 (fail closed)" }
+}
+# And for the macos/arm64 entry: none at all is the mac leg failing, an unusable hash is a STOP.
+foreach ($a in $latest.MacSha512) {
+    if ($a -notmatch '^[0-9a-f]{128}$') { Stop-Drift "feed macos/arm64 entry for $($latest.Version) has no usable SHA-512 (fail closed)" }
 }
 
 $installedSha = (Get-FileHash -LiteralPath $Cli -Algorithm SHA512).Hash.ToLower()
@@ -104,15 +123,22 @@ $feedLinux = @($latest.LinuxSha512)
 $feedLinuxShown = if ($feedLinux.Count -gt 0) { $feedLinux -join ', ' } else { '(no linux/x64 entry in that release)' }
 "feed linux/x64     : $feedLinuxShown"
 "certified linux/x64: $CertifiedLinuxX64Sha512"
+$feedMac = @($latest.MacSha512)
+$feedMacShown = if ($feedMac.Count -gt 0) { $feedMac -join ', ' } else { '(no macos/arm64 entry in that release)' }
+"feed macos/arm64   : $feedMacShown"
+"certified macos/arm64: $CertifiedMacArm64Sha512"
 
 # Case-sensitive, as the helper's own Go == compare is: a token differing only in case is a
-# different token to the helper, so it must be a MISMATCH here too. The linux leg is the same:
-# the feed's text is compared as it is, against the recorded constant, so a difference in case
-# is a MISMATCH and never a silent match. No linux entry, or any linux entry that differs, is False.
+# different token to the helper, so it must be a MISMATCH here too. The linux and macos legs are
+# the same: the feed's text is compared as it is, against the recorded constant, so a difference
+# in case is a MISMATCH and never a silent match. No linux entry, or any linux entry that
+# differs, is False; so is no macos/arm64 entry, or any macos/arm64 entry that differs. (The
+# windows leg lowercases the feed's hash when it reads it, above; these two do not.)
 $hashOk  = $latest.Sha512 -ceq $installedSha
 $tokenOk = $cliToken -ceq $certified
 $verOk   = $latest.Version -ceq $certifiedSemver
 $linuxOk = ($feedLinux.Count -gt 0) -and (@($feedLinux | Where-Object { $_ -cne $CertifiedLinuxX64Sha512 }).Count -eq 0)
-if ($hashOk -and $tokenOk -and $verOk -and $linuxOk) { 'DRIFT CHECK: MATCH'; exit 0 }
-"DRIFT CHECK: MISMATCH (installed CLI == feed: $hashOk; installed CLI == helper's certified token: $tokenOk; feed version == certified semver: $verOk; feed linux/x64 == certified linux/x64: $linuxOk) -- STOP"
+$macOk   = ($feedMac.Count -gt 0) -and (@($feedMac | Where-Object { $_ -cne $CertifiedMacArm64Sha512 }).Count -eq 0)
+if ($hashOk -and $tokenOk -and $verOk -and $linuxOk -and $macOk) { 'DRIFT CHECK: MATCH'; exit 0 }
+"DRIFT CHECK: MISMATCH (installed CLI == feed: $hashOk; installed CLI == helper's certified token: $tokenOk; feed version == certified semver: $verOk; feed linux/x64 == certified linux/x64: $linuxOk; feed macos/arm64 == certified macos/arm64: $macOk) -- STOP"
 exit 1
