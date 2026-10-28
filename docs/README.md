@@ -25,6 +25,7 @@ This repo ships two tools that share one version line; each has its own design d
 - [research/probes/](research/probes/) - Runnable probes against the real Proton CLI, and local probes of git, APFS and Go behaviour, with their pinned results.
 - [research/probes/macos-port/README.md](research/probes/macos-port/README.md) - The macOS port's local probes (no network, no Proton account): which file shows which finding (M12–M29, PM1–PM9), and what each file does not show.
 - [research/gates/vNEXT-macos-gate-brief.md](research/gates/vNEXT-macos-gate-brief.md) - The brief for the macOS port's one live gate, run once for the release that carries the port. Not yet run; renamed when the version is named.
+- [research/gates/vNEXT-composition-refusal-steps.md](research/gates/vNEXT-composition-refusal-steps.md) - The steps the same release's Windows and Linux gate briefs carry: an NFD create refused on each platform's own binary. Renamed with the macOS brief.
 
 ## Specs And Plans
 
