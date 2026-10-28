@@ -7,12 +7,18 @@ v0.10.0's tested the case refusal per platform." These are the steps those two b
 briefs themselves are written at release time from the v0.10.0 briefs plus this file (plan
 `docs/superpowers/plans/2026-10-27-v2-macos-port.md`, Task 15 and "Not tasks"). Written on
 2026-10-27 on branch `worktree-macos-port`, and re-anchored on 2026-10-28; code read at
-**`0faada8`**, the macOS brief's anchor. The code it cites is unchanged from `119227e` there
-[measured 2026-10-28: among the code paths, `git diff 119227e 0faada8` changes only
-`cmd/git-remote-proton/main.go` and its test, neither cited here]. The host brief's anchor check
-must list `internal/repo/casefold.go`, `internal/repo/push.go` and `internal/repo/lock.go`: a
-change to any of them between `0faada8` and the tag re-derives the expected line and N.2's
-"nothing written" argument before the gate.
+**`0faada8`**, the macOS brief's anchor. The code it cites is unchanged from `119227e` there but
+for two lines of `cmd/git-remote-proton/main.go` [measured 2026-10-28: among the code paths, `git
+diff 119227e 0faada8` changes only that file's lines 493-495 and 526-527, the Mac list refusals'
+MA3 tails, which these steps never meet, and its test]. The host brief's anchor check must cover
+every code file these steps cite or rely on: `internal/repo/casefold.go`, `internal/repo/push.go`,
+`internal/repo/lock.go`, `internal/repo/readcheck.go`, `internal/gitcmd/gitcmd.go`,
+`internal/transport/trace.go` and `cmd/git-remote-proton/main.go`. The macOS brief's C.2 requires
+the same files unchanged from `0faada8` to the tag (its pathspec holds `internal` and `cmd`), so no
+change is expected; but the Linux and Windows gates run before it, so their own check must catch
+one. A change to any of them re-derives, before the gate, the expected lines (the refusal, the
+case forms, the warning, the `.lock` read-back), N.1's one pack pair and N.2's "nothing written"
+argument.
 
 **`vNEXT` is a placeholder** for the release that carries the macOS port, whose version Craig has
 not named. When he names it, this file is renamed with the version and every `vNEXT` replaced, by
@@ -60,7 +66,10 @@ raw NFD name reads `cafe<U+0301>`, the raw NFC name `caf<U+00E9>`, and the helpe
 -> cafe<U+0301> (refs/heads/cafe<U+0301> conflicts with refs/heads/caf<U+00E9> (heads/cafe<U+0301> vs heads/caf<U+00E9>, by Unicode normalisation: "heads/cafe<BS>u0301" vs "heads/caf<BS>u00e9"): a Mac clone would mishandle the pair (README, Honest limits), so this create is refused on every platform)
 ```
 
-It is the macOS brief's `[nfd-create]` entry, character for character.
+It is the macOS brief's `[nfd-create]` entry, character for character. It has one item, the NFC
+ref, because the root is fresh: the host briefs refuse a root whose name already exists [record
+`v0.10.0-linux-gate-brief.md:563-565`; `v0.10.0-windows-gate-brief.md:262`, which the next section
+extends to the new root]. A leftover ref there would change the line, a BLOCK, never a false pass.
 
 ## What the host brief adds for these steps
 
@@ -134,12 +143,17 @@ main -> Feat/x (refs/heads/Feat/x conflicts with refs/heads/feat (heads/Feat vs 
 main -> MAIN (refs/heads/MAIN conflicts with refs/heads/Main (heads/MAIN vs heads/Main, by letter case: "heads/MAIN" vs "heads/Main"), refs/heads/main (heads/MAIN vs heads/main, by letter case: "heads/MAIN" vs "heads/main"): a Windows or Mac clone would mishandle the pair (README, Honest limits), so this create is refused on every platform)
 ```
 
-- **The pair warning on every platform** (spec section 3, "The warning"). Wherever the host's
-  remote holds a case pair, a push or fetch prints the macOS brief's `[warn-case]` lines: in
-  v0.10.0's Linux 5.4, `s5h-side` and `s5i-MAIN`, after `s5g-upload-Main` laid `Main` down beside
-  `main` [record `v0.10.0-linux-gate-brief.md:2718-2795`]. v0.10.0 treats an unexpected
-  `git-remote-proton:` line as BLOCKED [record `v0.10.0-linux-gate-brief.md:715, 2326`], so the host
-  brief expects these two lines there:
+- **The pair warning on every platform** (spec section 3, "The warning") [code
+  `cmd/git-remote-proton/main.go:563-570`, `internal/repo/readcheck.go:57-81`]. Wherever the host's
+  remote holds a case pair, every helper `list` and `list for-push` of it (a push, fetch, clone or
+  `ls-remote`) prints the macOS brief's `[warn-case]` lines. In v0.10.0's briefs that is Linux 5.4
+  alone, after `s5g-upload-Main` laid `Main` down beside `main`: `s5h-side` prints them twice, for
+  its push and for its `ls-remote`, and `s5i-MAIN` once [record
+  `v0.10.0-linux-gate-brief.md:2718-2795`]. No later Linux step reaches that remote [measured
+  2026-10-28: no line of that brief after 2771 names `$CASE`], and no Windows remote holds a pair
+  (its case create, 4.4, is refused) [record `v0.10.0-windows-gate-brief.md:1069`]. v0.10.0 treats
+  an unexpected `git-remote-proton:` line as BLOCKED [record `v0.10.0-linux-gate-brief.md:715,
+  2326`], so the host brief expects these two lines at each of those three places:
 
 ```text
 git-remote-proton: warning: this remote holds refs that differ only by letter case or Unicode normalisation; see README, Honest limits:
@@ -298,7 +312,8 @@ if ($rc -ne 1) { throw "BLOCKED: the push exited $rc, not 1" }
 - `exit 1` and `EXPECTED LINE: FOUND`, as on Linux, character for character: the same rule on the
   Windows binary. The push's output (in `log\N2-nfd-create.txt`, printed escaped by
   `Test-EscapedLine`) also holds the `.lock` read-back line, `gpb: downloaded .../.lock (<n>
-  bytes)`, as v0.10.0's 4.4 expected [record `v0.10.0-windows-gate-brief.md:1071-1078`]. The
+  bytes)` [code `internal/transport/trace.go:43`], as v0.10.0's 4.4 expected [record
+  `v0.10.0-windows-gate-brief.md:1071-1078`]. The
   block takes the after-snapshot and `ls-remote` before it judges the exit and the text, so a BLOCK
   still leaves both recorded and the output printed.
 - **Nothing written:** `COMPARE nfd-0 -> nfd-1: NO DIFFERENCE`, and `ls-remote` exits 0 listing
@@ -359,3 +374,20 @@ Rejected, so not to be raised again:
 - S25: the cited guardrails do not exist in the v0.10.0 Windows brief.
 - S26: the pre-adoption scan is outside these steps and fails closed.
 - S27: its concrete parts are S1 and S2; its alternative is noted under S2's fix.
+
+Multi-model review, round 2, 2026-10-28 (Codex, Gemini, DeepSeek, Kimi), on `6bf53aa`. Codex and
+Gemini raised nothing new. Applied:
+
+- S2-1 (Kimi, DeepSeek): the anchor check covers every code file cited or relied on, adding
+  `readcheck.go`, `gitcmd.go`, `trace.go` and `main.go`; the note on `main.go`'s MA3 lines
+  corrected.
+- S2-2 (DeepSeek, Kimi): the warning's and the `.lock` read-back's code cited; the warning lines
+  equal the macOS brief's `[warn-case]`, which its expected-texts check matched to the code.
+- S2-3 (DeepSeek): every helper `list` of a pair-holding remote warns; `s5h-side` warns twice.
+- S2-4 (DeepSeek): why a fresh root keeps the expected line to its one item.
+- S2-5: S22 has since been applied, in `docs/README.md` (`7f1ffd5`).
+
+Rejected, so not to be raised again:
+
+- S2-6 (DeepSeek): listing `main.go` is not "permanently red": C.2 holds `cmd` unchanged.
+- S2-7 (DeepSeek): v0.10.0's `names` sorts, so the WSL view's order is fixed.

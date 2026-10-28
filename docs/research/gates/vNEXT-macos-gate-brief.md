@@ -60,7 +60,9 @@ from rule 6, is stated at C.5, as the v0.10.0 briefs made it.
   inside `gate-a1`, as the v0.10.0 briefs retried keyring setup; anything from step 0 on is not.
   Step 0's git-version STOP comes first in its script, before anything is read or recorded;
   whether step 0 then runs again inside `gate-a1`, after Craig's ruling on that git, is his call
-  (Question 6). In-step re-firings Craig orders are not retries: 6.1 (the screen was not locked),
+  (Question 6). 6.0's STOP on launchd's environment likewise comes before anything of step 6 is
+  made or loaded, and whether 6.0 then runs again is his call too. In-step re-firings Craig orders
+  are not retries: 6.1 (the screen was not locked),
   6.2 (permission granted, or the `abandon` agent) and 6.3 ((b) not exercised). Each is recorded
   with its count; none follows a BLOCK.
 - **The composition refusal on the other platforms.** The release's Windows and Linux gates carry
@@ -217,7 +219,7 @@ that others depend on comes first.
 | PC | Windows, PowerShell 7.6.7, Git for Windows 2.55.0.windows.3, `proton-drive` at `C:\Users\craig\Tools\proton-drive.exe`, the helper at `%LOCALAPPDATA%\Programs\git-proton-backup\git-remote-proton.exe`, tasks `ProjectsBackupDaily` and `ProtonCliDriftCheck` at `\` [record `v0.10.0-linux-gate-brief.md`, measured there 2026-10-16]; `gh`, signed in to GitHub (W.C.2's draft check needs it). W.B.0 re-checks them, `gh auth status` included |
 | Main checkouts | Mac `~/Projects/_Tools/git-proton-backup`; PC `C:\Users\craig\Projects\_Tools\git-proton-backup` |
 | Runs | `probe-a1` (a re-run, on Craig's word only, is `probe-a2`), and `gate-a1`, the only gate run (the retry rule). SUF is the attempt, `a1` |
-| Mac scratch | `~/gpbmac/`: `extract.py`, `kit/`, `scripts/`, `cli/` (the feed-verified CLI), `v010-build/` (Part A), `run.txt`, and one folder per run holding `env.sh`, `cache/`, `log/`, `out/`, `snap/`, `refsets/`, `relay/` and the run's repositories; the gate run also holds the tag's clone `git-proton-backup-vNEXT` (`$SRC`, C.3) and the keep-awake's `caffeinate.pid` |
+| Mac scratch | `~/gpbmac/`: `extract.py`, `kit/`, `scripts/`, `cli/` (the feed-verified CLI), `v010-build/` (Part A), `run.txt`, and one folder per run holding `env.sh`, `cache/`, `log/`, `out/`, `snap/`, `refsets/`, `relay/`, `envprobe/` (B.0's and 6.0's probe agent) and the run's repositories; the gate run also holds the tag's clone `git-proton-backup-vNEXT` (`$SRC`, C.3) and the keep-awake's `caffeinate.pid` |
 | PC scratch | `C:\gpbmac\`: `extract.ps1`, `kit\`, `run.txt`, and one folder per run holding `log\`, `refsets\`, `relay\`, `stage\` and `w\` (repositories) |
 | Gate cache folder | `~/gpbmac/gate-a1/cache`, the gate's `PROTON_DRIVE_CACHE_DIR`; the probe's is `~/gpbmac/probe-a1/cache` |
 | Installed binaries | `~/.local/bin/git-remote-proton` (built at the tag) and `~/.local/bin/proton-drive` (the certified CLI) |
@@ -241,7 +243,8 @@ that others depend on comes first.
   at step 2.0, only if step 0 found it absent, with `filesystem create-folder /my-files
   GitRemotes`, as v0.10.0 did. `GPB_CREATE_PARENTS` is never set [code
   `cmd/git-remote-proton/main.go:740`], so no push creates a parent; step 6's failing pushes rely
-  on that.
+  on that, and B.0 and 6.0 check that launchd's own environment does not set it either (step 6,
+  "Nor may launchd's own environment set it").
 - **What this run owns, and so may trash, is recorded, never inferred from names.** Step 0 starts
   the ownership record `~/gpbmac/gate-a1/roots.tsv`, and only when its checks pass. Each root is
   added the first time it is seen live, with its uid (`kit roots update`). Step 7.1 trashes only
@@ -272,15 +275,18 @@ that others depend on comes first.
   - **One `.lock` file per lock session.** The gate's pushes, Mac and PC, and its one
     `--set-head` make **39** before step 6: step 3 makes 4, step 4 makes 4, 5.0 makes 2, 5.1 2,
     5.2 1, 5.3 7, 5.4 2, 5.5 1, 5.8 4, 5.9.1 3, 5.9.2 1, 5.9.3 2, 5.10 2 and 5.11 4. Step 6 adds
-    2 for each firing of its succeeding agent (one expected; a re-fire or a `runs = 2` adds two
-    more each, 6.4) and none for its failing ones.
+    2 for each firing of its succeeding agent (one expected; a re-fire, or a second firing a
+    `FIRINGS` line counts, adds two more each, 6.4) and none for its failing ones.
   - **Four ref files from deletes:** `topic-m` and `topic-w` (step 4), the NFC `cafe` (5.8, from
     the PC) and the NFD `cafe` (5.10) [code `internal/repo/push.go`, phase 4].
   - **19 folders from step 2's contract table:** its 17 per-test roots, plus `trash-empty` and
     `trash-subtree` [code `internal/transport/contract_test.go:413-452, 626-637`; 17 cases counted
     at the anchor].
-  - **The eleven roots 7.1 trashes,** plus `GitRemotes` if this run created it, and their
-    descendants, which this brief does not predict; each root's enumeration at 7.1 is the record.
+  - **The eleven roots 7.1 trashes,** plus `GitRemotes` if this run created it; each root's
+    enumeration at 7.1 is the record of what went with it.
+  - **A trashed folder's contents** are in none of these counts, the contract folders' and the
+    roots' alike: whether the trash lists them as rows of their own is not known (C.5), so any
+    that appear are recorded with the folder they came from, not predicted.
   - **No prune folders:** no nested branch is deleted.
 
   Whether the CLI can list the trash at all is uncertain (C.5). So a count that differs from these
@@ -299,7 +305,10 @@ The two share no files.
   `Save-Relay '<the line>'`. The quoted line is the only thing a runner fills in, and only with
   what Craig relays. Scripts and blocks then read it (`kit relaycmp` and `kit getval`;
   `Compare-Relay` and `Get-RelayValue`). A relay line holds only ASCII: ref-set digests, commit
-  IDs, uids. A second relay under the same name that differs from the first is BLOCKED by the kit.
+  IDs, uids. A second relay under the same name that differs from the first is BLOCKED by the kit,
+  and so is a value relay of a name this gate does not relay, or of the wrong shape: `pcroot` is a
+  uid, and `W3` a commit ID and `brief` a blob, both 40 lower-case hex digits (`kit relayin`
+  checks it, and `kit getval` again on reading it).
   *Brief author's call:* digests
   rather than whole ref sets, so a relay is one short line, and a mismatch is then diagnosed from
   both sides' logs.
@@ -489,8 +498,15 @@ brackets.
 9. **The Mac push rule, part 1(a)**, the local half [code `macpush.go:191-217, 226-228`].
    [`mac-local-half`]
 10. **The Mac push rule, part 3**, a delete [code `macpush.go:290-314`]. [`mac-part3`]
-11. **Part 2's paired delete and R3's create** [code `macpush.go:58-76`]. Not provoked live: no
-    section 6 push pairs a delete with a write the Mac rule refuses.
+11. **Part 2's paired delete, and R3's create:** two messages. Part 2's [code `macpush.go:58-64`]:
+    `<d>: delete refused because it pairs with <x>, which this Mac refused; neither was applied`,
+    which shares its first words with string 3 but not its end. R3's [code `macpush.go:66-76`, with
+    `macWriteTail` at `:38-39`]: `<x>: refused on this Mac: this push's delete of <k> was refused
+    here, and <x> would then conflict with <items>`, then `macWriteTail`, `; this repository's
+    default (files) ref store cannot keep these apart (README, Honest limits); repair the remote,
+    or push from a --ref-format=reftable clone`; with more than one kept delete, `deletes of <k1>,
+    ... and <kn> were`. Not provoked live: no section 6 push pairs a delete with a write the Mac
+    rule refuses.
 12. **R7's form of part 1(a)** adds ` (the tracking ref of <Y>, which this push deletes)` to an
     item [code `macpush.go:198-211`]. Not provoked live (see "R7 and this gate").
     [`r7-not-provoked`]
@@ -786,7 +802,7 @@ commit_in() { printf '%s\n' "$3" >> "$1/$2" && git -C "$1" add "$2" && git -C "$
 # through d5_check (string 16), so every push the gate makes counts toward its sightings.
 logged() {
   L="$G/out/$1.txt"; shift; "$@" >"$L" 2>&1; rc=$?; kit esc "$L"
-  case " $* " in *" git "*" push "*) d5_check "$L" ;; esac
+  case " $* " in *" git push "*|*" git "*" push "*) d5_check "$L" ;; esac
   return 0
 }
 # refs_of <repo> <file>: every local ref, raw bytes, for a before/after comparison with cmp.
@@ -856,10 +872,13 @@ locked() { /usr/sbin/ioreg -n Root -d1 -a | /usr/bin/plutil -extract IOConsoleUs
 # <linger> seconds more if given (6.2: a notification the run started is not cut short), prints
 # launchd's state, runs and last exit, and boots it out. The interval counts from the bootstrap,
 # not from the run's end (launchd.plist(5): "every N seconds"), so a run ending near a boundary
-# can be followed by a second firing before the bootout: `runs = 2` in the printed lines shows it.
-# Prints both logs in the escaped view. Returns 1 when it did not fire, or did not end, in time.
+# can be followed by a second firing before the bootout. `runs =` is printed before the bootout,
+# so it can miss a firing that starts between the print and the bootout; the FIRINGS line, counted
+# from the out log after the bootout, shows every firing that started and every one that ended.
+# Prints both logs in the escaped view. Returns 1 when it did not fire, or did not end, in time, or
+# when a firing started and did not end before the bootout (the bootout cut it).
 fire() {
-  local n="$1" limit="$2" linger="${3:-0}" dom lbl o e t0 t1 k
+  local n="$1" limit="$2" linger="${3:-0}" dom lbl o e t0 t1 k ns ne
   dom="gui/$(id -u)"; lbl="gpbmac.$RUN.$n"; o="$G/launchd/logs/$n.out.log"; e="$G/launchd/logs/$n.err.log"
   [ -f "$G/launchd/$n.plist" ] || { echo "BLOCKED: no plist $G/launchd/$n.plist"; return 1; }
   for k in 1 2 3 4 5 6 7 8 9; do [ -e "$o.$k" ] || break; done
@@ -887,8 +906,51 @@ fire() {
   if [ "$linger" -gt 0 ]; then echo "the run has ended; waiting $linger s before the bootout"; sleep "$linger"; fi
   launchctl print "$dom/$lbl" 2>&1 | grep -E 'state =|runs =|last exit'
   launchctl bootout "$dom/$lbl"; echo "bootout $lbl: exit $?"
+  sleep 2
+  ns=$(grep -c 'gpb-v2-push: start:' "$o"); ne=$(grep -c -E 'gpb-v2-push: (git push [^ ]+ --tags: exit |could not create a temporary directory)' "$o")
+  echo "FIRINGS in $n.out.log, counted after the bootout: $ns started, $ne ended"
   echo "== $n.out.log"; kit esc "$o"; echo "== $n.err.log"; kit esc "$e"
+  if [ "$ns" != "$ne" ]; then echo "BLOCKED: a firing started and did not end before the bootout, which cut it"; return 1; fi
   return 0
+}
+# envprobe <dir>: what launchd's own environment hands an agent of Craig's GUI domain (B.0, 6.0).
+# A probe agent, gpbmac.<run>.envprobe, with the gate plists' EnvironmentVariables (their
+# PROTON_DRIVE_CACHE_DIR alone) and no account access, runs once at its bootstrap (RunAtLoad):
+# bash's compgen -e, which lists exported names and never a value, keeps the GPB_, PROTON_DRIVE_
+# and GIT_ ones, then prints its HOME and PROTON_DRIVE_CACHE_DIR, both paths. envprobe waits at
+# most 60 s for it, boots it out and prints what it saw. Status 0 only when those names are
+# PROTON_DRIVE_CACHE_DIR alone, with the plist's value, and HOME is this runner's; 1 when not; 2
+# when the probe could not run. An earlier log in <dir> is moved aside first.
+envprobe() {
+  local d="$1" dom lbl o k names r=0
+  dom="gui/$(id -u)"; lbl="gpbmac.$RUN.envprobe"; o="$d/envprobe.out.log"
+  if launchctl print "$dom/$lbl" >/dev/null 2>&1; then echo "BLOCKED: $lbl is already loaded"; return 2; fi
+  mkdir -p "$d" || return 2
+  for k in 1 2 3 4 5 6 7 8 9; do [ -e "$o.$k" ] || break; done
+  [ -e "$o" ] && mv "$o" "$o.$k"
+  printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+    '<plist version="1.0">' '<dict>' '    <key>Label</key>' "    <string>$lbl</string>" \
+    '    <key>ProgramArguments</key>' '    <array>' '        <string>/bin/bash</string>' '        <string>-c</string>' \
+    '        <string>compgen -e | /usr/bin/grep -E "^(GPB_|PROTON_DRIVE_|GIT_)" | /usr/bin/sort; echo "HOME=$HOME"; echo "PROTON_DRIVE_CACHE_DIR=${PROTON_DRIVE_CACHE_DIR-}"; echo END</string>' \
+    '    </array>' '    <key>RunAtLoad</key>' '    <true/>' \
+    '    <key>StandardOutPath</key>' "    <string>$o</string>" '    <key>StandardErrorPath</key>' "    <string>$o</string>" \
+    '    <key>EnvironmentVariables</key>' '    <dict>' '        <key>PROTON_DRIVE_CACHE_DIR</key>' \
+    "        <string>$PROTON_DRIVE_CACHE_DIR</string>" '    </dict>' '</dict>' '</plist>' > "$d/envprobe.plist" || return 2
+  plutil -lint "$d/envprobe.plist" || return 2
+  launchctl bootstrap "$dom" "$d/envprobe.plist" || { echo "BLOCKED: launchctl bootstrap of $lbl failed"; return 2; }
+  for k in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do grep -qx END "$o" 2>/dev/null && break; sleep 2; done
+  launchctl bootout "$dom/$lbl"; echo "bootout $lbl: exit $?"
+  grep -qx END "$o" 2>/dev/null || { echo "BLOCKED: the probe agent wrote no END line within 60 s"; return 2; }
+  names=$(grep -E '^(GPB_|PROTON_DRIVE_|GIT_)[A-Za-z0-9_]*$' "$o" | tr '\n' ' ' | sed 's/ $//')
+  echo "launchd's job environment, its GPB_, PROTON_DRIVE_ and GIT_ names (names only): ${names:-none}"
+  echo "its HOME: [$(grep '^HOME=' "$o" | cut -d= -f2-)]; this runner's: [$HOME]"
+  echo "its PROTON_DRIVE_CACHE_DIR: [$(grep '^PROTON_DRIVE_CACHE_DIR=' "$o" | cut -d= -f2-)]; the plist's: [$PROTON_DRIVE_CACHE_DIR]"
+  [ "$names" = PROTON_DRIVE_CACHE_DIR ] || { echo "NOT CLEAN: a name other than the plist's PROTON_DRIVE_CACHE_DIR reaches the agent from launchd"; r=1; }
+  grep -qxF "HOME=$HOME" "$o" || { echo "NOT CLEAN: the agent's HOME is not this runner's"; r=1; }
+  grep -qxF "PROTON_DRIVE_CACHE_DIR=$PROTON_DRIVE_CACHE_DIR" "$o" || { echo "NOT CLEAN: the agent's PROTON_DRIVE_CACHE_DIR is not the plist's"; r=1; }
+  if [ "$r" = 0 ]; then echo "LAUNCHD ENVIRONMENT: CLEAN"; else echo "LAUNCHD ENVIRONMENT: NOT CLEAN"; fi
+  return "$r"
 }
 # awake_ok: the keep-awake Craig started at C.0 (kit/awake.sh) still runs, checked by the pid it
 # recorded alone, never by name, so no other caffeinate on the Mac counts. Sets AWAKE_PID.
@@ -1427,6 +1489,15 @@ def c_relay(label):
 
 REFSET_RELAY = r"^RELAY refset ([A-Za-z0-9.-]+) (clone|remote) ([0-9]+) ([0-9a-f]{64}) ([0-9]+) ([0-9a-f]{64})$"
 VALUE_RELAY = r"^RELAY value ([A-Za-z0-9_]+) ([A-Za-z0-9~_.-]+)$"
+# The values this gate relays, each with its shape: a uid, a commit ID, a blob.
+VALUE_SHAPES = {"pcroot": r"[A-Za-z0-9~_.-]+", "W3": r"[0-9a-f]{40}", "brief": r"[0-9a-f]{40}"}
+
+
+def value_ok(name, value):
+    if name not in VALUE_SHAPES:
+        raise Blocked("relay value %s: not a value this gate relays (%s)" % (esc(name), ", ".join(sorted(VALUE_SHAPES))))
+    if not re.fullmatch(VALUE_SHAPES[name], value):
+        raise Blocked("relay value %s: [%s] does not have its shape (%s)" % (name, esc(value), VALUE_SHAPES[name]))
 
 
 def c_relayin(line):
@@ -1434,6 +1505,8 @@ def c_relayin(line):
     m, v = re.match(REFSET_RELAY, line), re.match(VALUE_RELAY, line)
     if not (m or v):
         raise Blocked("not a relay line: [%s]" % esc(line))
+    if v:
+        value_ok(v.group(1), v.group(2))
     p = os.path.join(rdir("relay"), ("refset-" + m.group(1)) if m else ("value-" + v.group(1)))
     if os.path.exists(p + ".txt") and read_lines(p + ".txt")[0] != line:
         raise Blocked("a different relay of that name was received before: [%s]" % esc(read_lines(p + ".txt")[0]))
@@ -1448,6 +1521,8 @@ def c_relaycmp(label, theirs):
     if not os.path.exists(p):
         raise Blocked("no relayed ref set %s (pass the PC's RELAY line to kit.sh relayin first)" % theirs)
     m = re.match(REFSET_RELAY, read_lines(p)[0])
+    if not m:
+        raise Blocked("the stored relay refset-%s is not a ref-set relay line" % theirs)
     clone, rs = read_refset(label)
     drop = clone or m.group(2) == "clone"
     mine = nohead(rs) if drop else rs
@@ -1464,7 +1539,11 @@ def c_getval(name):
     p = os.path.join(rdir("relay"), "value-" + name + ".txt")
     if not os.path.exists(p):
         raise Blocked("no relayed value %s (pass the PC's RELAY line to kit.sh relayin first)" % name)
-    print(read_lines(p)[0].split(" ")[3])
+    v = re.match(VALUE_RELAY, read_lines(p)[0])
+    if not v or v.group(1) != name:
+        raise Blocked("the stored relay value-%s is not a relay line of that name" % name)
+    value_ok(name, v.group(2))
+    print(v.group(2))
     return 0
 
 
@@ -1658,16 +1737,26 @@ def c_pushtree(samples, outlog, errlog):
     # logs as killed at its bound counts as reaped only when its tree held a git-remote-proton or
     # proton-drive process still seen within 0.5 s of the bound (counted from the push's first
     # sample) or later, and the error log holds string 14 exactly once for each push that was not
-    # killed: a killed push's helper that still printed string 14 was not stopped by the kill.
+    # killed: a killed push that still printed string 14 either ended just before the kill landed
+    # or was not stopped by it. Any other git-remote-proton: line in the error log is BLOCKED, so
+    # that two anomalies cannot cancel in that count (string 17, a pipe held past exit, is listed
+    # and recorded, the brief's known-lines rule); and the out log must hold one firing.
     # Exit 0: a push reaped so, and nothing of any push still runs. Exit 3: (b) not exercised (no
-    # push reaped so, or string 14 from a killed push). Exit 1: BLOCKED (no push seen, a push not
-    # leading its group, a process still running, or a push not killed that printed no string 14).
+    # push reaped so, string 14 from a killed push, or not one firing). Exit 1: BLOCKED (no push
+    # seen, a push not leading its group, a process still running, another git-remote-proton:
+    # line, or a push not killed that printed no string 14).
     out = "\n".join(read_lines(outlog))
     killed = set(re.findall(r"gpb-v2-push: git push proton-fail (--all|--tags) ran past [0-9]+s and was killed", out))
     ended = set(re.findall(r"gpb-v2-push: git push proton-fail (--all|--tags): exit [0-9]+", out))
     bounds = [int(b) for b in re.findall(r"gpb-v2-push: git push proton-fail --[a-z]+ ran past ([0-9]+)s and was killed", out)]
     bound = max(bounds) if bounds else 0
-    n14 = len([l for l in read_lines(errlog) if l.startswith("git-remote-proton: parent folder ")])
+    elines = read_lines(errlog)
+    n14 = len([l for l in elines if l.startswith("git-remote-proton: parent folder ")])
+    s17 = re.compile(r"^git-remote-proton: .+ exited but something still held its output pipe open after ")
+    known = [l for l in elines if s17.match(l)]
+    others = [l for l in elines if l.startswith("git-remote-proton:") and not s17.match(l)
+              and not l.startswith("git-remote-proton: parent folder ")]
+    starts = len(re.findall(r"gpb-v2-push: start: ", out))
     procs = {}
     for l in read_lines(samples):
         p = l.split(None, 4)
@@ -1716,17 +1805,30 @@ def c_pushtree(samples, outlog, errlog):
     want14 = len(ended) - len(killed & ended)
     print("STRING 14: %d line(s) in %s; pushes ended: %d, killed at the bound: %d, so %d expected" % (
         n14, os.path.basename(errlog), len(ended), len(killed & ended), want14))
+    print("OTHER git-remote-proton: LINES in %s: %d (none expected); string 17's, recorded: %d" % (
+        os.path.basename(errlog), len(others), len(known)))
+    for l in known:
+        print("  KNOWN, string 17 (recorded): " + esc(l))
+    for l in others:
+        print("  OTHER: " + esc(l))
+    print("FIRINGS in %s: %d (one expected)" % (os.path.basename(outlog), starts))
     print("PUSH TREE: %d push root(s), %d still running; killed at the bound: %s" % (
         len(roots), alive, ", ".join(sorted(killed)) or "none"))
     for b in blocked:
         print("BLOCKED: " + b)
     if not roots or alive or blocked:
         return 1
+    if others:
+        print("BLOCKED: the error log holds a git-remote-proton: line that is neither string 14 nor string 17 (OTHER, above)")
+        return 1
+    if starts != 1:
+        print("(b) NOT EXERCISED: the out log holds %d firings, and this check judges one firing's logs" % starts)
+        return 3
     if n14 < want14:
         print("BLOCKED: a push that was not killed did not print string 14 (the missing-parent refusal)")
         return 1
     if n14 > want14:
-        print("(b) NOT EXERCISED: a push the wrapper logs as killed still printed string 14, so the kill did not stop its helper")
+        print("(b) NOT EXERCISED: a push the wrapper logs as killed also printed string 14: its helper ended just before the kill landed, or the kill did not stop it (the logs cannot tell which)")
         return 3
     if not exercised:
         print("(b) NOT EXERCISED: no push killed at its bound had a git-remote-proton or proton-drive process alive at the bound")
@@ -1951,7 +2053,7 @@ the probe's run, then the prep script.
 # B.0: the probe's CLI, downloaded once and checked against the certified SHA-512, and the
 # machine's starting state. No account.
 . "$HOME/gpbmac/kit/lib.sh" "$1" || exit 2
-have curl shasum xattr codesign security cksum od install || bad "missing tool(s), named above"
+have curl shasum xattr codesign security cksum od install launchctl plutil || bad "missing tool(s), named above"
 CONST=$(git -C "$MAIN" show refs/remotes/origin/main:scripts/Test-ProtonCliDrift.ps1 | tr -d '\r' | grep -oE "^[$]CertifiedMacArm64Sha512[[:space:]]*=[[:space:]]*'[0-9a-f]{128}'[[:space:]]*$" | grep -oE '[0-9a-f]{128}')
 echo "certified macos/arm64 SHA-512 (origin/main's drift script): ${CONST:-NONE}"
 echo "M2's value, quoted in this brief:                            $M2"
@@ -1977,6 +2079,8 @@ kc_expect absent "the CLI's Keychain item already exists"
 echo "probe cache folder: $PROTON_DRIVE_CACHE_DIR, entries: [$(ls -A "$PROTON_DRIVE_CACHE_DIR")]"
 echo "variables inherited by a probe script: ${INHERITED:-none}"
 [ -z "$INHERITED" ] || bad "GPB_, PROTON_DRIVE_, GIT_CONFIG or object-placement GIT_ variables reach the scripts"
+echo "== what launchd's own environment hands an agent of this GUI domain (a probe agent; no account)"
+envprobe "$G/envprobe" || bad "launchd's environment is not the gate's (the lines above say why; names only, never a value)"
 if [ "$fail" = 0 ]; then echo "PREP: PASS"; else echo "PREP: BLOCKED"; fi
 exit "$fail"
 ```
@@ -1994,7 +2098,14 @@ PC, whose W.B.0 blob must equal it), `RUN STARTED: probe-a1 ...`, then
 - no `proton-drive` on the probe's PATH, and neither `proton-drive` nor `git-remote-proton` in
   `~/.local/bin`, `/opt/homebrew/bin` or `/usr/local/bin` (the probe's PATH holds none of them, so
   it checks them by name); no M7 default folder, no Keychain item, an empty probe cache folder, and
-  no inherited variable.
+  no inherited variable;
+- `LAUNCHD ENVIRONMENT: CLEAN`: the probe agent `gpbmac.probe-a1.envprobe`, bootstrapped into
+  Craig's GUI domain, listed no `GPB_`, `PROTON_DRIVE_` or `GIT_` name but its plist's own
+  `PROTON_DRIVE_CACHE_DIR`, with the plist's value, and its `HOME` is Craig's (step 6, "Nor may
+  launchd's own environment set it"). It is the gate's first `launchctl bootstrap`; anything macOS
+  shows for it is recorded [untested]. `NOT CLEAN` names each variable, never its value: STOP for
+  Craig before the tag. Clearing one from launchd's environment (`launchctl unsetenv <name>`, in
+  his own Terminal) is his call; 6.0 checks again before any of step 6's agents exists.
 
 **The screen-lock reading's positive control** (no account):
 `/bin/bash ~/gpbmac/kit/gx.sh p0-lockcheck`. Step 6.1 judges a locked screen by `lib.sh`'s
@@ -2058,13 +2169,17 @@ if [ "$fail" = 0 ]; then echo "ASSERT: PASS (Craig may sign in)"; else echo "ASS
 exit "$fail"
 ```
 
-**Pass:** `ASSERT: PASS (Craig may sign in)`. **Craig types,** in a new Terminal window:
+**Pass:** `ASSERT: PASS (Craig may sign in)`. **Craig types,** in a new Terminal window, the first
+line, and the second only once the first has named this probe's run:
 
 ```bash
-source ~/gpbmac/probe-a1/env.sh
+source ~/gpbmac/"$(cat ~/gpbmac/run.txt)"/env.sh; echo "run: $RUN; cache folder: $PROTON_DRIVE_CACHE_DIR"
 "$PD" auth login; echo "auth login: exit $?"
 ```
 
+- **The run:** `run: probe-a1; cache folder: /Users/craig/gpbmac/probe-a1/cache`, or `probe-a2`
+  in both places on a re-run: the run B.0 started, whose cache folder B.4 checks and B.7 deletes.
+  Any other line: STOP, and no sign-in.
 - **Expected:** the CLI opens Craig's browser, or prints a URL to open (F10); Craig completes the
   sign-in there, and the CLI reports success. Its exact text is [untested] on the Mac: record it
   verbatim, any URL stripped of its query string and fragment.
@@ -2189,8 +2304,10 @@ exit "$fail"
 ```bash
 # file: mac:scripts/p7-delete.sh
 # B.7: delete the probe folder (the probe's PROTON_DRIVE_CACHE_DIR), only after a recorded logout;
-# M7's default folders must still be absent.
+# M7's default folders must still be absent. B.0's probe agent is booted out first if it is still
+# loaded (envprobe boots it out itself unless it was stopped part way).
 . "$HOME/gpbmac/kit/lib.sh" "$1" || exit 2
+if launchctl print "gui/$(id -u)/gpbmac.$RUN.envprobe" >/dev/null 2>&1; then launchctl bootout "gui/$(id -u)/gpbmac.$RUN.envprobe"; echo "booted out gpbmac.$RUN.envprobe: exit $?"; fi
 if [ ! -s "$G/logout.state" ]; then echo "7 KEPT: no logout is recorded ($G/logout.state), so the probe folder stays (STOP for Craig)"; exit 1; fi
 echo "logout: $(cat "$G/logout.state")"
 echo "== the probe folder, before deletion"; find "$PROTON_DRIVE_CACHE_DIR" -type f | sort | sed "s|^$PROTON_DRIVE_CACHE_DIR/|  |"
@@ -2209,9 +2326,10 @@ exit "$fail"
 stays, the PC's tasks stay paused, and Craig decides (the Linux probe's rule, *brief author's call*).
 
 **What the probe leaves.** On the Mac: `~/gpbmac` with the kit, the scripts, the feed-verified CLI
-in `cli/`, the v0.10.0 build, and `probe-a1/` without its cache folder (its logs are the probe's
-record). On the PC: `C:\gpbmac` with its kit and `probe-a1\`, whose baseline W.0 compares with the
-gate's. A probe re-run (Craig's word only) is `probe-a2`.
+in `cli/`, the v0.10.0 build, and the probe's run folder (`probe-a1/`, or `probe-a2/` after a
+re-run) without its cache folder (its logs are the probe's record). On the PC: `C:\gpbmac` with
+its kit and `probe-a1\`, whose baseline W.0 compares with the gate's. A probe re-run (Craig's word
+only) is `probe-a2`.
 
 ---
 
@@ -2336,7 +2454,10 @@ macOS install lines with this brief's quote themselves.
 (Question 13). The script already carries section 6's rule for that case: v0.10.0's helper
 refuses the new certified CLI, so its commands run with `GPB_UNCERTIFIED_CLI=1`, recorded as
 such [code `cmd/git-remote-proton/main.go:31` at `v0.10.0`; spec section 6, step 5.5].
-`GPB_UNCERTIFIED_CLI=1` is never set for the gated helper.
+`GPB_UNCERTIFIED_CLI=1` is never set for the gated helper. For a moved pin, though, this brief
+cannot stand as written: C.3's README quote, M2, `[version]` and `[cli-version]` all name the
+0.9.0 CLI, so a ruling that it stands would meet C.3's STOP on the README's lines. That branch of
+the script is carried for a brief written for a new pin.
 
 ### C.3 Build and install with the README's own lines, read at the tag (Mac)
 
@@ -3763,6 +3884,22 @@ anyway, it exits with the parent refusal, not 124, and (b) is recorded as not ex
 *Brief author's call:* a bound shorter than the push, on a read-only push, is how a hang is
 produced on purpose; a real hang (a Keychain prompt) cannot be.
 
+**Nor may launchd's own environment set it.** A variable set in launchd's environment
+(`launchctl setenv`) reaches every agent of Craig's GUI domain whatever its plist leaves out
+[measured 2026-10-28: `launchctl help` gives setenv as "Sets the specified environment variables
+for all services within the domain"]. So an inherited `GPB_CREATE_PARENTS=1` would let the
+failing agents create the parent this gate never creates, and push beneath it; and an inherited
+`GPB_PATH`, `GPB_NOTIFY`, `GPB_MARKER_DIR` or `GPB_PUSH_TIMEOUT` would change what step 6 tests.
+Step 0's check of inherited variables sees only the runner's own. So B.0, before the tag, and
+6.0, before any gate agent exists, bootstrap a probe agent of the same domain (`envprobe` in
+`lib.sh`), with the gate plists' `EnvironmentVariables` and no account access. It lists the names
+of the `GPB_`, `PROTON_DRIVE_` and `GIT_` variables it was handed, never a value, and prints its
+`HOME` and `PROTON_DRIVE_CACHE_DIR`. Any such name but the plist's own `PROTON_DRIVE_CACHE_DIR`,
+that variable with another value, or another `HOME`, is `NOT CLEAN`: at B.0 a STOP before the tag,
+at 6.0 a STOP before anything of step 6 is made. *Brief author's call:* the job's own view of its
+environment, rather than `launchctl getenv` by name, so that a name this brief does not foresee is
+seen too.
+
 **The gate's plist** is the README's example (`scripts/macos/gpb-v2-push.plist.example`) with
 section 4's two changes, the cache folder and the interval, and the gate's paths. It runs the
 tag's wrapper where the tag's clone holds it, not a copy installed in `~/.local/bin` as the README
@@ -3779,7 +3916,8 @@ install line and a plist in `~/Library/LaunchAgents` are listed under "Not cover
   `$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` [code
   `gpb-v2-push.sh:68-70`]: the helper and the CLI come from `~/.local/bin`, and git from
   `/usr/bin/git`, since neither `/opt/homebrew/bin` nor `/usr/local/bin` holds a git [measured
-  2026-10-27; 6.0 re-checks]. launchd sets `HOME` for a user agent [inference];
+  2026-10-27; 6.0 re-checks]. launchd sets `HOME` for a user agent [inference; the probe agent
+  of B.0 and 6.0 checks that it is Craig's];
 - the `hang` agent alone adds `GPB_PUSH_TIMEOUT` 1, and the `abandon` agent alone
   `AbandonProcessGroup` true;
 - `ProgramArguments` runs `/bin/bash` on the tag's wrapper, `$SRC/scripts/macos/gpb-v2-push.sh`
@@ -3788,19 +3926,23 @@ install line and a plist in `~/Library/LaunchAgents` are listed under "Not cover
 *Brief author's call:* the plists stay in the run folder and are loaded from there, not copied into
 `~/Library/LaunchAgents`, so none can load again at a later login if cleanup is interrupted; and
 the failure marker stays at its default folder, `~/Library/Logs`, as the README's example leaves
-it, and 7.7 removes this gate's markers by name. `GPB_NOTIFY` is not set: the default notification
-is what is tested.
+it, and 7.7 removes this gate's markers by name. `GPB_NOTIFY` is not set, in the plists or (6.0's
+probe agent shows) in launchd's environment: the default notification is what is tested.
 
 **6.0 Ready.** The keep-awake Craig started at C.0 must still run, checked by its recorded
 pid, and Craig confirms the Mac is on mains power with its lid open, where `-s` takes effect. Then
-`gx.sh s6-0-ready`.
+`gx.sh s6-0-ready`. Its first check is launchd's environment, through the probe agent, before
+anything of step 6 is made.
 
 ```bash
 # file: mac:scripts/s6-0-ready.sh
-# Step 6.0: mains power, the keep-awake (caffeinate -is) held, and the launchd step's folder,
-# repository and plists.
+# Step 6.0: launchd's own environment (a probe agent, first: a STOP before anything is made), mains
+# power, the keep-awake (caffeinate -is) held, and the launchd step's folder, repository and plists.
 . "$HOME/gpbmac/kit/lib.sh" "$1" || exit 2
 if [ -e "$G/launchd" ] || [ -e ld ]; then echo "BLOCKED: $G/launchd or $G/ld already exists"; exit 1; fi
+echo "== what launchd's own environment hands a gate agent, before any agent, folder or plist of step 6 exists"
+envprobe "$G/envprobe"; ev=$?
+if [ "$ev" != 0 ]; then echo "6.0: STOP: launchd's environment is not the gate's (the lines above say why); nothing of step 6 was made or loaded. Craig rules, and 6.0 runs again on his word"; exit 3; fi
 P=$(pmset -g batt | head -1); echo "power: $P"
 case "$P" in *"'AC Power'"*) echo "mains power: yes" ;; *) bad "the Mac is not on mains power (section 6 step 6)" ;; esac
 if awake_ok; then pmset -g assertions | grep -E "pid $AWAKE_PID[(]caffeinate[)]"; else bad "the keep-awake is not running (Craig started it at C.0)"; fi
@@ -3860,20 +4002,27 @@ for r in proton-v2 proton-fail; do
 done
 echo "== the README example's keys, for the record"; plutil -p "$SRC/scripts/macos/gpb-v2-push.plist.example"
 echo "== the ok plist"; plutil -p "$G/launchd/ok.plist"
-echo "== Craig's global git configuration, key names only, which step 6's runs use (Question 5)"
-env -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_NOSYSTEM git config --global --name-only --list | sort -u
+echo "== Craig's global git configuration, which step 6's runs use (Question 5): key names only, each subsection shown as <subsection>, since a url.<URL>.insteadOf or http.<URL>.* name can carry a credential"
+env -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_NOSYSTEM git config --global --name-only --list | sed -E 's/^([^.]+)[.].*[.]([^.]+)$/\1.<subsection>.\2/' | sort -u
 kit absentnode "$ABSENT" || bad "the never-created parent exists"
 for n in ok fail abandon hang; do launchctl print "gui/$(id -u)/gpbmac.$RUN.$n" >/dev/null 2>&1 && bad "gpbmac.$RUN.$n is already loaded"; done
 if [ "$fail" = 0 ]; then echo "6.0: READY"; else echo "6.0: BLOCKED"; fi
 exit "$fail"
 ```
 
-**Pass:** `mains power: yes`, `keep-awake: pid <n>, /usr/bin/caffeinate, running` with its two
+**Pass:** `LAUNCHD ENVIRONMENT: CLEAN`, as at B.0; `mains power: yes`; `keep-awake: pid <n>,
+/usr/bin/caffeinate, running` with its two
 assertions listed under `pid <n>(caffeinate)`, no `git` in
 `/opt/homebrew/bin` or `/usr/local/bin`, four `OK` lines from `plutil -lint`, both markers absent, `ABSENT NODE`, no gate agent already loaded, and
 `6.0: READY`. The marker's name is the wrapper's own rule, the first field of `printf '%s\n%s'
 "<physical path>" "<remote>" | cksum` [code `gpb-v2-push.sh:95-100`], so a step that reads it uses
-the repository's physical path (`pwd -P`), as the wrapper does.
+the repository's physical path (`pwd -P`), as the wrapper does. Craig's global configuration is
+recorded by key name with each subsection shown as `<subsection>`, since a `url.<URL>.insteadOf`
+or `http.<URL>.*` name can carry a credential.
+
+`6.0: STOP` (exit 3) means launchd's environment is not the gate's, met before anything of step 6
+exists: nothing was made or loaded. Craig rules, and whether 6.0 then runs again is his call (the
+retry rule).
 
 **6.1 The succeeding agent, fired by its schedule with the screen locked:** Craig says he is about
 to lock the screen; the runner starts `gx.sh s6-1-ok` in the background (at least 90 minutes); Craig
@@ -3899,7 +4048,10 @@ if [ "$mode" = refire ]; then
   echo "re-fire $k: main now at $(git -C ld rev-parse main); new branch $b"
 fi
 echo "waiting 60 s for Craig to lock the screen"; sleep 60
-fire ok 1800 || { echo "BLOCKED: section 6 step 6's bound (two intervals to fire, 30 minutes to finish)"; exit 1; }
+fire ok 1800 || { echo "BLOCKED: section 6 step 6's bound (two intervals to fire, 30 minutes to finish), or a firing the bootout cut (fire's lines above)"; exit 1; }
+echo "== the gate cache folder: files the scheduled run's CLI wrote or changed (nothing else has run the CLI since the bootstrap)"
+find "$PROTON_DRIVE_CACHE_DIR" -type f -newer "$G/launchd/ok.stamp" | sed "s|^$PROTON_DRIVE_CACHE_DIR/|  |"
+[ -n "$(find "$PROTON_DRIVE_CACHE_DIR" -type f -newer "$G/launchd/ok.stamp")" ] || bad "nothing in the gate cache folder changed: did the wrapper hand PROTON_DRIVE_CACHE_DIR on?"
 kit expect "$G/launchd/logs/ok.out.log" wrapper-ok || bad "the wrapper did not log both pushes succeeding"
 e="$G/launchd/logs/ok.err.log"
 if [ "$mode" = first ]; then
@@ -3915,9 +4067,6 @@ m=$(cat "$G/launchd/marker-proton-v2.txt"); if [ -e "$m" ]; then bad "the succee
 git -C ld ls-remote --heads --tags proton-v2 > "$G/refsets/ld-6-remote.txt" || bad "ls-remote failed"
 git -C ld for-each-ref --format='%(objectname) %(refname)' refs/heads refs/tags > "$G/refsets/ld-6-local.txt"
 kit refcmp ld-6-local ld-6-remote || bad "the remote's ref set is not the repository's branches and tags"
-echo "== the gate cache folder: files the scheduled run's CLI wrote or changed"
-find "$PROTON_DRIVE_CACHE_DIR" -type f -newer "$G/launchd/ok.stamp" | sed "s|^$PROTON_DRIVE_CACHE_DIR/|  |"
-[ -n "$(find "$PROTON_DRIVE_CACHE_DIR" -type f -newer "$G/launchd/ok.stamp")" ] || bad "nothing in the gate cache folder changed: did the wrapper hand PROTON_DRIVE_CACHE_DIR on?"
 m7 || bad "an M7 default folder exists after the scheduled run"
 kit roots-update || bad "the ownership record"
 echo "Craig may unlock the screen now, and reports any dialog on it (a Keychain prompt above all)."
@@ -3934,8 +4083,10 @@ exit "$fail"
   Craig decides whether 6.1 is re-fired with the screen locked, by `gx.sh s6-1-ok refire`, which
   gives the re-fire a new commit on `main` and a new branch to push.
 - The run ended within 30 minutes; `launchctl print` shows `last exit code = 0` and `runs = 1`;
-  the bootout exits 0. `runs = 2` (a second firing before the bootout) is recorded, and adds two
-  `.lock` files to the tally.
+  the bootout exits 0; and `FIRINGS in ok.out.log, counted after the bootout: 1 started, 1 ended`.
+  Two of each (a second firing before the bootout, which `runs = 2` also shows when it began
+  before the print) is recorded, and adds two `.lock` files to the tally. More started than ended
+  means the bootout cut a firing: BLOCKED.
 - `EXPECT wrapper-ok: FOUND` (both pushes exit 0 and the `done:` line, the repository named by its
   physical path); the error log holds git's `[new branch]` lines for `main` and `topic-ld` and
   `[new tag]` for `ld-v1` (on a re-fire: a fast-forward line for `main` and one `[new branch]` line
@@ -3944,7 +4095,9 @@ exit "$fail"
 - `REFSET ld-6-local == ld-6-remote: EQUAL (3 ref(s))`, one more for each re-fire's branch: the
   remote holds exactly the repository's branches and tags, so a push that sent less than
   everything cannot pass.
-- The gate cache folder holds files the scheduled run wrote, and M7's defaults are absent.
+- The gate cache folder holds files the scheduled run wrote, listed before the script's own
+  `ls-remote` and `roots-update` run the CLI, so no other command can have written them; and M7's
+  defaults are absent.
 - `RECORDED: .../vNEXT-mac-launchd-a1`.
 - **Craig's report**, recorded verbatim: no Keychain prompt and no other dialog on the screen when
   he unlocked it. A prompt is BLOCKED.
@@ -3955,7 +4108,15 @@ key "causes the job to be started every N seconds") [doc], and `fire` boots the 
 about a minute after its run ends, so a run that ends near a 300 s boundary can be followed by
 another firing; a run longer than 300 s makes launchd skip the firings it overlaps ("If the job is
 running during an interval firing, that interval firing will likewise be missed") [doc]. `fire`
-prints `runs =` just before the bootout; each firing adds two `.lock` files to the tally.
+prints `runs =` just before the bootout, so a firing that starts between that print and the
+bootout is missed there; its `FIRINGS` line, counted from the out log after the bootout, is the
+count. Each firing adds two `.lock` files to the tally.
+
+**A push that fails at 6.1 is BLOCKED, whatever refused it.** Step 6's runs are the only gate
+pushes made with Craig's own git configuration (Question 5), and 6.1's are the only ones of those
+that get as far as his `core.hooksPath` hooks: 6.2's and 6.3's are refused at `list for-push`,
+before git runs `pre-push` [inference from git's push order]. So the error log shows whether one
+of his hooks, rather than the helper, refused a push that fails at 6.1, and the record names which.
 
 **6.2 A failing agent: the banner, and the permission.** Craig unlocks the screen and watches it;
 the runner runs `gx.sh s6-2-fail` in the background.
@@ -3969,7 +4130,7 @@ LDREPO=$(cat "$G/launchd/repo.txt"); export LDREPO
 agent="${2:-fail}"
 case "$agent" in fail|abandon) ;; *) echo "BLOCKED: agent $agent"; exit 1 ;; esac
 echo "agent: $agent; screen locked now: $(locked) (Craig watches an unlocked screen)"
-fire "$agent" 600 30 || { echo "BLOCKED: the $agent agent did not fire or end in time"; exit 1; }
+fire "$agent" 600 30 || { echo "BLOCKED: the $agent agent did not fire or end in time, or the bootout cut a firing"; exit 1; }
 o="$G/launchd/logs/$agent.out.log"; e="$G/launchd/logs/$agent.err.log"
 grep -E 'gpb-v2-push: git push proton-fail --(all|tags): exit [1-9]' "$o" || bad "the wrapper did not log two failed pushes"
 kit expect "$e" parent-absent || bad "the helper's missing-parent refusal"
@@ -4032,8 +4193,14 @@ lets it finish, printing string 14 [inference from the code: no `signal.` use in
 leads its own process group (the watchdog's kill is a group kill, so a push that does not is
 BLOCKED); its tree held the helper or the CLI, still seen within 0.5 s of the bound, counted from
 the push's first sample, or later; and the error log holds string 14 exactly once for each push
-that was not killed, none for a killed one. A killed push whose helper still printed string 14 is
-"(b) not exercised": the kill did not stop it.
+that was not killed, none for a killed one. A killed push that still printed string 14 is "(b) not
+exercised": either its helper ended just before the kill landed (a push that ends within a moment
+of the bound is still logged as killed, since the wrapper reads the watchdog's mark only after the
+push has ended [code `gpb-v2-push.sh:198-204`]), or the kill did not stop it; the logs cannot tell
+which, and neither shows a reaping. Any other `git-remote-proton:` line in the error log is
+BLOCKED, so that two anomalies cannot cancel in the count (string 17, a pipe held past exit, is
+listed and recorded, as everywhere); and the out log must hold one firing, or the run is "(b) not
+exercised".
 
 ```bash
 # file: mac:scripts/s6-sampler.sh
@@ -4074,8 +4241,8 @@ if [ -f "$S" ]; then echo "sampler stopped: $(wc -l < "$S" | tr -d ' ') line(s)"
 # exercised: a STOP for Craig (exit 3), never a PASS.
 . "$HOME/gpbmac/kit/lib.sh" "$1" || exit 2
 LDREPO=$(cat "$G/launchd/repo.txt"); export LDREPO
-pgrep -f 's6-sampler[.]sh' >/dev/null || { echo "BLOCKED: the sampler is not running"; exit 1; }
-fire hang 600 || { echo "BLOCKED: the hang agent did not fire or end in time"; exit 1; }
+pgrep -f 's6-sampler[.]sh' >/dev/null || { echo "STOP: the sampler is not running, so nothing was fired. The runner starts it (gx.sh s6-sampler, in the background, at least 90 minutes), then runs gx.sh s6-3-hang again"; exit 3; }
+fire hang 600 || { echo "BLOCKED: the hang agent did not fire or end in time, or the bootout cut a firing"; exit 1; }
 sleep 15; : > "$G/launchd/stop-sampler"; sleep 2
 o="$G/launchd/logs/hang.out.log"; e="$G/launchd/logs/hang.err.log"
 grep -E 'gpb-v2-push: git push proton-fail --(all|tags)( ran past|: exit)' "$o"
@@ -4107,8 +4274,11 @@ echo "6.3: PASS"
   `proton-drive` process).
 - `STRING 14: <n> line(s) in hang.err.log; pushes ended: 2, killed at the bound: <k>, so <2-k>
   expected`, with n equal to 2 - k, as the script's own `string 14 lines` count shows. More means
-  a killed push's helper still refused, so the kill did not stop it: `(b) NOT EXERCISED`. Fewer
-  means a push that was not killed ended without the missing-parent refusal: BLOCKED.
+  a push logged as killed still refused, so no reaping is shown: `(b) NOT EXERCISED`. Fewer means
+  a push that was not killed ended without the missing-parent refusal: BLOCKED.
+- `OTHER git-remote-proton: LINES in hang.err.log: 0`; any other line there is BLOCKED (string
+  17's are listed as known and recorded). `FIRINGS in hang.out.log: 1`; another count is `(b) NOT
+  EXERCISED`, and `fire`'s own `FIRINGS` line shows it too.
 - Then `(b) EXERCISED`, and `PUSH TREE: <n> push root(s), 0 still running`, with n 1 or 2: the
   `--all` push, and the `--tags` push when the sampler saw it; `kit pushtree` needs at least one.
   A process of a tree in another process group is marked `(OTHER GROUP)`: a finding to record
@@ -4124,38 +4294,45 @@ echo "6.3: PASS"
 **(b) not exercised.** A push that ends inside its bound exits nonzero with string 14; that is not a
 BLOCK, and the `--all` push's `ran past` and `exit 124` counts are recorded either way. But when
 no push was reaped as above, the script ends `6.3: (b) NOT EXERCISED: STOP for Craig` (exit 3),
-never PASS, and Craig decides whether 6.3 is fired again (Question 4). A re-firing is judged on
-its own evidence alone: the sampler moves the earlier samples aside (`samples.txt.<k>`), `fire`
-moves the earlier logs aside, and the marker must be newer than this firing's stamp.
+never PASS, and Craig decides whether 6.3 is fired again (Question 4). A re-firing starts the
+sampler again first (6.3's run stopped it), then `gx.sh s6-3-hang`, which STOPs (exit 3) and fires
+nothing while no sampler runs. It is judged on its own evidence alone: the sampler moves the
+earlier samples aside (`samples.txt.<k>`), `fire` moves the earlier logs aside, and the marker must
+be newer than this firing's stamp.
 
 **6.4 The launchd step's `.lock` count.** Each `ok` firing made two lock sessions, `--all` and
-`--tags`: the first, any re-fire (`s6-1-ok refire`), and any second firing a `runs = 2` line shows.
-Count them from `fire`'s `FIRED` lines in `log/s6-1-ok.txt` and its `runs =` lines. The failing
-agents made none. A re-fire is a fresh bootstrap after a bootout, so its `runs` counts from 1 again
-[inference].
+`--tags`: the first, any re-fire (`s6-1-ok refire`), and any second firing a `FIRINGS` line shows.
+Count them from `fire`'s `FIRINGS ...: <n> started` lines in `log/s6-1-ok.txt`, one for each
+bootstrap; its `runs =` lines are printed before the bootout and can miss a firing. The failing
+agents made none. A re-fire is a fresh bootstrap after a bootout, with its logs moved aside first,
+so its `runs` and its `FIRINGS` count from 1 again [inference].
 
 **6.5 Step 0's re-check, after step 6:** `gx.sh s6-5-after`.
 
 ```bash
 # file: mac:scripts/s6-5-after.sh
-# Step 6.5: no gate agent is loaded, the gate cache folder is the one in use, M7's defaults are
-# absent, and the missing parent still is (section 6 step 0, "re-checked after step 6").
+# Step 6.5: no gate agent is loaded, the gate session still works from the gate cache folder,
+# which still holds its files, M7's defaults are absent, and the missing parent still is (section 6
+# step 0, "re-checked after step 6").
 . "$HOME/gpbmac/kit/lib.sh" "$1" || exit 2
-for n in ok fail abandon hang; do
+for n in ok fail abandon hang envprobe; do
   if launchctl print "gui/$(id -u)/gpbmac.$RUN.$n" >/dev/null 2>&1; then launchctl bootout "gui/$(id -u)/gpbmac.$RUN.$n"; echo "booted out gpbmac.$RUN.$n: exit $?"; else echo "gpbmac.$RUN.$n: not loaded"; fi
 done
 proton-drive filesystem info /my-files --json > "$G/out/6-5-info.json" 2> "$G/out/6-5-info.err"; irc=$?
 echo "read-only info: exit $irc"; [ "$irc" = 0 ] || { kit esc "$G/out/6-5-info.err"; bad "the read-only info failed"; }
-echo "gate cache folder files changed since 6.1 began: $(find "$PROTON_DRIVE_CACHE_DIR" -type f -newer "$G/launchd/ok.stamp" | wc -l | tr -d ' ')"
-[ -n "$(find "$PROTON_DRIVE_CACHE_DIR" -type f -newer "$G/launchd/ok.stamp")" ] || bad "the gate cache folder was not in use"
+echo "gate cache folder: $(find "$PROTON_DRIVE_CACHE_DIR" -type f | wc -l | tr -d ' ') file(s); changed since 6.1 began: $(find "$PROTON_DRIVE_CACHE_DIR" -type f -newer "$G/launchd/ok.stamp" | wc -l | tr -d ' ') (recorded, not judged: the runner's own CLI calls count there too)"
+[ -n "$(find "$PROTON_DRIVE_CACHE_DIR" -type f)" ] || bad "the gate cache folder holds no file"
 m7 || bad "an M7 default folder exists"
 kit absentnode "$ABSENT" || bad "the missing parent exists"
 if [ "$fail" = 0 ]; then echo "6.5: PASS"; else echo "6.5: BLOCKED"; fi
 exit "$fail"
 ```
 
-**Pass:** every agent `not loaded` or booted out, the info exits 0, cache files changed, the three
-`M7 default absent` lines, `ABSENT NODE`, and `6.5: PASS`. A failed info is BLOCKED.
+**Pass:** every agent `not loaded` or booted out, the info exits 0 (the session in the gate cache
+folder still works), the folder still holds files (step 0's check; the count changed since 6.1 is
+recorded, not judged, since the runner's own CLI calls touch the folder too, and 6.1's list is the
+scheduled run's alone), the three `M7 default absent` lines, `ABSENT NODE`, and `6.5: PASS`. A
+failed info is BLOCKED.
 
 ### Step 7: cleanup, in order, on every exit path, including after a BLOCK
 
@@ -4186,14 +4363,15 @@ runner goes on to the next, except that nothing is trashed or deleted while a wr
 
 ```bash
 # file: mac:scripts/s7-0-quiet.sh
-# Step 7.0: every gate agent unloaded, and no push, helper, CLI or wrapper process still running.
+# Step 7.0: every gate agent unloaded, and no push, helper, CLI or wrapper process still running,
+# nor a go test (step 2.1's launcher, which can still start the live table) or its test binary.
 # strays prints only the pid and program of each matching process, never its arguments.
 . "$HOME/gpbmac/kit/lib.sh" "$1" || exit 2
-for n in ok fail abandon hang; do
+for n in ok fail abandon hang envprobe; do
   if launchctl print "gui/$(id -u)/gpbmac.$RUN.$n" >/dev/null 2>&1; then launchctl bootout "gui/$(id -u)/gpbmac.$RUN.$n"; echo "booted out gpbmac.$RUN.$n: exit $?"; else echo "gpbmac.$RUN.$n: not loaded"; fi
 done
 if [ -d "$G/launchd" ]; then : > "$G/launchd/stop-sampler"; fi
-WP='proton-drive|git-remote-proton|gpb-v2-push|git( -C [^ ]+)? (push|fetch|clone) |[.]test( |$)'
+WP='proton-drive|git-remote-proton|gpb-v2-push|git( -C [^ ]+)? (push|fetch|clone) |[.]test( |$)|(^|/)go test( |$)'
 for k in 1 2 3 4 5 6 7 8 9 10 11 12; do
   strays "$WP" >/dev/null || break
   echo "waiting for a writer to finish (check $k of 12):"; strays "$WP"; sleep 10
@@ -4204,7 +4382,9 @@ echo "HANDOFF -> PC: W.7.0"
 ```
 
 **Pass:** `MAC WRITERS: NONE`, and W.7.0's `WINDOWS WRITERS: NONE`. Neither: wait and run 7.0
-again; nothing is trashed or deleted meanwhile. A writer is listed by pid and program only.
+again; nothing is trashed or deleted meanwhile. A writer is listed by pid and program only. A
+`go test` counts as one, as its test binary does: after an interrupted step 2.1, its launcher can
+still be compiling, and then start the live table.
 Then Craig presses Ctrl-C in the keep-awake's window (held since C.0), and the runner checks that
 one pid: `/bin/ps -p "$(/bin/cat ~/gpbmac/gate-a1/caffeinate.pid)" -o pid=,comm=; echo "ps: exit
 $?"`. It must print only `ps: exit 1`. A line naming `/usr/bin/caffeinate` means it still runs:
@@ -4241,7 +4421,7 @@ in the escaped view):
 | `mp1` | `caf<U+00E9>`, `main`, `side` | none | 2 (M1, M2) |
 | `mp3` | `main` | none | 1 |
 | `r1` | `caf<U+00E9>`, `main` | none | 1 |
-| `launchd` | `main`, `topic-ld`, and each 6.1 re-fire's `topic-ld-r<k>` | `ld-v1` | 2 (the `--all` push's, and the `--tags` push's tag object, which no branch reaches), plus 1 for each re-fire |
+| `launchd` | `main`, `topic-ld`, and each 6.1 re-fire's `topic-ld-r<k>` | `ld-v1` | 2 (the `--all` push's, and the `--tags` push's tag object, which no branch reaches), plus 1 for each re-fire (its new commit); a second firing that a `FIRINGS` line shows adds none, having nothing to push, though it adds two `.lock` files (6.4) |
 | `contract-mac` | empty after a step 2 that passed; after a step-2 BLOCK, `TestContractCLI_*` folders and their contents, gate debris that goes with the root | | |
 
 A root missing from the record was never created: nothing to trash. **After a BLOCK,** a root
@@ -4268,7 +4448,7 @@ for n in $(cut -f1,3 "$G/roots.tsv" 2>/dev/null | grep -E $'\tcreated$' | cut -f
   kit trashroot "$n" || fail=1
 done
 kit trashgr || fail=1
-if grep -q $'^GitRemotes\t[^-]' "$G/roots.tsv" 2>/dev/null; then
+if grep -q $'^GitRemotes\t[^\t]*\tpresent-at-step-0\t' "$G/roots.tsv" 2>/dev/null; then
   kit snapshot gitremotes-final "$R" && kit compare gitremotes-0 gitremotes-final || echo "GITREMOTES COMPARISON NOT AVAILABLE"
 fi
 exit "$fail"
@@ -4276,7 +4456,8 @@ exit "$fail"
 
 **Expected:** each `trash <root> (uid ...): exit 0 ...` with the CLI's `ok:true` answer and its
 time; then `GitRemotes:` either trashed (this run made it and nothing live is left) or the line
-saying why it stays. If `GitRemotes` was present at step 0: `COMPARE gitremotes-0 ->
+saying why it stays. If `GitRemotes` was present at step 0, and only then (one this run made has
+gone to the trash with `trashgr`): `COMPARE gitremotes-0 ->
 gitremotes-final: NO DIFFERENCE`, or differences that are only rows of skipped roots, so every
 child that is not this run's is as it was; anything else is a STOP for Craig. `kit trashgr`
 enumerates `GitRemotes`' whole live subtree first (rule 3): a row that is not one of this run's
@@ -4393,8 +4574,10 @@ local repositories (`r1-clone` among them, with 5.11's stale ref still in it, an
 tag's clone, the README lines C.3 ran (`readme/`), the launchd step's plists, logs, marker copies
 and samples (`samples.txt`, and `samples.txt.<k>` after a re-fire), and small state files: `env.sh`,
 `gitconfig-global`, `caffeinate.pid` and `caffeinate.started`, `logout.state`, `installed.txt`, the
-`*-commits.sh` commit records, `v010-needs-uncertified`, `d5-unknown.txt`, and in `launchd/` the
-stamps, `repo.txt`, the `marker-*.txt` path records and `stop-sampler`. None of the small files
+`*-commits.sh` commit records, `v010-needs-uncertified`, `d5-unknown.txt`, in `launchd/` the
+stamps, `repo.txt`, the `marker-*.txt` path records and `stop-sampler`, and in `envprobe/` the
+probe agent's plist and logs (`GPB_`, `PROTON_DRIVE_` and `GIT_` names only, `HOME` and the cache
+folder's path; the probe run's folder holds one too). None of the small files
 holds a secret (paths, process and commit ids, times). Those hold account metadata: the names, uids and times of `/my-files`'
 top-level rows (Craig's own among them), of `/my-files/_cas-probe`, of `/trash` and of the gate's
 roots, and the command lines of the processes in the gate wrapper's trees (the sampler keeps
@@ -4981,15 +5164,18 @@ gh release download vNEXT --repo craigstoller/git-proton-backup --pattern 'git-r
 $exe = (Get-FileHash -LiteralPath "$G\stage\git-remote-proton.exe" -Algorithm SHA256).Hash.ToLower()
 $side = Get-Content -LiteralPath "$G\stage\git-remote-proton.exe.sha256" -Raw
 "draft exe SHA-256: $exe"
-"sidecar == '<sha256>  git-remote-proton.exe': $($side -ceq "$exe  git-remote-proton.exe")"
-Test-WindowsHelper
-'HANDOFF -> MAC: C.3 (give it only after WINDOWS HELPER IS THE DRAFT: YES above)'
+$sideOk = $side -ceq "$exe  git-remote-proton.exe"
+"sidecar == '<sha256>  git-remote-proton.exe': $sideOk"
+$wh = @(Test-WindowsHelper); $wh
+if ($sideOk -and ($wh -ccontains 'WINDOWS HELPER IS THE DRAFT: YES')) { 'HANDOFF -> MAC: C.3' } else { 'NO HANDOFF: the sidecar or the Windows helper check above failed (STOP for Craig; the Mac waits)' }
 ```
 
 **Pass:** `release vNEXT: true vNEXT (gh exit 0)`; the download exits 0; the sidecar line is `True` (the sidecar
 has no trailing newline [code `.github/workflows/release.yml`, Checksum step]); and `WINDOWS HELPER
 IS THE DRAFT: YES`, its one line showing `git-remote-proton vNEXT (certified CLI:
-cli-drive@0.9.0+75612299)`. **`NO`:** this release's Windows gate installs the draft helper, and
+cli-drive@0.9.0+75612299)`. Only then does the block print `HANDOFF -> MAC: C.3`; otherwise it
+prints `NO HANDOFF: ...` and the Mac waits. **`NO`:** this release's Windows gate installs the
+draft helper, and
 this gate runs after it (section 6, O5), so a `NO` is a STOP for Craig; this brief installs
 nothing on the PC. The exe's SHA-256 must also equal the STAGED BASELINE of this release's Windows
 gate record; the runner compares the two and records both.
@@ -5223,11 +5409,12 @@ create meets no other spelling.
 
 ```powershell
 . C:\gpbmac\kit\pc-kit.ps1
-Test-NoWriters
-'HANDOFF -> MAC: 7.1 (give it only after WINDOWS WRITERS: NONE above)'
+$nw = @(Test-NoWriters); $nw
+if ($nw -ccontains 'WINDOWS WRITERS: NONE') { 'HANDOFF -> MAC: 7.1' } else { 'NO HANDOFF: a Windows writer still runs (above); wait, then run W.7.0 again' }
 ```
 
-**Pass:** `WINDOWS WRITERS: NONE`; otherwise wait and check again.
+**Pass:** `WINDOWS WRITERS: NONE`, then `HANDOFF -> MAC: 7.1`; otherwise `NO HANDOFF: ...`: wait,
+and run W.7.0 again.
 
 **W.7.6 The Windows check** (section 6 step 7), after `HANDOFF -> PC: W.7.6`:
 
@@ -5299,8 +5486,9 @@ two documents; the hold, Question 13); C.3 (`-e` and go1.27.0 for the README's l
 binaries); B.0 (the lock reading's positive control); B.3 and B.6 (a sign-in retry, Craig's
 fallback delete); step 5's remotes, 5.0 (NC), 5.4 (the third spelling), 5.5 (5.6's clone first),
 5.10 (the recovery) and 5.11 (its place, `r1-clone` left with its stale ref); step 6 (the
-failing agents, the plists' folder, 6.2's 30 s before the bootout, 6.3's evidence of a landed
-kill) and its sampler's filter (`kit/tree.awk`); step 7 (sub-step preconditions, `vet`, what
+failing agents, the probe agent for launchd's environment, which B.0 runs too, the plists'
+folder, 6.2's 30 s before the bootout, 6.3's evidence of a landed kill) and its sampler's filter
+(`kit/tree.awk`); step 7 (sub-step preconditions, `vet`, what
 stays); C.5 (rule 6); the PC kit; and step 0 (git 2.54.0).
 
 ## Not covered live by this gate
@@ -5395,3 +5583,37 @@ Rejected, so not to be raised again:
 - B33: `TRASHED, STILL LISTED` is the tested rule, which 5.8 accepts.
 - B41: those checks are read-only or fail closed.
 - B42: no macOS asset ships; the README's download carries no quarantine.
+
+Multi-model review, round 2, 2026-10-28 (Codex, Gemini, DeepSeek, Kimi), on `6bf53aa`. Gemini
+raised nothing new. Applied, with the round-3 re-review's five minors (R3-a to R3-e):
+
+- B2-1 (Codex): launchd's own environment is checked by a probe agent (`envprobe`) at B.0 and
+  6.0; 6.0 STOPs before anything of step 6 exists.
+- B2-2 (Codex): 7.0's writer check counts a `go test` launcher.
+- B2-3 (Codex): B.3's sign-in sources the current run's `env.sh` and names the run.
+- B2-4 (Kimi): string 11's two messages quoted apart, with their code sites.
+- B2-5 (Kimi): `kit relayin` checks a value relay's name and shape; `getval` and `relaycmp`
+  re-check what is stored.
+- B2-6 (Kimi, in part): 6.1 says a hook's refusal is BLOCKED and named in the record; Question 5
+  stays Craig's, its default failing closed.
+- B2-7 (Kimi): the `launchd` row: a second firing adds two locks but no pack.
+- B2-8 (Kimi): `fire` counts firings from the out log after the bootout, a cut firing BLOCKED;
+  `kit pushtree` judges one firing.
+- B2-9 (DeepSeek): 6.1 lists the cache files before its own CLI calls; 6.5 re-checks step 0's
+  condition, the changed-file count recorded.
+- B2-10 (DeepSeek): "(b) not exercised" by string 14 names both possible causes.
+- B2-11 (DeepSeek): 7.1b compares `GitRemotes` only when it was present at step 0.
+- B2-12 (DeepSeek): "The pin": a moved pin cannot stand as written.
+- B2-13 (DeepSeek): the tally treats a trashed folder's contents alike in every class.
+- R3-a: `kit pushtree` BLOCKs on any other `git-remote-proton:` line in `hang.err.log`; string 17
+  is recorded.
+- R3-b: W.C.2 and W.7.0 print their handoff only inside an `if` on YES or NONE.
+- R3-c: `logged` sees a bare `git push`.
+- R3-d: 6.0 prints config key names with any subsection shown as `<subsection>`.
+- R3-e: 6.3 STOPs, firing nothing, while no sampler runs; a re-fire restarts it first.
+
+Rejected, so not to be raised again:
+
+- B2-14 (Kimi): string 3 and B17's reason match `push.go:480-481`; the kind precedes "rename".
+- B2-15 (Kimi): 6.3's pushes are refused before `pre-push`, so no hook runs in them.
+- B2-16 (DeepSeek): M14 measured both tracking refs after a Mac `files` clone.
