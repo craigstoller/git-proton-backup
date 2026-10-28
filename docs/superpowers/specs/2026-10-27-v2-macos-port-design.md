@@ -467,9 +467,12 @@ advertised set, `gitDir` and stderr; the comparisons are pure functions beside `
 
   **The refusal's remedies follow its cause** [review: DeepSeek]: for a pair on the remote (1),
   repair the remote (below) or clone with `--ref-format=reftable` (M17); for a stale local ref
-  (2), delete that one local ref by its exact bytes (`git update-ref --stdin` reading
-  `delete <ref>`, so no argument is precomposed) or re-clone with `--ref-format=reftable`; for two
-  destinations aliasing each other (2), change the remote's refspecs or use a `reftable` clone.
+  (2), re-clone with `--ref-format=reftable`; or, in place, pack every ref with precomposition off
+  and only then delete the stale ref by its exact bytes (`git -c core.precomposeunicode=false
+  pack-refs --all`, then `git update-ref --stdin` reading `delete <ref>`). A bare delete is not
+  safe: with the other spelling's ref loose, APFS resolves both names to that file, git unlinks
+  it, and that ref falls back to a stale packed value or vanishes (MA3); for two destinations
+  aliasing each other (2), change the remote's refspecs or use a `reftable` clone.
 - **The Mac push rule, in `repo.Push`'s phase 2**, on darwin with the `files` store (as at `list`,
   with `GIT_DIR` set, which git always sets for a push). It refuses per ref, each message passing
   through `oneLine`, and every ref it does not refuse proceeds, so D2's ruling that a remote
@@ -923,15 +926,18 @@ default; the questions as put to him follow under "Questions raised in review".
 | O5 | all four: the Mac gate last, after the draft Windows helper, never concurrent; a Mac-only failure does not hold the release; a paired PC session runs the Windows side; the Windows and Linux gates test the composition refusal on their own binaries | any of the four left out |
 | O6 | (c) rule 12, an AGENTS.md line, and a shim-resolution check in the test code | (a) the checklist only; (b) the checklist and AGENTS.md |
 
-**Amendments, ruled 2026-10-27, after the spec's approval.** Both correct a fact the approved text
-stated; each is Craig's call, accepting the recommended default. They were found while writing the
-plan (`docs/superpowers/plans/2026-10-27-v2-macos-port.md`, Task 0), where each one's before-and-after
-text was put to him.
+**Amendments, ruled 2026-10-27 and 2026-10-28, after the spec's approval.** Each corrects a fact
+the approved text stated, and each is Craig's call. MA1 and MA2 accept the recommended default;
+they were found while writing the plan (`docs/superpowers/plans/2026-10-27-v2-macos-port.md`,
+Task 0), where each one's before-and-after text was put to him. MA3 was found by the review of the
+plan's Task 13, which probed the remedy in scratch repositories; Craig chose option (c) of three on
+2026-10-28, with its before-and-after text in front of him.
 
 | | Ruled | Not taken |
 |---|---|---|
 | MA1 | `remote.<name>.mirror` is not a fetch-destination source (§3, rule (2)): git uses it for push only [doc: `git help config`, git 2.54.0] | keep reading it, a key git never uses for fetch |
 | MA2 | the pin-moving fetch checks the files' version lines and records their SHA-256s, and the data is cross-checked by `NormalizationTest.txt` and the containment test (§3, "The inputs are committed"); Unicode publishes no checksums [2026-10-27: none in the 17.0.0 `ucd/` listing or either ReadMe] | the original "published checksums" check, which cannot be made |
+| MA3 | the stale-local-ref remedy: a bare exact-bytes delete can unlink the other spelling's loose ref on APFS (§3, "The refusal's remedies follow its cause"), so the re-clone comes first and the in-place delete runs only after `pack-refs` with precomposition off; the helper's refusal messages name only the re-clone and point to the README for the in-place route [measured 2026-10-28, git 2.54.0: after a real clone and a fetch, the bare delete rewound the other ref to a stale packed value with `git fsck` clean; packed first, only the named ref went] | the bare exact-bytes delete; (a) the re-clone alone, everywhere; (b) the pack-first delete alone |
 
 The plan also makes six refinements (R1–R6) under O3(d)'s licence that "a plan may refine them with
 a reason". They were put to Craig on 2026-10-27 and not objected to, so they stand as unopposed
