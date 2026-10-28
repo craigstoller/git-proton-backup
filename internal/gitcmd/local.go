@@ -1,0 +1,272 @@
+package gitcmd
+
+// Three reads of the local repository that the helper makes before it decides
+// whether a fetch or a push is safe on a Mac: the ref storage format, the
+// remote's configuration, and the names of the refs it already holds.
+//
+// All three run on gitStdout rather than on git(). git() mixes stderr into the
+// output it returns and trims the result: a warning git writes on stderr would
+// become a bogus ref name, and TrimSpace could strip trailing bytes from a real
+// one. These reads are about exact bytes, so they take stdout alone, untrimmed.
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"regexp"
+	"strconv"
+	"strings"
+)
+
+// gitStdout runs `git -C gitDir <args>` like git() does, with the same
+// GIT_ALTERNATE_OBJECT_DIRECTORIES scrub and the same waitDelay, but captures
+// stdout and stderr SEPARATELY and trims neither. stdout is exactly the bytes
+// git wrote to it.
+//
+// The return shape follows git(): code is the exit code, or -1 when the process
+// never started (git missing from PATH, permission denied), and err is whatever
+// os/exec reported, so a non-zero exit comes back as a non-nil *exec.ExitError
+// beside its code. Callers that branch on a particular exit code (RemoteConfig
+// on 1) look at code first.
+//
+// exec.ErrWaitDelay is the one case that cannot be passed through. os/exec
+// substitutes it for a nil error when git itself exited 0 but a grandchild (an
+// fsmonitor daemon, say) still held an output pipe after waitDelay: the pipe
+// was abandoned, so stdout may be cut short. Every caller here treats stdout as
+// a complete list, and a truncated ref list or config dump would fail open, so
+// the output is withheld, the code is -1 (a caller that checks only the code
+// fails closed too), and err wraps exec.ErrWaitDelay. revListWithAlt and
+// ShowIndex refuse a possibly truncated list the same way; this one keeps the
+// sentinel reachable through errors.Is.
+func gitStdout(gitDir string, args ...string) (stdout []byte, stderr string, code int, err error) {
+	cmd := exec.Command("git", append([]string{"-C", gitDir}, args...)...)
+	// Scrubbed for the reason git() scrubs it: an inherited alternate must not
+	// make these reads see a world the rest of the package does not.
+	cmd.Env = append(os.Environ(), "GIT_ALTERNATE_OBJECT_DIRECTORIES=")
+	// See waitDelay: DO NOT DELETE as unnecessary.
+	cmd.WaitDelay = waitDelay
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	err = cmd.Run()
+	if errors.Is(err, exec.ErrWaitDelay) {
+		return nil, errBuf.String(), -1, fmt.Errorf("git %s exited but something still held its "+
+			"output pipe open after %s, so its output cannot be trusted to be complete; refusing "+
+			"to act on a possibly truncated answer: %w", strings.Join(args, " "), waitDelay, err)
+	}
+	// ProcessState is nil when the process never started; ExitCode() on it would
+	// panic. See git() for the same guard.
+	if cmd.ProcessState == nil {
+		return outBuf.Bytes(), errBuf.String(), -1, err
+	}
+	return outBuf.Bytes(), errBuf.String(), cmd.ProcessState.ExitCode(), err
+}
+
+// gitStdoutError describes a gitStdout call that did not succeed: the command,
+// git's stderr, and the exit code (or the start error when the process never
+// ran).
+func gitStdoutError(args []string, stderr string, code int, err error) error {
+	if errors.Is(err, exec.ErrWaitDelay) {
+		return err // gitStdout's own message already names the command
+	}
+	what := "git " + strings.Join(args, " ")
+	detail := strings.TrimSpace(stderr)
+	if detail == "" {
+		detail = "no message on stderr"
+	}
+	var exit *exec.ExitError
+	if err != nil && !errors.As(err, &exit) {
+		return fmt.Errorf("%s: %s: %w", what, detail, err)
+	}
+	return fmt.Errorf("%s: %s (exit %d)", what, detail, code)
+}
+
+// RefFormat returns the reference storage format of the repository at gitDir,
+// "files" or "reftable", as `git rev-parse --show-ref-format` reports it.
+// Stdout minus ONE trailing newline must be exactly one of those two words.
+// Anything else, or a non-zero exit, is an error naming the command and git's
+// stderr: the format decides whether refs can be treated as files, so it is
+// never guessed.
+func RefFormat(gitDir string) (string, error) {
+	args := []string{"rev-parse", "--show-ref-format"}
+	out, stderr, code, err := gitStdout(gitDir, args...)
+	if err != nil || code != 0 {
+		return "", gitStdoutError(args, stderr, code, err)
+	}
+	format := strings.TrimSuffix(string(out), "\n")
+	if format != "files" && format != "reftable" {
+		return "", fmt.Errorf("git %s: unexpected output %q, want files or reftable",
+			strings.Join(args, " "), string(out))
+	}
+	return format, nil
+}
+
+// RemoteCfg is what the repository's configuration says about one remote.
+type RemoteCfg struct {
+	// URL is the remote's first remote.<name>.url, the one git fetches from; ""
+	// when none is set (or the value is empty).
+	URL string
+	// PushURL is the remote's first remote.<name>.pushurl; "" when none is set.
+	PushURL string
+	// Fetch holds every remote.<name>.fetch refspec in configuration order,
+	// negative ones ("^refs/heads/x") included and unparsed.
+	Fetch []string
+	// Prune is remote.<name>.prune when that is set, else fetch.prune, read as
+	// git reads a boolean.
+	Prune bool
+}
+
+// RemoteConfig reads the configuration of the remote called name from the
+// repository at gitDir. name is any string git accepts as a remote name, a
+// dotted one such as back.up included, and may be the anonymous URL the helper
+// is handed ("proton::/my-files/a.b"), which has no configuration at all.
+//
+// It makes ONE call, `git config -z --get-regexp
+// '^(remote\.<name>\.(url|pushurl|fetch|prune)|fetch\.prune)$'`, with <name>
+// regex-escaped, and parses the NUL-separated "key\nvalue" records it prints. A
+// record with no newline is a key with no value. Exit 1 means none of the keys
+// is set: the zero RemoteCfg and no error. Any other non-zero exit (a broken
+// config file is 128) is an error, because it must never read as "unset".
+//
+// A url, pushurl or fetch with no value, and a prune that is not a boolean, are
+// errors, as git itself refuses them. For url and pushurl the FIRST value is
+// kept (git fetches from the first url); for prune the LAST wins, as for any
+// single-valued key.
+//
+// remote.<name>.mirror is deliberately not read (MA1).
+func RemoteConfig(gitDir, name string) (RemoteCfg, error) {
+	pattern := `^(remote\.` + regexp.QuoteMeta(name) + `\.(url|pushurl|fetch|prune)|fetch\.prune)$`
+	args := []string{"config", "-z", "--get-regexp", pattern}
+	out, stderr, code, err := gitStdout(gitDir, args...)
+	if code == 1 {
+		return RemoteCfg{}, nil // none of the keys is set
+	}
+	if err != nil || code != 0 {
+		return RemoteCfg{}, gitStdoutError(args, stderr, code, err)
+	}
+	// Every record ends in NUL. Output that does not was cut short, or is not
+	// what -z promises; either way it cannot be trusted.
+	if len(out) == 0 || out[len(out)-1] != 0 {
+		return RemoteCfg{}, fmt.Errorf("git config -z --get-regexp exited 0 with output that is "+
+			"empty or not NUL-terminated (%q); refusing to read it", out)
+	}
+
+	prefix := "remote." + name + "."
+	var cfg RemoteCfg
+	var haveURL, havePushURL, haveRemotePrune, haveFetchPrune bool
+	var remotePrune, fetchPrune bool
+	for _, rec := range bytes.Split(out[:len(out)-1], []byte{0}) {
+		key, value, hasValue := strings.Cut(string(rec), "\n")
+		switch key {
+		case prefix + "url":
+			if !hasValue {
+				return RemoteCfg{}, fmt.Errorf("%s has no value", key)
+			}
+			if !haveURL {
+				cfg.URL, haveURL = value, true
+			}
+		case prefix + "pushurl":
+			if !hasValue {
+				return RemoteCfg{}, fmt.Errorf("%s has no value", key)
+			}
+			if !havePushURL {
+				cfg.PushURL, havePushURL = value, true
+			}
+		case prefix + "fetch":
+			if !hasValue {
+				return RemoteCfg{}, fmt.Errorf("%s has no value", key)
+			}
+			cfg.Fetch = append(cfg.Fetch, value)
+		case prefix + "prune":
+			b, perr := parseGitBool(value, hasValue)
+			if perr != nil {
+				return RemoteCfg{}, fmt.Errorf("%s: %w", key, perr)
+			}
+			remotePrune, haveRemotePrune = b, true
+		case "fetch.prune":
+			b, perr := parseGitBool(value, hasValue)
+			if perr != nil {
+				return RemoteCfg{}, fmt.Errorf("%s: %w", key, perr)
+			}
+			fetchPrune, haveFetchPrune = b, true
+		default:
+			return RemoteCfg{}, fmt.Errorf("git config -z --get-regexp returned the unexpected key %q", key)
+		}
+	}
+	switch {
+	case haveRemotePrune:
+		cfg.Prune = remotePrune
+	case haveFetchPrune:
+		cfg.Prune = fetchPrune
+	}
+	return cfg, nil
+}
+
+// gitIntRe is the shape of an integer git_parse_int accepts: an optional sign,
+// decimal, octal (leading 0) or hexadecimal digits, and one optional unit
+// suffix. Anything else, underscores and Go's 0b prefix included, is not one.
+var gitIntRe = regexp.MustCompile(`^[+-]?(0[xX][0-9a-fA-F]+|[0-9]+)[kKmMgG]?$`)
+
+// parseGitBool reads a config value the way git_parse_maybe_bool does. A key
+// with no value (hasValue false) is true; "" is false; true, yes and on, and
+// false, no and off, in any case, are what they say; any other integer is true
+// unless it is zero. Everything else is an error, as git dies with "bad boolean
+// config value" on it.
+func parseGitBool(value string, hasValue bool) (bool, error) {
+	if !hasValue {
+		return true, nil
+	}
+	switch strings.ToLower(value) {
+	case "":
+		return false, nil
+	case "true", "yes", "on":
+		return true, nil
+	case "false", "no", "off":
+		return false, nil
+	}
+	if m := gitIntRe.FindStringSubmatch(value); m != nil {
+		n, err := strconv.ParseUint(m[1], 0, 64)
+		if err == nil {
+			return n != 0, nil
+		}
+	}
+	return false, fmt.Errorf("bad boolean config value %q", value)
+}
+
+// LocalRefs returns the name of every ref in the repository at gitDir, mapped to
+// the ref it points at when it is symbolic ("refs/remotes/o/HEAD" to
+// "refs/remotes/o/main") and to "" when it is direct. It reads `git for-each-ref
+// --format=%(refname)%00%(symref)` and splits stdout on "\n" only, each line at
+// its NUL, so every name keeps its bytes: no trimming, and no Unicode
+// normalisation, which is the point when a Mac holds both spellings of a name.
+//
+// Stdout alone is parsed. A warning git prints on stderr (it does so for a ref
+// file it cannot parse) is not a ref. for-each-ref itself leaves out a ref it
+// cannot resolve, a dangling symbolic ref among them, so the map holds the refs
+// git can resolve.
+func LocalRefs(gitDir string) (map[string]string, error) {
+	args := []string{"for-each-ref", "--format=%(refname)%00%(symref)"}
+	out, stderr, code, err := gitStdout(gitDir, args...)
+	if err != nil || code != 0 {
+		return nil, gitStdoutError(args, stderr, code, err)
+	}
+	refs := map[string]string{}
+	if len(out) == 0 {
+		return refs, nil
+	}
+	// Every line ends in "\n". Output that does not was cut short.
+	if out[len(out)-1] != '\n' {
+		return nil, fmt.Errorf("git %s: output does not end in a newline (%d bytes); refusing to "+
+			"read a possibly truncated ref list", strings.Join(args, " "), len(out))
+	}
+	for _, line := range bytes.Split(out[:len(out)-1], []byte{'\n'}) {
+		name, target, ok := bytes.Cut(line, []byte{0})
+		if !ok || len(name) == 0 {
+			return nil, fmt.Errorf("git %s: unparseable line %q", strings.Join(args, " "), line)
+		}
+		refs[string(name)] = string(target)
+	}
+	return refs, nil
+}
