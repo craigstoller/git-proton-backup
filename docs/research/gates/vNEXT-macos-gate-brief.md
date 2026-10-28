@@ -49,7 +49,9 @@ from rule 6, is stated at C.5, as the v0.10.0 briefs made it.
 - **A Mac-only failure does not hold the release.** No macOS asset ships. The Windows and Linux
   assets publish on their own gates, and the README keeps macOS "not yet live-gated" [README]
   until a Mac gate passes. A defect in shared code found here is a defect in the release, under
-  `docs/releasing.md`'s no-retag rule.
+  `docs/releasing.md`'s no-retag rule: its draft is not published, and the fix ships as a new tag.
+  The record classes each failure, and Craig rules the class before he publishes ("After the
+  gate", "The release").
 - **The retry rule.** After a failed Mac gate, the next attempt is all of section 6 again, at a
   later release: its own v0.10.0 build and sign-in probe, its own paired PC session, the same
   order after that release's Windows and Linux gates and its draft Windows helper, and its own
@@ -198,7 +200,8 @@ that others depend on comes first.
     it stands, the gate goes on at C.3; if not, step 7 runs (C.2 says what it does then) and the
     Mac gate is retried at a later release. Reason: nothing has reached the account at C.2; a brief
     at a tag cannot be re-anchored, since the gate runs the tag's brief and tags never move; and
-    step 7 deletes Part A's build, which a gate that goes on still needs.
+    step 7 deletes Part A's build, which a gate that goes on still needs. C.3's and step 1's STOPs
+    (exit 3) hold the same way, for the same reasons.
 
 ---
 
@@ -413,8 +416,13 @@ briefs' rule.*
   floor probe (M11). The first form is BLOCKED. The second is recorded the first time (most likely
   the probe's 10 s timeout), and a second occurrence in the run is BLOCKED: `d5_check` in `lib.sh`
   applies that rule to every push `logged` runs and to 6.1's scheduled run, the v0.10.0 briefs'
-  rule. Where a pass
-  condition counts `git-remote-proton:` lines, that recorded first sighting adds one to the count.
+  rule.
+
+**Counting them.** A pass condition that says "no `git-remote-proton:` line", or counts them, means
+none but these known lines, on the Mac and on the PC. `kit helperlines` lists a log's
+`git-remote-proton:` lines, marks string 17's and the "could not check" warning's `KNOWN:`, and
+prints `others: <n>`, the count such a condition judges. `d5_check` judges the "could not check"
+warning itself, and each step that expects the pair warning judges it there.
 
 **A trashed row that outlives the re-takes** is printed by `kit compare` as `TRASHED, STILL
 LISTED`, is not counted as a difference, and is recorded; Craig decides whether the listing is
@@ -1418,11 +1426,19 @@ def c_absent(path, label):
     return 0
 
 
+# The lines the brief's known-lines rule tolerates: string 17 (a pipe held past exit), recorded;
+# and string 16's "could not check", which d5_check judges (recorded once, BLOCKED the second time).
+S17 = re.compile(r"^git-remote-proton: .+ exited but something still held its output pipe open after ")
+D5_UNKNOWN = "git-remote-proton: WARNING: could not check whether this git can restore"
+
+
 def c_helperlines(path):
-    hits = [esc(l) for l in read_lines(path) if l.startswith("git-remote-proton:")]
-    print("git-remote-proton: lines in %s: %d" % (os.path.basename(path), len(hits)))
+    hits = [l for l in read_lines(path) if l.startswith("git-remote-proton:")]
+    known = [l for l in hits if S17.match(l) or l.startswith(D5_UNKNOWN)]
+    print("git-remote-proton: lines in %s: %d; known lines among them: %d; others: %d" % (
+        os.path.basename(path), len(hits), len(known), len(hits) - len(known)))
     for h in hits:
-        print("  " + h)
+        print("  %s%s" % ("KNOWN: " if h in known else "", esc(h)))
     return 0
 
 
@@ -1752,7 +1768,7 @@ def c_pushtree(samples, outlog, errlog):
     bound = max(bounds) if bounds else 0
     elines = read_lines(errlog)
     n14 = len([l for l in elines if l.startswith("git-remote-proton: parent folder ")])
-    s17 = re.compile(r"^git-remote-proton: .+ exited but something still held its output pipe open after ")
+    s17 = S17
     known = [l for l in elines if s17.match(l)]
     others = [l for l in elines if l.startswith("git-remote-proton:") and not s17.match(l)
               and not l.startswith("git-remote-proton: parent folder ")]
@@ -2092,7 +2108,10 @@ PC, whose W.B.0 blob must equal it), `RUN STARTED: probe-a1 ...`, then
 
 - the drift script on `origin/main` holds `$CertifiedMacArm64Sha512` equal to M2's value, and the
   probe CLI's SHA-512 is that value (M2). A missing constant means plan Task 12 has not landed:
-  STOP for Craig;
+  STOP for Craig. `BLOCKED: the download failed`, or `... not the certified build`, means the
+  certified 0.9.0 `darwin-arm64` artifact is gone or re-cut (the README warns its versioned URL
+  may stop serving once Proton moves on [README]): a new CLI needs a new pin, M2 and README quote,
+  so it is a STOP for Craig before the tag, and the brief is revised first;
 - no quarantine attribute (M2: a `curl` download carries none), and `codesign` prints Proton's
   Developer ID (M3); record it;
 - no `proton-drive` on the probe's PATH, and neither `proton-drive` nor `git-remote-proton` in
@@ -2384,8 +2403,9 @@ Mac stores it with `kit.sh relayin`. The tasks stay paused until W.7.
 
 ```bash
 # file: mac:scripts/c2-anchor.sh
-# C.2: every file this brief quotes or relies on is unchanged between the anchor and the tag; and
-# whether the release moved the CLI pin since v0.10.0 (section 6 step 5.5).
+# C.2: every file this brief quotes or relies on is unchanged between the anchor and the tag;
+# whether the release moved the CLI pin since v0.10.0 (section 6 step 5.5); and whether the
+# certified CLI's versioned URL, which C.3's README line downloads, still serves it.
 . "$HOME/gpbmac/kit/lib.sh" "$1" || exit 2
 A=0faada84151fde79376bac180cda32fa8277e31f
 tagc=$(git -C "$MAIN" rev-parse --verify "$TAG^{commit}") || { echo "BLOCKED: no tag $TAG in the main checkout"; exit 1; }
@@ -2412,15 +2432,23 @@ else
   echo yes > "$G/v010-needs-uncertified"
   echo "CLI PIN MOVED SINCE v0.10.0: YES (step 5.5 runs v0.10.0's commands alone with GPB_UNCERTIFIED_CLI=1)"
 fi
+code=$(/usr/bin/curl -sS -L -r 0-0 -o /dev/null -w '%{http_code}' https://proton.me/download/drive/cli/0.9.0/darwin-arm64/proton-drive) || code="$code (curl exit $?)"
+echo "the certified CLI's versioned download (M1; C.3's README line), one byte asked for: HTTP $code"
+case "$code" in 200|206) ;; *) bad "the certified CLI's versioned URL does not serve it now, so C.3's README lines would fail: a new CLI needs a new pin, M2 and README quote" ;; esac
 if [ "$fail" = 0 ]; then echo "C.2 (Mac): PASS"; exit 0; fi
 echo "C.2 (Mac): STOP before any account write; it holds, nothing cleaned, until Craig rules (Question 13)"
 exit 3
 ```
 
 **Pass:** `anchor present: yes`, `files the brief quotes or relies on, changed between the anchor
-and the tag: 0` (the count is what is judged), and `C.2 (Mac): PASS`. The count covers the code and
-the files whose text the brief quotes (the wrapper and plist under `scripts/macos`, the drift
-script's `$CertifiedMacArm64Sha512`, the release workflow).
+and the tag: 0` (the count is what is judged), `the certified CLI's versioned download ...: HTTP
+200` (or 206, the one byte asked for), and `C.2 (Mac): PASS`. The count covers the code and the
+files whose text the brief quotes (the wrapper and plist under `scripts/macos`, the drift script's
+`$CertifiedMacArm64Sha512`, the release workflow). The download check is there because the README
+warns that this versioned URL may stop serving once Proton moves on [README], and a lapse found
+here holds before anything is installed, where at C.3 it would come after the helper's build. Its
+`curl` reaches the network but not the account [untested: this brief was written with no network
+call to that URL].
 
 **A listed file, or any other failed check:** `C.2 (Mac): STOP` (exit 3), before any account write.
 It holds (Question 13): nothing is cleaned, and the PC's tasks stay paused, until Craig rules
@@ -2521,7 +2549,7 @@ echo "~/.local/bin before the gate: $(if [ -d "$HOME/.local/bin" ]; then echo pr
 echo "== README.md at the tag $TAG (main checkout): its macOS install lines"
 git -C "$MAIN" show "$TAG:README.md" > "$G/out/c3-readme-at-tag.md" || { echo "BLOCKED: no README.md at $TAG"; exit 1; }
 mkdir "$G/readme" || exit 1
-kit readme "$G/out/c3-readme-at-tag.md" "$G/readme" "$README_HELPER_SHA" "$README_CLI_SHA" || { echo "STOP for adjudication: the README's macOS install lines at the tag are not the ones this brief quotes"; exit 1; }
+kit readme "$G/out/c3-readme-at-tag.md" "$G/readme" "$README_HELPER_SHA" "$README_CLI_SHA" || { echo "C.3: STOP for adjudication: the README's macOS install lines at the tag are not the ones this brief quotes; nothing written, nothing run, and it holds until Craig rules"; exit 3; }
 echo "== the helper: the README's lines, run in $G"
 logged c3-helper env PATH="$HOME/sdk/go1.27.0/bin:$PATH" GOTOOLCHAIN=local /bin/bash -e "$G/readme/helper.sh"
 echo "README helper lines: exit $rc"
@@ -2538,7 +2566,7 @@ logged c3-cli /bin/bash "$G/readme/cli.sh"
 cd "$G" || exit 1
 echo "README CLI lines: exit $rc"
 if [ -e "$HOME/.local/bin/proton-drive" ]; then echo "$HOME/.local/bin/proton-drive" >> "$G/installed.txt"; fi
-[ "$rc" = 0 ] || { echo "BLOCKED: the README's CLI lines exited $rc (a failed download or check installs nothing)"; exit 1; }
+[ "$rc" = 0 ] || { echo "C.3: STOP: the README's CLI lines exited $rc; a failed download or check installs nothing. A certified CLI gone or re-cut since C.2 needs a new pin, M2 and README quote; it holds until Craig rules"; exit 3; }
 grep -q 'proton-drive: OK' "$L" || bad "no 'proton-drive: OK' from shasum"
 s=$(shasum -a 512 < "$HOME/.local/bin/proton-drive" | cut -d' ' -f1); echo "installed CLI SHA-512: $s"
 [ "$s" = "$M2" ] || bad "the installed CLI is not M2's bytes"
@@ -2560,11 +2588,12 @@ exit "$fail"
   run folder, or if the run folder is inside a git working tree.
 - `README helper lines: 7, SHA-256 <the quote's> (as quoted)`, `README cli lines: 2, SHA-256 <the
   quote's> (as quoted)` and `README LINES: AS QUOTED`. `NOT AS QUOTED`, or a `BLOCKED:` line from
-  `kit readme`: STOP for adjudication, and nothing has run.
+  `kit readme`: `C.3: STOP for adjudication` (exit 3), and nothing has run.
 - `README helper lines: exit 0` and `EXPECT version: FOUND` (the README's own `--version` line);
   the tag's clone at the tag's commit, and the `untracked or modified` list empty.
-- `README CLI lines: exit 0`, `proton-drive: OK` from `shasum`, and the installed CLI's SHA-512
-  M2's value; neither binary quarantined (M2, M8, M20); and `codesign` showing the helper
+- `README CLI lines: exit 0` (any other exit is `C.3: STOP`, exit 3), `proton-drive: OK` from
+  `shasum`, and the installed CLI's SHA-512 M2's value; neither binary quarantined (M2, M8, M20);
+  and `codesign` showing the helper
   `adhoc,linker-signed` (M9), recorded.
 - `go version -m` shows `-trimpath=true`, `CGO_ENABLED=0`, `GOOS=darwin`, `GOARCH=arm64`,
   `vcs.revision=<the tag's commit>` and `vcs.modified=false` (M27). Record its first line, the
@@ -2574,6 +2603,15 @@ exit "$fail"
 
 A helper line that fails after the build line (the `--version` line, say) leaves the built helper
 installed: `installed.txt` lists each binary that exists, whatever the exit, and C.3 is BLOCKED.
+
+**A C.3 STOP** (exit 3: the README's lines at the tag are not the ones quoted, or its CLI lines
+failed) holds as C.2's does (Question 13): nothing is cleaned and the PC's tasks stay paused until
+Craig rules, and nothing has reached the account. The tag's brief runs only the README lines it
+quotes (Question 12), so with other lines at the tag the gate cannot go on at this release. For a
+failed CLI download Craig rules whether it was transient (C.3 then runs again once, Question 3,
+after he moves aside what it made, each of which C.3 refuses to find: the binaries `installed.txt`
+lists, and `$SRC`, `readme` and `dl` in the run folder) or the certified CLI is gone or re-cut,
+which needs a new pin, M2 and README quote. Step 7 runs only on his ruling, as after a C.2 STOP.
 
 **These binaries stay after the gate.** Section 6's cleanup does not remove them, and real use
 starts from them ("Afterwards"). *Brief author's call, following section 6 step 7's list.* After a
@@ -2747,7 +2785,7 @@ logged 1-version git-remote-proton --version; kit expect "$L" version || bad "th
 T="$G/t1"
 if [ -e "$T" ]; then echo "BLOCKED: $T already exists"; exit 1; fi
 mkdir -p "$T/home/.local/bin" "$T/readme" || exit 1
-kit readme "$SRC/README.md" "$T/readme" "$README_HELPER_SHA" "$README_CLI_SHA" || { echo "STOP for adjudication: the README's macOS install lines at the tag are not the ones C.3 quotes"; exit 1; }
+kit readme "$SRC/README.md" "$T/readme" "$README_HELPER_SHA" "$README_CLI_SHA" || { echo "STEP 1: STOP for adjudication: the README's macOS install lines at the tag are not the ones C.3 quotes; nothing written, nothing run, and it holds until Craig rules"; exit 3; }
 grep -qF 'curl -fLo proton-drive https://proton.me/download/drive/cli/0.9.0/darwin-arm64/proton-drive' "$T/readme/cli.sh" || bad "the README's curl line does not name the versioned darwin-arm64 URL (M1)"
 grep -qF "&& echo \"$M2  proton-drive\" | shasum -a 512 -c && install -m 0755 proton-drive ~/.local/bin/proton-drive" "$T/readme/cli.sh" || bad "the README's check line does not carry M2's value, chained to the install"
 PRE=$(shasum -a 512 < "$HOME/.local/bin/proton-drive" | cut -d' ' -f1)
@@ -2782,6 +2820,10 @@ exit "$fail"
 - **The login-shell view** is recorded, not judged: Craig's `~/.zprofile` adds `~/.local/bin`
   twice [measured 2026-10-27, lines 7 and 11], so a path may print twice. A README finding, if
   any, is reported to Craig.
+
+`STEP 1: STOP for adjudication` (exit 3) holds for Craig's ruling, as a C.3 STOP does: step 0 has
+read the account and started the root record, and nothing has been written to it. It cannot follow
+a C.3 pass unless the tag's clone changed since [inference], which is itself a finding.
 
 ### Step 2: the live contract table from the Mac, under its own root
 
@@ -2891,8 +2933,8 @@ exit "$fail"
 `* [new branch]` and `main -> main`, `branch 'main' set up to track 'proton-v2/main'.`, and
 `gpb: downloaded /my-files/GitRemotes/vNEXT-mac-smoke-a1/.lock (<n> bytes)` (the lock's read-back;
 other `gpb: downloaded` lines may appear). `ABSENT d5-too-old: YES` and `ABSENT d5-unknown: YES`
-(or a first "could not check" recorded instead, `d5_check`); `git-remote-proton: lines in
-3a-push.txt: 0`, or 1 when that one line is the first "could not check" just recorded; and
+(or a first "could not check" recorded instead, `d5_check`); `kit helperlines`' `others: 0` (a
+known line, string 17 or that first "could not check", is listed `KNOWN:` and recorded); and
 `RECORDED: .../vNEXT-mac-smoke-a1 (uid ...)`.
 
 **3.2 Clone, with `git fsck --full`:** `gx.sh s3b-clone`.
@@ -3172,8 +3214,8 @@ exit "$fail"
 ```
 
 **Pass:** `exit 1`, `EXPECT nfd-create: FOUND` (string 1: both spellings raw and as `%+q`
-escapes, `by Unicode normalisation`, `a Mac clone would mishandle the pair`), `git-remote-proton:
-lines ...: 0`, the Mac view `refs/heads (Mac view): caf<U+00E9> main` with 5.0's two pack pairs,
+escapes, `by Unicode normalisation`, `a Mac clone would mishandle the pair`), `kit helperlines`'
+`others: 0`, the Mac view `refs/heads (Mac view): caf<U+00E9> main` with 5.0's two pack pairs,
 and `COMPARE nfd-0 -> nfd-1: NO DIFFERENCE`. The output also holds the `.lock` read-back line. git
 frames the reason as ` ! [remote rejected] main -> cafe<U+0301> (...)`. D2 refuses it before the
 Mac push rule sees it (its tracking ref would also collide), so the text is string 1's [code
@@ -4082,15 +4124,17 @@ exit "$fail"
   is absent on an unlocked screen; B.0's positive control reads it on a locked one]: recorded, and
   Craig decides whether 6.1 is re-fired with the screen locked, by `gx.sh s6-1-ok refire`, which
   gives the re-fire a new commit on `main` and a new branch to push.
-- The run ended within 30 minutes; `launchctl print` shows `last exit code = 0` and `runs = 1`;
-  the bootout exits 0; and `FIRINGS in ok.out.log, counted after the bootout: 1 started, 1 ended`.
-  Two of each (a second firing before the bootout, which `runs = 2` also shows when it began
-  before the print) is recorded, and adds two `.lock` files to the tally. More started than ended
-  means the bootout cut a firing: BLOCKED.
+- The run ended within 30 minutes; `launchctl print` shows `last exit code = 0`; the bootout exits
+  0; and `FIRINGS in ok.out.log, counted after the bootout: <n> started, <n> ended`, the two
+  counts equal. One firing (`runs = 1`, `1 started, 1 ended`) is expected. Two or more, every one
+  ended (a second firing before the bootout, which `runs = 2` also shows when it began before the
+  print), pass as well: the later firings push nothing, the record names the count, and each
+  firing adds two `.lock` files to the tally (6.4). More started than ended means the bootout cut
+  a firing: BLOCKED (`fire` returns 1).
 - `EXPECT wrapper-ok: FOUND` (both pushes exit 0 and the `done:` line, the repository named by its
   physical path); the error log holds git's `[new branch]` lines for `main` and `topic-ld` and
   `[new tag]` for `ld-v1` (on a re-fire: a fast-forward line for `main` and one `[new branch]` line
-  for its `topic-ld-r<k>`), each checked by the script; no `git-remote-proton:` line, and neither
+  for its `topic-ld-r<k>`), each checked by the script; `kit helperlines`' `others: 0`, and neither
   D5 warning (a first "could not check" is recorded, `d5_check`); no marker.
 - `REFSET ld-6-local == ld-6-remote: EQUAL (3 ref(s))`, one more for each re-fire's branch: the
   remote holds exactly the repository's branches and tags, so a push that sent less than
@@ -4891,8 +4935,18 @@ function Test-UnpauseCondition([string]$Final) {
 # The Task Scheduler's running instances, as task paths (flag 1 adds hidden tasks).
 function Get-RunningTaskPaths { $svc = New-Object -ComObject Schedule.Service; $svc.Connect(); @($svc.GetRunningTasks(1) | ForEach-Object { [string]$_.Path }) }
 # Both tasks registered, Disabled and not running; no backup or drift worker; no proton-drive process.
+# The running tasks and the process list must be read: an error reading either gives QUIET: UNKNOWN,
+# never YES.
 function Test-Quiet {
-    $ok = $true; $running = @(Get-RunningTaskPaths)
+    $ok = $true
+    try {
+        $running = @(Get-RunningTaskPaths)
+        $workers = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.CommandLine -match 'backup-projects|ProjectsBackup\.psm1|Invoke-ProtonBackup|Test-ProtonCliDrift' })
+        $cli = @(Get-Process -ErrorAction Stop | Where-Object { $_.ProcessName -eq 'proton-drive' })
+    } catch {
+        "QUIET: UNKNOWN (the running tasks or the process list could not be read: $($_.Exception.Message)); never proceed on it"
+        return
+    }
     foreach ($name in 'ProjectsBackupDaily', 'ProtonCliDriftCheck') {
         $t = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
         if (-not $t) { "${name}: NOT REGISTERED (STOP for Craig)"; $ok = $false; continue }
@@ -4901,8 +4955,6 @@ function Test-Quiet {
         "${name}: State=$($t.State) RunningNow=$now LastRun=$($i.LastRunTime) LastResult=$($i.LastTaskResult) NextRun=$($i.NextRunTime)"
         if ([string]$t.State -cne 'Disabled' -or $now) { $ok = $false }
     }
-    $workers = @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'backup-projects|ProjectsBackup\.psm1|Invoke-ProtonBackup|Test-ProtonCliDrift' })
-    $cli = @(Get-Process -Name proton-drive -ErrorAction SilentlyContinue)
     "backup or drift workers: $($workers.Count); proton-drive processes: $($cli.Count)"
     if ($workers.Count -ne 0 -or $cli.Count -ne 0) { $ok = $false }
     "QUIET: $(if ($ok) { 'YES' } else { 'NO (a run in flight: wait, then run Test-Quiet again; NOT REGISTERED: STOP for Craig)' })"
@@ -4916,12 +4968,19 @@ function Show-TaskTimes {
     }
     'REMINDER: if a Monday 09:00 ProtonCliDriftCheck fell inside the pause, Craig runs scripts\Test-ProtonCliDrift.ps1 once by hand (docs/releasing.md, "Between releases").'
 }
-# Step 7.0: no Windows process that could still write to the account.
+# Step 7.0: no Windows process that could still write to the account. Both process lists must be
+# read: an error reading either gives WINDOWS WRITERS: UNKNOWN, never NONE, so W.7.0 hands nothing
+# off on it.
 function Test-NoWriters {
-    $w = @(Get-Process -Name git-remote-proton, proton-drive -ErrorAction SilentlyContinue)
+    try {
+        $w = @(Get-Process -ErrorAction Stop | Where-Object { $_.ProcessName -in 'git-remote-proton', 'proton-drive' })
+        # A git push, fetch or clone that has not reached the helper yet; its pid alone is printed.
+        $g = @(Get-CimInstance Win32_Process -Filter "Name = 'git.exe'" -ErrorAction Stop | Where-Object { $_.CommandLine -match ' (push|fetch|clone)( |$)' })
+    } catch {
+        "WINDOWS WRITERS: UNKNOWN (a process list could not be read: $($_.Exception.Message))"
+        return
+    }
     $w | ForEach-Object { "  $($_.ProcessName) $($_.Id) started $($_.StartTime)" }
-    # A git push, fetch or clone that has not reached the helper yet; its pid alone is printed.
-    $g = @(Get-CimInstance Win32_Process -Filter "Name = 'git.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match ' (push|fetch|clone)( |$)' })
     $g | ForEach-Object { "  git.exe $($_.ProcessId) (a push, fetch or clone)" }
     "WINDOWS WRITERS: $(if ($w.Count -or $g.Count) { 'RUNNING (wait, then check again)' } else { 'NONE' })"
 }
@@ -5067,8 +5126,9 @@ Test-Quiet
 ```
 
 **Pass:** `QUIET: YES`. If a run is in flight: wait, then `Test-Quiet` again; never proceed while
-`QUIET: NO`. `NOT REGISTERED`: STOP for Craig. If the runner may not disable tasks, Craig runs the
-two `Disable` lines himself.
+`QUIET: NO` or `QUIET: UNKNOWN` (the running tasks or the process list could not be read: run it
+again, and one that repeats is a STOP for Craig). `NOT REGISTERED`: STOP for Craig. If the runner
+may not disable tasks, Craig runs the two `Disable` lines himself.
 
 **W.B.2 The read-only Windows check, as a baseline** (probe step 2):
 
@@ -5145,7 +5205,8 @@ Test-Quiet
 Test-GpbEnv
 ```
 
-**Pass:** `QUIET: YES` and `ENV check done: 0 SET line(s).` Then, once quiet:
+**Pass:** `QUIET: YES` (never `NO` or `UNKNOWN`, as at W.B.1) and `ENV check done: 0 SET line(s).`
+Then, once quiet:
 
 ```powershell
 . C:\gpbmac\kit\pc-kit.ps1
@@ -5410,11 +5471,13 @@ create meets no other spelling.
 ```powershell
 . C:\gpbmac\kit\pc-kit.ps1
 $nw = @(Test-NoWriters); $nw
-if ($nw -ccontains 'WINDOWS WRITERS: NONE') { 'HANDOFF -> MAC: 7.1' } else { 'NO HANDOFF: a Windows writer still runs (above); wait, then run W.7.0 again' }
+if ($nw -ccontains 'WINDOWS WRITERS: NONE') { 'HANDOFF -> MAC: 7.1' } else { 'NO HANDOFF: a Windows writer still runs, or a process list could not be read (above); wait, then run W.7.0 again' }
 ```
 
 **Pass:** `WINDOWS WRITERS: NONE`, then `HANDOFF -> MAC: 7.1`; otherwise `NO HANDOFF: ...`: wait,
-and run W.7.0 again.
+and run W.7.0 again. `WINDOWS WRITERS: UNKNOWN` (a process list could not be read) is never NONE,
+so it hands nothing off: run W.7.0 again, and one that repeats is a STOP for Craig, with nothing
+trashed or deleted meanwhile.
 
 **W.7.6 The Windows check** (section 6 step 7), after `HANDOFF -> PC: W.7.6`:
 
@@ -5455,9 +5518,16 @@ Craig deleted or kept (C.5); the PC's ledger of Windows checks; and the final st
 is public: a sign-in URL keeps only its scheme, host and path.
 
 **The release.** This gate ran against the tag's source and the draft's Windows exe. Tags never
-move; a defect in shared code ships as a later tag. Once this gate has ended, pass or fail, Craig
-may publish the draft under `docs/releasing.md` steps 6 and 7, if the Windows and Linux gates
-passed; a Mac-only failure does not hold the release (section 6).
+move. Once this gate has ended, and only if the Windows and Linux gates passed, Craig may publish
+the draft under `docs/releasing.md` steps 6 and 7: when this gate passed, or when it failed and
+every failure is Mac-only (section 6, O5(b): a Mac-only failure does not hold the release). A
+failure is Mac-only when it lies in what no Windows or Linux asset carries: the helper's Mac
+rules, which act only on darwin; the wrapper and plist under `scripts/macos`; the Mac CLI build,
+launchd or the Keychain; or the gate's own setup. A failure in shared code, which the Windows and
+Linux assets carry, is a defect in the release: the draft is not published, and the fix ships as
+a new tag under the no-retag rule (section 6; `docs/releasing.md` step 5). The record classes each
+failure with its evidence. *Brief author's call:* the runners propose the class, and the class is
+Craig's ruling, made before he publishes.
 
 **After a pass:** the README's second-pass status line ("live-gated once, at <version>; later
 releases' Mac builds and later CLI versions on the Mac are not live-gated", spec section 1) and the
@@ -5617,3 +5687,24 @@ Rejected, so not to be raised again:
 - B2-14 (Kimi): string 3 and B17's reason match `push.go:480-481`; the kind precedes "rename".
 - B2-15 (Kimi): 6.3's pushes are refused before `pre-push`, so no hook runs in them.
 - B2-16 (DeepSeek): M14 measured both tracking refs after a Mac `files` clone.
+
+Multi-model review, round 3, 2026-10-28 (Codex, Gemini, DeepSeek, Kimi), on `3098dc2`. Gemini
+raised nothing new. Applied:
+
+- B3-1 (Codex): `Test-NoWriters` fails closed: a process list it cannot read is `WINDOWS WRITERS:
+  UNKNOWN`, which W.7.0 never hands off on.
+- B3-2 (found verifying B3-1): `Test-Quiet` had the same gap; it is `QUIET: UNKNOWN` now.
+- B3-3 (Codex): publication needs every failure classed; a shared-code failure holds the draft
+  (section 6, O5(b); `docs/releasing.md` step 5); the class is Craig's ruling.
+- B3-4 (Kimi): C.3's and step 1's README STOPs exit 3 and hold as C.2's does; so does C.3's
+  failed CLI download.
+- B3-5 (Kimi): 6.1 passes two or more firings that all ended; B13's `runs = 1` superseded.
+- B3-6 (Kimi): `kit helperlines` counts the known lines apart; "no `git-remote-proton:` line"
+  means none but known ones.
+- B3-7 (DeepSeek): C.2 checks that the certified CLI's versioned URL still serves; B.0 and C.3 name
+  a gone or re-cut CLI.
+
+Rejected, so not to be raised again:
+
+- B3-8 (DeepSeek): 6.0's redaction leaves one-dot names alone (`init.defaultbranch`, tested).
+- B3-9 (DeepSeek): `docs/README.md` exists; its line 28 names the steps file.

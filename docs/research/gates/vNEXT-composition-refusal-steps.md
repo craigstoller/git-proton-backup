@@ -10,15 +10,21 @@ briefs themselves are written at release time from the v0.10.0 briefs plus this 
 **`0faada8`**, the macOS brief's anchor. The code it cites is unchanged from `119227e` there but
 for two lines of `cmd/git-remote-proton/main.go` [measured 2026-10-28: among the code paths, `git
 diff 119227e 0faada8` changes only that file's lines 493-495 and 526-527, the Mac list refusals'
-MA3 tails, which these steps never meet, and its test]. The host brief's anchor check must cover
-every code file these steps cite or rely on: `internal/repo/casefold.go`, `internal/repo/push.go`,
-`internal/repo/lock.go`, `internal/repo/readcheck.go`, `internal/gitcmd/gitcmd.go`,
-`internal/transport/trace.go` and `cmd/git-remote-proton/main.go`. The macOS brief's C.2 requires
-the same files unchanged from `0faada8` to the tag (its pathspec holds `internal` and `cmd`), so no
-change is expected; but the Linux and Windows gates run before it, so their own check must catch
-one. A change to any of them re-derives, before the gate, the expected lines (the refusal, the
-case forms, the warning, the `.lock` read-back), N.1's one pack pair and N.2's "nothing written"
-argument.
+MA3 tails, which these steps never meet, and its test]. The host brief's anchor check must count
+all of `internal` and `cmd`, and `go.mod` and `go.sum`, as v0.10.0's already do [record
+`v0.10.0-linux-gate-brief.md:1407`, `v0.10.0-windows-gate-brief.md:705`], not a list of files:
+what these steps rely on is wider than what they cite. It runs from the push batch the helper
+parses (`internal/protocol`), through `checkDst`'s name checks before the rule (`push.go`,
+`gitcmd.CheckRefFormat` in `gitcmd.go`, `advertisableName` in `refname.go`) and the remote's ref
+scan (`ScanRefs` in `refs.go`), to the rule itself: `caseConflicts` in `casefold.go` keys every
+prefix by `canonKey`, which is `canon.go`'s, over the pinned tables in `unicode_tables.go` that
+`gen_unicode.go` generates from `unicodedata/` [code `internal/repo/canon.go:21, 165`,
+`casefold.go:128-147`]; then the lock (`lock.go`), the trace line (`internal/transport/trace.go`),
+the pack (`gitcmd.go`) and the warning (`readcheck.go`, `cmd/git-remote-proton/main.go`). The
+macOS brief's C.2 counts the same pathspec from `0faada8` to the tag, so no change is expected;
+but the Linux and Windows gates run before it, so their own check must catch one. A change there
+re-derives, before the gate, the expected lines (the refusal, the case forms, the warning, the
+`.lock` read-back), N.1's one pack pair and N.2's "nothing written" argument.
 
 **`vNEXT` is a placeholder** for the release that carries the macOS port, whose version Craig has
 not named. When he names it, this file is renamed with the version and every `vNEXT` replaced, by
@@ -73,18 +79,20 @@ extends to the new root]. A leftover ref there would change the line, a BLOCK, n
 
 ## What the host brief adds for these steps
 
-*Brief author's call:* a remote of its own, so the pair warning a case pair now prints on every
-platform (spec section 3, "The warning") cannot appear in these steps, and so these steps do not
-depend on the host brief's other steps. (The alternative not taken: seed the NFC name on the host
-brief's smoke root after its case step, keeping the Windows kit single-root, at the cost of
-changing smoke's frame.)
+*Brief author's call:* a remote of its own, so that these steps depend on none of the host brief's
+other steps, frames or tallies; and, on Linux, whose case root holds a pair once its 5.4 has run,
+so that the pair warning a pair now prints on every platform (spec section 3, "The warning")
+cannot appear in them. (The alternative not taken: seed the NFC name on the host brief's smoke
+root after its case step, keeping the Windows kit single-root, at the cost of changing smoke's
+frame.)
 
 - **A root:** `/my-files/GitRemotes/vNEXT-<platform>-nfd-<SUF>` (`vNEXT-linux-nfd-a1` and
   `vNEXT-win-nfd-a1` for the first attempts), named in the host brief's root list, its
   confinement (rule 2) and its ownership record, as the v0.10.0 briefs named theirs. **Linux:** add
   the role `nfd` to `$RootNames` in `kit.ps1` (v0.10.0's is built from the roles `contract`,
   `smoke`, `xl`, `xw`, `case` [record `v0.10.0-linux-gate-brief.md:193`]), which `Update-RootRecord`
-  reads, and set `$NFDL` beside `$CASE`. **Windows:** define `$NfdwName` and `$NFDW` beside
+  reads, and set `$NFDL` beside `$CASE` both in `kit.ps1` and in the WSL `env.sh`, since the bash
+  blocks below run under `set -u`. **Windows:** define `$NfdwName` and `$NFDW` beside
   `$SmokeName` and `$SMOKE` [record `v0.10.0-windows-gate-brief.md:212`], and extend
   `Start-SmokeRecord`, `Test-SmokeRecord`, 5.1's enumeration and 5.2's trash, which name the smoke
   root alone [record `v0.10.0-windows-gate-brief.md:254-290, 1197, 1223-1227`], to the second root.
@@ -114,12 +122,12 @@ function ConvertTo-Esc([string]$s) {
     $b.ToString()
 }
 # Prints a file's escaped view, then FOUND or MISSING for an expected substring of one line;
-# MISSING throws, so the block stops there.
-function Test-EscapedLine([string]$File, [string]$Expected) {
+# MISSING throws, so the block stops there. $What names the expected line in the throw.
+function Test-EscapedLine([string]$File, [string]$Expected, [string]$What = 'the refusal text') {
     $lines = @([IO.File]::ReadAllLines($File, [Text.UTF8Encoding]::new($false)) | ForEach-Object { ConvertTo-Esc $_ })
     $lines | ForEach-Object { "  | $_" }
     $at = 0; for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i].Contains($Expected, [StringComparison]::Ordinal)) { $at = $i + 1; break } }
-    if ($at) { "EXPECTED LINE: FOUND at line $at" } else { "EXPECTED LINE: MISSING"; throw 'BLOCKED: the refusal text differs' }
+    if ($at) { "EXPECTED LINE: FOUND at line $at" } else { "EXPECTED LINE: MISSING"; throw "BLOCKED: $What differs or is missing" }
 }
 $NfdRefusal = '-> cafe<U+0301> (refs/heads/cafe<U+0301> conflicts with refs/heads/caf<U+00E9> (heads/cafe<U+0301> vs heads/caf<U+00E9>, by Unicode normalisation: "heads/cafe<BS>u0301" vs "heads/caf<BS>u00e9"): a Mac clone would mishandle the pair (README, Honest limits), so this create is refused on every platform)'
 ```
@@ -150,8 +158,13 @@ main -> MAIN (refs/heads/MAIN conflicts with refs/heads/Main (heads/MAIN vs head
   alone, after `s5g-upload-Main` laid `Main` down beside `main`: `s5h-side` prints them twice, for
   its push and for its `ls-remote`, and `s5i-MAIN` once [record
   `v0.10.0-linux-gate-brief.md:2718-2795`]. No later Linux step reaches that remote [measured
-  2026-10-28: no line of that brief after 2771 names `$CASE`], and no Windows remote holds a pair
-  (its case create, 4.4, is refused) [record `v0.10.0-windows-gate-brief.md:1069`]. v0.10.0 treats
+  2026-10-28: after line 2771 the one git command that reaches a remote through the helper (a
+  push, fetch, clone, `ls-remote` or `proton::` URL) is the adoption scan of Craig's own remotes,
+  line 3220; the cleanup reaches the roots through the CLI alone], and no Windows remote holds a
+  pair (its case create, 4.4, is refused) [record `v0.10.0-windows-gate-brief.md:1069`]. The
+  adoption scans of Craig's own remotes (that Linux block; Windows step 3) print the warning too,
+  for a pair they meet: there it is the scan's report (spec section 3), and their STOP on a pair
+  stands. v0.10.0 treats
   an unexpected `git-remote-proton:` line as BLOCKED [record `v0.10.0-linux-gate-brief.md:715,
   2326`], so the host brief expects these two lines at each of those three places:
 
@@ -159,6 +172,9 @@ main -> MAIN (refs/heads/MAIN conflicts with refs/heads/Main (heads/MAIN vs head
 git-remote-proton: warning: this remote holds refs that differ only by letter case or Unicode normalisation; see README, Honest limits:
   refs/heads/Main (<OID>, "refs/heads/Main") and refs/heads/main (<OID>, "refs/heads/main"): by letter case
 ```
+
+`<OID>` is any 40 lower-case hex digits, as in the macOS brief's `expected.txt`: the host brief
+matches it as such, or puts in the object IDs its own run's two refs carry.
 
 ## The Linux steps (WSL scripts and Windows snapshots, in the v0.10.0 Linux brief's shape)
 
@@ -221,6 +237,7 @@ exit "$rc"
 Save-Snapshot nfd-1 $NFDL -Recurse
 Compare-Snapshot nfd-0 nfd-1
 Test-EscapedLine (Join-Path $G 'log' 'sN2-nfd-create.txt') $NfdRefusal
+Test-EscapedLine (Join-Path $G 'log' 'sN2-nfd-create.txt') "gpb: downloaded $NFDL/.lock (" 'the .lock read-back line'
 ```
 
 **Pass:** all of the following hold.
@@ -231,6 +248,10 @@ Test-EscapedLine (Join-Path $G 'log' 'sN2-nfd-create.txt') $NfdRefusal
 - `EXPECTED LINE: FOUND`: the refusal names both spellings and the relation, exactly as above. It
   is also what shows the bytes git sent the helper: the helper names the destination it
   received, and the escaped view reads `cafe<U+0301>` only if it arrived as NFD.
+- `EXPECTED LINE: FOUND` a second time, for the `.lock` read-back line, `gpb: downloaded
+  <root>/.lock (<n> bytes)` [code `internal/transport/trace.go:43`, `internal/repo/lock.go:58`]:
+  the refused push took the repository's lock and read it back, as v0.10.0's 4.4 expected of its
+  refused push [record `v0.10.0-windows-gate-brief.md:1073-1075`].
 - **Nothing written, the v0.10.0 shape:** `COMPARE nfd-0 -> nfd-1: NO DIFFERENCE`, and the WSL
   view, from the session that pushed, agrees: `refs/heads (WSL view): caf<U+00E9> main` in the
   escaped print of the log above (one name of the two, never both), and `packs (WSL view)` N.1's
@@ -301,6 +322,7 @@ $ls = @(git -C $x ls-remote proton-v2 2>&1 | ForEach-Object { "$_" }); $lc = $LA
 $ls | ForEach-Object { "  ls-remote | $(ConvertTo-Esc $_)" }
 if ($lc -ne 0) { throw "BLOCKED: ls-remote exited $lc" }
 Test-EscapedLine (Join-Path $G 'log' 'N2-nfd-create.txt') $NfdRefusal
+Test-EscapedLine (Join-Path $G 'log' 'N2-nfd-create.txt') "gpb: downloaded $NFDW/.lock (" 'the .lock read-back line'
 if ($rc -ne 1) { throw "BLOCKED: the push exited $rc, not 1" }
 ```
 
@@ -309,13 +331,13 @@ if ($rc -ne 1) { throw "BLOCKED: the push exited $rc, not 1" }
 - `dst as PowerShell encodes it` ends `63616665cc81`. That is PowerShell's own encoding, no more;
   that Git for Windows passed those bytes on unchanged is [inference] (it reads its arguments as
   wide strings and converts them to UTF-8), and the refusal text below is what shows it.
-- `exit 1` and `EXPECTED LINE: FOUND`, as on Linux, character for character: the same rule on the
-  Windows binary. The push's output (in `log\N2-nfd-create.txt`, printed escaped by
-  `Test-EscapedLine`) also holds the `.lock` read-back line, `gpb: downloaded .../.lock (<n>
-  bytes)` [code `internal/transport/trace.go:43`], as v0.10.0's 4.4 expected [record
-  `v0.10.0-windows-gate-brief.md:1071-1078`]. The
-  block takes the after-snapshot and `ls-remote` before it judges the exit and the text, so a BLOCK
-  still leaves both recorded and the output printed.
+- `exit 1` and `EXPECTED LINE: FOUND` twice, as on Linux, character for character: the refusal,
+  the same rule on the Windows binary, and then the `.lock` read-back line, `gpb: downloaded
+  <root>/.lock (<n> bytes)` [code `internal/transport/trace.go:43`], in the push's output
+  (`log\N2-nfd-create.txt`, printed escaped by `Test-EscapedLine`), as v0.10.0's 4.4 expected
+  [record `v0.10.0-windows-gate-brief.md:1071-1078`]. The block takes the after-snapshot and
+  `ls-remote` before it judges the exit and the text, so a BLOCK still leaves both recorded and
+  the output printed.
 - **Nothing written:** `COMPARE nfd-0 -> nfd-1: NO DIFFERENCE`, and `ls-remote` exits 0 listing
   `HEAD`, `refs/heads/main` and `refs/heads/caf<U+00E9>`, all at N.1's commit, and no NFD name.
   The Windows session is the one that pushed, so its view is the writer's own. No pack (C2
@@ -336,6 +358,12 @@ brief's ownership record; its frame is above.
   refuses one; hermetic tests cover the rest.
 - A mixed push off the Mac (an update that lands beside a refused NFD create, in one push): only
   the macOS gate's 5.2 runs one, from the Mac.
+- A normalisation-changing rename in one push (the delete of the NFC ref beside a create of its
+  NFD twin), which the same rule refuses whole: hermetic only
+  (`TestPushNormalisationChangingRenameIsRefusedWhole`, `internal/repo/repo_test.go:3026`).
+- A create outside `refs/heads`: `caseConflicts` keys every ref's prefixes the same way in every
+  namespace [code `internal/repo/casefold.go:128-147`]; `TestPushCaseRuleCoversTags` covers a
+  case-variant tag, and no test or gate step runs an NFD one [inference from the code].
 
 ## Review record
 
@@ -391,3 +419,21 @@ Rejected, so not to be raised again:
 
 - S2-6 (DeepSeek): listing `main.go` is not "permanently red": C.2 holds `cmd` unchanged.
 - S2-7 (DeepSeek): v0.10.0's `names` sorts, so the WSL view's order is fixed.
+
+Multi-model review, round 3, 2026-10-28 (Codex, Gemini, DeepSeek, Kimi), on `3098dc2`. Codex and
+Gemini raised nothing new. Applied:
+
+- S3-1 (DeepSeek, Kimi): the anchor check is v0.10.0's whole `internal` and `cmd` pathspec, and the
+  path the rule runs through is named (`canon.go`, `unicode_tables.go`, `refname.go`,
+  `internal/protocol` among it); S2-1's file list superseded.
+- S3-2 (Kimi): both N.2 blocks assert the `.lock` read-back line.
+- S3-3 (DeepSeek): the warning's three places rest on every command that reaches a remote through
+  the helper, not on a name; the adoption scans' warning is their report.
+- S3-4 (DeepSeek): "Not covered" adds the one-push rename and a create outside `refs/heads`.
+- S3-5 (Kimi): `$NFDL` goes in the WSL `env.sh` as well as `kit.ps1`.
+- S3-6 (DeepSeek): `<OID>` in the warning lines explained.
+- S3-7 (DeepSeek): the separate root's reason puts decoupling first.
+
+Rejected, so not to be raised again:
+
+- S3-8 (DeepSeek): Windows N.2's `ls-remote` stays runner-judged, as v0.10.0's 4.4 judged its own.
