@@ -110,33 +110,67 @@ func macPass(local *LocalSide, ups []protocol.RefUpdate, remote map[string]strin
 	// push, into whatever file the files store names it by, and the local
 	// refs judged are those before the push, because git rewrites tracking
 	// refs only afterwards, so a same-batch delete never clears this half.
+	// R7 (Ruling T9-1): an UPDATE's tracking ref is also checked against
+	// the tracking refs of the batch's other valid deletes. Measured
+	// 2026-10-27 (git 2.54.0, a files clone that never fetched, pushing over
+	// the local transport to a reftable remote holding both names): when
+	// the update is listed before the delete in the remote's ref order, git
+	// writes the update's tracking ref, then its post-push delete of the
+	// delete's aliasing tracking ref unlinks that file, and the push still
+	// exits 0. With the delete listed first the tracking ref survived. A
+	// create beside such a delete was measured safe (git handled the delete
+	// first), so creates are not checked against deletes. The delete itself
+	// is not refused: it is the repair half.
+	//
 	// One caseConflicts call covers every write: a conflict with a ref that
-	// is neither local nor another write's tracking ref (X's own other
-	// tracking ref) is dropped after, which equals leaving it out of the
-	// set, since conflicts are pairwise.
+	// is neither local, nor another write's tracking ref, nor (for an
+	// update) another delete's tracking ref, such as X's own other tracking
+	// ref, is dropped after, which equals leaving it out of the set, since
+	// conflicts are pairwise.
 	//
 	// (b) An update X is checked against batchFinalSet, the remote's set as
 	// the batch would leave it, so a same-batch delete of the other member
 	// clears it. A create's remote side is D2's to judge.
 	var writes []int
-	owners := map[string][]string{} // tracking ref -> the valid writes it belongs to
+	owners := map[string][]string{}   // tracking ref -> the valid writes it belongs to
+	deleters := map[string][]string{} // tracking ref -> the valid deletes it belongs to (R7)
 	for i, u := range ups {
-		if !valid[i] || isDelete[i] {
+		if !valid[i] {
+			continue
+		}
+		ts := sortedUnique(append([]string(nil), local.Tracking[u.Dst]...))
+		if isDelete[i] {
+			for _, tr := range ts {
+				deleters[tr] = append(deleters[tr], u.Dst)
+			}
 			continue
 		}
 		writes = append(writes, i)
-		for _, tr := range sortedUnique(append([]string(nil), local.Tracking[u.Dst]...)) {
+		for _, tr := range ts {
 			owners[tr] = append(owners[tr], u.Dst)
 		}
 	}
-	set := make(map[string]bool, len(local.Refs)+len(owners))
+	set := make(map[string]bool, len(local.Refs)+len(owners)+len(deleters))
 	for r := range local.Refs {
 		set[r] = true
+	}
+	for tr := range deleters {
+		set[tr] = true
 	}
 	tracked := make([]string, 0, len(owners))
 	for tr := range owners {
 		set[tr] = true
 		tracked = append(tracked, tr)
+	}
+	// smallestOther is the smallest name in names other than x, or "".
+	smallestOther := func(names []string, x string) string {
+		best := ""
+		for _, o := range names {
+			if o != x && (best == "" || o < best) {
+				best = o
+			}
+		}
+		return best
 	}
 	byTracking := caseConflicts(set, tracked)
 	var updates []string
@@ -160,18 +194,20 @@ func macPass(local *LocalSide, ups []protocol.RefUpdate, remote map[string]strin
 		for _, tr := range sortedUnique(append([]string(nil), local.Tracking[x]...)) {
 			var items []string
 			for _, c := range byTracking[tr] {
-				other := ""
-				for _, o := range owners[c.Ref] {
-					if o != x && (other == "" || o < other) {
-						other = o
-					}
+				other := smallestOther(owners[c.Ref], x)
+				deleter := ""
+				if !isCreate[i] {
+					deleter = smallestOther(deleters[c.Ref], x)
 				}
-				if !local.Refs[c.Ref] && other == "" {
+				if !local.Refs[c.Ref] && other == "" && deleter == "" {
 					continue
 				}
 				item := formatItem(c)
 				if other != "" {
 					item += " (the tracking ref of " + other + " in this push)"
+				}
+				if deleter != "" {
+					item += " (the tracking ref of " + deleter + ", which this push deletes)"
 				}
 				items = append(items, item)
 			}
@@ -179,8 +215,13 @@ func macPass(local *LocalSide, ups []protocol.RefUpdate, remote map[string]strin
 				clauses = append(clauses, "its tracking ref "+tr+" would collide with "+strings.Join(items, ", "))
 			}
 		}
+		// After an (a) clause the joiner already says "also" (Ruling T9-2).
 		if cs := remoteHalf[x]; !isCreate[i] && len(cs) > 0 {
-			clauses = append(clauses, "the remote also holds "+macItems(cs))
+			holds := "the remote also holds "
+			if len(clauses) > 0 {
+				holds = "the remote holds "
+			}
+			clauses = append(clauses, holds+macItems(cs))
 		}
 		if len(clauses) > 0 {
 			verdicts = append(verdicts, verdict{i, x + ": refused on this Mac: " +

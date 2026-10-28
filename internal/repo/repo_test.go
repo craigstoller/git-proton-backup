@@ -8456,21 +8456,43 @@ func TestPushWithLocalRefusesAnUpdateToAPairMember(t *testing.T) {
 	})
 }
 
-// TestPushWithLocalClearsTheRemoteHalfWhenTheOtherMemberIsDeleted is a GUARD
-// (part 1(b) judges against batchFinalSet): the batch updates one member of
-// the remote pair and deletes the other, which is the repair, so both land.
-// No local ref aliases either member's tracking ref.
+// TestPushWithLocalClearsTheRemoteHalfWhenTheOtherMemberIsDeleted (part 1(b)
+// judges against batchFinalSet): the batch updates one member of the remote
+// pair and deletes the other, which is the repair, so the remote half never
+// refuses the update. No local ref aliases either member's tracking ref.
+//   - "aliasing tracking refs" is RED (R7, Ruling T9-1; fix round 1). Under
+//     git's default mapping the two members' tracking refs alias each other,
+//     and git's post-push delete of one can unlink the other it just wrote,
+//     so the update is refused by part 1(a) alone, with no remote clause,
+//     and the delete lands.
+//   - "no tracking refs" is a GUARD: with no mapping for either member, as
+//     an anonymous URL gives, both land.
 func TestPushWithLocalClearsTheRemoteHalfWhenTheOtherMemberIsDeleted(t *testing.T) {
 	gitDir := newGitRepoForPush(t)
 	c1 := headOf(t, gitDir)
-	f, remote := seedCaseRemote(t, map[string]string{"refs/heads/main": c1, mpBranchNFC: c1, mpBranchNFD: c1})
+	seeded := map[string]string{"refs/heads/main": c1, mpBranchNFC: c1, mpBranchNFD: c1}
 	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
-
 	ups := []protocol.RefUpdate{{Src: c2, Dst: mpBranchNFC}, {Src: "", Dst: mpBranchNFD}}
-	local := macSide(ups, "refs/heads/main", "refs/remotes/origin/main", mpBranchNFC)
-	res := PushWithLocal(f, "/r", gitDir, ups, remote, nil, local)
-	wantResults(t, res, ups, []string{"", ""})
-	assertCaseRemote(t, f, map[string]string{"refs/heads/main": c1, mpBranchNFC: c2})
+
+	t.Run("aliasing tracking refs", func(t *testing.T) {
+		f, remote := seedCaseRemote(t, seeded)
+		local := macSide(ups, "refs/heads/main", "refs/remotes/origin/main", mpBranchNFC)
+		res := PushWithLocal(f, "/r", gitDir, ups, remote, nil, local)
+		wantResults(t, res, ups, []string{
+			mpBranchNFC + ": refused on this Mac: its tracking ref " + mpTrackNFC + " would collide with " +
+				mpTrackItem(true) + " (the tracking ref of " + mpBranchNFD + ", which this push deletes)" + mpWriteTail,
+			"",
+		})
+		assertCaseRemote(t, f, map[string]string{"refs/heads/main": c1, mpBranchNFC: c1})
+	})
+	t.Run("no tracking refs", func(t *testing.T) {
+		f, remote := seedCaseRemote(t, seeded)
+		local := &LocalSide{Refs: mpRefs("refs/heads/main", "refs/remotes/origin/main", mpBranchNFC),
+			Tracking: map[string][]string{}}
+		res := PushWithLocal(f, "/r", gitDir, ups, remote, nil, local)
+		wantResults(t, res, ups, []string{"", ""})
+		assertCaseRemote(t, f, map[string]string{"refs/heads/main": c1, mpBranchNFC: c2})
+	})
 }
 
 // TestPushWithLocalLocalHalfIsNotClearedBySameBatchDelete is RED (part 1(a)
@@ -8478,7 +8500,10 @@ func TestPushWithLocalClearsTheRemoteHalfWhenTheOtherMemberIsDeleted(t *testing.
 // NFD member's stale tracking ref, so the update of the NFC member is refused
 // even though the batch deletes the NFD member: git rewrites tracking refs
 // only after the push. The delete is judged by part 3 alone, and its tracking
-// ref aliases no other local ref, so it commits.
+// ref aliases no other local ref, so it commits. The NFD tracking ref is also
+// the tracking ref of the batch's delete, so the item carries R7's note too
+// (fix round 1), as an item that is both local and another write's carries
+// the write's.
 func TestPushWithLocalLocalHalfIsNotClearedBySameBatchDelete(t *testing.T) {
 	gitDir := newGitRepoForPush(t)
 	c1 := headOf(t, gitDir)
@@ -8490,10 +8515,54 @@ func TestPushWithLocalLocalHalfIsNotClearedBySameBatchDelete(t *testing.T) {
 	res := PushWithLocal(f, "/r", gitDir, ups, remote, nil, local)
 	wantResults(t, res, ups, []string{
 		mpBranchNFC + ": refused on this Mac: its tracking ref " + mpTrackNFC + " would collide with " +
-			mpTrackItem(true) + mpWriteTail,
+			mpTrackItem(true) + " (the tracking ref of " + mpBranchNFD + ", which this push deletes)" + mpWriteTail,
 		"",
 	})
 	assertCaseRemote(t, f, map[string]string{"refs/heads/main": c1, mpBranchNFC: c1})
+}
+
+// TestPushWithLocalRefusesAnUpdateWhoseTrackingRefAliasesASameBatchDelete is
+// RED (R7, Ruling T9-1; fix round 1). The clone holds neither member's
+// tracking ref. The batch updates the NFD member and deletes the NFC one, and
+// under git's default mapping their tracking refs alias. Measured 2026-10-27
+// (git 2.54.0, a files clone pushing to a reftable remote): with the update
+// listed first in the remote's order, as the NFD member is, git's post-push
+// delete of the NFC tracking ref unlinked the NFD one it had just written. So
+// the update is refused, naming the delete, and the delete, the repair half,
+// lands.
+func TestPushWithLocalRefusesAnUpdateWhoseTrackingRefAliasesASameBatchDelete(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	f, remote := seedCaseRemote(t, map[string]string{"refs/heads/main": c1, mpBranchNFC: c1, mpBranchNFD: c1})
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{{Src: c2, Dst: mpBranchNFD}, {Src: "", Dst: mpBranchNFC}}
+	local := macSide(ups, "refs/heads/main", "refs/remotes/origin/main", mpBranchNFD)
+	res := PushWithLocal(f, "/r", gitDir, ups, remote, nil, local)
+	wantResults(t, res, ups, []string{
+		mpBranchNFD + ": refused on this Mac: its tracking ref " + mpTrackNFD + " would collide with " +
+			mpTrackItem(false) + " (the tracking ref of " + mpBranchNFC + ", which this push deletes)" + mpWriteTail,
+		"",
+	})
+	assertCaseRemote(t, f, map[string]string{"refs/heads/main": c1, mpBranchNFD: c1})
+}
+
+// TestPushWithLocalSparesACreateBesideAnAliasingSameBatchDelete is a GUARD (R7
+// is for updates only, Ruling T9-1). A plain case-changing rename, feat to
+// Feat: the create's tracking ref aliases the delete's, but measured on
+// 2026-10-27 git handled the delete first and the create's tracking ref
+// survived, so the create is not refused, and both halves land.
+func TestPushWithLocalSparesACreateBesideAnAliasingSameBatchDelete(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	f, remote := seedCaseRemote(t, map[string]string{"refs/heads/main": c1, "refs/heads/feat": c1})
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{{Src: c2, Dst: "refs/heads/Feat"}, {Src: "", Dst: "refs/heads/feat"}}
+	local := macSide(ups, "refs/heads/main", "refs/remotes/origin/main")
+	res := PushWithLocal(f, "/r", gitDir, ups, remote, nil, local)
+	wantResults(t, res, ups, []string{"", ""})
+	assertCaseRemote(t, f, map[string]string{"refs/heads/main": c1, "refs/heads/Feat": c2})
 }
 
 // TestPushWithLocalRefusesAWriteWhoseTrackingRefCollidesWithALocalRef is RED
@@ -8649,7 +8718,7 @@ func TestPushWithLocalNamesEveryCollisionSorted(t *testing.T) {
 			mpCase("refs/remotes/mirror/Feat", "remotes/mirror/feat", "remotes/mirror/Feat") +
 			"; also its tracking ref refs/remotes/origin/feat would collide with " +
 			mpCase("refs/remotes/origin/Feat", "remotes/origin/feat", "remotes/origin/Feat") +
-			"; also the remote also holds " + mpCase("refs/heads/Feat", "heads/feat", "heads/Feat") + mpWriteTail,
+			"; also the remote holds " + mpCase("refs/heads/Feat", "heads/feat", "heads/Feat") + mpWriteTail,
 		"refs/heads/other: refused on this Mac: its tracking ref refs/remotes/mirror/FEAT would collide with " +
 			mpCase("refs/remotes/mirror/Feat", "remotes/mirror/FEAT", "remotes/mirror/Feat") + ", " +
 			mpCase("refs/remotes/mirror/feat", "remotes/mirror/FEAT", "remotes/mirror/feat") +
@@ -8695,7 +8764,10 @@ func TestPushWithLocalAttributesAKeptDeleteToTheMac(t *testing.T) {
 // (R2). Phase 2 passes the update of the NFC member only because the batch
 // deletes the NFD member, and that delete then fails in phase 4. Phase 5
 // re-checks the update against the live set and refuses it with part 1(b)'s
-// text and the delete it depended on, before ensureRefParents.
+// text and the delete it depended on, before ensureRefParents. The local side
+// maps neither member to a tracking ref, as an anonymous URL gives: under a
+// mapping the two tracking refs would alias, and R7 would refuse the update in
+// phase 2 (fix round 1).
 func TestPushWithLocalPhase5RefusesAnUpdateWhenItsCounterpartDeleteFails(t *testing.T) {
 	gitDir := newGitRepoForPush(t)
 	c1 := headOf(t, gitDir)
@@ -8704,7 +8776,8 @@ func TestPushWithLocalPhase5RefusesAnUpdateWhenItsCounterpartDeleteFails(t *test
 	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
 
 	ups := []protocol.RefUpdate{{Src: c2, Dst: mpBranchNFC}, {Src: "", Dst: mpBranchNFD}}
-	local := macSide(ups, "refs/heads/main", "refs/remotes/origin/main", mpBranchNFC)
+	local := &LocalSide{Refs: mpRefs("refs/heads/main", "refs/remotes/origin/main", mpBranchNFC),
+		Tracking: map[string][]string{}}
 	tr := trashFailsForTransport{Fake: f, path: "/r/" + mpBranchNFD}
 	res := PushWithLocal(tr, "/r", gitDir, ups, remote, nil, local)
 	if len(res) != 2 {
@@ -8727,7 +8800,9 @@ func TestPushWithLocalPhase5RefusesAnUpdateWhenItsCounterpartDeleteFails(t *test
 // TestPushWithLocalPhase5SparesAReplacement is a GUARD (R2's exemption). The
 // batch deletes both members and recreates the NFC one; the NFD delete fails
 // in phase 4. The NFC write is a replacement whose own delete committed, so
-// refusing it now would lose the ref it replaces: it must land.
+// refusing it now would lose the ref it replaces: it must land. As in the
+// test above, the local side maps neither member to a tracking ref, so R7
+// does not refuse the write in phase 2 (fix round 1).
 func TestPushWithLocalPhase5SparesAReplacement(t *testing.T) {
 	gitDir := newGitRepoForPush(t)
 	c1 := headOf(t, gitDir)
@@ -8737,7 +8812,8 @@ func TestPushWithLocalPhase5SparesAReplacement(t *testing.T) {
 	ups := []protocol.RefUpdate{
 		{Src: "", Dst: mpBranchNFD}, {Src: "", Dst: mpBranchNFC}, {Src: c2, Dst: mpBranchNFC},
 	}
-	local := macSide(ups, "refs/heads/main", "refs/remotes/origin/main", mpBranchNFC)
+	local := &LocalSide{Refs: mpRefs("refs/heads/main", "refs/remotes/origin/main", mpBranchNFC),
+		Tracking: map[string][]string{}}
 	tr := trashFailsForTransport{Fake: f, path: "/r/" + mpBranchNFD}
 	res := PushWithLocal(tr, "/r", gitDir, ups, remote, nil, local)
 	if len(res) != 3 {
