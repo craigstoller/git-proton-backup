@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/craigstoller/git-proton-backup/internal/gitcmd"
@@ -42,8 +41,9 @@ type Result struct {
 //     skipped path is refused, kind-aware, naming the occupant), a
 //     final-state directory/file preflight over the refs that will exist
 //     once the batch lands, and the case-variant rule on creates (spec §5;
-//     see the block itself). Failures here cost nothing: no pack has been
-//     built yet.
+//     see the block itself), with, through PushWithLocal only, the Mac push
+//     rule after it (macpush.go). Failures here cost nothing: no pack has
+//     been built yet.
 //  3. Build, upload, and confirm ONE pack for every valid create/update —
 //     the design's normative "Object transfer per batch", which Stage 2's
 //     per-ref packing quietly diverged from (see gitcmd.WritePack's doc
@@ -60,6 +60,17 @@ type Result struct {
 // version.
 func Push(t transport.Transport, root, gitDir string,
 	ups []protocol.RefUpdate, remote map[string]string, skipped []SkippedRef) []Result {
+	return PushWithLocal(t, root, gitDir, ups, remote, skipped, nil)
+}
+
+// PushWithLocal is Push with the local side of a Mac files-store repository
+// (LocalSide, macpush.go), which adds the Mac push rule to phase 2 and its
+// re-check (R2) to phase 5. Push reads no local refs or remote configuration,
+// so the push arm makes those reads and passes the result; it passes nil off
+// darwin and for a reftable repository. With local nil, PushWithLocal is
+// exactly Push.
+func PushWithLocal(t transport.Transport, root, gitDir string,
+	ups []protocol.RefUpdate, remote map[string]string, skipped []SkippedRef, local *LocalSide) []Result {
 
 	results := make([]Result, len(ups))
 	// fail/okResult flatten every outcome through the same funnel pushOne
@@ -303,6 +314,22 @@ func Push(t transport.Transport, root, gitDir string,
 		valid[i] = true
 	}
 
+	// The rest of phase 2 is three checks, each a closure run by the loop at
+	// the end of it: the final-state D/F preflight (dfPreflight), the
+	// case-variant rule on creates with its rename pairing, to their own fixed
+	// point (caseFixedPoint), and, with a local side only, the Mac push rule
+	// (macPass, macpush.go). refuse is fail plus the invalidation every
+	// refusal in them makes; no check ever sets valid back to true.
+	refuse := func(i int, msg string) {
+		fail(i, msg)
+		valid[i] = false
+	}
+	// macKept holds the deletes the Mac push rule kept, and macCreates the
+	// creates caseFixedPoint refused only because of one (R3). Both stay
+	// empty with no local side, so caseFixedPoint is then exactly D2 and A1.
+	macKept := map[string]bool{}
+	macCreates := map[string]bool{}
+
 	// Final-state D/F preflight over REFS ONLY (empty folders are runtime,
 	// self-heal's job — Task 9b). finalSet is the ref namespace as it will
 	// read immediately after this batch: every currently-advertised ref,
@@ -310,21 +337,24 @@ func Push(t transport.Transport, root, gitDir string,
 	// subtracted — the ref genuinely still exists on the remote, so a
 	// dependent create must still be checked against it), plus every valid
 	// create/update's destination. batchFinalSet's doc comment says why it is
-	// built in two passes.
-	finalSet := batchFinalSet(remote, ups, valid, isDelete)
-	for i, u := range ups {
-		if !valid[i] || isDelete[i] || !isCreate[i] {
-			continue
-		}
-		for other := range finalSet {
-			if other == u.Dst {
+	// built in two passes. It reads the CURRENT valid flags, so a re-run (the
+	// loop below) checks the creates still valid against the deletes the Mac
+	// rule has since kept.
+	dfPreflight := func() {
+		finalSet := batchFinalSet(remote, ups, valid, isDelete)
+		for i, u := range ups {
+			if !valid[i] || isDelete[i] || !isCreate[i] {
 				continue
 			}
-			if strings.HasPrefix(other, u.Dst+"/") || strings.HasPrefix(u.Dst, other+"/") {
-				fail(i, fmt.Sprintf("%s conflicts with %s: a ref cannot be both a leaf and a "+
-					"folder containing other refs", u.Dst, other))
-				valid[i] = false
-				break
+			for other := range finalSet {
+				if other == u.Dst {
+					continue
+				}
+				if strings.HasPrefix(other, u.Dst+"/") || strings.HasPrefix(u.Dst, other+"/") {
+					refuse(i, fmt.Sprintf("%s conflicts with %s: a ref cannot be both a leaf and a "+
+						"folder containing other refs", u.Dst, other))
+					break
+				}
 			}
 		}
 	}
@@ -373,82 +403,108 @@ func Push(t transport.Transport, root, gitDir string,
 	// Sparing the two deletes above changes no pass's set: subtracting an
 	// absent name is a no-op, and a replaced name is added back by its
 	// recreate, which is no create, so this loop never changes its validity.
-	// The D/F preflight needs no re-run for a kept ref: a create above or
+	// The D/F preflight needs no re-run for a ref A1 keeps: a create above or
 	// beneath it either shares its spelling where it differs from X, and so
 	// conflicts with X here in the same pass, or lies above or beneath X too,
 	// and already met X in the D/F preflight. That holds under either
 	// relation, because each key of a prefix is the same prefix of the key of
-	// the whole name ('/' is a starter that both keys keep).
-	for {
-		caseSet := batchFinalSet(remote, ups, valid, isDelete)
-		var candidates []string
-		for i, u := range ups {
-			if valid[i] && !isDelete[i] && isCreate[i] {
-				candidates = append(candidates, u.Dst)
-			}
-		}
-		conflicts := caseConflicts(caseSet, candidates)
-		if len(conflicts) == 0 {
-			break
-		}
-		var refused []string
-		for i, u := range ups {
-			if !valid[i] || isDelete[i] || !isCreate[i] {
-				continue
-			}
-			if cs, ok := conflicts[u.Dst]; ok {
-				fail(i, caseConflictMessage(u.Dst, cs))
-				valid[i] = false
-				refused = append(refused, u.Dst)
-			}
-		}
-		// The refused creates, indexed by each key, each index keeping its
-		// smallest create. A delete pairs with byCase[caseKey(D)] and
-		// byCanon[canonKey(D)], whichever exist, and names the smaller, so
-		// its text depends neither on batch order nor on which key matched.
-		sort.Strings(refused)
-		byCase, byCanon := map[string]string{}, map[string]string{}
-		for _, x := range refused {
-			if _, ok := byCase[caseKey(x)]; !ok {
-				byCase[caseKey(x)] = x
-			}
-			if _, ok := byCanon[canonKey(x)]; !ok {
-				byCanon[canonKey(x)] = x
-			}
-		}
-		pairedCreate := func(d string) (string, bool) {
-			x, ok := byCase[caseKey(d)]
-			if y, canon := byCanon[canonKey(d)]; canon && (!ok || y < x) {
-				return y, true
-			}
-			return x, ok
-		}
-		// rewritten: every name a still-valid non-delete writes, so a delete
-		// of one of them is half of a replacement.
-		rewritten := map[string]bool{}
-		for i, u := range ups {
-			if valid[i] && !isDelete[i] {
-				rewritten[u.Dst] = true
-			}
-		}
-		for j, u := range ups {
-			if !valid[j] || !isDelete[j] {
-				continue
-			}
-			if _, held := remote[u.Dst]; !held || rewritten[u.Dst] {
-				continue
-			}
-			if x, ok := pairedCreate(u.Dst); ok {
-				// Both spellings again in %+q form, as formatItem shows them:
-				// a normalisation-changing rename's two names display alike.
-				kind := "normalisation-changing"
-				if caseKey(u.Dst) == caseKey(x) {
-					kind = "case-changing"
+	// the whole name ('/' is a starter that both keys keep). The argument
+	// covers A1's keeps only: a delete the Mac rule keeps is kept for a reason
+	// unrelated to case, so the loop below re-runs the preflight after it.
+	//
+	// R3 (the Mac push rule). A create whose conflicts include a delete the
+	// Mac rule kept (macKept) is refused because of that rule, so its message
+	// is macKeptMessage, naming only those kept deletes, not
+	// caseConflictMessage's "on every platform". A delete A1 pairs with such
+	// a create gets the Mac rule's part 2 text and joins macKept, so a later
+	// pass attributes a create that conflicts only with it to the Mac too.
+	caseFixedPoint := func() {
+		for {
+			caseSet := batchFinalSet(remote, ups, valid, isDelete)
+			var candidates []string
+			for i, u := range ups {
+				if valid[i] && !isDelete[i] && isCreate[i] {
+					candidates = append(candidates, u.Dst)
 				}
-				fail(j, fmt.Sprintf("%s: delete refused because it pairs with the refused "+
-					"%s rename to %s (%+q to %+q); the rename was not applied", u.Dst, kind, x, u.Dst, x))
-				valid[j] = false
 			}
+			conflicts := caseConflicts(caseSet, candidates)
+			if len(conflicts) == 0 {
+				return
+			}
+			var refused []string
+			for i, u := range ups {
+				if !valid[i] || isDelete[i] || !isCreate[i] {
+					continue
+				}
+				if cs, ok := conflicts[u.Dst]; ok {
+					if kept := keptConflicts(cs, macKept); len(kept) > 0 {
+						refuse(i, macKeptMessage(u.Dst, kept, cs))
+						macCreates[u.Dst] = true
+					} else {
+						refuse(i, caseConflictMessage(u.Dst, cs))
+					}
+					refused = append(refused, u.Dst)
+				}
+			}
+			// renamePairs indexes the refused creates by each key; a delete
+			// names the smallest create it pairs with under either.
+			pairedCreate := renamePairs(refused)
+			// rewritten: every name a still-valid non-delete writes, so a delete
+			// of one of them is half of a replacement.
+			rewritten := map[string]bool{}
+			for i, u := range ups {
+				if valid[i] && !isDelete[i] {
+					rewritten[u.Dst] = true
+				}
+			}
+			for j, u := range ups {
+				if !valid[j] || !isDelete[j] {
+					continue
+				}
+				if _, held := remote[u.Dst]; !held || rewritten[u.Dst] {
+					continue
+				}
+				x, ok := pairedCreate(u.Dst)
+				switch {
+				case !ok:
+				case macCreates[x]:
+					refuse(j, macPairMessage(u.Dst, x))
+					macKept[u.Dst] = true
+				default:
+					// Both spellings again in %+q form, as formatItem shows them:
+					// a normalisation-changing rename's two names display alike.
+					kind := "normalisation-changing"
+					if caseKey(u.Dst) == caseKey(x) {
+						kind = "case-changing"
+					}
+					refuse(j, fmt.Sprintf("%s: delete refused because it pairs with the refused "+
+						"%s rename to %s (%+q to %+q); the rename was not applied", u.Dst, kind, x, u.Dst, x))
+				}
+			}
+		}
+	}
+
+	// The Mac push rule's place (spec 2026-10-27, section 3, "Where it sits in
+	// phase 2"): around the case fixed point, not inside one of its passes.
+	// Each round runs the D/F preflight, then D2 and A1 to their own fixed
+	// point, exactly as with no local side; then the Mac rule's three parts
+	// once over what is still valid. If they refused anything, the round
+	// repeats, because a delete they keep stays in batchFinalSet and can
+	// expose a conflict for the D/F preflight or D2 to judge. So D2 always
+	// speaks first: a create D2 would refuse in the current state is refused
+	// by D2 before the Mac rule sees it. With no local side there is one
+	// round, which is phase 2 as it was before the Mac rule.
+	//
+	// Termination: no step sets valid back to true, and each inner pass and
+	// each outer round that continues refuses at least one update, even when
+	// the Mac rule refuses only deletes, so the loops end within (updates + 1)
+	// rounds. Every step is set algebra over the valid flags, so neither
+	// outcome nor text depends on batch order.
+	for {
+		dfPreflight()
+		caseFixedPoint()
+		if local == nil || !macPass(local, ups, remote, valid, isDelete, isCreate, refuse, macKept) {
+			break
 		}
 	}
 
@@ -610,6 +666,15 @@ func Push(t transport.Transport, root, gitDir string,
 			batchDeletes[u.Dst] = true
 		}
 	}
+	// uncommitted: whether some delete this batch asked for did not commit.
+	// Without one, the Mac rule's re-check (R2, below) can refuse nothing, so
+	// it is skipped rather than paying a caseConflicts index per update.
+	uncommitted := false
+	for d := range batchDeletes {
+		if !deletedThisBatch[d] {
+			uncommitted = true
+		}
+	}
 
 	for i, u := range ups {
 		if !valid[i] || isDelete[i] {
@@ -654,6 +719,29 @@ func Push(t transport.Transport, root, gitDir string,
 				}
 				fail(i, caseConflictMessage(u.Dst, cs)+failedDeleteClause(undeleted))
 				continue
+			}
+		}
+		// The Mac push rule's re-check (R2), with a local side only, for an
+		// update: a write of a name the pre-batch remote holds, other than a
+		// replacement whose own delete committed (that one adds no spelling,
+		// and refusing it now would lose the ref it replaces). Phase 2's part
+		// 1(b) cleared it against a set that assumed every valid delete
+		// commits; when a conflicting ref's same-batch delete failed in phase
+		// 4, the remote keeps the pair, so the update is refused with part
+		// 1(b)'s text and the delete it depended on. Like the re-check above,
+		// before ensureRefParents.
+		if local != nil && uncommitted && preExists && !deletedThisBatch[u.Dst] {
+			if cs := caseConflicts(live, []string{u.Dst})[u.Dst]; len(cs) > 0 {
+				var undeleted []string
+				for _, c := range cs {
+					if batchDeletes[c.Ref] && !deletedThisBatch[c.Ref] {
+						undeleted = append(undeleted, c.Ref)
+					}
+				}
+				if len(undeleted) > 0 {
+					fail(i, macRemoteHalfMessage(u.Dst, cs)+failedDeleteClause(undeleted))
+					continue
+				}
 			}
 		}
 		// exists is BATCH-AWARE (fix round M4, corrected in fix round 2), not
@@ -1226,7 +1314,10 @@ func requiresForce(dst string) bool {
 // single space. Push results become "error <ref> <reason>" status lines, one
 // per line, so a reason carrying git's multi-line diagnostics would split into
 // two lines and desynchronise git's read of the batch.
-func oneLine(s string) string {
+func oneLine(s string) string { return OneLine(s) }
+
+// OneLine is oneLine's exported name, for callers outside the package.
+func OneLine(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 

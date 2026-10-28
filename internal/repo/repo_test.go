@@ -8309,3 +8309,836 @@ func TestSetHeadNeverCreatesParents(t *testing.T) {
 			"no lock, no marker — got Dirs=%v Files=%v", f.Dirs, f.Files)
 	}
 }
+
+// ---- The Mac push rule (spec 2026-10-27, section 3; Task 9) -----------------
+//
+// PushWithLocal is Push with the local side of a Mac files-store repository:
+// its ref names and each pushed destination's tracking refs. Each test below
+// builds that side as the push arm does, or spells it out where an exact
+// refspec would map only some names. As in the canonical-equivalence tests
+// above, a raw character is an escape in a double-quoted string and the %+q
+// form a message prints is a backquoted raw string.
+
+// The two spellings of "cafe" with an acute accent, NFC and NFD, and the text
+// %+q prints for each.
+const (
+	mpNFC  = "caf\u00e9"
+	mpNFD  = "cafe\u0301"
+	mpNFCq = `caf\u00e9`
+	mpNFDq = `cafe\u0301`
+)
+
+// The branches and their tracking refs under a remote "origin".
+const (
+	mpBranchNFC = "refs/heads/" + mpNFC
+	mpBranchNFD = "refs/heads/" + mpNFD
+	mpTrackNFC  = "refs/remotes/origin/" + mpNFC
+	mpTrackNFD  = "refs/remotes/origin/" + mpNFD
+)
+
+// mpWriteTail ends every refusal of a write by the Mac rule, spelled out here
+// rather than taken from macpush.go, so a change to either side fails a test.
+const mpWriteTail = "; this repository's default (files) ref store cannot keep these apart " +
+	"(README, Honest limits); repair the remote, or push from a --ref-format=reftable clone"
+
+// mpDeleteTail ends a refusal by part 3.
+const mpDeleteTail = " (README, Honest limits); delete it from a --ref-format=reftable clone"
+
+// mpItem is formatItem's text, spelled out: the conflicting ref, the prefix
+// pair, the relation, and the pair again as %+q prints it (oq and tq).
+func mpItem(ref, ours, theirs, rel, oq, tq string) string {
+	return ref + " (" + ours + " vs " + theirs + ", by " + rel + `: "` + oq + `" vs "` + tq + `")`
+}
+
+// mpCase is mpItem for an ASCII pair, which %+q prints unchanged.
+func mpCase(ref, ours, theirs string) string {
+	return mpItem(ref, ours, theirs, "letter case", ours, theirs)
+}
+
+// mpBranchItem and mpTrackItem are the items for the NFC/NFD branch pair and
+// tracking-ref pair: seen from the NFC side when fromNFC, naming the NFD ref,
+// and the other way round otherwise.
+func mpBranchItem(fromNFC bool) string {
+	if fromNFC {
+		return mpItem(mpBranchNFD, "heads/"+mpNFC, "heads/"+mpNFD, "Unicode normalisation",
+			"heads/"+mpNFCq, "heads/"+mpNFDq)
+	}
+	return mpItem(mpBranchNFC, "heads/"+mpNFD, "heads/"+mpNFC, "Unicode normalisation",
+		"heads/"+mpNFDq, "heads/"+mpNFCq)
+}
+
+func mpTrackItem(fromNFC bool) string {
+	if fromNFC {
+		return mpItem(mpTrackNFD, "remotes/origin/"+mpNFC, "remotes/origin/"+mpNFD, "Unicode normalisation",
+			"remotes/origin/"+mpNFCq, "remotes/origin/"+mpNFDq)
+	}
+	return mpItem(mpTrackNFC, "remotes/origin/"+mpNFD, "remotes/origin/"+mpNFC, "Unicode normalisation",
+		"remotes/origin/"+mpNFDq, "remotes/origin/"+mpNFCq)
+}
+
+// mpPairMsg is part 2's refusal of delete d, paired with the refused write x.
+func mpPairMsg(d, x string) string {
+	return d + ": delete refused because it pairs with " + x + ", which this Mac refused; neither was applied"
+}
+
+// mpKeptMsg is R3's refusal of create x: deletes is the grammar phrase
+// ("delete of A was", "deletes of A and B were"), items the conflicts.
+func mpKeptMsg(x, deletes, items string) string {
+	return x + ": refused on this Mac: this push's " + deletes + " refused here, and " + x +
+		" would then conflict with " + items + mpWriteTail
+}
+
+// macSide is the LocalSide the push arm builds for a remote "origin" with
+// git's default fetch mapping: refs are the local ref names, and each
+// destination in ups maps to its tracking ref under refs/remotes/origin/.
+func macSide(ups []protocol.RefUpdate, refs ...string) *LocalSide {
+	l := &LocalSide{Refs: map[string]bool{}, Tracking: map[string][]string{}}
+	for _, r := range refs {
+		l.Refs[r] = true
+	}
+	specs := DefaultFetchRefspecs("origin")
+	for _, u := range ups {
+		if ts := PushTrackingRefs(specs, u.Dst); len(ts) > 0 {
+			l.Tracking[u.Dst] = ts
+		}
+	}
+	return l
+}
+
+// mpRefs is a set of ref names.
+func mpRefs(refs ...string) map[string]bool {
+	m := make(map[string]bool, len(refs))
+	for _, r := range refs {
+		m[r] = true
+	}
+	return m
+}
+
+// wantResults checks each result against want: "" means OK, anything else is
+// the exact refusal text.
+func wantResults(t *testing.T, res []Result, ups []protocol.RefUpdate, want []string) {
+	t.Helper()
+	if len(res) != len(want) {
+		t.Fatalf("want %d results, got %d: %+v", len(want), len(res), res)
+	}
+	for i, w := range want {
+		switch {
+		case w == "" && !res[i].OK:
+			t.Errorf("result %d (%+q) must be OK, got %+q", i, ups[i].Dst, res[i].Err)
+		case w != "" && res[i].OK:
+			t.Errorf("result %d (%+q) must be refused, got OK; want %+q", i, ups[i].Dst, w)
+		case w != "" && res[i].Err != w:
+			t.Errorf("result %d (%+q):\n got %+q\nwant %+q", i, ups[i].Dst, res[i].Err, w)
+		}
+	}
+}
+
+// TestPushWithLocalRefusesAnUpdateToAPairMember is RED (part 1(b)): the
+// remote holds the NFC and NFD branches, and an update of one is refused on
+// a Mac because the other stays, while an unrelated create in the same batch
+// lands, by D2's ruling that a pair still takes pushes to its other refs.
+func TestPushWithLocalRefusesAnUpdateToAPairMember(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{"refs/heads/main": c1, mpBranchNFC: c1, mpBranchNFD: c1}
+	f, remote := seedCaseRemote(t, seeded)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{{Src: c2, Dst: mpBranchNFC}, {Src: c2, Dst: "refs/heads/topic"}}
+	local := macSide(ups, "refs/heads/main", "refs/remotes/origin/main", mpBranchNFC, mpTrackNFC)
+	res := PushWithLocal(f, "/r", gitDir, ups, remote, nil, local)
+	wantResults(t, res, ups, []string{
+		mpBranchNFC + ": refused on this Mac: the remote also holds " + mpBranchItem(true) + mpWriteTail,
+		"",
+	})
+	assertCaseRemote(t, f, map[string]string{
+		"refs/heads/main": c1, mpBranchNFC: c1, mpBranchNFD: c1, "refs/heads/topic": c2,
+	})
+}
+
+// TestPushWithLocalClearsTheRemoteHalfWhenTheOtherMemberIsDeleted is a GUARD
+// (part 1(b) judges against batchFinalSet): the batch updates one member of
+// the remote pair and deletes the other, which is the repair, so both land.
+// No local ref aliases either member's tracking ref.
+func TestPushWithLocalClearsTheRemoteHalfWhenTheOtherMemberIsDeleted(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	f, remote := seedCaseRemote(t, map[string]string{"refs/heads/main": c1, mpBranchNFC: c1, mpBranchNFD: c1})
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{{Src: c2, Dst: mpBranchNFC}, {Src: "", Dst: mpBranchNFD}}
+	local := macSide(ups, "refs/heads/main", "refs/remotes/origin/main", mpBranchNFC)
+	res := PushWithLocal(f, "/r", gitDir, ups, remote, nil, local)
+	wantResults(t, res, ups, []string{"", ""})
+	assertCaseRemote(t, f, map[string]string{"refs/heads/main": c1, mpBranchNFC: c2})
+}
+
+// TestPushWithLocalLocalHalfIsNotClearedBySameBatchDelete is RED (part 1(a)
+// judges the local refs as they stand before the push). The clone holds the
+// NFD member's stale tracking ref, so the update of the NFC member is refused
+// even though the batch deletes the NFD member: git rewrites tracking refs
+// only after the push. The delete is judged by part 3 alone, and its tracking
+// ref aliases no other local ref, so it commits.
+func TestPushWithLocalLocalHalfIsNotClearedBySameBatchDelete(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	f, remote := seedCaseRemote(t, map[string]string{"refs/heads/main": c1, mpBranchNFC: c1, mpBranchNFD: c1})
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{{Src: c2, Dst: mpBranchNFC}, {Src: "", Dst: mpBranchNFD}}
+	local := macSide(ups, "refs/heads/main", "refs/remotes/origin/main", mpBranchNFC, mpTrackNFD)
+	res := PushWithLocal(f, "/r", gitDir, ups, remote, nil, local)
+	wantResults(t, res, ups, []string{
+		mpBranchNFC + ": refused on this Mac: its tracking ref " + mpTrackNFC + " would collide with " +
+			mpTrackItem(true) + mpWriteTail,
+		"",
+	})
+	assertCaseRemote(t, f, map[string]string{"refs/heads/main": c1, mpBranchNFC: c1})
+}
+
+// TestPushWithLocalRefusesAWriteWhoseTrackingRefCollidesWithALocalRef is RED
+// (part 1(a)): the remote holds neither spelling, so D2 has nothing to say,
+// but the clone holds a stale NFC tracking ref, and the NFD create's tracking
+// ref would land in the same file. It is refused in phase 2, so no pack.
+func TestPushWithLocalRefusesAWriteWhoseTrackingRefCollidesWithALocalRef(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{"refs/heads/main": c1}
+	f, remote := seedCaseRemote(t, seeded)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{{Src: c2, Dst: mpBranchNFD}}
+	local := macSide(ups, "refs/heads/main", "refs/remotes/origin/main", mpTrackNFC)
+	res := PushWithLocal(f, "/r", gitDir, ups, remote, nil, local)
+	wantResults(t, res, ups, []string{
+		mpBranchNFD + ": refused on this Mac: its tracking ref " + mpTrackNFD + " would collide with " +
+			mpTrackItem(false) + mpWriteTail,
+	})
+	assertNoPack(t, f)
+	assertCaseRemote(t, f, seeded)
+}
+
+// TestPushWithLocalRefusesTwoWritesWhoseTrackingRefsCollide is RED (part
+// 1(a), the check list makes between destinations). Exact refspecs map a to
+// the NFC tracking ref and b to the NFD one: neither name conflicts with the
+// other, but their tracking refs would share a file, so both are refused,
+// each naming the other's tracking ref and whose it is.
+func TestPushWithLocalRefusesTwoWritesWhoseTrackingRefsCollide(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{"refs/heads/main": c1}
+	f, remote := seedCaseRemote(t, seeded)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{{Src: c2, Dst: "refs/heads/a"}, {Src: c2, Dst: "refs/heads/b"}}
+	local := &LocalSide{
+		Refs:     mpRefs("refs/heads/main", "refs/remotes/origin/main"),
+		Tracking: map[string][]string{"refs/heads/a": {mpTrackNFC}, "refs/heads/b": {mpTrackNFD}},
+	}
+	res := PushWithLocal(f, "/r", gitDir, ups, remote, nil, local)
+	wantResults(t, res, ups, []string{
+		"refs/heads/a: refused on this Mac: its tracking ref " + mpTrackNFC + " would collide with " +
+			mpTrackItem(true) + " (the tracking ref of refs/heads/b in this push)" + mpWriteTail,
+		"refs/heads/b: refused on this Mac: its tracking ref " + mpTrackNFD + " would collide with " +
+			mpTrackItem(false) + " (the tracking ref of refs/heads/a in this push)" + mpWriteTail,
+	})
+	assertNoPack(t, f)
+	assertCaseRemote(t, f, seeded)
+}
+
+// TestPushWithLocalRefusesADeleteThatWouldUnlinkALocalRef is RED (part 3,
+// M24). The remote holds the NFD branch; the clone holds a stale NFC tracking
+// ref. git's post-push delete of the NFD tracking ref would unlink the NFC
+// ref's loose file, which would then fall back to a stale packed value, so
+// the delete is refused and the remote keeps the branch.
+func TestPushWithLocalRefusesADeleteThatWouldUnlinkALocalRef(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{"refs/heads/main": c1, mpBranchNFD: c1}
+	f, remote := seedCaseRemote(t, seeded)
+
+	ups := []protocol.RefUpdate{{Src: "", Dst: mpBranchNFD}}
+	local := macSide(ups, "refs/heads/main", "refs/remotes/origin/main", mpTrackNFC)
+	res := PushWithLocal(f, "/r", gitDir, ups, remote, nil, local)
+	wantResults(t, res, ups, []string{
+		mpBranchNFD + ": delete refused on this Mac: git would then delete its tracking ref " + mpTrackNFD +
+			", which this repository's default (files) ref store keeps under the same file name as " +
+			mpTrackItem(false) + mpDeleteTail,
+	})
+	assertCaseRemote(t, f, seeded)
+}
+
+// TestPushWithLocalRefusesAReplacementWhole is RED (part 2, first step; M26).
+// git never sends a batch that deletes and writes one ref, but a direct
+// caller can. The write of the NFC member is an update for part 1(b), which
+// refuses it, so the delete of the same name is refused with it: a
+// replacement never commits its delete while its write is refused.
+func TestPushWithLocalRefusesAReplacementWhole(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{"refs/heads/main": c1, mpBranchNFC: c1, mpBranchNFD: c1}
+	f, remote := seedCaseRemote(t, seeded)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{{Src: "", Dst: mpBranchNFC}, {Src: c2, Dst: mpBranchNFC}}
+	local := macSide(ups, "refs/heads/main", "refs/remotes/origin/main")
+	res := PushWithLocal(f, "/r", gitDir, ups, remote, nil, local)
+	wantResults(t, res, ups, []string{
+		mpPairMsg(mpBranchNFC, mpBranchNFC),
+		mpBranchNFC + ": refused on this Mac: the remote also holds " + mpBranchItem(true) + mpWriteTail,
+	})
+	assertNoPack(t, f)
+	assertCaseRemote(t, f, seeded)
+}
+
+// TestPushWithLocalPairsARenameDeleteWithARefusedCreate is RED (part 2,
+// second step). A plain case-changing rename, Topic to TOPIC, passes D2 (the
+// remote holds no other variant), but the clone holds Topic's tracking ref,
+// so TOPIC's tracking ref would share its file and part 1(a) refuses the
+// create. Part 3 would pass the delete (its tracking ref is Topic's own), so
+// part 2 must refuse it, or the rename would be half-applied.
+func TestPushWithLocalPairsARenameDeleteWithARefusedCreate(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{"refs/heads/main": c1, "refs/heads/Topic": c1}
+	f, remote := seedCaseRemote(t, seeded)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/Topic"}, {Src: c2, Dst: "refs/heads/TOPIC"}}
+	local := macSide(ups, "refs/heads/main", "refs/remotes/origin/main", "refs/heads/Topic",
+		"refs/remotes/origin/Topic")
+	res := PushWithLocal(f, "/r", gitDir, ups, remote, nil, local)
+	wantResults(t, res, ups, []string{
+		mpPairMsg("refs/heads/Topic", "refs/heads/TOPIC"),
+		"refs/heads/TOPIC: refused on this Mac: its tracking ref refs/remotes/origin/TOPIC would collide with " +
+			mpCase("refs/remotes/origin/Topic", "remotes/origin/TOPIC", "remotes/origin/Topic") + mpWriteTail,
+	})
+	assertNoPack(t, f)
+	assertCaseRemote(t, f, seeded)
+}
+
+// TestPushWithLocalNamesEveryCollisionSorted is RED (part 1's message). The
+// update of feat has two tracking refs, under origin and mirror. The mirror
+// one collides with two refs: mirror/FEAT, which is both a local ref and
+// other's tracking ref in this push (so it carries the note), and the local
+// mirror/Feat. The origin one collides with the local origin/Feat. And the
+// remote holds Feat. One message lists every clause, tracking refs sorted,
+// items sorted by ref, the remote clause last. other is refused too, naming
+// both of its collisions.
+func TestPushWithLocalNamesEveryCollisionSorted(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{"refs/heads/main": c1, "refs/heads/feat": c1, "refs/heads/Feat": c1}
+	f, remote := seedCaseRemote(t, seeded)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{{Src: c2, Dst: "refs/heads/feat"}, {Src: c2, Dst: "refs/heads/other"}}
+	local := &LocalSide{
+		Refs: mpRefs("refs/heads/main", "refs/remotes/origin/main", "refs/remotes/origin/Feat",
+			"refs/remotes/mirror/Feat", "refs/remotes/mirror/FEAT"),
+		Tracking: map[string][]string{
+			"refs/heads/feat":  {"refs/remotes/origin/feat", "refs/remotes/mirror/feat"},
+			"refs/heads/other": {"refs/remotes/origin/other", "refs/remotes/mirror/FEAT"},
+		},
+	}
+	res := PushWithLocal(f, "/r", gitDir, ups, remote, nil, local)
+	wantResults(t, res, ups, []string{
+		"refs/heads/feat: refused on this Mac: its tracking ref refs/remotes/mirror/feat would collide with " +
+			mpCase("refs/remotes/mirror/FEAT", "remotes/mirror/feat", "remotes/mirror/FEAT") +
+			" (the tracking ref of refs/heads/other in this push), " +
+			mpCase("refs/remotes/mirror/Feat", "remotes/mirror/feat", "remotes/mirror/Feat") +
+			"; also its tracking ref refs/remotes/origin/feat would collide with " +
+			mpCase("refs/remotes/origin/Feat", "remotes/origin/feat", "remotes/origin/Feat") +
+			"; also the remote also holds " + mpCase("refs/heads/Feat", "heads/feat", "heads/Feat") + mpWriteTail,
+		"refs/heads/other: refused on this Mac: its tracking ref refs/remotes/mirror/FEAT would collide with " +
+			mpCase("refs/remotes/mirror/Feat", "remotes/mirror/FEAT", "remotes/mirror/Feat") + ", " +
+			mpCase("refs/remotes/mirror/feat", "remotes/mirror/FEAT", "remotes/mirror/feat") +
+			" (the tracking ref of refs/heads/feat in this push)" + mpWriteTail,
+	})
+	assertNoPack(t, f)
+	assertCaseRemote(t, f, seeded)
+}
+
+// TestPushWithLocalAttributesAKeptDeleteToTheMac is RED (R3, Gemini's case).
+// The remote holds the NFD branch, and the clone the NFC tracking ref. The
+// batch renames NFD to NFC. Round 1: D2 passes the create (the NFD branch is
+// being deleted) and part 3 refuses the delete, keeping the NFD branch. Round
+// 2: D2 now refuses the create, but only because this rule kept the delete,
+// so the refusal says so, and does not say "on every platform".
+func TestPushWithLocalAttributesAKeptDeleteToTheMac(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{"refs/heads/main": c1, mpBranchNFD: c1}
+	f, remote := seedCaseRemote(t, seeded)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{{Src: "", Dst: mpBranchNFD}, {Src: c2, Dst: mpBranchNFC}}
+	local := macSide(ups, "refs/heads/main", "refs/remotes/origin/main", mpTrackNFC)
+	res := PushWithLocal(f, "/r", gitDir, ups, remote, nil, local)
+	if len(res) == 2 {
+		if !strings.Contains(res[1].Err, "refused on this Mac") || strings.Contains(res[1].Err, "on every platform") {
+			t.Errorf("the create's refusal must say %q and not %q, got %+q",
+				"refused on this Mac", "on every platform", res[1].Err)
+		}
+	}
+	wantResults(t, res, ups, []string{
+		mpBranchNFD + ": delete refused on this Mac: git would then delete its tracking ref " + mpTrackNFD +
+			", which this repository's default (files) ref store keeps under the same file name as " +
+			mpTrackItem(false) + mpDeleteTail,
+		mpKeptMsg(mpBranchNFC, "delete of "+mpBranchNFD+" was", mpBranchItem(true)),
+	})
+	assertNoPack(t, f)
+	assertCaseRemote(t, f, seeded)
+}
+
+// TestPushWithLocalPhase5RefusesAnUpdateWhenItsCounterpartDeleteFails is RED
+// (R2). Phase 2 passes the update of the NFC member only because the batch
+// deletes the NFD member, and that delete then fails in phase 4. Phase 5
+// re-checks the update against the live set and refuses it with part 1(b)'s
+// text and the delete it depended on, before ensureRefParents.
+func TestPushWithLocalPhase5RefusesAnUpdateWhenItsCounterpartDeleteFails(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{"refs/heads/main": c1, mpBranchNFC: c1, mpBranchNFD: c1}
+	f, remote := seedCaseRemote(t, seeded)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{{Src: c2, Dst: mpBranchNFC}, {Src: "", Dst: mpBranchNFD}}
+	local := macSide(ups, "refs/heads/main", "refs/remotes/origin/main", mpBranchNFC)
+	tr := trashFailsForTransport{Fake: f, path: "/r/" + mpBranchNFD}
+	res := PushWithLocal(tr, "/r", gitDir, ups, remote, nil, local)
+	if len(res) != 2 {
+		t.Fatalf("want 2 results, got %+v", res)
+	}
+	if res[1].OK {
+		t.Errorf("the delete of %+q must fail in phase 4, got %+v", mpBranchNFD, res[1])
+	}
+	want := mpBranchNFC + ": refused on this Mac: the remote also holds " + mpBranchItem(true) + mpWriteTail +
+		" (the same-batch delete of " + mpBranchNFD + " did not commit)"
+	if res[0].OK || res[0].Err != want {
+		t.Errorf("the update must be refused in phase 5:\n got %+v\nwant Err %+q", res[0], want)
+	}
+	assertCaseRemote(t, f, seeded)
+	if packs, idxs := countPackFiles(f, "/r"); packs != 1 || idxs != 1 {
+		t.Errorf("phase 3 uploads the update's pack before phase 5 refuses it, got pack=%d idx=%d", packs, idxs)
+	}
+}
+
+// TestPushWithLocalPhase5SparesAReplacement is a GUARD (R2's exemption). The
+// batch deletes both members and recreates the NFC one; the NFD delete fails
+// in phase 4. The NFC write is a replacement whose own delete committed, so
+// refusing it now would lose the ref it replaces: it must land.
+func TestPushWithLocalPhase5SparesAReplacement(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	f, remote := seedCaseRemote(t, map[string]string{"refs/heads/main": c1, mpBranchNFC: c1, mpBranchNFD: c1})
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: mpBranchNFD}, {Src: "", Dst: mpBranchNFC}, {Src: c2, Dst: mpBranchNFC},
+	}
+	local := macSide(ups, "refs/heads/main", "refs/remotes/origin/main", mpBranchNFC)
+	tr := trashFailsForTransport{Fake: f, path: "/r/" + mpBranchNFD}
+	res := PushWithLocal(tr, "/r", gitDir, ups, remote, nil, local)
+	if len(res) != 3 {
+		t.Fatalf("want 3 results, got %+v", res)
+	}
+	if res[0].OK {
+		t.Errorf("the delete of %+q must fail in phase 4, got %+v", mpBranchNFD, res[0])
+	}
+	if !res[1].OK || !res[2].OK {
+		t.Errorf("the replacement of %+q must land whole, got %+v and %+v", mpBranchNFC, res[1], res[2])
+	}
+	assertCaseRemote(t, f, map[string]string{"refs/heads/main": c1, mpBranchNFC: c2, mpBranchNFD: c1})
+}
+
+// TestPushWithLocalKeepsD2Precedence is a GUARD (spec section 3, "Where it
+// sits in phase 2"). TestPushRenameRefusalsReachAFixedPoint's batch, with a
+// clone that holds every remote branch's tracking ref: FOO/B's tracking ref
+// would collide with Foo/a's and Foo/b's, so a rule interleaved with D2 pass
+// by pass would take FOO/B's refusal. Run after D2's fixed point, it finds
+// nothing left to refuse, and the results and texts are Push's.
+func TestPushWithLocalKeepsD2Precedence(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{
+		"refs/heads/main": c1, "refs/heads/Foo/a": c1, "refs/heads/FOO/a": c1, "refs/heads/Foo/b": c1,
+	}
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/Foo/a"},
+		{Src: "", Dst: "refs/heads/Foo/b"},
+		{Src: c2, Dst: "refs/heads/FOO/A"},
+		{Src: c2, Dst: "refs/heads/FOO/B"},
+	}
+	f0, remote0 := seedCaseRemote(t, seeded)
+	want := Push(f0, "/r", gitDir, ups, remote0, nil)
+
+	f, remote := seedCaseRemote(t, seeded)
+	local := macSide(ups, "refs/heads/main", "refs/remotes/origin/main", "refs/remotes/origin/Foo/a",
+		"refs/remotes/origin/FOO/a", "refs/remotes/origin/Foo/b")
+	got := PushWithLocal(f, "/r", gitDir, ups, remote, nil, local)
+	if len(got) != 4 {
+		t.Fatalf("want 4 results, got %+v", got)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("PushWithLocal must keep D2's results and texts:\n got %+v\nwant %+v", got, want)
+	}
+	assertCaseRefused(t, got[3], "refs/heads/FOO/B conflicts with refs/heads/Foo/a "+
+		`(heads/FOO vs heads/Foo, by letter case: "heads/FOO" vs "heads/Foo"): `)
+	assertNoPack(t, f)
+	assertCaseRemote(t, f, seeded)
+}
+
+// TestPushWithLocalNilIsPush is a GUARD: with no local side, PushWithLocal is
+// Push. The update of a remote pair member, which the Mac rule refuses, lands,
+// and two of the case rule's batches keep their results.
+func TestPushWithLocalNilIsPush(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+	for _, c := range []struct {
+		name   string
+		seeded map[string]string
+		ups    []protocol.RefUpdate
+	}{
+		{"update of a pair member", map[string]string{"refs/heads/main": c1, mpBranchNFC: c1, mpBranchNFD: c1},
+			[]protocol.RefUpdate{{Src: c2, Dst: mpBranchNFC}}},
+		{"rename fixed point", map[string]string{
+			"refs/heads/main": c1, "refs/heads/Foo/a": c1, "refs/heads/FOO/a": c1, "refs/heads/Foo/b": c1,
+		}, []protocol.RefUpdate{
+			{Src: "", Dst: "refs/heads/Foo/a"}, {Src: "", Dst: "refs/heads/Foo/b"},
+			{Src: c2, Dst: "refs/heads/FOO/A"}, {Src: c2, Dst: "refs/heads/FOO/B"},
+		}},
+		{"rename to an NFD name", map[string]string{"refs/heads/main": c1, mpBranchNFD: c1},
+			[]protocol.RefUpdate{{Src: "", Dst: mpBranchNFD}, {Src: c2, Dst: mpBranchNFC}}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f0, remote0 := seedCaseRemote(t, c.seeded)
+			want := Push(f0, "/r", gitDir, c.ups, remote0, nil)
+			f, remote := seedCaseRemote(t, c.seeded)
+			got := PushWithLocal(f, "/r", gitDir, c.ups, remote, nil, nil)
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("PushWithLocal(nil):\n got %+v\nwant %+v", got, want)
+			}
+			s0, err0 := ScanRefs(f0, "/r")
+			s, err := ScanRefs(f, "/r")
+			if err0 != nil || err != nil || !reflect.DeepEqual(s.Refs, s0.Refs) {
+				t.Errorf("remote after PushWithLocal(nil) = %v (%v), after Push = %v (%v)", s.Refs, err, s0.Refs, err0)
+			}
+		})
+	}
+	f, remote := seedCaseRemote(t, map[string]string{"refs/heads/main": c1, mpBranchNFC: c1, mpBranchNFD: c1})
+	if res := PushWithLocal(f, "/r", gitDir, []protocol.RefUpdate{{Src: c2, Dst: mpBranchNFC}}, remote, nil,
+		nil); len(res) != 1 || !res[0].OK {
+		t.Errorf("with no local side, the update of a pair member must land, got %+v", res)
+	}
+}
+
+// mpOrders returns n distinct orders of 0..k-1: the identity, its reverse,
+// then fixed-seed shuffles, so every run checks the same orders.
+func mpOrders(k, n int) [][]int {
+	seen := map[string]bool{}
+	var out [][]int
+	add := func(p []int) {
+		if key := fmt.Sprint(p); !seen[key] {
+			seen[key] = true
+			out = append(out, append([]int(nil), p...))
+		}
+	}
+	id := make([]int, k)
+	rev := make([]int, k)
+	for i := range id {
+		id[i], rev[i] = i, k-1-i
+	}
+	add(id)
+	add(rev)
+	state := uint32(20261027)
+	for len(out) < n {
+		p := append([]int(nil), id...)
+		for i := k - 1; i > 0; i-- {
+			state = state*1664525 + 1013904223
+			j := int(state>>8) % (i + 1)
+			p[i], p[j] = p[j], p[i]
+		}
+		add(p)
+	}
+	return out
+}
+
+// TestPushWithLocalRefusalsAreOrderIndependent is RED (Review Focus 5). One
+// batch reaches every part and R3: an update of a pair member (1(b)), a
+// create whose tracking ref aliases a local one (1(a)), a case-changing
+// rename whose create 1(a) refuses (so part 2 takes the delete), a delete
+// whose tracking ref aliases a local one (part 3), a rename whose delete part
+// 3 keeps (so D2 refuses the create in round 2, R3), and a create that lands.
+// In 20 orders every destination gets the same result and text.
+func TestPushWithLocalRefusalsAreOrderIndependent(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{
+		"refs/heads/main": c1, mpBranchNFC: c1, mpBranchNFD: c1,
+		"refs/heads/Topic": c1, "refs/heads/gone": c1, "refs/heads/Doc": c1,
+	}
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+	batch := []protocol.RefUpdate{
+		{Src: c2, Dst: mpBranchNFC},
+		{Src: c2, Dst: "refs/heads/x"},
+		{Src: "", Dst: "refs/heads/Topic"},
+		{Src: c2, Dst: "refs/heads/TOPIC"},
+		{Src: "", Dst: "refs/heads/gone"},
+		{Src: c2, Dst: "refs/heads/ok"},
+		{Src: "", Dst: "refs/heads/Doc"},
+		{Src: c2, Dst: "refs/heads/doc"},
+	}
+	refs := []string{"refs/heads/main", "refs/remotes/origin/main", mpBranchNFC, mpTrackNFC,
+		"refs/remotes/origin/X", "refs/remotes/origin/Topic", "refs/remotes/origin/GONE", "refs/remotes/origin/doc"}
+	want := map[string]string{
+		mpBranchNFC: mpBranchNFC + ": refused on this Mac: the remote also holds " + mpBranchItem(true) + mpWriteTail,
+		"refs/heads/x": "refs/heads/x: refused on this Mac: its tracking ref refs/remotes/origin/x would collide with " +
+			mpCase("refs/remotes/origin/X", "remotes/origin/x", "remotes/origin/X") + mpWriteTail,
+		"refs/heads/Topic": mpPairMsg("refs/heads/Topic", "refs/heads/TOPIC"),
+		"refs/heads/TOPIC": "refs/heads/TOPIC: refused on this Mac: its tracking ref refs/remotes/origin/TOPIC would " +
+			"collide with " + mpCase("refs/remotes/origin/Topic", "remotes/origin/TOPIC", "remotes/origin/Topic") +
+			mpWriteTail,
+		"refs/heads/gone": "refs/heads/gone: delete refused on this Mac: git would then delete its tracking ref " +
+			"refs/remotes/origin/gone, which this repository's default (files) ref store keeps under the same file " +
+			"name as " + mpCase("refs/remotes/origin/GONE", "remotes/origin/gone", "remotes/origin/GONE") + mpDeleteTail,
+		"refs/heads/ok": "",
+		"refs/heads/Doc": "refs/heads/Doc: delete refused on this Mac: git would then delete its tracking ref " +
+			"refs/remotes/origin/Doc, which this repository's default (files) ref store keeps under the same file " +
+			"name as " + mpCase("refs/remotes/origin/doc", "remotes/origin/Doc", "remotes/origin/doc") + mpDeleteTail,
+		"refs/heads/doc": mpKeptMsg("refs/heads/doc", "delete of refs/heads/Doc was",
+			mpCase("refs/heads/Doc", "heads/doc", "heads/Doc")),
+	}
+	for _, p := range mpOrders(len(batch), 20) {
+		ups := make([]protocol.RefUpdate, len(p))
+		for i, k := range p {
+			ups[i] = batch[k]
+		}
+		f, remote := seedCaseRemote(t, seeded)
+		res := PushWithLocal(f, "/r", gitDir, ups, remote, nil, macSide(ups, refs...))
+		if len(res) != len(ups) {
+			t.Fatalf("order %v: want %d results, got %+v", p, len(ups), res)
+		}
+		for i, r := range res {
+			w := want[ups[i].Dst]
+			if (w == "") != r.OK || r.Err != w {
+				t.Errorf("order %v: %+q:\n got %+v\nwant Err %+q", p, ups[i].Dst, r, w)
+			}
+		}
+	}
+}
+
+// TestPushWithLocalSkipsRefsWithNoTrackingMapping is RED (Review Focus 5). A
+// destination with no tracking mapping (a tag, or a branch an exact refspec
+// does not cover) has no local half to judge: a tag create beside a local tag
+// of the other spelling, and a delete beside a stale tracking ref of the
+// other spelling, both land. The remote half still applies: an update of a
+// remote pair member is refused.
+func TestPushWithLocalSkipsRefsWithNoTrackingMapping(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	f, remote := seedCaseRemote(t, map[string]string{
+		"refs/heads/main": c1, mpBranchNFD: c1, "refs/heads/feat": c1, "refs/heads/Feat": c1,
+	})
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{
+		{Src: c2, Dst: "refs/tags/v" + mpNFC},
+		{Src: "", Dst: mpBranchNFD},
+		{Src: c2, Dst: "refs/heads/feat"},
+	}
+	local := &LocalSide{
+		Refs:     mpRefs("refs/heads/main", "refs/remotes/origin/main", mpTrackNFC, "refs/tags/v"+mpNFD),
+		Tracking: map[string][]string{"refs/heads/main": {"refs/remotes/origin/main"}},
+	}
+	res := PushWithLocal(f, "/r", gitDir, ups, remote, nil, local)
+	wantResults(t, res, ups, []string{
+		"",
+		"",
+		"refs/heads/feat: refused on this Mac: the remote also holds " +
+			mpCase("refs/heads/Feat", "heads/feat", "heads/Feat") + mpWriteTail,
+	})
+	assertCaseRemote(t, f, map[string]string{
+		"refs/heads/main": c1, "refs/heads/feat": c1, "refs/heads/Feat": c1, "refs/tags/v" + mpNFC: c2,
+	})
+}
+
+// TestPushWithLocalAttributesAChainedKeptDelete is RED (R3 through A1). Only
+// p/Y has a tracking mapping, and its tracking ref aliases a local one, so
+// part 3 keeps p/Y. Round 2's first D2 pass then refuses p/y against it (R3),
+// and A1 pairs the rename delete P/y with p/y: that delete gets part 2's text
+// and is kept for the Mac too. The next pass refuses p/z, which conflicts only
+// with P/y, so it is the Mac's as well, and so is its rename delete P/z.
+func TestPushWithLocalAttributesAChainedKeptDelete(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{
+		"refs/heads/main": c1, "refs/heads/p/Y": c1, "refs/heads/P/y": c1, "refs/heads/P/z": c1,
+	}
+	f, remote := seedCaseRemote(t, seeded)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/p/Y"},
+		{Src: c2, Dst: "refs/heads/p/y"},
+		{Src: "", Dst: "refs/heads/P/y"},
+		{Src: c2, Dst: "refs/heads/p/z"},
+		{Src: "", Dst: "refs/heads/P/z"},
+	}
+	local := &LocalSide{
+		Refs:     mpRefs("refs/heads/main", "refs/remotes/origin/main", "refs/remotes/origin/p/y"),
+		Tracking: map[string][]string{"refs/heads/p/Y": {"refs/remotes/origin/p/Y"}},
+	}
+	res := PushWithLocal(f, "/r", gitDir, ups, remote, nil, local)
+	wantResults(t, res, ups, []string{
+		"refs/heads/p/Y: delete refused on this Mac: git would then delete its tracking ref refs/remotes/origin/p/Y, " +
+			"which this repository's default (files) ref store keeps under the same file name as " +
+			mpCase("refs/remotes/origin/p/y", "remotes/origin/p/Y", "remotes/origin/p/y") + mpDeleteTail,
+		mpKeptMsg("refs/heads/p/y", "delete of refs/heads/p/Y was", mpCase("refs/heads/p/Y", "heads/p/y", "heads/p/Y")),
+		mpPairMsg("refs/heads/P/y", "refs/heads/p/y"),
+		mpKeptMsg("refs/heads/p/z", "delete of refs/heads/P/y was", mpCase("refs/heads/P/y", "heads/p", "heads/P")),
+		mpPairMsg("refs/heads/P/z", "refs/heads/p/z"),
+	})
+	assertNoPack(t, f)
+	assertCaseRemote(t, f, seeded)
+}
+
+// TestPushWithLocalReRunsTheDFPreflightForAKeptDelete is RED (the D/F
+// preflight re-runs each outer round). Part 3 keeps feat, so the same batch's
+// create of feat/sub would make feat both a leaf and a folder. The next
+// round's D/F preflight refuses it, in phase 2, so it costs no pack and never
+// reaches phase 5. Only feat has a tracking mapping, as an exact refspec would
+// give: under a wildcard, feat/sub's tracking ref would share feat's prefix,
+// and part 1(a) would refuse it first.
+func TestPushWithLocalReRunsTheDFPreflightForAKeptDelete(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{"refs/heads/main": c1, "refs/heads/feat": c1}
+	f, remote := seedCaseRemote(t, seeded)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{{Src: "", Dst: "refs/heads/feat"}, {Src: c2, Dst: "refs/heads/feat/sub"}}
+	local := &LocalSide{
+		Refs:     mpRefs("refs/heads/main", "refs/remotes/origin/main", "refs/remotes/origin/FEAT"),
+		Tracking: map[string][]string{"refs/heads/feat": {"refs/remotes/origin/feat"}},
+	}
+	res := PushWithLocal(f, "/r", gitDir, ups, remote, nil, local)
+	wantResults(t, res, ups, []string{
+		"refs/heads/feat: delete refused on this Mac: git would then delete its tracking ref refs/remotes/origin/feat, " +
+			"which this repository's default (files) ref store keeps under the same file name as " +
+			mpCase("refs/remotes/origin/FEAT", "remotes/origin/feat", "remotes/origin/FEAT") + mpDeleteTail,
+		"refs/heads/feat/sub conflicts with refs/heads/feat: a ref cannot be both a leaf and a folder containing other refs",
+	})
+	assertNoPack(t, f)
+	assertCaseRemote(t, f, seeded)
+}
+
+// TestPushWithLocalAttributesAPart2KeptDelete is RED (R3 for a delete part 2
+// keeps; Gemini's iota batch, here in ASCII). Only p/x's tracking ref aliases
+// a local one, so part 1(a) refuses the create p/x and part 2 keeps the rename
+// delete P/x. Round 2's D2 then refuses p/y, which conflicts with the kept
+// P/x by its directory, and the refusal names P/x and is the Mac's.
+func TestPushWithLocalAttributesAPart2KeptDelete(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{"refs/heads/main": c1, "refs/heads/P/x": c1}
+	f, remote := seedCaseRemote(t, seeded)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/P/x"}, {Src: c2, Dst: "refs/heads/p/x"}, {Src: c2, Dst: "refs/heads/p/y"},
+	}
+	local := &LocalSide{
+		Refs:     mpRefs("refs/heads/main", "refs/remotes/origin/main", "refs/remotes/origin/p/X"),
+		Tracking: map[string][]string{"refs/heads/p/x": {"refs/remotes/origin/p/x"}},
+	}
+	res := PushWithLocal(f, "/r", gitDir, ups, remote, nil, local)
+	wantResults(t, res, ups, []string{
+		mpPairMsg("refs/heads/P/x", "refs/heads/p/x"),
+		"refs/heads/p/x: refused on this Mac: its tracking ref refs/remotes/origin/p/x would collide with " +
+			mpCase("refs/remotes/origin/p/X", "remotes/origin/p/x", "remotes/origin/p/X") + mpWriteTail,
+		mpKeptMsg("refs/heads/p/y", "delete of refs/heads/P/x was", mpCase("refs/heads/P/x", "heads/p", "heads/P")),
+	})
+	assertNoPack(t, f)
+	assertCaseRemote(t, f, seeded)
+}
+
+// TestPushWithLocalR3NamesOnlyTheConflictingKeptDeletes is RED (R3's
+// deletes are cs and macKept's intersection). Part 3 keeps Doc, DOC and Zed.
+// The create doc conflicts with Doc and DOC, so its refusal names those two,
+// in the plural grammar, and not the unrelated Zed.
+func TestPushWithLocalR3NamesOnlyTheConflictingKeptDeletes(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{
+		"refs/heads/main": c1, "refs/heads/Doc": c1, "refs/heads/DOC": c1, "refs/heads/Zed": c1,
+	}
+	f, remote := seedCaseRemote(t, seeded)
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+
+	ups := []protocol.RefUpdate{
+		{Src: "", Dst: "refs/heads/Doc"}, {Src: "", Dst: "refs/heads/DOC"},
+		{Src: c2, Dst: "refs/heads/doc"}, {Src: "", Dst: "refs/heads/Zed"},
+	}
+	local := macSide(ups, "refs/heads/main", "refs/remotes/origin/main", "refs/remotes/origin/doc",
+		"refs/remotes/origin/zed")
+	res := PushWithLocal(f, "/r", gitDir, ups, remote, nil, local)
+	part3 := func(y, theirs string) string {
+		leaf := strings.TrimPrefix(y, "refs/heads/")
+		return y + ": delete refused on this Mac: git would then delete its tracking ref refs/remotes/origin/" + leaf +
+			", which this repository's default (files) ref store keeps under the same file name as " +
+			mpCase("refs/remotes/origin/"+theirs, "remotes/origin/"+leaf, "remotes/origin/"+theirs) + mpDeleteTail
+	}
+	wantResults(t, res, ups, []string{
+		part3("refs/heads/Doc", "doc"),
+		part3("refs/heads/DOC", "doc"),
+		mpKeptMsg("refs/heads/doc", "deletes of refs/heads/DOC and refs/heads/Doc were",
+			mpCase("refs/heads/DOC", "heads/doc", "heads/DOC")+", "+mpCase("refs/heads/Doc", "heads/doc", "heads/Doc")),
+		part3("refs/heads/Zed", "zed"),
+	})
+	if len(res) == 4 && strings.Contains(res[2].Err, "Zed") {
+		t.Errorf("the create's refusal must not name the unrelated kept delete of Zed, got %+q", res[2].Err)
+	}
+	assertNoPack(t, f)
+	assertCaseRemote(t, f, seeded)
+}
+
+// TestPushWithLocalFollowsASymbolicTrackingRef is RED (R6, Codex). The local
+// refs/remotes/origin/topic is a symbolic ref to the NFD tracking ref, and the
+// clone also holds a stale NFC one. git follows the symbolic ref when it
+// updates topic's tracking ref, so the side the push arm builds lists the
+// target too, and the update is refused naming it. Without the expansion the
+// same update lands.
+func TestPushWithLocalFollowsASymbolicTrackingRef(t *testing.T) {
+	gitDir := newGitRepoForPush(t)
+	c1 := headOf(t, gitDir)
+	seeded := map[string]string{"refs/heads/main": c1, "refs/heads/topic": c1}
+	c2 := commitOnPushRepo(t, gitDir, "b.txt", "two")
+	ups := []protocol.RefUpdate{{Src: c2, Dst: "refs/heads/topic"}}
+	refs := mpRefs("refs/heads/main", "refs/remotes/origin/main", "refs/heads/topic",
+		"refs/remotes/origin/topic", mpTrackNFD, mpTrackNFC)
+	symrefs := map[string]string{"refs/remotes/origin/topic": mpTrackNFD}
+
+	direct := PushTrackingRefs(DefaultFetchRefspecs("origin"), "refs/heads/topic")
+	dests := map[string]string{}
+	for _, tr := range direct {
+		dests[tr] = "refs/heads/topic"
+	}
+	expanded := sortedKeys(ExpandSymrefs(dests, symrefs))
+
+	f, remote := seedCaseRemote(t, seeded)
+	res := PushWithLocal(f, "/r", gitDir, ups, remote, nil,
+		&LocalSide{Refs: refs, Tracking: map[string][]string{"refs/heads/topic": expanded}})
+	wantResults(t, res, ups, []string{
+		"refs/heads/topic: refused on this Mac: its tracking ref " + mpTrackNFD + " would collide with " +
+			mpTrackItem(false) + mpWriteTail,
+	})
+	assertCaseRemote(t, f, seeded)
+
+	f2, remote2 := seedCaseRemote(t, seeded)
+	res2 := PushWithLocal(f2, "/r", gitDir, ups, remote2, nil,
+		&LocalSide{Refs: refs, Tracking: map[string][]string{"refs/heads/topic": direct}})
+	wantResults(t, res2, ups, []string{""})
+}

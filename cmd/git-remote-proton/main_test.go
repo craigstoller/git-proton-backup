@@ -3268,3 +3268,202 @@ func TestLoop_ListOnAMacFilesRepoTheEverydayFetchPasses(t *testing.T) {
 		t.Errorf("stderr = %q, want nothing", stderr)
 	}
 }
+
+// ---- The Mac push rule at the push arm (Task 9) -----------------------------
+
+// wantMacWriteTail ends every refusal of a write by the Mac push rule, as a
+// push status line carries it.
+const wantMacWriteTail = "; this repository's default (files) ref store cannot keep these apart " +
+	"(README, Honest limits); repair the remote, or push from a --ref-format=reftable clone"
+
+// macRemoteRefs is the remote's advertised ref set, as ScanRefs reads it.
+func macRemoteRefs(t *testing.T, ft *transport.Fake, root string) map[string]string {
+	t.Helper()
+	scan, err := repo.ScanRefs(ft, root)
+	if err != nil {
+		t.Fatalf("ScanRefs: %v", err)
+	}
+	return scan.Refs
+}
+
+// macPackCount is the number of files under the remote's packs folder.
+func macPackCount(ft *transport.Fake, root string) int {
+	n := 0
+	for p := range ft.Files {
+		if strings.HasPrefix(p, root+"/packs/") {
+			n++
+		}
+	}
+	return n
+}
+
+// TestLoop_PushOnAMacFailsClosedOnALocalRead is RED (Task 9; spec section 3:
+// the push arm makes the local reads list makes and fails closed the same
+// way). The reads succeed at "list for-push", and the local-refs read then
+// fails at the push with a two-line error, as git's stderr is. Every update
+// in the batch gets exactly one "error <dst> ..." line, on one line, naming
+// the read; the batch ends with its blank line; nothing reaches the remote;
+// and the session ends 0.
+func TestLoop_PushOnAMacFailsClosedOnALocalRead(t *testing.T) {
+	_, gitDir := macRepo(t)
+	reads := 0
+	stubLocalReads(t,
+		func(string) (string, error) { return "files", nil },
+		func(string, string) (gitcmd.RemoteCfg, error) {
+			return gitcmd.RemoteCfg{URL: "proton::/my-files/r"}, nil
+		},
+		func(string) (map[string]string, error) {
+			reads++
+			if reads == 1 {
+				return map[string]string{"refs/heads/main": ""}, nil
+			}
+			return nil, errors.New("git for-each-ref exited 128:\nfatal: bad object refs/heads/x")
+		})
+	refs := map[string]string{"refs/heads/main": toid('1')}
+	ft, root := macRemote(t, refs)
+	code, stdout, stderr := macSession(t, ft, root, gitDir, macEnv("origin"),
+		"list for-push\npush refs/heads/main:refs/heads/main\npush refs/heads/main:refs/heads/other\n\n")
+	if code != 0 {
+		t.Fatalf("loopEnv() = %d, want 0: stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if reads != 2 {
+		t.Errorf("the local refs were read %d times, want 2 (list for-push, then the push arm)", reads)
+	}
+	const reason = "cannot check this Mac repository before pushing: local refs: " +
+		"git for-each-ref exited 128: fatal: bad object refs/heads/x"
+	want := toid('1') + " refs/heads/main\n\n" +
+		"error refs/heads/main " + reason + "\n" +
+		"error refs/heads/other " + reason + "\n\n"
+	if stdout != want {
+		t.Errorf("stdout =\n%q\nwant\n%q", stdout, want)
+	}
+	if got := macRemoteRefs(t, ft, root); len(got) != 1 || got["refs/heads/main"] != toid('1') {
+		t.Errorf("remote refs = %v, want %v: a batch refused before Push must write nothing", got, refs)
+	}
+	if n := macPackCount(ft, root); n != 0 {
+		t.Errorf("the remote holds %d pack files, want 0", n)
+	}
+}
+
+// TestLoop_PushOnAMacRefusesByTrackingRef is RED (Task 9, part 1(a) through
+// the push arm). The clone holds a stale NFD tracking ref under git's default
+// mapping. A create of the NFC branch would put its tracking ref in that
+// file, so it is refused; an unrelated create in the same batch lands.
+func TestLoop_PushOnAMacRefusesByTrackingRef(t *testing.T) {
+	wt, gitDir := macRepo(t)
+	macConfig(t, gitDir, macOriginDefault)
+	macPackedRefs(t, wt, "refs/remotes/origin/"+tNFD)
+	ft, root := macRemote(t, map[string]string{"refs/heads/main": toid('1')})
+	code, stdout, stderr := macSession(t, ft, root, gitDir, macEnv("origin"),
+		"list for-push\npush refs/heads/main:refs/heads/"+tNFC+"\npush refs/heads/main:refs/heads/other\n\n")
+	if code != 0 {
+		t.Fatalf("loopEnv() = %d, want 0: stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	wantLine := "error refs/heads/" + tNFC + " refs/heads/" + tNFC + ": refused on this Mac: its tracking ref " +
+		"refs/remotes/origin/" + tNFC + " would collide with refs/remotes/origin/" + tNFD +
+		" (remotes/origin/" + tNFC + " vs remotes/origin/" + tNFD + `, by Unicode normalisation: "remotes/origin/` +
+		tNFCq + `" vs "remotes/origin/` + tNFDq + `")` + wantMacWriteTail + "\n"
+	if !strings.Contains(stdout, wantLine) {
+		t.Errorf("stdout =\n%q\nwant it to contain\n%q", stdout, wantLine)
+	}
+	if !strings.Contains(stdout, "ok refs/heads/other\n") {
+		t.Errorf("stdout = %q, want the unrelated create to land", stdout)
+	}
+	if stderr != "" {
+		t.Errorf("stderr = %q, want nothing", stderr)
+	}
+	got := macRemoteRefs(t, ft, root)
+	if _, ok := got["refs/heads/"+tNFC]; ok {
+		t.Errorf("remote refs = %v: the refused create must not be written", got)
+	}
+	if _, ok := got["refs/heads/other"]; !ok {
+		t.Errorf("remote refs = %v: the unrelated create must be written", got)
+	}
+}
+
+// TestLoop_PushOffAMacUsesNoLocalSide is a GUARD (Task 9: in every case but a
+// Mac files repository, the push arm passes no local side). Off darwin, on
+// darwin with GIT_DIR unset, and in a Mac reftable repository, a forced
+// update of one member of a remote pair lands, which the Mac rule would
+// refuse; and no read beyond the ref format is made.
+func TestLoop_PushOffAMacUsesNoLocalSide(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		env      helperEnv
+		reftable bool
+	}{
+		{"zero env (loop)", helperEnv{}, false},
+		{"linux", helperEnv{goos: "linux", remoteName: "origin", gitDirSet: true}, false},
+		{"windows", helperEnv{goos: "windows", remoteName: "origin", gitDirSet: true}, false},
+		{"darwin, GIT_DIR unset", helperEnv{goos: "darwin", remoteName: "origin"}, false},
+		{"darwin, reftable", macEnv("origin"), true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var initArgs []string
+			if c.reftable {
+				initArgs = []string{"--ref-format=reftable"}
+			}
+			_, gitDir := macRepo(t, initArgs...)
+			stubLocalReads(t,
+				func(string) (string, error) {
+					if !c.reftable {
+						t.Fatal("the ref format was read off a Mac")
+					}
+					return "reftable", nil
+				},
+				func(string, string) (gitcmd.RemoteCfg, error) {
+					t.Fatal("the remote config was read")
+					return gitcmd.RemoteCfg{}, nil
+				},
+				func(string) (map[string]string, error) { t.Fatal("the local refs were read"); return nil, nil })
+			ft, root := macRemote(t, macPairRemote())
+			code, stdout, stderr := macSession(t, ft, root, gitDir, c.env,
+				"list for-push\npush +refs/heads/main:refs/heads/"+tNFC+"\n\n")
+			if code != 0 {
+				t.Fatalf("loopEnv() = %d, want 0: stdout=%q stderr=%q", code, stdout, stderr)
+			}
+			if !strings.Contains(stdout, "ok refs/heads/"+tNFC+"\n") {
+				t.Errorf("stdout = %q, want the update of %+q to land", stdout, "refs/heads/"+tNFC)
+			}
+		})
+	}
+}
+
+// TestLoop_PushOnAMacWithAnAnonymousURLAppliesTheRemoteHalfOnly is RED (Task
+// 9, Review Focus 5; Kimi). git passes the URL itself as the remote's name,
+// and no remote config names it, so no tracking ref is written and the rule
+// has no local half. It still has its remote half: with a pair on the remote,
+// a forced update of one member is refused by part 1(b). A create of a name
+// whose tracking ref would alias a local one under a default mapping lands,
+// and nothing fails closed.
+func TestLoop_PushOnAMacWithAnAnonymousURLAppliesTheRemoteHalfOnly(t *testing.T) {
+	wt, gitDir := macRepo(t)
+	macPackedRefs(t, wt, "refs/remotes/origin/OTHER")
+	refs := macPairRemote()
+	ft, root := macRemote(t, refs)
+	const url = "proton::/my-files/r"
+	code, stdout, stderr := macSession(t, ft, root, gitDir, macEnv(url),
+		"list for-push\npush +refs/heads/main:refs/heads/"+tNFC+"\npush refs/heads/main:refs/heads/other\n\n")
+	if code != 0 {
+		t.Fatalf("loopEnv() = %d, want 0: stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	wantLine := "error refs/heads/" + tNFC + " refs/heads/" + tNFC + ": refused on this Mac: the remote also holds " +
+		"refs/heads/" + tNFD + " (heads/" + tNFC + " vs heads/" + tNFD + `, by Unicode normalisation: "heads/` +
+		tNFCq + `" vs "heads/` + tNFDq + `")` + wantMacWriteTail + "\n"
+	if !strings.Contains(stdout, wantLine) {
+		t.Errorf("stdout =\n%q\nwant it to contain\n%q", stdout, wantLine)
+	}
+	if !strings.Contains(stdout, "ok refs/heads/other\n") {
+		t.Errorf("stdout = %q, want the create of refs/heads/other to land", stdout)
+	}
+	if strings.Contains(stdout, "cannot check") || strings.Contains(stderr, "cannot check") {
+		t.Errorf("nothing may fail closed for an anonymous URL: stdout=%q stderr=%q", stdout, stderr)
+	}
+	got := macRemoteRefs(t, ft, root)
+	if got["refs/heads/"+tNFC] != toid('1') {
+		t.Errorf("remote refs = %v: the refused update must leave %+q at %s", got, "refs/heads/"+tNFC, toid('1'))
+	}
+	if _, ok := got["refs/heads/other"]; !ok {
+		t.Errorf("remote refs = %v: the create must be written", got)
+	}
+}

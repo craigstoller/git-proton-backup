@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 
 	"github.com/craigstoller/git-proton-backup/internal/gitcmd"
@@ -527,6 +528,37 @@ func macPushCheck(gitDir string, env helperEnv, refs map[string]string) error {
 	return nil
 }
 
+// macLocalSide is the local side the Mac push rule judges a batch against
+// (repo.LocalSide): the local ref names, and for each destination in ups its
+// tracking refs, the positive mappings of the remote's fetch refspecs (R6,
+// repo.PushTrackingRefs ignores negatives) followed through local symbolic
+// refs, since git follows a symbolic tracking ref when it updates one. An
+// anonymous URL has no remote config, so git writes no tracking ref and no
+// destination gets one; nor does a destination no refspec maps.
+func macLocalSide(st localState, ups []protocol.RefUpdate) *repo.LocalSide {
+	side := &repo.LocalSide{Refs: st.refs, Tracking: map[string][]string{}}
+	if st.anonymous {
+		return side
+	}
+	for _, u := range ups {
+		dests := map[string]string{}
+		for _, tr := range repo.PushTrackingRefs(st.specs, u.Dst) {
+			dests[tr] = u.Dst
+		}
+		if len(dests) == 0 {
+			continue
+		}
+		expanded := repo.ExpandSymrefs(dests, st.symrefs)
+		ts := make([]string, 0, len(expanded))
+		for tr := range expanded {
+			ts = append(ts, tr)
+		}
+		sort.Strings(ts)
+		side.Tracking[u.Dst] = ts
+	}
+	return side
+}
+
 // warnPairs writes the pair warning (spec section 3, "The warning") to stderr
 // when pairs is not empty. Each list arm calls it at most once; the push arm's
 // own scan never does.
@@ -550,7 +582,9 @@ func loop(t transport.Transport, root, gitDir string, in *bufio.Scanner, out *bu
 // loopEnv is the command exchange, with env saying how git started the helper:
 // the "list" and "list for-push" arms warn about remote pairs everywhere and,
 // on a Mac files-store repository, refuse what the filesystem would confuse
-// (macFetchCheck, macPushCheck). run() is its only production caller.
+// (macFetchCheck, macPushCheck), and there the push arm hands repo.Push the
+// local side its per-ref Mac rule judges (macLocalSide). run() is its only
+// production caller.
 func loopEnv(t transport.Transport, root, gitDir string, env helperEnv, in *bufio.Scanner, out *bufio.Writer) int {
 	var opts protocol.Options
 	var lock *repo.Lock
@@ -854,7 +888,30 @@ func loopEnv(t transport.Transport, root, gitDir string, env helperEnv, in *bufi
 			// before any pack is built. This call site's job is only to pass
 			// through what ScanRefs just found.
 			remote := scan.Refs
-			for _, r := range repo.Push(t, root, gitDir, ups, remote, scan.Skipped) {
+			// The Mac push rule (spec 2026-10-27, section 3): on a Mac files
+			// repository, Push also judges each ref against the local refs
+			// and its tracking refs, which only this arm can read. A failed
+			// read refuses every update in the batch, naming the read, like
+			// the poisoned path above: nothing has been written yet. The
+			// reason goes through repo.OneLine because git's stderr is
+			// multi-line, and a newline would desynchronise the protocol.
+			var local *repo.LocalSide
+			if env.macRules() {
+				state, err := readLocalState(gitDir, env.remoteName)
+				if err != nil {
+					reason := repo.OneLine("cannot check this Mac repository before pushing: " + err.Error())
+					for _, u := range ups {
+						fmt.Fprintf(out, "error %s %s\n", u.Dst, reason)
+					}
+					fmt.Fprint(out, "\n")
+					out.Flush()
+					continue
+				}
+				if state.format == "files" {
+					local = macLocalSide(state, ups)
+				}
+			}
+			for _, r := range repo.PushWithLocal(t, root, gitDir, ups, remote, scan.Skipped, local) {
 				if r.OK {
 					fmt.Fprintf(out, "ok %s\n", r.Ref)
 				} else {
