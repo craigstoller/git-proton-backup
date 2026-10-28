@@ -6,7 +6,10 @@
 v0.10.0's tested the case refusal per platform." These are the steps those two briefs carry. The
 briefs themselves are written at release time from the v0.10.0 briefs plus this file (plan
 `docs/superpowers/plans/2026-10-27-v2-macos-port.md`, Task 15 and "Not tasks"). Written on
-2026-10-27 on branch `worktree-macos-port`; code read at **`119227e`**, the macOS brief's anchor.
+2026-10-27 on branch `worktree-macos-port`, and re-anchored on 2026-10-28; code read at
+**`0faada8`**, the macOS brief's anchor. The code it cites is unchanged from `119227e` there
+[measured 2026-10-28: among the code paths, `git diff 119227e 0faada8` changes only
+`cmd/git-remote-proton/main.go` and its test, neither cited here].
 
 **`vNEXT` is a placeholder** for the release that carries the macOS port, whose version Craig has
 not named. When he names it, this file is renamed with the version and every `vNEXT` replaced, by
