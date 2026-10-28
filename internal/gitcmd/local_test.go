@@ -589,14 +589,16 @@ func TestLocalRefsReportsSymbolicTargets(t *testing.T) {
 	}
 }
 
-// RED. Git's warnings go to stderr and never into the names. The fixture holds a
-// dangling symbolic ref (the brief's) and a ref file with garbage in it: the
-// second is what makes git 2.54.0 print "warning: ignoring broken ref" on stderr
-// (measured 2026-10-27); a dangling symbolic ref alone is skipped silently. The
-// precondition asserts the warning exists, so the test cannot pass vacuously on
-// a git that stays quiet. A runner that merged stderr into stdout, as git()
-// does, would hand the warning to LocalRefs as a malformed record.
-func TestLocalRefsIgnoresStderr(t *testing.T) {
+// RED (fix round 1, finding I1). When git exits 0 but says something on stderr
+// while listing refs, LocalRefs fails closed: it names the command, carries
+// git's own words, and returns no map. The fixture holds a dangling symbolic ref
+// and a ref file with garbage in it. The garbage file is what makes git 2.54.0
+// print "warning: ignoring broken ref" on stderr and leave that ref out of the
+// listing (measured 2026-10-27); the dangling symbolic ref alone is skipped
+// silently. The ref is a file on disk that the helper cannot read, so the design
+// (spec section 3) stops rather than skips. The precondition asserts the warning
+// exists, so the test cannot pass vacuously on a git that stays quiet.
+func TestLocalRefsFailsClosedOnAWarning(t *testing.T) {
 	d := localRepo(t)
 	localGit(t, d, "symbolic-ref", "refs/heads/dangling", "refs/heads/nope")
 	if err := os.WriteFile(filepath.Join(d, ".git", "refs", "heads", "garbage"), []byte("garbage\n"), 0o644); err != nil {
@@ -608,16 +610,35 @@ func TestLocalRefsIgnoresStderr(t *testing.T) {
 	}
 
 	got, err := LocalRefs(filepath.Join(d, ".git"))
-	if err != nil {
-		t.Fatalf("LocalRefs: %v", err)
+	if err == nil {
+		t.Fatalf("LocalRefs = %q, nil; want an error: git skipped a ref and said so on stderr", got)
 	}
-	if target, ok := got["refs/heads/main"]; !ok || target != "" {
-		t.Errorf("LocalRefs lost refs/heads/main: %q", got)
+	if got != nil {
+		t.Errorf("LocalRefs = %q alongside the error, want no map", got)
 	}
-	for name := range got {
-		if !strings.HasPrefix(name, "refs/") || strings.Contains(name, "warning") || strings.Contains(name, "broken") {
-			t.Errorf("LocalRefs holds %q, which is not a ref name: stderr leaked in", name)
-		}
+	if !strings.Contains(err.Error(), "for-each-ref") {
+		t.Errorf("error %q does not name the command", err)
+	}
+	if !strings.Contains(err.Error(), "garbage") {
+		t.Errorf("error %q does not carry git's warning, which names the ref", err)
+	}
+	if !strings.Contains(err.Error(), strings.TrimSpace(warn)) {
+		t.Errorf("error %q does not carry git's stderr %q", err, strings.TrimSpace(warn))
+	}
+}
+
+// RED (fix round 1, finding I1). The decision turns on stderr being non-empty,
+// never on what it says: git's messages are localised and the helper runs in the
+// user's locale. A fake git exits 0, lists one ref, and complains in French.
+// Skipped on Windows, like the other fake-git tests.
+func TestLocalRefsFailsClosedOnAnyStderrText(t *testing.T) {
+	fakeGitOnPath(t, "printf 'refs/heads/main\\000\\n'\necho 'avertissement : reference ignoree' >&2")
+	got, err := LocalRefs(t.TempDir())
+	if err == nil {
+		t.Fatalf("LocalRefs = %q, nil; want an error for any text on stderr", got)
+	}
+	if !strings.Contains(err.Error(), "avertissement") {
+		t.Errorf("error %q does not carry git's stderr", err)
 	}
 }
 

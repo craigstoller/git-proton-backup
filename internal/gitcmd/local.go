@@ -242,15 +242,27 @@ func parseGitBool(value string, hasValue bool) (bool, error) {
 // its NUL, so every name keeps its bytes: no trimming, and no Unicode
 // normalisation, which is the point when a Mac holds both spellings of a name.
 //
-// Stdout alone is parsed. A warning git prints on stderr (it does so for a ref
-// file it cannot parse) is not a ref. for-each-ref itself leaves out a ref it
-// cannot resolve, a dangling symbolic ref among them, so the map holds the refs
-// git can resolve.
+// Stdout alone is parsed, and anything git says on stderr stops the read. git
+// skips a ref file it cannot parse, exits 0, and warns on stderr
+// ("ignoring broken ref"); that ref is content the helper cannot read, so the
+// design stops rather than skips (spec section 3) and a clean exit with a
+// non-empty stderr is an error carrying git's words. The test is "stderr is not
+// empty", never a match on the message, which is localised.
+//
+// Known limit (controller ruling T6-2): a dangling symbolic ref, for example a
+// refs/remotes/<r>/HEAD left behind by a prune, is not listed and produces no
+// warning. Every git enumerator leaves it out silently (only fsck sees it), so
+// the caller's collision check cannot see it either.
 func LocalRefs(gitDir string) (map[string]string, error) {
 	args := []string{"for-each-ref", "--format=%(refname)%00%(symref)"}
 	out, stderr, code, err := gitStdout(gitDir, args...)
 	if err != nil || code != 0 {
 		return nil, gitStdoutError(args, stderr, code, err)
+	}
+	if strings.TrimSpace(stderr) != "" {
+		return nil, fmt.Errorf("git %s exited 0 but wrote to stderr, so it may have skipped a ref; "+
+			"refusing to act on a possibly incomplete ref list: %s",
+			strings.Join(args, " "), strings.TrimSpace(stderr))
 	}
 	refs := map[string]string{}
 	if len(out) == 0 {
