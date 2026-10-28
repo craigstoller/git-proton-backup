@@ -5,9 +5,9 @@
     Containment: the script is run in a CHILD pwsh so its `exit` codes are observable and its
     network call never happens — the child defines a function named Invoke-RestMethod before
     invoking the script, and a function shadows the cmdlet for command resolution, so the feed
-    is whatever the test says it is. The helper and the CLI are .cmd stubs under TestDrive:
-    that print the lines the real binaries print and exit with the code the case needs. No
-    real helper, no real CLI, no Proton account.
+    is whatever the test says it is. The helper and the CLI are stubs under TestDrive: (a .cmd
+    on Windows, an executable sh script elsewhere) that print the lines the real binaries print
+    and exit with the code the case needs. No real helper, no real CLI, no Proton account.
 
     Why these cases: the script is the FIRST triage step for an uncertified-CLI refusal, so it
     must be at least as strict as the helper's own gate (exit 0 AND identity token equal, the
@@ -20,11 +20,26 @@ BeforeAll {
     $script:driftScript = Join-Path $PSScriptRoot '..\scripts\Test-ProtonCliDrift.ps1'
     $script:driftScript = (Resolve-Path $script:driftScript).Path
 
-    # Writes a .cmd stub that prints the given lines and exits with the given code.
+    # The path of the stub called $Name under TestDrive: a .cmd on Windows, the bare name elsewhere.
+    function Get-StubPath {
+        param([string]$Name)
+        $leaf = if ($IsWindows) { "$Name.cmd" } else { $Name }
+        return Join-Path $TestDrive $leaf
+    }
+
+    # Writes a stub that prints the given lines and exits with the given code: a .cmd on Windows,
+    # an executable #!/bin/sh script elsewhere (each line printed by printf '%s\n').
     function New-Stub {
         param([string]$Path, [string[]]$Lines, [int]$ExitCode)
-        $body = @('@echo off') + ($Lines | ForEach-Object { "echo $_" }) + @("exit /b $ExitCode")
-        Set-Content -LiteralPath $Path -Value ($body -join "`r`n") -Encoding ascii
+        if ($IsWindows) {
+            $body = @('@echo off') + ($Lines | ForEach-Object { "echo $_" }) + @("exit /b $ExitCode")
+            Set-Content -LiteralPath $Path -Value ($body -join "`r`n") -Encoding ascii
+        } else {
+            $body = @('#!/bin/sh') + ($Lines | ForEach-Object { "printf '%s\n' '" + ($_ -replace "'", "'\''") + "'" }) + @("exit $ExitCode")
+            Set-Content -LiteralPath $Path -Value ($body -join "`n") -Encoding ascii
+            & chmod +x $Path
+            if ($LASTEXITCODE -ne 0) { throw "chmod +x failed for $Path" }
+        }
         return $Path
     }
 
@@ -72,19 +87,19 @@ BeforeAll {
     }
 
     $script:certifiedToken = 'cli-drive@0.9.0+75612299'
-    $script:helperOk = New-Stub -Path (Join-Path $TestDrive 'helper-ok.cmd') -Lines @("git-remote-proton v9.9.9 (certified CLI: $script:certifiedToken)") -ExitCode 0
-    $script:helperOld = New-Stub -Path (Join-Path $TestDrive 'helper-old.cmd') -Lines @('git-remote-proton v9.9.9 (certified CLI: cli-drive@0.8.0+06e8c605)') -ExitCode 0
-    $script:helperBad = New-Stub -Path (Join-Path $TestDrive 'helper-bad.cmd') -Lines @("git-remote-proton v9.9.9 (certified CLI: $script:certifiedToken)") -ExitCode 1
+    $script:helperOk = New-Stub -Path (Get-StubPath 'helper-ok') -Lines @("git-remote-proton v9.9.9 (certified CLI: $script:certifiedToken)") -ExitCode 0
+    $script:helperOld = New-Stub -Path (Get-StubPath 'helper-old') -Lines @('git-remote-proton v9.9.9 (certified CLI: cli-drive@0.8.0+06e8c605)') -ExitCode 0
+    $script:helperBad = New-Stub -Path (Get-StubPath 'helper-bad') -Lines @("git-remote-proton v9.9.9 (certified CLI: $script:certifiedToken)") -ExitCode 1
     $cliLines = @("Proton Drive CLI $script:certifiedToken", 'Proton Drive SDK js@0.0.0+stub', 'You are running the latest version.')
-    $script:cliOk = New-Stub -Path (Join-Path $TestDrive 'cli-ok.cmd') -Lines $cliLines -ExitCode 0
-    $script:cliBad = New-Stub -Path (Join-Path $TestDrive 'cli-bad.cmd') -Lines $cliLines -ExitCode 3
+    $script:cliOk = New-Stub -Path (Get-StubPath 'cli-ok') -Lines $cliLines -ExitCode 0
+    $script:cliBad = New-Stub -Path (Get-StubPath 'cli-bad') -Lines $cliLines -ExitCode 3
     $script:cliOkSha = (Get-FileHash -LiteralPath $script:cliOk -Algorithm SHA512).Hash.ToLower()
     $script:cliBadSha = (Get-FileHash -LiteralPath $script:cliBad -Algorithm SHA512).Hash.ToLower()
 
     # A helper/CLI pair whose tokens differ ONLY in the case of the build id: the helper's Go
     # compare (==) refuses that pair, so the script must not read it as MATCH.
-    $script:helperHex = New-Stub -Path (Join-Path $TestDrive 'helper-hex.cmd') -Lines @('git-remote-proton v9.9.9 (certified CLI: cli-drive@0.9.0+0abc0001)') -ExitCode 0
-    $script:cliHexUpper = New-Stub -Path (Join-Path $TestDrive 'cli-hex-upper.cmd') -Lines @('Proton Drive CLI cli-drive@0.9.0+0ABC0001', 'Proton Drive SDK js@0.0.0+stub') -ExitCode 0
+    $script:helperHex = New-Stub -Path (Get-StubPath 'helper-hex') -Lines @('git-remote-proton v9.9.9 (certified CLI: cli-drive@0.9.0+0abc0001)') -ExitCode 0
+    $script:cliHexUpper = New-Stub -Path (Get-StubPath 'cli-hex-upper') -Lines @('Proton Drive CLI cli-drive@0.9.0+0ABC0001', 'Proton Drive SDK js@0.0.0+stub') -ExitCode 0
     $script:cliHexUpperSha = (Get-FileHash -LiteralPath $script:cliHexUpper -Algorithm SHA512).Hash.ToLower()
 }
 
