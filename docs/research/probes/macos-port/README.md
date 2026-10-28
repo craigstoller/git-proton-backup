@@ -14,6 +14,8 @@ measurements listed in [the plan](../../../superpowers/plans/2026-10-27-v2-macos
 (the 2026-10-23 runs against Proton's CLI and the hermetic suite) have no files here.
 
 This is a subfolder, unlike the flat probes beside it, because the port's probes come to 34 files.
+Eight more, run on 2026-10-28 for Amendment MA3, sit in `stale-ref-remedy/`; the last section
+below covers them.
 
 ## Reading the files
 
@@ -103,3 +105,45 @@ One note on a file, not an edit: `mnprobe.go` says its samples are Go escapes "s
 ASCII". The file holds the characters themselves (NFC `café` is `63 61 66 c3 a9`, NFD
 `63 61 66 65 cc 81`), so it is not ASCII and the comment is out of date. The comment was left as it
 was.
+
+## The stale-ref remedy (MA3): `stale-ref-remedy/`
+
+**Pinned results, run locally on 2026-10-28** by the review of the plan's Task 13, on the same
+Mac (Apple git 2.54.0, `/bin/bash` 3.2.57, macOS 27.2; pass 1's first lines show APFS opening an
+NFC-named file by its NFD name). They test the in-place repair of a stale local ref that the
+README's macOS honest limits give, and they are the measurement behind Amendment MA3 in
+[the spec](../../../superpowers/specs/2026-10-27-v2-macos-port-design.md). Local repositories
+only: no network, no Proton account. Every layout uses the two spellings of `café`, NFC
+(`63 61 66 c3 a9`) and NFD (`63 61 66 65 cc 81`), and deletes the NFD one.
+
+Each script takes an existing empty folder for its repositories and the folder holding `emit.py`
+and `show.py`: `/bin/bash probe.sh <empty folder> <this folder>`, and the same for `probe2.sh` and
+`probe3.sh`. `emit.py` writes one `git update-ref --stdin` line with exact bytes; `show.py` lists a
+namespace's loose ref files and the packed-refs entries, both with raw name bytes. git runs with
+no system or global config and fixed dates, so the commit IDs are the same in every log
+(A=`cdeb7feb82d3`, B=`ea92338cb941`, C=`578d65cf39ea`).
+
+| Layouts | Files | What they show |
+|---|---|---|
+| L1–L6 (pass 1) | `probe.sh`, `t13-probe-transcript.txt` | A bare exact-bytes delete under git's Mac default, `core.precomposeunicode=true`, which `git init` sets. **L1** (`refs/heads`: NFC packed at A, NFD loose at C) and **L5** (the same in `refs/remotes/proton-v2`, NFC at B): only the NFD ref goes. **L6** (only NFC, loose at B, and the delete naming NFD): the NFC ref is gone, and `git fsck` exits 0. **L2, L3 and L4 never built** the layout they name: `pack-refs` under the default setting wrote the NFD ref into `packed-refs` spelled in NFC, so the next step failed (`reference already exists` in L2 and L4). **L3** records the overwrite this causes: NFC was packed at A, and after `pack-refs` the one packed entry, spelled in NFC, holds C, the NFD ref's commit (`is at 578d65cf… but expected cdeb7feb…`). That is why the in-place route's `pack-refs` needs `-c core.precomposeunicode=false`. |
+| L7–L9 (pass 2) | `probe2.sh`, `t13-probe-transcript3.txt` | The layouts pass 1 could not build, made two ways, then the bare delete. **L7** (NFD packed at C by `pack-refs` with precomposition off, NFC loose at B): both refs are gone. **L8** (a real `files` clone of a `reftable` remote holding both, then a fetch that writes NFC loose at B; M24's layout): NFD is gone and NFC falls back to its stale packed A, with `git fsck` exiting 0 and listing B, NFC's lost commit, among the dangling commits. **L9** (the clone held only NFD, packed at C; a fetch then wrote NFC loose at B): both refs are gone. |
+| L10–L12 (pass 3) | `probe3.sh`, `t13-probe-transcript4.txt` | The same delete after `git -c core.precomposeunicode=false pack-refs --all`, in L8's layout (**L10**), L9's (**L11**) and L1's (**L12**). In all three only the NFD ref goes, and NFC keeps its current value (B, B and A). These are the "three ref layouts" the README and design doc cite. |
+
+**What these files do not show.**
+
+- **Pass 2's first run is not here.** `probe2.sh` first ran with a bug: in L8 and L9 the fetch, the
+  listings and the delete ran against the bare remote instead of the clone, and its log shows
+  `fatal: 'proton-v2' does not appear to be a git repository` and `fetch exit 128`. That log was
+  discarded; `t13-probe-transcript3.txt` is the corrected run. The `probe2.sh` here keeps each
+  repository in a local variable in its `upd` helper (`local target=$1`), where `probe.sh`'s
+  helper assigns the global `r` that L8 and L9 use for the clone, so this copy matches the
+  corrected run [inference from the code and both logs: the files do not record whether the
+  script was edited again after that run].
+- **Pass 3 runs no `git fsck`,** and none of the passes tests letter-case pairs, a `reftable`
+  clone, or the helper itself.
+
+**Changes made when these were committed.** The files are copies. In `t13-probe-transcript.txt`
+only, the run's scratch folder is written `$SP` (the repositories' root was `$SP/t13-probe`), and
+the local account name in the `ls -la` lines is written `$USER`. Two of those lines (32 and 202)
+show the NFD file name raw, as `ls` printed it; the `od -c` lines below them give its bytes. The
+scripts take their folders as arguments and hold no path.

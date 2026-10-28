@@ -1311,9 +1311,10 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
     stale local ref (2), re-clone with `--ref-format=reftable`, or, in place, run `git -c
     core.precomposeunicode=false pack-refs --all` and only then delete the stale ref by its exact
     bytes (`printf 'delete <ref>\n' | git update-ref --stdin`), both required and in that order
-    (MA3, measured 2026-10-28 with git 2.54.0 in three ref layouts). A bare delete is not safe:
-    with the other spelling's ref loose, APFS resolves both names to that file, git unlinks it,
-    and that ref falls back to a stale packed value or vanishes, with `git fsck` clean; without
+    (MA3; measured 2026-10-28, git 2.54.0, in three ref layouts; record in
+    `docs/research/probes/macos-port/stale-ref-remedy/`). A bare delete is not safe: with the
+    other spelling's ref loose, APFS resolves both names to that file, git unlinks it, and that
+    ref falls back to a stale packed value or vanishes, with `git fsck` still exiting 0; without
     the `-c`, `pack-refs` re-spells the NFD ref in NFC and can overwrite the NFC ref. For two
     destinations aliasing each other (2), change the remote's refspecs or use a `reftable` clone.
     The two refusal messages name only the re-clone (and the refspec change) and point to the

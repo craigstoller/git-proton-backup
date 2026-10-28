@@ -704,8 +704,10 @@ case. They apply where git keeps each ref as a file, so that APFS can take two n
     repair a stale local ref in place, follow the README (a plain delete can unlink the other
     spelling's ref)`.
     - **For a stale local ref, re-clone with `--ref-format=reftable`.** To repair the ref in place
-      instead, run both of these commands, in this order (measured 2026-10-28 with git 2.54.0 on
-      APFS, in three ref layouts); the second line removes an NFD tracking ref of `café`:
+      instead, run both of these commands, in this order (measured 2026-10-28, git 2.54.0, on
+      APFS in three ref layouts; record in
+      [docs/research/probes/macos-port/stale-ref-remedy/](docs/research/probes/macos-port/stale-ref-remedy/));
+      the second line removes an NFD tracking ref of `café`:
 
       ```bash
       git -c core.precomposeunicode=false pack-refs --all
@@ -714,11 +716,13 @@ case. They apply where git keeps each ref as a file, so that APFS can take two n
 
       Both are required. A delete on its own is not safe: while the other spelling's ref is a
       loose file, APFS resolves both names to that one file and git unlinks it, so the other ref
-      rewinds to a stale packed value, or disappears, and `git fsck` reports nothing. Packing
-      every ref first leaves no loose file for the delete to unlink [inference], and in each
-      measured layout only the named ref went. The `-c` is required too: under git's Mac default, `core.precomposeunicode=true`, `pack-refs`
-      re-spells the NFD ref in NFC and can overwrite the NFC ref's value. `git update-ref` reads
-      the name from its input, so the shell's bytes reach it unchanged.
+      rewinds to a stale packed value, or disappears, and `git fsck` still exits 0, listing the
+      lost commit only as dangling (measured, the record's layouts L6 to L9). Packing every ref
+      first leaves no loose file for the delete to unlink [inference], and in each measured
+      layout (L10 to L12) only the named ref went. The `-c` is required too: under git's Mac
+      default, `core.precomposeunicode=true`, `pack-refs` re-spells the NFD ref in NFC and
+      overwrites the NFC ref's value (measured, layout L3). `git update-ref` reads the name from
+      its input, so the shell's bytes reach it unchanged.
     - **For two remote refs whose mapped names collide,** change the remote's fetch refspecs, or use
       a `reftable` clone.
   - **A whole push is refused when an up-to-date ref would rewrite a colliding tracking ref.**
@@ -733,7 +737,11 @@ case. They apply where git keeps each ref as a file, so that APFS can take two n
     --ref-format=reftable clone; to repair the stale local ref in place, follow the README (a
     plain delete can unlink the other spelling's ref)`. While that stale ref stands, no push from
     this clone runs. Push from a `reftable` clone, or repair the stale ref in place with the same
-    two commands as above, in the same order; both are required.
+    two commands as above, in the same order, putting the stale ref's own full name, as exact
+    bytes, in place of the `café` example: here, `printf 'delete refs/remotes/proton-v2/Main\n' |
+    git update-ref --stdin` after the `pack-refs` line. Both are required. For a letter-case pair
+    such as this one the route is [inference: the same mechanism; the committed probe covers the
+    NFC/NFD pair only].
   - **Single refs in a push are refused, and the rest of the push goes on,** each with a message
     that names this Mac as the reason. A create or update is refused when its tracking ref would
     collide with a local ref or with another pushed ref's tracking ref. An update is also refused
@@ -793,8 +801,8 @@ case. They apply where git keeps each ref as a file, so that APFS can take two n
   repository's tree git tells the helper which repository it is in, and in a `files` repository
   the scan becomes a fetch check against that repository's refs.
 - **Repairing a pair, on a Mac.** Delete one member from Linux or a `reftable` clone, or from
-  Windows only when the pair differs by normalisation alone (see the letter-case item above for
-  why); a Mac `files` clone that holds the other member's tracking ref refuses the delete.
+  Windows only when the pair differs by normalisation alone [inference] (see the letter-case item
+  above for why); a Mac `files` clone that holds the other member's tracking ref refuses the delete.
   Deleting from such a clone is what the helper prevents: git's cleanup of the deleted name's
   tracking ref can unlink the surviving member's file, which APFS takes for the same name, and
   rewind that ref to an old packed value with `git fsck` reporting nothing (measured). The repair,
@@ -805,7 +813,7 @@ case. They apply where git keeps each ref as a file, so that APFS can take two n
   3. In it, delete one member by its exact bytes, because a typed name is stored in NFC: run
      `git config core.precomposeunicode false`, then for example `git push proton-v2
      ":$(printf 'refs/heads/cafe\314\201')"`. Or delete it from a Linux client, or, for a pair
-     that differs by normalisation alone, a Windows one.
+     that differs by normalisation alone, a Windows one [inference].
   4. Then, on every Mac clone of that remote, recover what only that clone holds before `git gc`
      can drop it: any commit `git fsck` reports dangling, and any branch you never pushed. Then
      re-clone it, with `--ref-format=reftable` or without. The re-clone is not optional: the
