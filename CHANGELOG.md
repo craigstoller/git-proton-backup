@@ -23,7 +23,7 @@
   both spellings in escaped form, since they print alike. Case is now folded from tables pinned at
   Unicode 17.0.0 instead of the Go toolchain's own, so every build refuses the same names; no pair
   refused before is let through. The cost is that some pairs no filesystem is known to confuse
-  are refused too, such as `ᾳ` beside `αι`.
+  are refused too, such as `ᾳ` beside `αι` [inference: no measurement shows a Mac confusing them].
 - **git-remote-proton: a warning when a remote already holds such a pair, and refusals on a Mac.**
   On every platform, fetch, clone, `ls-remote` and push print a warning naming each pair, with
   both object IDs. On a Mac, in a repository that uses git's default `files` ref store, the helper

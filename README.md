@@ -260,10 +260,12 @@ because its transport is the Windows sync app. No release carries a macOS binary
 gate runs Mac bytes: you build the helper yourself from a release tag. CI runs the hermetic Go
 suite on an Apple Silicon runner at Go's latest stable release, and the port's design rests on
 local probes run on one Mac
-([docs/research/probes/macos-port/](docs/research/probes/macos-port/README.md)). No live gate
-has run on a Mac yet. On a Mac the helper also refuses some fetches and pushes that
-would let the filesystem mix two refs up; read [Honest limits on macOS](#honest-limits-on-macos-v2)
-before you rely on it.
+([docs/research/probes/macos-port/](docs/research/probes/macos-port/README.md)). The M-numbers
+below are findings in the
+[macOS port spec](docs/superpowers/specs/2026-10-27-v2-macos-port-design.md), which marks how each
+was measured. No live gate has run on a Mac yet. On a Mac the helper also refuses some fetches
+and pushes that would let the filesystem mix two refs up; read
+[Honest limits on macOS](#honest-limits-on-macos-v2) before you rely on it.
 
 **Prerequisites.**
 
@@ -279,7 +281,8 @@ before you rely on it.
   Linux only, so it is not claimed for macOS.
 - **The certified Proton Drive CLI**, version 0.9.0 (`cli-drive@0.9.0+75612299`), Proton's
   `macos/arm64` build, installed with the commands below and checked against its SHA-512. It prints
-  the same identity token as the Windows and Linux builds, so the helper accepts it unchanged.
+  the same identity token as the Windows and Linux builds, so the helper accepts it unchanged
+  (measured offline, M4).
 
 **Install.** Build the helper in a fresh clone at the release tag, so the build records no local
 edits. Set `TAG` to the release you are installing. These commands put both programs in
@@ -331,12 +334,13 @@ proton::/my-files/GitRemotes/myrepo`): none of the Mac refusals applies to such 
 **A helper binary that arrived some other way.** No macOS binary is published. A helper copied
 from another Mac by browser, mail, AirDrop or an archive can carry macOS's quarantine attribute,
 and git then reports `error: git-remote-proton died of signal 9` and `fatal: remote helper 'proton'
-aborted session` (measured once, with the attribute a Safari download sets). Confirm the attribute
-before you act on it: `xattr -p com.apple.quarantine ~/.local/bin/git-remote-proton` prints it, or
-reports `No such xattr`. Rebuild from the tag rather than run a file whose origin you do not know.
-Removing the attribute, `xattr -d com.apple.quarantine <file>`, is what made a known-good copy run
-in the probes. A helper you build yourself carries no quarantine attribute, and Go's linker signs
-it ad hoc, so it runs. Proton's CLI is notarized, and a quarantined copy of it ran normally.
+aborted session` (measured once, with the attribute a Safari download sets, M18). Confirm the
+attribute before you act on it: `xattr -p com.apple.quarantine ~/.local/bin/git-remote-proton`
+prints it, or reports `No such xattr`. Rebuild from the tag rather than run a file whose origin you
+do not know. Removing the attribute, `xattr -d com.apple.quarantine <file>`, is what made a
+known-good copy run in the probes (M20). A helper you build yourself carries no quarantine
+attribute, and Go's linker signs it ad hoc, so it runs (measured, M9). Proton's CLI is notarized,
+and a quarantined copy of it ran normally (measured, M3 and M19).
 
 ### Scheduled use on macOS (v2)
 
@@ -381,8 +385,8 @@ physical path (as `pwd -P` prints it) and the remote's name. The marker names th
 remote and each push that failed, and the next successful run for the same repository and remote
 removes it. git's own output is in the two log files the plist names.
 
-- **A refusal is a stop, not a transient.** If the log shows the helper refusing a ref, or the
-  whole push, the next run will refuse it again. Repair what the message names (see
+- **A refusal needs a repair before the next run.** If the log shows the helper refusing a ref,
+  or the whole push, the next run will refuse it again, so repair what the message names (see
   [Honest limits](#honest-limits)) before you count on that backup.
 - **A push that runs past its limit is ended**, with its whole process group (git, the helper and
   the CLI), and counts as a failure. It may leave the remote's lock behind, and the next push then
@@ -583,11 +587,15 @@ download them; you don't need this tool, or even a Windows machine, to get your 
     case variant sits in a skipped file is not checked, because skipped names never reach a clone,
     so a push can create the other half of a pair there; the pair becomes visible to clones once
     the file is repaired.
-  - **Repair a pair** by deleting one member from Windows, Linux or a `reftable` clone (`git push
-    proton-v2 --delete Main`). A Mac `files` clone that holds the other member's tracking ref
-    refuses that delete; on a Mac, follow [the repair on macOS](#honest-limits-on-macos-v2). A
-    remote that already holds a pair keeps taking pushes to its other refs, but under a directory
-    pair (`Feat/a` beside `feat/b`) a new ref under either spelling is refused until the pair is
+  - **Repair a pair** by deleting one member from Linux or a `reftable` clone (`git push
+    proton-v2 --delete Main`). Do not use a Windows `files` clone for a letter-case pair: NTFS
+    ignores case, so git's cleanup of the deleted name's tracking ref plausibly unlinks the other
+    member's loose tracking ref there, as it does on a Mac [inference; not measured on NTFS].
+    Windows is a route only for a pair that differs by normalisation alone, which NTFS keeps
+    apart [inference]. A Mac `files` clone that holds the other member's tracking ref refuses
+    the delete; on a Mac, follow [the repair on macOS](#honest-limits-on-macos-v2). A remote that
+    already holds a pair keeps taking pushes to its other refs, but under a directory pair
+    (`Feat/a` beside `feat/b`) a new ref under either spelling is refused until the pair is
     repaired.
 - **v2: refs that differ only by Unicode normalisation (two spellings of `café`).** An accented
   letter can be stored as one character (NFC, `é`) or as a plain letter followed by a combining
@@ -673,8 +681,11 @@ case. They apply where git keeps each ref as a file, so that APFS can take two n
     `git clone`, `git ls-remote` and `git push` print `git-remote-proton: warning: this remote
     holds refs that differ only by letter case or Unicode normalisation; see README, Honest
     limits:`, then one line per pair with both names, their object IDs, their escaped spellings
-    and the relation. Off a Mac it blocks nothing. When the helper refuses instead, as below, or
-    cannot make one of its local reads, the refusal is printed and the warning is not.
+    and the relation. Off a Mac it blocks nothing. When the helper refuses the whole session
+    before git sees the ref list (either fetch refusal below, the push refusal for up-to-date
+    refs, or a local read that fails at that point), the refusal is printed and the warning is
+    not. Refusals of single refs in a push, and a local read that fails once the push itself has
+    begun, come after the warning has printed.
 - **What a Mac `files` repository refuses, and what to do about it.** On a Mac, inside a
   repository whose ref store is `files` (git's default; `git rev-parse --show-ref-format` prints
   which one a repository uses), the helper refuses what APFS would confuse. A `reftable`
@@ -689,19 +700,40 @@ case. They apply where git keeps each ref as a file, so that APFS can take two n
     or, with pruning configured (`remote.<name>.prune`, else `fetch.prune`), a ref it could prune
     collides with one that stays: `refusing to fetch on this Mac: refs this fetch would write or
     prune collide with each other or with refs this repository holds (README, Honest limits):`.
-    For a stale local ref, delete that one ref by its exact bytes, which `git update-ref --stdin`
-    reads without precomposing them: `printf 'delete refs/remotes/proton-v2/cafe\314\201\n' | git
-    update-ref --stdin`. Or re-clone with `--ref-format=reftable`. For two remote refs whose mapped
-    names collide, change the remote's fetch refspecs, or use a `reftable` clone.
+    The message ends `use a --ref-format=reftable clone, or change the remote's fetch refspecs; to
+    repair a stale local ref in place, follow the README (a plain delete can unlink the other
+    spelling's ref)`.
+    - **For a stale local ref, re-clone with `--ref-format=reftable`.** To repair the ref in place
+      instead, run both of these commands, in this order (measured 2026-10-28 with git 2.54.0 on
+      APFS, in three ref layouts); the second line removes an NFD tracking ref of `café`:
+
+      ```bash
+      git -c core.precomposeunicode=false pack-refs --all
+      printf 'delete refs/remotes/proton-v2/cafe\314\201\n' | git update-ref --stdin
+      ```
+
+      Both are required. A delete on its own is not safe: while the other spelling's ref is a
+      loose file, APFS resolves both names to that one file and git unlinks it, so the other ref
+      rewinds to a stale packed value, or disappears, and `git fsck` reports nothing. Packing
+      every ref first leaves no loose file for the delete to unlink [inference], and in each
+      measured layout only the named ref went. The `-c` is required too: under git's Mac default, `core.precomposeunicode=true`, `pack-refs`
+      re-spells the NFD ref in NFC and can overwrite the NFC ref's value. `git update-ref` reads
+      the name from its input, so the shell's bytes reach it unchanged.
+    - **For two remote refs whose mapped names collide,** change the remote's fetch refspecs, or use
+      a `reftable` clone.
   - **A whole push is refused when an up-to-date ref would rewrite a colliding tracking ref.**
     After a push, git rewrites the tracking ref of every ref the push matched by name, even one
-    that was already up to date ("Everything up-to-date"), and the helper never hears about that
-    ref. So when a ref the remote has and this repository holds under the same name has a tracking
-    ref that collides with another local ref, the helper refuses the push session: `refusing to
-    push on this Mac: git would rewrite tracking refs that collide with refs this repository holds,
-    even for refs that are already up to date (README, Honest limits):`. While that stale ref
-    stands, no push from this clone runs. Delete it by its exact bytes, as above, or push from a
-    `reftable` clone.
+    that was already up to date ("Everything up-to-date"), and git does not tell the helper about
+    those refs. Take `main`, held both on the remote and in this repository: after any push that
+    matches it, git rewrites `refs/remotes/proton-v2/main`. If that tracking ref collides with
+    another local ref, such as a stale `refs/remotes/proton-v2/Main` left by an earlier fetch, the
+    helper refuses the whole push session: `refusing to push on this Mac: git would rewrite
+    tracking refs that collide with refs this repository holds, even for refs that are already up
+    to date (README, Honest limits):`, then the collisions, ending `push from a
+    --ref-format=reftable clone; to repair the stale local ref in place, follow the README (a
+    plain delete can unlink the other spelling's ref)`. While that stale ref stands, no push from
+    this clone runs. Push from a `reftable` clone, or repair the stale ref in place with the same
+    two commands as above, in the same order; both are required.
   - **Single refs in a push are refused, and the rest of the push goes on,** each with a message
     that names this Mac as the reason. A create or update is refused when its tracking ref would
     collide with a local ref or with another pushed ref's tracking ref. An update is also refused
@@ -760,17 +792,20 @@ case. They apply where git keeps each ref as a file, so that APFS can take two n
   warning above, and anything the helper cannot read stops the scan with an error. Inside any
   repository's tree git tells the helper which repository it is in, and in a `files` repository
   the scan becomes a fetch check against that repository's refs.
-- **Repairing a pair, on a Mac.** Delete one member from Windows, Linux or a `reftable` clone; a
-  Mac `files` clone that holds the other member's tracking ref refuses the delete. Deleting from
-  such a clone is what the helper prevents: git's cleanup of the deleted name's tracking ref can
-  unlink the surviving member's file, which APFS takes for the same name, and rewind that ref to an
-  old packed value with `git fsck` reporting nothing (measured). The repair, in order:
+- **Repairing a pair, on a Mac.** Delete one member from Linux or a `reftable` clone, or from
+  Windows only when the pair differs by normalisation alone (see the letter-case item above for
+  why); a Mac `files` clone that holds the other member's tracking ref refuses the delete.
+  Deleting from such a clone is what the helper prevents: git's cleanup of the deleted name's
+  tracking ref can unlink the surviving member's file, which APFS takes for the same name, and
+  rewind that ref to an old packed value with `git fsck` reporting nothing (measured). The repair,
+  in order:
   1. Record both members' names and object IDs; the warning prints them.
   2. Make a temporary clone with `--ref-format=reftable`, which the refusal allows and whose refs
      APFS cannot merge.
   3. In it, delete one member by its exact bytes, because a typed name is stored in NFC: run
      `git config core.precomposeunicode false`, then for example `git push proton-v2
-     ":$(printf 'refs/heads/cafe\314\201')"`. Or delete it from a Windows or Linux client.
+     ":$(printf 'refs/heads/cafe\314\201')"`. Or delete it from a Linux client, or, for a pair
+     that differs by normalisation alone, a Windows one.
   4. Then, on every Mac clone of that remote, recover what only that clone holds before `git gc`
      can drop it: any commit `git fsck` reports dangling, and any branch you never pushed. Then
      re-clone it, with `--ref-format=reftable` or without. The re-clone is not optional: the
@@ -780,7 +815,10 @@ case. They apply where git keeps each ref as a file, so that APFS can take two n
   If a Mac `files` clone pushes the delete of one member together with an update of the other, the
   update is refused, because its tracking ref would share a file with the deleted one's. The
   delete goes through unless it is refused as above, so push the update again once the delete is
-  done.
+  done. But a clone that pushes an update of one member usually holds that member's tracking ref,
+  and then the delete is refused as above too and both halves fail; the push refusal for
+  up-to-date refs can also refuse the whole session before either is judged. That is why the
+  repair runs from a `reftable` clone.
 
 ## Documentation
 

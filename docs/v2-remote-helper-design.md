@@ -1307,9 +1307,21 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
     `remote.<name>.mirror` is not read (MA1). `git ls-remote` inside such a repository is refused
     the same way, and a clone into a `files` store is refused before any ref is written (M28). A
     `reftable` repository, or any `list` with `GIT_DIR` unset, gets the warning only. The remedies
-    follow the cause: for (1), repair the remote or clone with `--ref-format=reftable`; for (2),
-    delete the stale local ref by its exact bytes (`git update-ref --stdin`), change the remote's
-    refspecs, or use a `reftable` clone.
+    follow the cause: for (1), repair the remote or clone with `--ref-format=reftable`; for a
+    stale local ref (2), re-clone with `--ref-format=reftable`, or, in place, run `git -c
+    core.precomposeunicode=false pack-refs --all` and only then delete the stale ref by its exact
+    bytes (`printf 'delete <ref>\n' | git update-ref --stdin`), both required and in that order
+    (MA3, measured 2026-10-28 with git 2.54.0 in three ref layouts). A bare delete is not safe:
+    with the other spelling's ref loose, APFS resolves both names to that file, git unlinks it,
+    and that ref falls back to a stale packed value or vanishes, with `git fsck` clean; without
+    the `-c`, `pack-refs` re-spells the NFD ref in NFC and can overwrite the NFC ref. For two
+    destinations aliasing each other (2), change the remote's refspecs or use a `reftable` clone.
+    The two refusal messages name only the re-clone (and the refspec change) and point to the
+    README for the in-place route: the fetch refusal ends "use a --ref-format=reftable clone, or
+    change the remote's fetch refspecs; to repair a stale local ref in place, follow the README (a
+    plain delete can unlink the other spelling's ref)", and the R1 push refusal (below) ends "push
+    from a --ref-format=reftable clone; to repair the stale local ref in place, follow the README
+    (a plain delete can unlink the other spelling's ref)".
   - *Its local reads fail closed.* The ref format, the remote's configuration and the local ref
     names; if any read fails, the helper refuses, naming it. They are the only new git processes,
     and run only on darwin inside a repository.
@@ -1436,13 +1448,16 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   | O5 | all four: the Mac gate last, after the draft Windows helper, never concurrent; a Mac-only failure does not hold the release; a paired PC session runs the Windows side; the Windows and Linux gates test the composition refusal on their own binaries | any of the four left out |
   | O6 | (c) rule 12, an AGENTS.md line, and a shim-resolution check in the test code | (a) the checklist only; (b) the checklist and AGENTS.md |
 
-- **Amendments MA1 and MA2 (2026-10-27, Craig's calls, each accepting the recommended default;
-  copied from the spec).** Both correct a fact the approved spec stated.
+- **Amendments MA1–MA3 (copied from the spec).** Each corrects a fact the approved spec stated,
+  and each is Craig's call. MA1 and MA2 (2026-10-27) accept the recommended default. MA3
+  (2026-10-28) was found by the review of the plan's Task 13, which probed the remedy in scratch
+  repositories; Craig chose option (c) of three, with its before-and-after text in front of him.
 
   | | Ruled | Not taken |
   |---|---|---|
   | MA1 | `remote.<name>.mirror` is not a fetch-destination source: git uses it for push only [doc: `git help config`, git 2.54.0] | keep reading it, a key git never uses for fetch |
   | MA2 | the pin-moving fetch checks the files' version lines and records their SHA-256s, and the data is cross-checked by `NormalizationTest.txt` and the containment test; Unicode publishes no checksums | the original "published checksums" check, which cannot be made |
+  | MA3 | the stale-local-ref remedy: a bare exact-bytes delete can unlink the other spelling's loose ref on APFS (§3, "The refusal's remedies follow its cause"), so the re-clone comes first and the in-place delete runs only after `pack-refs` with precomposition off; the helper's refusal messages name only the re-clone and point to the README for the in-place route [measured 2026-10-28, git 2.54.0: after a real clone and a fetch, the bare delete rewound the other ref to a stale packed value with `git fsck` clean; packed first, only the named ref went] | the bare exact-bytes delete; (a) the re-clone alone, everywhere; (b) the pack-first delete alone |
 
 **v6.9, 2026-10-16 — Linux port: linux/amd64 becomes a supported platform, pushes refuse new case-variant refs, and the git-floor and distro-CLI messages change.**
 

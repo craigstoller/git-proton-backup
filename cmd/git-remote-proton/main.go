@@ -490,8 +490,9 @@ func macFetchCheck(gitDir string, env helperEnv, refs map[string]string, pairs [
 	if len(cs) > 0 {
 		return fmt.Errorf("refusing to fetch on this Mac: refs this fetch would write or prune collide "+
 			"with each other or with refs this repository holds (README, Honest limits):\n%s\n"+
-			"delete the stale local ref by its exact bytes (git update-ref --stdin), change the remote's "+
-			"fetch refspecs, or use a --ref-format=reftable clone", repo.DestLines(cs, refs))
+			"use a --ref-format=reftable clone, or change the remote's fetch refspecs; to repair a stale "+
+			"local ref in place, follow the README (a plain delete can unlink the other spelling's ref)",
+			repo.DestLines(cs, refs))
 	}
 	return nil
 }
@@ -522,8 +523,8 @@ func macPushCheck(gitDir string, env helperEnv, refs map[string]string) error {
 	if len(cs) > 0 {
 		return fmt.Errorf("refusing to push on this Mac: git would rewrite tracking refs that collide "+
 			"with refs this repository holds, even for refs that are already up to date (README, Honest "+
-			"limits):\n%s\ndelete the stale local ref by its exact bytes (git update-ref --stdin), or push "+
-			"from a --ref-format=reftable clone", repo.DestLines(cs, refs))
+			"limits):\n%s\npush from a --ref-format=reftable clone; to repair the stale local ref in place, "+
+			"follow the README (a plain delete can unlink the other spelling's ref)", repo.DestLines(cs, refs))
 	}
 	return nil
 }

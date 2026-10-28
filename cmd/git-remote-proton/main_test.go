@@ -2264,13 +2264,14 @@ const (
 	wantPairRefusalTail = "\nrepair the remote, or clone with --ref-format=reftable\n"
 	wantDestRefusalHead = "git-remote-proton: refusing to fetch on this Mac: refs this fetch would write " +
 		"or prune collide with each other or with refs this repository holds (README, Honest limits):\n"
-	wantDestRefusalTail = "\ndelete the stale local ref by its exact bytes (git update-ref --stdin), " +
-		"change the remote's fetch refspecs, or use a --ref-format=reftable clone\n"
+	wantDestRefusalTail = "\nuse a --ref-format=reftable clone, or change the remote's fetch refspecs; " +
+		"to repair a stale local ref in place, follow the README (a plain delete can unlink the other " +
+		"spelling's ref)\n"
 	wantPushRefusalHead = "git-remote-proton: refusing to push on this Mac: git would rewrite tracking " +
 		"refs that collide with refs this repository holds, even for refs that are already up to " +
 		"date (README, Honest limits):\n"
-	wantPushRefusalTail = "\ndelete the stale local ref by its exact bytes (git update-ref --stdin), " +
-		"or push from a --ref-format=reftable clone\n"
+	wantPushRefusalTail = "\npush from a --ref-format=reftable clone; to repair the stale local ref in " +
+		"place, follow the README (a plain delete can unlink the other spelling's ref)\n"
 )
 
 // macOriginDefault is a remote "origin" as `git remote add` writes it.
