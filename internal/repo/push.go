@@ -335,10 +335,11 @@ func Push(t transport.Transport, root, gitDir string,
 	// valid non-delete whose dst is absent from the PRE-BATCH advertised set
 	// (isCreate), is refused when a prefix of it is spelled differently from,
 	// but folds equal to, a prefix of another ref in the set it would join
-	// (caseConflicts; Unicode simple folding, as strings.EqualFold). This
-	// applies on every platform, by the precedent of the Windows device names
-	// (windowsReserved, marker.go): a repo stays usable from every machine,
-	// whichever one pushed first. Updates and replacements (a same-batch
+	// (caseConflicts; Unicode simple case folding at the pinned version,
+	// unicodeVersion, not Go's own tables). This applies on every platform,
+	// by the precedent of the Windows device names (windowsReserved,
+	// marker.go): a repo stays usable from every machine, whichever one
+	// pushed first. Updates and replacements (a same-batch
 	// delete and recreate of a name already on the remote) are never refused,
 	// neither half of a replacement, since they add no spelling the remote did
 	// not already have; nor is anything checked against skipped names, which

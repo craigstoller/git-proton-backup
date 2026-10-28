@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 )
 
@@ -14,11 +13,13 @@ import (
 // refuses, on every platform, a create that would add such a pair. The
 // helpers here are the rule's pure half; Push's phase 2 applies them.
 
-// caseKey maps s to a key that two strings share exactly when
-// strings.EqualFold calls them equal (Unicode simple folding, not ASCII and
-// not full folding: "ß" and "SS" stay distinct). Each valid rune becomes the
-// smallest rune in its unicode.SimpleFold orbit, which is a canonical member
-// of the equivalence class EqualFold tests.
+// caseKey maps s to a key that two strings share exactly when Unicode simple
+// case folding at the pinned version (unicodeVersion) calls them equal: not
+// ASCII, and not full folding, so "ß" and "SS" stay distinct. Each valid rune
+// becomes its simple folding target (foldRune: the C or S entry of
+// CaseFolding.txt, or the rune itself), which every member of a fold class
+// shares. The table is the generated pinned one, never Go's own, so every
+// build keys alike whatever Go compiled it (spec 2026-10-27, section 3).
 //
 // Invalid UTF-8 bytes are copied through unfolded. strings.EqualFold decodes
 // every invalid byte to U+FFFD and so calls "a\xffb" and "a\xfeb" equal;
@@ -34,23 +35,10 @@ func caseKey(s string) string {
 			i++
 			continue
 		}
-		b.WriteRune(minFold(r))
+		b.WriteRune(foldRune(r))
 		i += size
 	}
 	return b.String()
-}
-
-// minFold returns the smallest rune in r's simple-folding orbit.
-// unicode.SimpleFold walks the orbit in increasing order and wraps, so the
-// loop visits every member exactly once before returning to r.
-func minFold(r rune) rune {
-	m := r
-	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
-		if f < m {
-			m = f
-		}
-	}
-	return m
 }
 
 // refPrefixes returns ref's component chains from the namespace component
