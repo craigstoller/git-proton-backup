@@ -138,7 +138,7 @@ set -u
 source "$HOME/gpb010/${1:?no run named}/env.sh" || exit 1
 cd "$G/nfd" || exit 1
 NFD=$'cafe\xcc\x81'
-echo "dst bytes: $(printf '%s' "refs/heads/$NFD" | od -An -tx1 | tr -d '[:space:]')"
+echo "dst as the script passes it: $(printf '%s' "refs/heads/$NFD" | od -An -tx1 | tr -d '[:space:]')"
 git push proton-v2 "main:refs/heads/$NFD"; rc=$?
 echo "push main:<the NFD name>: exit $rc (expected 1: refused)"
 echo "refs/heads (WSL view): $(names "$NFDL/refs/heads")"
@@ -155,8 +155,11 @@ Compare-Snapshot nfd-0 nfd-1
 
 **Pass:** all of the following hold.
 
-- `dst bytes:` ends `63616665cc81`, and `EXIT sN2-nfd-create = 1`.
-- `EXPECTED LINE: FOUND`: the refusal names both spellings and the relation, exactly as above.
+- `dst as the script passes it:` ends `63616665cc81` (the bytes bash hands git, no more), and
+  `EXIT sN2-nfd-create = 1`.
+- `EXPECTED LINE: FOUND`: the refusal names both spellings and the relation, exactly as above. It
+  is also what shows the bytes git sent the helper: the helper names the destination it
+  received, and the escaped view reads `cafe<U+0301>` only if it arrived as NFD.
 - **Nothing written, the v0.10.0 shape:** `COMPARE nfd-0 -> nfd-1: NO DIFFERENCE`, and the WSL
   view, from the session that pushed, agrees: `refs/heads (WSL view)` lists `main` and the NFC name
   (`names` prints it raw: one name of the two, never both) and `packs (WSL view)` N.1's one pair.
@@ -210,7 +213,7 @@ Assert-Run
 Test-WindowsHelper -Require
 $x = Join-Path $G 'w' 'pnfd'
 $NFD = "cafe$([char]0x0301)"
-"dst bytes: $(([Text.Encoding]::UTF8.GetBytes("refs/heads/$NFD") | ForEach-Object { $_.ToString('x2') }) -join '')"
+"dst as PowerShell encodes it (UTF-8): $(([Text.Encoding]::UTF8.GetBytes("refs/heads/$NFD") | ForEach-Object { $_.ToString('x2') }) -join '')"
 $out = @(git -C $x push proton-v2 "main:refs/heads/$NFD" 2>&1 | ForEach-Object { "$_" }); $rc = $LASTEXITCODE
 [IO.File]::WriteAllLines((Join-Path $G 'log' 'composition-create.txt'), [string[]]$out, [Text.UTF8Encoding]::new($false))
 "push main:<the NFD name>: exit $rc (expected 1: refused) ($(Get-Date -Format o))"
@@ -222,9 +225,9 @@ Compare-Snapshot nfd-0 nfd-1
 
 **Pass:** all of the following hold.
 
-- `dst bytes:` ends `63616665cc81`: Git for Windows received the NFD bytes PowerShell passed
-  [inference that it converts wide arguments to UTF-8 unchanged; this line and the refusal show
-  it].
+- `dst as PowerShell encodes it` ends `63616665cc81`. That is PowerShell's own encoding, no more;
+  that Git for Windows passed those bytes on unchanged is [inference] (it reads its arguments as
+  wide strings and converts them to UTF-8), and the refusal text below is what shows it.
 - `exit 1` and `EXPECTED LINE: FOUND`, as on Linux, character for character: the same rule on the
   Windows binary.
 - **Nothing written:** `COMPARE nfd-0 -> nfd-1: NO DIFFERENCE`. The Windows session is the one that
