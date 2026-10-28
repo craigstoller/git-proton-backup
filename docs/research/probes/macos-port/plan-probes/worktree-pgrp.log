@@ -1,0 +1,15 @@
+worktree git dir: main/.git/worktrees/wt
+== -C main/.git
+  format: files (exit 0)
+  url:    /nonexistent (exit 0)
+  refs:   refs/heads/master refs/heads/wtbranch refs/remotes/origin/x 
+== -C main/.git/worktrees/wt
+  format: files (exit 0)
+  url:    /nonexistent (exit 0)
+  refs:   refs/heads/master refs/heads/wtbranch refs/remotes/origin/x 
+== bash 3.2.57(1)-release: set -m and process groups
+  wrapper pgid=15765  job pid=15794 pgid=15794  grandchild pgid=15794
+$SP/helperprobe/worktree-pgrp.sh: line 30: 15794 Terminated: 15          ( sleep 300 & echo $! > "$W/grandchild.pid"; sleep 300 )
+  pid 15794 gone
+  pid 15796 gone
+  wrapper still running: yes (this line printed)

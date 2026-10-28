@@ -1,0 +1,38 @@
+remote refs (hex):
+3ec84d6 726566732f68656164732f63616665cc81
+09560c8 726566732f68656164732f636166c3a9
+598dfbc 726566732f68656164732f6d61696e
+  clone: warning: remote HEAD refers to nonexistent ref, unable to checkout
+== case A: ref format files
+  loose files under refs/remotes/origin:
+  local refs before (hex):
+    3ec84d6 726566732f72656d6f7465732f6f726967696e2f63616665cc81
+    09560c8 726566732f72656d6f7465732f6f726967696e2f636166c3a9
+    598dfbc 726566732f72656d6f7465732f6f726967696e2f6d61696e
+  push: To $SP/delprobe/work/remote.git
+  push:  - [deleted]         café
+  push exit: 0
+  local refs after (hex):
+    09560c8 726566732f72656d6f7465732f6f726967696e2f636166c3a9
+    598dfbc 726566732f72656d6f7465732f6f726967696e2f6d61696e
+  remote refs after (hex):
+    09560c8 726566732f68656164732f636166c3a9
+    598dfbc 726566732f68656164732f6d61696e
+  clone: warning: remote HEAD refers to nonexistent ref, unable to checkout
+== case B: ref format files
+  loose files under refs/remotes/origin:
+    636166c3a9
+  local refs before (hex):
+    3ec84d6 726566732f72656d6f7465732f6f726967696e2f63616665cc81
+    598dfbc 726566732f72656d6f7465732f6f726967696e2f636166c3a9
+    598dfbc 726566732f72656d6f7465732f6f726967696e2f6d61696e
+  push: To $SP/delprobe/work/remote.git
+  push:  - [deleted]         café
+  push exit: 0
+  local refs after (hex):
+    09560c8 726566732f72656d6f7465732f6f726967696e2f636166c3a9
+    598dfbc 726566732f72656d6f7465732f6f726967696e2f6d61696e
+  remote refs after (hex):
+    09560c8 726566732f68656164732f636166c3a9
+    598dfbc 726566732f68656164732f6d61696e
+hex key: NFC=636166c3a9 NFD=63616665cc81

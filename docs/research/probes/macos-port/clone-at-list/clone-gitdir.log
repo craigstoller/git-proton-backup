@@ -1,0 +1,8 @@
+clone (default): ARGS: origin x GIT_DIR=$W/plain/new-default/.git PWD=$W/plain
+    IN: list
+    LISTFMT: files (exit 0)
+    LISTFETCH: 
+clone (reftable): ARGS: origin x GIT_DIR=$W/plain/new-reftable/.git PWD=$W/plain
+    IN: list
+    LISTFMT: reftable (exit 0)
+    LISTFETCH: 

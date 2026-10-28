@@ -1,0 +1,9 @@
+--- git remote add 'a:b':
+fatal: 'a:b' is not a valid remote name
+exit 128
+--- hand-written [remote "a:b"] in .git/config, then ls-remote a:b:
+exit 128
+  stderr: fatal: invalid refspec '+refs/heads/*:refs/remotes/a:b/*'
+--- git config --get on an anonymous URL's would-be key:
+exit 1
+exit 1

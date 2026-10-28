@@ -1,0 +1,17 @@
+warning: remote HEAD refers to nonexistent ref, unable to checkout
+A=f202c20 B=4bf563e
+== case 1: tracking ref main deliberately stale at A; local main == remote main == B
+  push: error: src refspec main does not match any
+  push: error: failed to push some refs to '$SP/delprobe/w-uptodate/remote.git'
+  refs/remotes/origin/main now: f202c20
+== case 2: local branch NFC == remote NFC == A; a stale loose NFD tracking ref at B
+  before:
+    4bf563e 726566732f72656d6f7465732f6f726967696e2f63616665cc81
+    f202c20 726566732f72656d6f7465732f6f726967696e2f636166c3a9
+    f202c20 726566732f72656d6f7465732f6f726967696e2f6d61696e
+  push: Everything up-to-date
+  after:
+    f202c20 726566732f72656d6f7465732f6f726967696e2f63616665cc81
+    f202c20 726566732f72656d6f7465732f6f726967696e2f636166c3a9
+    f202c20 726566732f72656d6f7465732f6f726967696e2f6d61696e
+hex: NFC=636166c3a9 NFD=63616665cc81

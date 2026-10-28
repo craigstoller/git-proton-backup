@@ -1,0 +1,14 @@
+ARGS: origin x GIT_DIR=$SP/helperprobe/w4/plain/new-reftable/.git PWD=$SP/helperprobe/w4/plain
+IN: capabilities
+IN: option progress false
+IN: option verbosity 1
+IN: list
+LISTFMT: reftable (exit 0)
+LISTFETCH: 
+LISTCONFIG: remote.origin.url logtest::x; REFS: 0
+IN: option cloning true
+IN: fetch 0123456789012345678901234567890123456789 refs/heads/main
+FETCH-COMMAND-RECEIVED
+IN: fetch 0123456789012345678901234567890123456789 refs/heads/main
+FETCH-COMMAND-RECEIVED
+IN: 

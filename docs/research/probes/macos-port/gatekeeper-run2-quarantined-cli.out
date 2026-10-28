@@ -1,0 +1,1 @@
+git-remote-proton: stat /my-files/GitRemotes/probe-does-not-exist/gpb-remote.json: info /my-files/GitRemotes/probe-does-not-exist/gpb-remote.json failed: You need to login first: exit status 1
