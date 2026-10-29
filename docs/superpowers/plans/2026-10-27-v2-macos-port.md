@@ -1400,3 +1400,88 @@ package gets the trap too.
 Subagent-driven, task by task, a fresh reviewer per task, then a whole-branch review. Tasks 5, 8 and
 9 change refusal behaviour that every platform's release ships; a defect there reaches Windows and
 Linux users, not only the Mac.
+
+## Execution notes, 2026-10-27 to 2026-10-28
+
+A dated record of the rulings made while this plan ran (subagent-driven, task by task, with a
+review after each task and a whole-branch review at the end). Each one changed or superseded the
+task text above, which is left as written. Where they differ, the note and the code win. Each is
+the executor's call unless it says Craig's. The working ledger behind them is not part of the
+repository.
+
+**Craig's calls during execution.**
+- **P6, 2026-10-27:** "Run this plan's Pester and PSScriptAnalyzer commands in my Terminal panel
+  (Tasks 12 and 13 only), each preceded by the proton-drive PATH check." The session's harness
+  refused every `pwsh` run, so Task 0's route (a) could not run as written. Not taken: deferring
+  the Pester runs to CI; allowing `pwsh` in the session's permissions.
+- **MA3, 2026-10-28, option (c):** the stale-local-ref remedy. A bare exact-bytes delete can
+  unlink the other spelling's loose ref on APFS (measured; record in
+  `docs/research/probes/macos-port/stale-ref-remedy/`). The helper's two refusal messages and the
+  gate name only the `reftable` re-clone. The spec and README give the re-clone first, then the
+  pack-first delete. This supersedes the message tails quoted in Task 8 (`:796`, `:806`) and the
+  remedy Task 13 was to document. The spec carries MA3 in its Amendments table. Not taken: (a)
+  the re-clone alone everywhere; (b) the pack-first delete alone.
+
+**Refinements of the push rule and the read rules.**
+- **R7 (T9-1), a refinement under O3(d):** part 1(a) also refuses an *update* whose tracking ref
+  aliases a still-valid same-batch delete's tracking ref; a create is not refused. It was measured
+  with git 2.54.0, which processes the update first and loses its tracking ref. This supersedes
+  Task 9's wording at `:905`, `:915` and `:970-971`. The README and the design doc (v6.10) carry
+  R7, and the gate brief records why no §6 step can provoke it.
+- **T9-2:** when both halves of part 1 fire, the second clause reads "the remote holds", with no
+  doubled "also".
+- **T8-2:** when the local repository holds no refs, the checks use the configured fetch specs
+  plus git's default mapping, because git adds that mapping to a `-c` fetch spec during clone. It
+  supersedes `:163-164` and `:773-774`. Cost: an empty non-clone repository with custom fetch specs
+  can be over-refused (the README says so).
+- **T8-1:** the pair warning keeps the `git-remote-proton: ` prefix every helper line carries.
+- **T6-1:** `LocalRefs` fails closed on any stderr after exit 0. `TestLocalRefsIgnoresStderr`
+  (`:624`) became a RED test expecting that error.
+- **T6-2, an accepted limit:** a dangling symbolic local ref is invisible to every git enumerator.
+  A destination written through one is unseen. The common case is still caught: a dangling
+  `refs/remotes/<r>/HEAD` after a prune meets R6's synthesized `<p>/HEAD`. A loose-ref walk would
+  amend spec §3; that is Craig's call.
+- **T3-1:** Task 3 also pins that no rune folds to or from `/`.
+- **T12-2:** the drift check's macOS leg mirrors the Linux leg as built. An uppercase hash passes
+  the format check and is a MISMATCH, not the STOP Task 12's Interfaces said. The existing Linux
+  test pins that behaviour.
+
+**Tasks 11 to 15.**
+- **P4:** Task 11 Step 4's push and draft PR are deferred and merged with Task 15 Step 4. CI has
+  not run on this branch; the plan's "passing CI on the exact final commit" waits for that push.
+- **T11-1:** the Go 1.22 leg also runs the containment test with `-v`, so the merged-class count
+  is in the log.
+- **T12-1:** the macOS CLI's fresh download, needed to record its SHA-512, went to a scratch
+  folder. It was only hashed, never run, then deleted. The live feed, spec M2 and the download
+  agree (2026-10-27).
+- **T13-1 to T13-5:**
+  - the design doc v6.10 copies in R1–R7 and states T6-2 and T8-2 (not only R1–R5);
+  - the README and CHANGELOG prose had house style's pass and its detector, run from this Mac;
+  - the README routes a letter-case pair's repair to Linux or a `reftable` clone, and Windows only
+    for a normalisation-only pair [inference: NTFS ignores case and keeps normalisation];
+  - MA3's probe is committed as its record.
+- **T14-1 to T14-5:** Task 14 copied what it lists plus the two `nfd-run1*.log` outputs. It added
+  `//go:build ignore` to the copied Go files, because `go vet ./...` failed on two `func main`.
+  `run1-default/` (it holds a client UID) and `version.out` stayed out. Scratch paths became `$SP`.
+- **P5 and T15-1 to T15-5:**
+  - Task 15's implementer wrote the two documents;
+  - the executor ran Step 3's full-panel review: Codex, Gemini, DeepSeek and Kimi, three rounds,
+    the skill's cap, with five fix rounds;
+  - the brief was re-anchored after Tasks 12 and 13;
+  - its PowerShell is unparsed on the Mac, so the parse is a PC-side check;
+  - the brief carries 13 questions for Craig, each with a default.
+- **The final review's fixes:** see the commits after `7c9aca7`. Among them, the lone-NFD finding
+  (measured 2026-10-28; record in `docs/research/probes/macos-port/lone-nfd-default/`): at the Mac
+  default `core.precomposeunicode=true`, git reports a loose NFD ref name precomposed. A lone NFD
+  branch's second update then fails in git itself. The code keeps git's view, and a test pins the
+  helper's refusal; whether to change that is Craig's call.
+
+**What this record does not settle.** Five spec texts wait on Craig, each with its before and
+after text:
+- M28's plain-clone-only text;
+- §3 repair step 3's "a Windows or Linux client" for any pair;
+- the MA3 row's "with `git fsck` clean" (L8 shows fsck exiting 0 while listing the lost commit as
+  dangling), copied into the design doc's v6.10 entry;
+- §3's lone-NFD premise ("corrupts nothing"), false at git's Mac default (measured above);
+- the push rule's termination bound, "(updates + 1)": a round can continue on a part-3 delete
+  alone, so the bound that holds is entries + 1.

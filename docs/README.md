@@ -34,7 +34,7 @@ Feature work is specified and planned in dated pairs under [superpowers/](superp
 - [superpowers/specs/2026-10-15-v2-linux-port-design.md](superpowers/specs/2026-10-15-v2-linux-port-design.md) - The Linux port of `git-remote-proton`: the findings behind it (F1–F14), the case-variant ref rule, the install and gate design, and Craig's rulings D1–D8. Approved 2026-10-16; its design record is v6.9 of the v2 design doc.
 - [superpowers/plans/2026-10-16-v2-linux-port.md](superpowers/plans/2026-10-16-v2-linux-port.md) - The 12-task implementation plan for that spec.
 - [superpowers/specs/2026-10-27-v2-macos-port-design.md](superpowers/specs/2026-10-27-v2-macos-port-design.md) - The macOS port of `git-remote-proton`: the findings behind it (M0–M29), the canonical-equivalence rule, the Mac refusals and the repair, scheduled use, the one live macOS gate, and Craig's rulings MD1–MD8 and O1–O6. Approved 2026-10-27; its design record is v6.10 of the v2 design doc.
-- [superpowers/plans/2026-10-27-v2-macos-port.md](superpowers/plans/2026-10-27-v2-macos-port.md) - The 15-task implementation plan for that spec, with its refinements R1–R6.
+- [superpowers/plans/2026-10-27-v2-macos-port.md](superpowers/plans/2026-10-27-v2-macos-port.md) - The 15-task implementation plan for that spec, with its refinements R1–R6, and its execution notes, which add R7 and record every ruling made while it ran.
 
 ## Conventions
 
