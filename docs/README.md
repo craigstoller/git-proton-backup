@@ -1,6 +1,6 @@
 # git-proton-backup Docs
 
-**Living reference. Last updated: 2026-10-28.** Update this index when a doc is added, renamed, retired, or superseded — not on a review calendar.
+**Living reference. Last updated: 2026-10-29.** Update this index when a doc is added, renamed, retired, or superseded — not on a review calendar.
 
 This repo ships two tools that share one version line; each has its own design doc.
 
