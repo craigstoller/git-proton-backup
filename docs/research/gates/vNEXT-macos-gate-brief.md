@@ -205,11 +205,12 @@ that others depend on comes first.
 14. **A step 5 sub-step with a clone left at git's Mac default?** Default: no new live step; the
     hermetic tests cover the helper's side
     (`TestLoop_ListAtTheMacDefaultRefusesALoneNFDBranchAfterItsFirstFetch` and
-    `TestLocalRefsAtTheMacDefaultReportsALooseNFDNamePrecomposed`). Reason: every step 5 clone
-    sets `core.precomposeunicode=false` (`exact_bytes`), so the gate never runs under the default,
-    where git reports loose ref names precomposed; git's side of that was measured on local
-    repositories [measured 2026-10-28: `docs/research/probes/macos-port/lone-nfd-default/`], and
-    gate content is his to add.
+    `TestLocalRefsAtTheMacDefaultReportsALooseNFDNamePrecomposed`). Reason: some step 5 clones
+    run at git's Mac default (`case-clone` at 5.3, `ren-clone` until 5.9.2, `mp1-clone` at 5.9.1,
+    `mp1-fresh` at 5.10), but no step builds a lone NFD branch and fetches it incrementally there,
+    the case in which git reports a loose NFD ref name precomposed; git's side of that was measured
+    on local repositories [measured 2026-10-28: `docs/research/probes/macos-port/lone-nfd-default/`],
+    and gate content is his to add.
 
 ---
 
@@ -2126,7 +2127,8 @@ PC, whose W.B.0 blob must equal it), `RUN STARTED: probe-a1 ...`, then
   probe CLI's SHA-512 is that value (M2). A missing constant means plan Task 12 has not landed:
   STOP for Craig. `BLOCKED: the download failed` may mean that the certified 0.9.0 `darwin-arm64`
   artifact is gone (the README warns its versioned URL may stop serving once Proton moves on
-  [README]), or may be a transient failure; `... not the certified build` means it was re-cut.
+  [README]), or may be a transient failure; `... not the certified build` may mean it was re-cut,
+  or that the download or its install was damaged.
   Either is a STOP for Craig before the tag; a gone or re-cut CLI needs a new pin, M2 and README
   quote, and the brief is revised first;
 - no quarantine attribute (M2: a `curl` download carries none), and `codesign` prints Proton's
@@ -3153,9 +3155,9 @@ ref(s), HEAD left out)`.
   step sets it back to `false` before it names a spelling by bytes. Under that default git also
   reports loose ref names precomposed, so that after a lone NFD branch's first incremental fetch
   it lists a phantom NFC tracking ref beside the stale NFD one [measured 2026-10-28, local
-  repositories: `docs/research/probes/macos-port/lone-nfd-default/`], and the gate's clones, all
-  set to `false`, do not exercise that setting; a sub-step at the default is Craig's call
-  (Question 14).
+  repositories: `docs/research/probes/macos-port/lone-nfd-default/`]. The clones this rule sets to
+  `false` do not exercise that; the clones left at the default (Question 14 names them) hold no
+  lone NFD branch, so no step does. A sub-step at the default is Craig's call (Question 14).
 - **Seeded with `main`.** Each remote of its own is seeded with a push of `main` alone first, so its
   `HEAD` names `main` and deleting a `cafe` spelling is never the `HEAD`-branch delete the helper
   refuses [code `internal/repo/push.go:192-196`].
