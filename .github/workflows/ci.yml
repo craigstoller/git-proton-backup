@@ -198,7 +198,7 @@ jobs:
         # the committed tables cannot drift from their generator. One leg
         # only; keyed on that leg's matrix values, not on the runner OS, so a
         # future matrix entry cannot move it.
-        run: cd internal/repo && go generate . && git diff --exit-code && test -z "$(git status --porcelain .)"
+        run: cd internal/repo && go generate . && git diff --exit-code && { test -z "$(git status --porcelain .)" || { git status --porcelain .; exit 1; }; }
       - name: gofmt
         if: runner.os != 'Windows'
         shell: bash
