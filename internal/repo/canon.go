@@ -16,7 +16,9 @@ import (
 // by gen_unicode.go from the files committed under unicodedata/<version>/, with
 // no network. Moving the pin is: run fetch_unicode.go (by hand, it is the only
 // code that touches the network), change -version below, run go generate, and
-// delete the old unicodedata directory.
+// delete the old unicodedata directory. Then update canon_test.go's pinned
+// constants: pinnedUnicodeInputs' sizes and SHA-256s, and the version its test
+// requires.
 //
 //go:generate go run gen_unicode.go -version 17.0.0
 

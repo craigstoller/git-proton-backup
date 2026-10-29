@@ -2100,6 +2100,41 @@ func TestPushPreflightDFAgainstExistingRefs(t *testing.T) {
 	}
 }
 
+// TestPushDFPreflightNamesTheSmallestConflictingRef is RED (final review, m3).
+// When a create conflicts with several refs, the D/F preflight names the
+// smallest of them, so its text never depends on map iteration order. It now
+// re-runs every outer round, so the same batch must read the same way each
+// time. Eight refs sit beneath the create, so a text that took the first
+// conflict in map order would be unlikely to name feature/a twenty times.
+func TestPushDFPreflightNamesTheSmallestConflictingRef(t *testing.T) {
+	f := transport.NewFake()
+	f.Dirs["/r"] = true
+	_ = Bootstrap(f, "/r")
+	gitDir := newGitRepoForPush(t)
+	head := headOf(t, gitDir)
+	remote := map[string]string{}
+	for _, leaf := range []string{"h", "c", "f", "a", "g", "d", "b", "e"} {
+		ref := "refs/heads/feature/" + leaf
+		if _, err := WriteRef(f, "/r", ref, head, false); err != nil {
+			t.Fatal(err)
+		}
+		remote[ref] = head
+	}
+
+	ups := []protocol.RefUpdate{{Src: "refs/heads/main", Dst: "refs/heads/feature"}}
+	const want = "refs/heads/feature conflicts with refs/heads/feature/a: a ref cannot be both a leaf " +
+		"and a folder containing other refs"
+	for run := 0; run < 20; run++ {
+		res := Push(f, "/r", gitDir, ups, remote, nil)
+		if len(res) != 1 || res[0].OK {
+			t.Fatalf("run %d: want the create refused, got %+v", run, res)
+		}
+		if res[0].Err != want {
+			t.Fatalf("run %d: Err = %q, want %q", run, res[0].Err, want)
+		}
+	}
+}
+
 // TestPushFinalStateDFPreflightOrderIndependentOfInputOrder is RED (fix
 // round I1, Important): the final-state preflight is SET ALGEBRA (remote
 // minus every valid delete, plus every valid non-delete) and must not depend

@@ -206,6 +206,13 @@ func TestSimpleFoldOrbitsLieInsideGeneratedClasses(t *testing.T) {
 			}
 		}
 	}
+	// A floor, as TestNFDMatchesNormalizationTest has, so that a regression in
+	// assignedIn cannot pass this loop vacuously. Measured 2026-10-28: 3090 on
+	// go1.27.0 (toolchain Unicode 17.0.0). The floor leaves room for Go 1.22's
+	// Unicode 15.0.0 tables, which hold fewer case pairs [inference: not run].
+	if checked < 2500 {
+		t.Fatalf("the containment check covered only %d orbit members (3090 at toolchain Unicode 17.0.0)", checked)
+	}
 
 	// 2. Where the toolchain is at the pin, the converse: one generated class
 	// is one orbit. Group the assigned code points by foldRune and require a

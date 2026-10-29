@@ -106,9 +106,12 @@ func RefFormat(gitDir string) (string, error) {
 // RemoteCfg is what the repository's configuration says about one remote.
 type RemoteCfg struct {
 	// URL is the remote's first remote.<name>.url, the one git fetches from; ""
-	// when none is set (or the value is empty).
+	// when none is set. An empty value clears the values before it, as in git,
+	// so this is the first value after the last empty one, and "" when the
+	// last value is empty.
 	URL string
-	// PushURL is the remote's first remote.<name>.pushurl; "" when none is set.
+	// PushURL is the remote's first remote.<name>.pushurl, read as URL is; ""
+	// when none is set.
 	PushURL string
 	// Fetch holds every remote.<name>.fetch refspec in configuration order,
 	// negative ones ("^refs/heads/x") included and unparsed.
@@ -132,8 +135,10 @@ type RemoteCfg struct {
 //
 // A url, pushurl or fetch with no value, and a prune that is not a boolean, are
 // errors, as git itself refuses them. For url and pushurl the FIRST value is
-// kept (git fetches from the first url); for prune the LAST wins, as for any
-// single-valued key.
+// kept (git fetches from the first url), except that an empty value clears
+// the list before it, which git's documentation says of both keys (git help
+// config, git 2.54.0): the first value after the last empty one is kept. For
+// prune the LAST wins, as for any single-valued key.
 //
 // remote.<name>.mirror is deliberately not read (MA1).
 func RemoteConfig(gitDir, name string) (RemoteCfg, error) {
@@ -164,14 +169,20 @@ func RemoteConfig(gitDir, name string) (RemoteCfg, error) {
 			if !hasValue {
 				return RemoteCfg{}, fmt.Errorf("%s has no value", key)
 			}
-			if !haveURL {
+			switch {
+			case value == "": // clears the list, as in git
+				cfg.URL, haveURL = "", false
+			case !haveURL:
 				cfg.URL, haveURL = value, true
 			}
 		case prefix + "pushurl":
 			if !hasValue {
 				return RemoteCfg{}, fmt.Errorf("%s has no value", key)
 			}
-			if !havePushURL {
+			switch {
+			case value == "": // clears the list, as in git
+				cfg.PushURL, havePushURL = "", false
+			case !havePushURL:
 				cfg.PushURL, havePushURL = value, true
 			}
 		case prefix + "fetch":
@@ -239,8 +250,19 @@ func parseGitBool(value string, hasValue bool) (bool, error) {
 // the ref it points at when it is symbolic ("refs/remotes/o/HEAD" to
 // "refs/remotes/o/main") and to "" when it is direct. It reads `git for-each-ref
 // --format=%(refname)%00%(symref)` and splits stdout on "\n" only, each line at
-// its NUL, so every name keeps its bytes: no trimming, and no Unicode
-// normalisation, which is the point when a Mac holds both spellings of a name.
+// its NUL, so every name keeps the bytes git printed: this code neither trims
+// nor normalises a name.
+//
+// What git prints is git's view under the repository's config (and whatever
+// config the caller's environment passes it), not the bytes on disk. With
+// core.precomposeunicode on, which git init and git clone set on a Mac, git
+// reads the name of a loose ref file precomposed to NFC and a packed-refs
+// entry by its bytes. So a loose NFD ref is reported under its NFC name, and
+// beside a packed entry of the same NFD name git lists both, the packed one at
+// its stale value (measured 2026-10-28, git 2.54.0;
+// docs/research/probes/macos-port/lone-nfd-default/, and
+// TestLocalRefsAtTheMacDefaultReportsALooseNFDNamePrecomposed). With it off,
+// each name is listed by the bytes it is stored under.
 //
 // Stdout alone is parsed, and anything git says on stderr stops the read. git
 // skips a ref file it cannot parse, exits 0, and warns on stderr

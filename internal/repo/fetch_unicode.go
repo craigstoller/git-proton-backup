@@ -22,7 +22,9 @@
 // fresh fetch disagrees with is a finding to investigate, so the command stops
 // and names both hashes. After a good fetch: put the new -version in the
 // go:generate directive in canon.go, run go generate, update the checksums in
-// canon_test.go, and delete the old unicodedata directory.
+// canon_test.go, and delete the old unicodedata directory. canon_test.go's
+// pinned constants are pinnedUnicodeInputs' sizes and SHA-256s and the version
+// its test requires: update all of them, from the sizes and hashes printed here.
 package main
 
 import (

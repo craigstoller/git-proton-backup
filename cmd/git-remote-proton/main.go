@@ -375,7 +375,8 @@ var (
 //   - format is "files" or "reftable". For reftable nothing else is read and
 //     every other field is zero.
 //   - specs is the remote's fetch mapping (see readLocalState for which).
-//   - anonymous is a remote with neither url nor pushurl configured (R5).
+//   - anonymous is a remote with neither url nor pushurl configured (R5), as
+//     git reads them: an empty value clears the values before it.
 //   - prune is remote.<name>.prune, else fetch.prune (R6).
 //   - refs holds the name of every local ref; symrefs maps each symbolic one
 //     to its target.
@@ -394,7 +395,8 @@ type localState struct {
 // failed (spec section 3, "Its local reads fail closed").
 //
 // The fetch mapping (R5, R6, PM9):
-//   - a remote whose url and pushurl are both unset or empty is anonymous and
+//   - a remote whose url and pushurl are both unset, or both left empty by
+//     their last value (RemoteConfig reads them as git does), is anonymous and
 //     has no specs, whatever its name looks like (PM3, PM4); a push-only
 //     remote, with pushurl and fetch set, keeps its mapping;
 //   - configured fetch refspecs are parsed, and one the helper does not

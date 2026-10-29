@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -507,6 +508,51 @@ func TestRemoteConfigTakesTheFirstOfSeveralURLs(t *testing.T) {
 	}
 }
 
+// RED (final review, m1). An empty url or pushurl value clears the list before
+// it, as git's documentation says of both keys (git help config, git 2.54.0):
+// the value kept is the first one after the last empty value, and only a list
+// left empty reads as "". Keeping the first value even when it was empty made
+// `url = ""` followed by a real url read as no url at all, which the helper
+// takes for an anonymous remote and so checks less: fail-open.
+func TestRemoteConfigAnEmptyURLClearsTheList(t *testing.T) {
+	cases := []struct {
+		name string
+		kvs  [][2]string // remote.m.<key>, value, added in this order
+		want RemoteCfg
+	}{
+		{"an empty url, then a url", [][2]string{{"url", ""}, {"url", "/srv/later"}},
+			RemoteCfg{URL: "/srv/later"}},
+		{"a url, then an empty one", [][2]string{{"url", "/srv/first"}, {"url", ""}},
+			RemoteCfg{}},
+		{"a url, an empty one, then another", [][2]string{{"url", "/srv/first"}, {"url", ""},
+			{"url", "/srv/third"}, {"url", "/srv/fourth"}},
+			RemoteCfg{URL: "/srv/third"}},
+		{"an empty pushurl, then a pushurl", [][2]string{{"url", "/srv/u"}, {"pushurl", ""},
+			{"pushurl", "/srv/push"}},
+			RemoteCfg{URL: "/srv/u", PushURL: "/srv/push"}},
+		{"a pushurl, then an empty one", [][2]string{{"url", "/srv/u"}, {"pushurl", "/srv/push"},
+			{"pushurl", ""}},
+			RemoteCfg{URL: "/srv/u"}},
+		{"an empty url beside a pushurl", [][2]string{{"url", ""}, {"pushurl", "/srv/push"}},
+			RemoteCfg{PushURL: "/srv/push"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			d := localRepo(t)
+			for _, kv := range c.kvs {
+				localGit(t, d, "config", "--add", "remote.m."+kv[0], kv[1])
+			}
+			got, err := RemoteConfig(filepath.Join(d, ".git"), "m")
+			if err != nil {
+				t.Fatalf("RemoteConfig(m): %v", err)
+			}
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("RemoteConfig(m) = %+v, want %+v", got, c.want)
+			}
+		})
+	}
+}
+
 // RED. parseGitBool reads a value as git_parse_maybe_bool does: true, yes, on in
 // any case are true; false, no, off and the empty string are false; any other
 // integer (a unit suffix allowed) is true unless it is zero; a key with no value
@@ -565,6 +611,137 @@ func TestLocalRefsKeepsNFDBytes(t *testing.T) {
 	want := map[string]string{"refs/heads/main": "", nfc: "", nfd: ""}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("LocalRefs = %q, want %q", got, want)
+	}
+}
+
+// lonePackedNFDClone builds, on a Mac, the layout of a lone NFD branch after
+// its first incremental fetch, the way git itself builds it (final review I1;
+// docs/research/probes/macos-port/lone-nfd-default/): a reftable bare remote,
+// reached by path, holds refs/heads/<NFD> at commit a; a plain `git clone`
+// into a files repository, left at git's Mac default core.precomposeunicode
+// (true), packs refs/remotes/origin/<NFD> at a; the remote moves the branch to
+// b, and `git fetch` writes the tracking ref as a loose file at b. It returns
+// the clone's git directory and both commits. The fixture checks run git
+// directly or read the files, never through the code under test.
+func lonePackedNFDClone(t *testing.T) (gitDir, a, b string) {
+	t.Helper()
+	const nfd = "cafe\u0301" // e, then a combining acute accent
+	seed := localRepo(t)     // isolated; one commit, c1
+	a = strings.TrimSpace(localGit(t, seed, "rev-parse", "HEAD"))
+	localGit(t, seed, "commit", "-q", "--allow-empty", "-m", "c2")
+	b = strings.TrimSpace(localGit(t, seed, "rev-parse", "HEAD"))
+
+	top := t.TempDir()
+	remote := filepath.Join(top, "remote.git")
+	clone := filepath.Join(top, "clone")
+	gitDir = filepath.Join(clone, ".git")
+	localGit(t, top, "init", "-q", "--bare", "--ref-format=reftable", "-b", "main", remote)
+	localGit(t, seed, "push", "-q", remote, "HEAD:refs/heads/main")
+	updateRefStdin(t, remote, "create refs/heads/"+nfd+" "+a+"\n")
+	localGit(t, top, "clone", "-q", remote, clone)
+
+	if got := strings.TrimSpace(localGit(t, clone, "config", "--get", "core.precomposeunicode")); got != "true" {
+		t.Fatalf("fixture: the clone's core.precomposeunicode is %q, want git's Mac default true", got)
+	}
+	if got := strings.TrimSpace(localGit(t, clone, "rev-parse", "--show-ref-format")); got != "files" {
+		t.Fatalf("fixture: the clone's ref format is %q, want files", got)
+	}
+	packed := filepath.Join(gitDir, "packed-refs")
+	if p, err := os.ReadFile(packed); err != nil || !strings.Contains(string(p), a+" refs/remotes/origin/"+nfd+"\n") {
+		t.Fatalf("fixture: packed-refs (%v) = %q, want refs/remotes/origin/<NFD> packed at %s", err, p, a)
+	}
+
+	updateRefStdin(t, remote, "update refs/heads/"+nfd+" "+b+" "+a+"\n")
+	localGit(t, clone, "fetch", "-q", "origin")
+
+	ents, err := os.ReadDir(filepath.Join(gitDir, "refs", "remotes", "origin"))
+	if err != nil {
+		t.Fatalf("fixture: read the loose tracking refs: %v", err)
+	}
+	var loose []string
+	for _, e := range ents {
+		loose = append(loose, e.Name())
+	}
+	if !reflect.DeepEqual(loose, []string{"HEAD", nfd}) {
+		t.Fatalf("fixture: loose files under refs/remotes/origin = %q, want HEAD and the NFD name", loose)
+	}
+	if p, err := os.ReadFile(packed); err != nil || !strings.Contains(string(p), a+" refs/remotes/origin/"+nfd+"\n") {
+		t.Fatalf("fixture: after the fetch, packed-refs (%v) = %q, want the stale NFD entry at %s", err, p, a)
+	}
+	return gitDir, a, b
+}
+
+// updateRefStdin feeds one `git update-ref --stdin` script to the repository
+// at dir, so ref names reach git as stdin bytes, never as argv.
+func updateRefStdin(t *testing.T, dir, script string) {
+	t.Helper()
+	cmd := exec.Command("git", "-C", dir, "update-ref", "--stdin")
+	cmd.Stdin = strings.NewReader(script)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git update-ref --stdin (%q): %v: %s", script, err, out)
+	}
+}
+
+// GUARD (final review I1): it pins git's behaviour, which no code here
+// changes, so it cannot be RED. LocalRefs reports git's view under the
+// repository's config, not the bytes on disk. At git's Mac default,
+// core.precomposeunicode=true, git reads a loose ref file's name precomposed
+// to NFC and a packed-refs entry by its bytes. So after a lone NFD branch's
+// first incremental fetch git lists two tracking refs: the packed NFD one at
+// its stale commit, and a phantom NFC one at the new commit, which is the
+// loose NFD file's (measured 2026-10-28, git 2.54.0;
+// docs/research/probes/macos-port/lone-nfd-default/run1.log). With
+// precomposition off, the same files list as one NFD ref at the new commit.
+// The test needs macOS: git precomposes names only there.
+func TestLocalRefsAtTheMacDefaultReportsALooseNFDNamePrecomposed(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS only: git precomposes loose ref names (core.precomposeunicode) only on darwin, " +
+			"so this layout cannot be built here")
+	}
+	const nfc = "refs/remotes/origin/caf\u00e9"  // the accented e as one code point
+	const nfd = "refs/remotes/origin/cafe\u0301" // e, then a combining acute accent
+	gitDir, a, b := lonePackedNFDClone(t)
+
+	got, err := LocalRefs(gitDir)
+	if err != nil {
+		t.Fatalf("LocalRefs: %v", err)
+	}
+	want := map[string]string{
+		"refs/heads/main":          "",
+		"refs/remotes/origin/HEAD": "refs/remotes/origin/main",
+		"refs/remotes/origin/main": "",
+		nfd:                        "",
+		nfc:                        "",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("LocalRefs at the Mac default = %q, want %q (the stale NFD and the phantom NFC)", got, want)
+	}
+	// Which commit each name is at: the stale packed value, and the loose
+	// file's. The pattern is ASCII: git precomposes non-ASCII argv on a Mac.
+	listing := localGit(t, filepath.Dir(gitDir), "for-each-ref", "--format=%(objectname) %(refname)",
+		"refs/remotes/origin/")
+	wantListing := b + " refs/remotes/origin/HEAD\n" + a + " " + nfd + "\n" + b + " " + nfc + "\n" +
+		b + " refs/remotes/origin/main\n"
+	if listing != wantListing {
+		t.Errorf("git for-each-ref at the Mac default =\n%q\nwant\n%q", listing, wantListing)
+	}
+
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "core.precomposeunicode")
+	t.Setenv("GIT_CONFIG_VALUE_0", "false")
+	got, err = LocalRefs(gitDir)
+	if err != nil {
+		t.Fatalf("LocalRefs with precomposition off: %v", err)
+	}
+	delete(want, nfc)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("LocalRefs with precomposition off = %q, want %q (the NFD ref alone)", got, want)
+	}
+	listing = localGit(t, filepath.Dir(gitDir), "for-each-ref", "--format=%(objectname) %(refname)",
+		"refs/remotes/origin/")
+	wantListing = b + " refs/remotes/origin/HEAD\n" + b + " " + nfd + "\n" + b + " refs/remotes/origin/main\n"
+	if listing != wantListing {
+		t.Errorf("git for-each-ref with precomposition off =\n%q\nwant\n%q", listing, wantListing)
 	}
 }
 

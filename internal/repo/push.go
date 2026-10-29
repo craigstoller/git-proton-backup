@@ -339,22 +339,28 @@ func PushWithLocal(t transport.Transport, root, gitDir string,
 	// create/update's destination. batchFinalSet's doc comment says why it is
 	// built in two passes. It reads the CURRENT valid flags, so a re-run (the
 	// loop below) checks the creates still valid against the deletes the Mac
-	// rule has since kept.
+	// rule has since kept. A create that conflicts with several refs names the
+	// smallest, so the text does not depend on map order.
 	dfPreflight := func() {
 		finalSet := batchFinalSet(remote, ups, valid, isDelete)
 		for i, u := range ups {
 			if !valid[i] || isDelete[i] || !isCreate[i] {
 				continue
 			}
+			conflict := ""
 			for other := range finalSet {
 				if other == u.Dst {
 					continue
 				}
 				if strings.HasPrefix(other, u.Dst+"/") || strings.HasPrefix(u.Dst, other+"/") {
-					refuse(i, fmt.Sprintf("%s conflicts with %s: a ref cannot be both a leaf and a "+
-						"folder containing other refs", u.Dst, other))
-					break
+					if conflict == "" || other < conflict {
+						conflict = other
+					}
 				}
+			}
+			if conflict != "" {
+				refuse(i, fmt.Sprintf("%s conflicts with %s: a ref cannot be both a leaf and a "+
+					"folder containing other refs", u.Dst, conflict))
 			}
 		}
 	}
@@ -495,10 +501,14 @@ func PushWithLocal(t transport.Transport, root, gitDir string,
 	// by D2 before the Mac rule sees it. With no local side there is one
 	// round, which is phase 2 as it was before the Mac rule.
 	//
-	// Termination: no step sets valid back to true, and each inner pass and
-	// each outer round that continues refuses at least one update, even when
-	// the Mac rule refuses only deletes, so the loops end within (updates + 1)
-	// rounds. Every step is set algebra over the valid flags, so neither
+	// Termination: no step sets valid back to true. Each inner pass that
+	// continues refuses at least one create, and each outer round that
+	// continues refuses at least one entry that was still valid, which may be
+	// a delete alone (one the Mac rule's part 3 keeps). Either way it
+	// invalidates an entry, so the outer loop ends within (entries + 1) rounds,
+	// where entries is the batch's length, and each case fixed point within
+	// (creates + 1) passes. Every step is set algebra over the valid flags,
+	// and the D/F preflight names the smallest conflicting ref, so neither
 	// outcome nor text depends on batch order.
 	for {
 		dfPreflight()

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -2662,6 +2663,98 @@ func TestLoop_ListRefusesTheRenameTransition(t *testing.T) {
 	}
 }
 
+// macLoneNFDClone builds, on a Mac, what git itself builds for a lone NFD
+// branch at git's Mac default, core.precomposeunicode=true (final review I1;
+// docs/research/probes/macos-port/lone-nfd-default/). A reftable bare remote,
+// reached by path, holds refs/heads/<NFD> at commit a, and a plain `git clone`
+// into a files repository packs refs/remotes/origin/<NFD> at a. With fetched
+// set, the remote then moves the branch to commit b and `git fetch` writes the
+// tracking ref as a loose file at b, which git lists as a phantom NFC tracking
+// ref at b beside the stale NFD one at a. It returns the clone's git
+// directory. The fixture checks run git directly, never the helper.
+func macLoneNFDClone(t *testing.T, fetched bool) (gitDir string) {
+	t.Helper()
+	macIsolateGit(t)
+	seed := newGitRepoWithCommit(t)
+	a := headOf(t, seed)
+	macGit(t, seed, "", "commit", "-q", "--allow-empty", "-m", "c2")
+	b := headOf(t, seed)
+	top := t.TempDir()
+	remote := filepath.Join(top, "remote.git")
+	clone := filepath.Join(top, "clone")
+	macGit(t, top, "", "init", "-q", "--bare", "--ref-format=reftable", "-b", "main", remote)
+	macGit(t, seed, "", "push", "-q", remote, "HEAD:refs/heads/main")
+	macGit(t, remote, "create refs/heads/"+tNFD+" "+a+"\n", "update-ref", "--stdin")
+	macGit(t, top, "", "clone", "-q", remote, clone)
+	if got := strings.TrimSpace(macGit(t, clone, "", "config", "--get", "core.precomposeunicode")); got != "true" {
+		t.Fatalf("fixture: the clone's core.precomposeunicode is %q, want git's Mac default true", got)
+	}
+	// The pattern is ASCII: git precomposes non-ASCII argv on a Mac.
+	listing := func() string {
+		return macGit(t, clone, "", "for-each-ref", "--format=%(objectname) %(refname)", "refs/remotes/origin/")
+	}
+	want := b + " refs/remotes/origin/HEAD\n" + a + " refs/remotes/origin/" + tNFD + "\n" +
+		b + " refs/remotes/origin/main\n"
+	if fetched {
+		macGit(t, remote, "update refs/heads/"+tNFD+" "+b+" "+a+"\n", "update-ref", "--stdin")
+		macGit(t, clone, "", "fetch", "-q", "origin")
+		want = b + " refs/remotes/origin/HEAD\n" + a + " refs/remotes/origin/" + tNFD + "\n" +
+			b + " refs/remotes/origin/" + tNFC + "\n" + b + " refs/remotes/origin/main\n"
+	}
+	if got := listing(); got != want {
+		t.Fatalf("fixture (fetched=%v): git's own listing of refs/remotes/origin/ =\n%q\nwant\n%q", fetched, got, want)
+	}
+	return filepath.Join(clone, ".git")
+}
+
+// TestLoop_ListAtTheMacDefaultRefusesALoneNFDBranchAfterItsFirstFetch is a
+// GUARD (final review I1): it pins what the helper already does, so it cannot
+// be RED. The repository is a plain clone left at git's Mac default, which no
+// other Mac-rule test uses. The clone's first incremental fetch passes the
+// helper: its one destination, refs/remotes/origin/<NFD>, is the packed
+// tracking ref's own bytes. git then lists a phantom NFC tracking ref beside
+// the stale NFD one, and the next fetch is refused at "list" by rule (2),
+// with the Mac message, before git's own fetch could fail with "cannot lock
+// ref" (git's part measured 2026-10-28, git 2.54.0;
+// docs/research/probes/macos-port/lone-nfd-default/run1.log).
+func TestLoop_ListAtTheMacDefaultRefusesALoneNFDBranchAfterItsFirstFetch(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS only: git precomposes loose ref names (core.precomposeunicode) only on darwin, " +
+			"so this layout cannot be built here")
+	}
+	t.Run("the first fetch passes", func(t *testing.T) {
+		gitDir := macLoneNFDClone(t, false)
+		refs := map[string]string{"refs/heads/main": toid('1'), "refs/heads/" + tNFD: toid('2')}
+		ft, root := macRemote(t, refs)
+		code, stdout, stderr := macSession(t, ft, root, gitDir, macEnv("origin"), "list\n\n")
+		if code != 0 {
+			t.Fatalf("loopEnv() = %d, want 0; stderr=%q", code, stderr)
+		}
+		wantAdvertised(t, stdout, refs)
+		if stderr != "" {
+			t.Errorf("stderr = %q, want nothing", stderr)
+		}
+	})
+	t.Run("the next fetch is refused", func(t *testing.T) {
+		gitDir := macLoneNFDClone(t, true)
+		ft, root := macRemote(t, map[string]string{"refs/heads/main": toid('1'), "refs/heads/" + tNFD: toid('3')})
+		code, stdout, stderr := macSession(t, ft, root, gitDir, macEnv("origin"), "list\n\n")
+		if code != 1 {
+			t.Fatalf("loopEnv() = %d, want 1: stdout=%q stderr=%q", code, stdout, stderr)
+		}
+		if stdout != "" {
+			t.Errorf("stdout = %q, want no ref line", stdout)
+		}
+		want := wantDestRefusalHead +
+			"  refs/remotes/origin/" + tNFD + " (from refs/heads/" + tNFD + ", " + toid('3') +
+			") and refs/remotes/origin/" + tNFC + ` (local) ("refs/remotes/origin/` + tNFDq +
+			`" vs "refs/remotes/origin/` + tNFCq + `"): by Unicode normalisation` + wantDestRefusalTail
+		if stderr != want {
+			t.Errorf("stderr =\n%q\nwant\n%q", stderr, want)
+		}
+	})
+}
+
 // TestLoop_ListRefusesTwoAliasingDestinations is RED (Task 8, rule (2),
 // Codex). Two remote branches with no pair between them map, through the
 // remote's configured refspecs, into directories spelled NFC and NFD, which
@@ -3135,6 +3228,54 @@ func TestLoop_ListFollowsALocalSymbolicTrackingRef(t *testing.T) {
 // commands, and the rename-transition and PM1 states are refused.
 func TestLoop_ListTreatsAPushOnlyRemoteAsNamed(t *testing.T) {
 	const cfg = "[remote \"origin\"]\n\tpushurl = proton::/my-files/r\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n"
+	t.Run("list", func(t *testing.T) {
+		wt, gitDir := macRepo(t)
+		macConfig(t, gitDir, cfg)
+		macPackedRefs(t, wt, "refs/remotes/origin/"+tNFC)
+		ft, root := macRemote(t, map[string]string{"refs/heads/" + tNFD: toid('2')})
+		code, stdout, stderr := macSession(t, ft, root, gitDir, macEnv("origin"), "list\n\n")
+		if code != 1 {
+			t.Fatalf("loopEnv() = %d, want 1: stdout=%q stderr=%q", code, stdout, stderr)
+		}
+		want := wantDestRefusalHead +
+			"  refs/remotes/origin/" + tNFD + " (from refs/heads/" + tNFD + ", " + toid('2') +
+			") and refs/remotes/origin/" + tNFC + ` (local) ("refs/remotes/origin/` + tNFDq +
+			`" vs "refs/remotes/origin/` + tNFCq + `"): by Unicode normalisation` + wantDestRefusalTail
+		if stderr != want {
+			t.Errorf("stderr =\n%q\nwant\n%q", stderr, want)
+		}
+	})
+	t.Run("list for-push", func(t *testing.T) {
+		wt, gitDir := macRepo(t)
+		macConfig(t, gitDir, cfg)
+		macPackedRefs(t, wt, "refs/heads/"+tNFC, "refs/remotes/origin/"+tNFD)
+		ft, root := macRemote(t, map[string]string{"refs/heads/" + tNFC: toid('1')})
+		lw := &lockWatch{Fake: ft, root: root}
+		code, stdout, stderr := macSession(t, lw, root, gitDir, macEnv("origin"), "list for-push\n\n")
+		if code != 1 {
+			t.Fatalf("loopEnv() = %d, want 1: stdout=%q stderr=%q", code, stdout, stderr)
+		}
+		wantLockTakenAndReleased(t, lw)
+		want := wantPushRefusalHead +
+			"  refs/remotes/origin/" + tNFC + " (from refs/heads/" + tNFC + ", " + toid('1') +
+			") and refs/remotes/origin/" + tNFD + ` (local) ("refs/remotes/origin/` + tNFCq +
+			`" vs "refs/remotes/origin/` + tNFDq + `"): by Unicode normalisation` + wantPushRefusalTail
+		if stderr != want {
+			t.Errorf("stderr =\n%q\nwant\n%q", stderr, want)
+		}
+	})
+}
+
+// TestLoop_ListTreatsAnEmptyURLThenARealOneAsNamed is RED (final review, m1).
+// An empty url clears the list before it (git help config), so a remote whose
+// first url is "" and whose second is real has a url, and git starts the
+// helper as that named remote with the second one (measured 2026-10-28, git
+// 2.54.0, with a stand-in helper). It is not anonymous: its refspecs are
+// checked at both list commands, as for TestLoop_ListTreatsAPushOnlyRemoteAsNamed,
+// and the rename-transition and PM1 states are refused.
+func TestLoop_ListTreatsAnEmptyURLThenARealOneAsNamed(t *testing.T) {
+	const cfg = "[remote \"origin\"]\n\turl = \"\"\n\turl = proton::/my-files/r\n" +
+		"\tfetch = +refs/heads/*:refs/remotes/origin/*\n"
 	t.Run("list", func(t *testing.T) {
 		wt, gitDir := macRepo(t)
 		macConfig(t, gitDir, cfg)
