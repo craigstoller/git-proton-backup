@@ -73,3 +73,18 @@ the rules from scratch.
     exe exits 126. A rule-10 audit of a staged CLI binary's `--version` or help output is not a
     hermetic test run, and stays governed by rule 10. (A live gate in WSL asserts the same
     interop-off precondition: spec §7, step 0.)
+
+12. **Hermetic test runs on a Mac never resolve a real `proton-drive`.** A hermetic test run
+    (`go test`, Pester) on a Mac with a signed-in `proton-drive` on PATH must not resolve it. On
+    a Mac the harm is not only the network: the real CLI can read the login keychain and write
+    its local state, so blocking the network alone does not make a run hermetic. A gate's
+    hermetic run also takes the real CLI off PATH, so that PATH holds no `proton-drive` except a
+    test shim: the stronger form rule 11 uses in WSL. `sandbox-exec` with networking denied may
+    be added on top, never instead of that: it leaves files and the Keychain reachable, and
+    Apple has deprecated it. The Go tests back the rule on every platform, the PC included
+    (`docs/superpowers/specs/2026-10-27-v2-macos-port-design.md` §5): a helper that places a
+    shim asserts that a PATH lookup of `proton-drive` resolves to that shim, and each package
+    that can reach `transport.NewCLI("")` puts a trap `proton-drive` first on PATH in
+    `TestMain` (`internal/testtrap`), which exits 3 with "a hermetic test reached proton-drive
+    without a shim". `GPB_LIVE_ACCOUNT=1`, the live contract half, installs no trap. A rule-10
+    audit of a staged CLI binary is not a hermetic test run, and stays governed by rule 10.

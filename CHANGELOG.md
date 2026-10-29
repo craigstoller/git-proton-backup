@@ -8,6 +8,45 @@
   wrote refs for a push nobody asked for in that shape. It now refuses the batch with a stderr
   message and exits non-zero before any further remote read or write, and still releases the
   lock.
+- **git-remote-proton: macOS on Apple Silicon, built from source.** The README has an "Install on
+  macOS (v2)" section: build the helper with Go in a fresh clone of the release tag, install
+  Proton's certified `macos/arm64` CLI after checking it against its SHA-512, put both on PATH,
+  and check that each resolves to one path. No release carries a macOS binary. CI now runs the
+  hermetic suite on an Apple Silicon macOS runner. macOS is not yet live-gated. For scheduled
+  backups, `scripts/macos/` has a wrapper that runs `push --all` and then `push --tags` with a
+  30-minute limit on each, and an example LaunchAgent that runs it daily, one per repository.
+- **git-remote-proton: a push now also refuses to create a ref that differs from another only by
+  Unicode normalisation, on every platform.** An example is `café` with its accent stored as one
+  character (NFC) beside the same name stored as `e` plus a combining accent (NFD). The two look
+  identical, Proton stores both, and a Mac clone of such a remote mishandles them silently, as a
+  Windows clone mishandles `main` beside `Main`. The refusal says which relation matched and shows
+  both spellings in escaped form, since they print alike. Case is now folded from tables pinned at
+  Unicode 17.0.0 instead of the Go toolchain's own, so every build refuses the same names; no pair
+  refused before is let through [basis: a containment test of the toolchain's case folding against
+  the pinned tables. Release builds use Go 1.22, whose tables are Unicode 15.0.0, and CI's Go 1.22
+  leg runs the test against them; it passed on 2026-10-28, with 2974 orbit members checked]. The
+  cost is that some pairs no
+  filesystem is known to confuse are refused too, such as `ᾳ` beside `αι` [inference: no
+  measurement shows a Mac confusing them].
+- **git-remote-proton: a warning when a remote already holds such a pair, and refusals on a Mac.**
+  On every platform, fetch, clone, `ls-remote` and push print a warning naming each pair, with
+  both object IDs. On a Mac, in a repository that uses git's default `files` ref store, the helper
+  refuses a fetch or clone when the remote holds a pair or when a ref the fetch would write
+  collides with a local ref under another spelling, refuses a push whose up-to-date refs would
+  make git rewrite a colliding tracking ref, and refuses single pushed refs whose tracking refs
+  would collide. A `reftable` repository gets the warning only. The README's honest limits give
+  the remedy for each refusal, what the checks cannot see, and a repair a Mac can perform.
+- **Release procedure: the Proton CLI drift check has a fifth leg.** `scripts/Test-ProtonCliDrift.ps1`
+  now also compares the `macos/arm64` SHA-512 in Proton's feed with the value it records for the
+  certified macOS build; a release with no `macos/arm64` entry is a MISMATCH. Each certification
+  adds offline checks of the macOS CLI. `docs/releasing.md` says why macOS has no release asset and
+  no per-release gate, and where the port's one macOS gate sits in its release.
+- **Tests: the README's macOS CLI download URL and SHA-512 are guarded** by the same Pester file as
+  Linux's, and a hermetic test run that would reach a real `proton-drive` now fails instead.
+- **Docs: the README, the v2 design (now v6.10) and the gate checklist describe the macOS port.**
+  The design records the rulings behind it; the gate checklist gains rule 12 (a hermetic run on a
+  Mac with a signed-in CLI must not resolve the real `proton-drive`). The docs index links the
+  port's spec, plan, probes and gate brief.
 
 ## 0.10.0 — 2026-10-21
 

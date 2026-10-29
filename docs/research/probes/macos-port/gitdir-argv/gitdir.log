@@ -1,0 +1,6 @@
+ls-remote-repo-top:                ARGS: logtest::x x GIT_DIR=.git PWD=$SP/helperprobe/w3/repo
+ls-remote-repo-subfolder:          ARGS: logtest::x x GIT_DIR=.git PWD=$SP/helperprobe/w3/repo
+ls-remote-plain-folder:            ARGS: logtest::x x GIT_DIR=<unset> PWD=$SP/helperprobe/w3/plain/a
+fetch-named-remote:                ARGS: lt x GIT_DIR=.git PWD=$SP/helperprobe/w3/repo
+fetch-anonymous-url:               ARGS: logtest::x x GIT_DIR=.git PWD=$SP/helperprobe/w3/repo
+is a repository above the plain folder? fatal: not a git repository (or any of the parent directories): .git

@@ -1,0 +1,24 @@
+#!/bin/bash
+# Logging stand-in helper, variant 2: as git-remote-logtest, and at `list` it
+# also records the ref format of the repository GIT_DIR names, if any.
+log="$LOGTEST_LOG"
+echo "ARGS: $* GIT_DIR=${GIT_DIR-<unset>} PWD=$(pwd)" >> "$log"
+while IFS= read -r line; do
+  echo "IN: $line" >> "$log"
+  case "$line" in
+    capabilities) printf 'option\nfetch\n\n' ;;
+    option\ *) echo ok ;;
+    list|"list for-push")
+      if [ -n "${GIT_DIR+x}" ]; then
+        echo "LISTFMT: $(git -C "$GIT_DIR" rev-parse --show-ref-format 2>&1) (exit $?)" >> "$log"
+        echo "LISTFETCH: $(git -C "$GIT_DIR" config --get-all "remote.$1.fetch" 2>&1 | tr "\n" " ")" >> "$log"
+        echo "LISTCONFIG: $(git -C "$GIT_DIR" config --get-regexp "^remote\\." 2>&1 | tr "\n" ";") REFS: $(git -C "$GIT_DIR" for-each-ref 2>&1 | wc -l | tr -d " ")" >> "$log"
+      else
+        echo "LISTFMT: GIT_DIR unset" >> "$log"
+      fi
+      printf '%s refs/heads/main\n@refs/heads/main HEAD\n\n' "$LOGTEST_SHA" ;;
+    fetch\ *) echo "FETCH-COMMAND-RECEIVED" >> "$log" ;;
+    "") printf '\n' ;;
+  esac
+done
+echo "EOF" >> "$log"

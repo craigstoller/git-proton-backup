@@ -1,0 +1,127 @@
+== environment: git version 2.54.0 (Apple Git-157); 27.2
+
+== L7: hand-built. NFD packed (C) by pack-refs with precomposition off, then NFC loose (B)
+  commits: A=cdeb7feb82d3 B=ea92338cb941 C=578d65cf39ea D=38800fb40fb7
+    update-ref --stdin in L7 (create refs/remotes/proton-v2 nfd 578d65cf39eab464ee3257fe5ce5557aa9c11a6c): exit 0
+    update-ref --stdin in L7 (create refs/remotes/proton-v2 nfc ea92338cb941fd04e2d4dd5d46d58f8331361d05): exit 0
+  [before]
+    loose files in refs/remotes/proton-v2:
+      b'caf\xc3\xa9' -> ea92338cb941
+    packed-refs entries:
+      b'refs/remotes/proton-v2/cafe\xcc\x81' -> 578d65cf39ea
+    git -c core.precomposeunicode=false for-each-ref refs/remotes/proton-v2:
+      b'578d65c refs/remotes/proton-v2/cafe\xcc\x81'
+      b'ea92338 refs/remotes/proton-v2/caf\xc3\xa9'
+    ls .git/refs/remotes/proton-v2 | od -c:
+      0000000   c   a   f 303 251  \n
+      0000006
+  RUN: printf 'delete refs/remotes/proton-v2/cafe\314\201\n' | git update-ref --stdin
+    exit 0
+  [after]
+    loose files in refs/remotes/proton-v2:
+      (no such directory)
+    packed-refs entries:
+      (none)
+    git -c core.precomposeunicode=false for-each-ref refs/remotes/proton-v2:
+      (none)
+    ls .git/refs/remotes/proton-v2 | od -c:
+      (no such directory)
+    git fsck:
+      notice: No default references
+      dangling commit ea92338cb941fd04e2d4dd5d46d58f8331361d05
+      dangling commit 38800fb40fb7d5ffb7cb94afc789caed23eb720e
+      (fsck exit 0)
+
+== L8: real clone and fetch, M24's layout. The remote (reftable) holds NFC (A) and NFD (C);
+   a files clone packs both; the remote moves NFC to B; a fetch writes NFC loose.
+  commits: A=cdeb7feb82d3 B=ea92338cb941 C=578d65cf39ea D=38800fb40fb7
+    update-ref --stdin in remote.git (create refs/heads nfc cdeb7feb82d3f48d227dc94405676bd0f68f57c2): exit 0
+    update-ref --stdin in remote.git (create refs/heads nfd 578d65cf39eab464ee3257fe5ce5557aa9c11a6c): exit 0
+    clone: warning: remote HEAD refers to nonexistent ref, unable to checkout
+  clone: ref format files; core.precomposeunicode=true
+  [after clone]
+    loose files in refs/remotes/proton-v2:
+      (no such directory)
+    packed-refs entries:
+      b'refs/remotes/proton-v2/cafe\xcc\x81' -> 578d65cf39ea
+      b'refs/remotes/proton-v2/caf\xc3\xa9' -> cdeb7feb82d3
+    git -c core.precomposeunicode=false for-each-ref refs/remotes/proton-v2:
+      b'578d65c refs/remotes/proton-v2/cafe\xcc\x81'
+      b'cdeb7fe refs/remotes/proton-v2/caf\xc3\xa9'
+    ls .git/refs/remotes/proton-v2 | od -c:
+      (no such directory)
+    update-ref --stdin in remote.git (update refs/heads nfc ea92338cb941fd04e2d4dd5d46d58f8331361d05 cdeb7feb82d3f48d227dc94405676bd0f68f57c2): exit 0
+    fetch exit 0
+  [before the README command (after fetch)]
+    loose files in refs/remotes/proton-v2:
+      b'caf\xc3\xa9' -> ea92338cb941
+    packed-refs entries:
+      b'refs/remotes/proton-v2/cafe\xcc\x81' -> 578d65cf39ea
+      b'refs/remotes/proton-v2/caf\xc3\xa9' -> cdeb7feb82d3
+    git -c core.precomposeunicode=false for-each-ref refs/remotes/proton-v2:
+      b'578d65c refs/remotes/proton-v2/cafe\xcc\x81'
+      b'ea92338 refs/remotes/proton-v2/caf\xc3\xa9'
+    ls .git/refs/remotes/proton-v2 | od -c:
+      0000000   c   a   f 303 251  \n
+      0000006
+  RUN: printf 'delete refs/remotes/proton-v2/cafe\314\201\n' | git update-ref --stdin
+    exit 0
+  [after]
+    loose files in refs/remotes/proton-v2:
+      (no such directory)
+    packed-refs entries:
+      b'refs/remotes/proton-v2/caf\xc3\xa9' -> cdeb7feb82d3
+    git -c core.precomposeunicode=false for-each-ref refs/remotes/proton-v2:
+      b'cdeb7fe refs/remotes/proton-v2/caf\xc3\xa9'
+    ls .git/refs/remotes/proton-v2 | od -c:
+      (no such directory)
+    git fsck:
+      dangling commit ea92338cb941fd04e2d4dd5d46d58f8331361d05
+      dangling commit 38800fb40fb7d5ffb7cb94afc789caed23eb720e
+      (fsck exit 0)
+
+== L9: real clone and fetch, the R1 / stale-ref case. At clone time the remote holds only NFD (C);
+   then NFC (B) appears on the remote and a fetch writes its tracking ref loose.
+  commits: A=cdeb7feb82d3 B=ea92338cb941 C=578d65cf39ea D=38800fb40fb7
+    update-ref --stdin in remote.git (create refs/heads nfd 578d65cf39eab464ee3257fe5ce5557aa9c11a6c): exit 0
+    clone: warning: remote HEAD refers to nonexistent ref, unable to checkout
+  [after clone]
+    loose files in refs/remotes/proton-v2:
+      (no such directory)
+    packed-refs entries:
+      b'refs/remotes/proton-v2/cafe\xcc\x81' -> 578d65cf39ea
+    git -c core.precomposeunicode=false for-each-ref refs/remotes/proton-v2:
+      b'578d65c refs/remotes/proton-v2/cafe\xcc\x81'
+    ls .git/refs/remotes/proton-v2 | od -c:
+      (no such directory)
+    update-ref --stdin in remote.git (create refs/heads nfc ea92338cb941fd04e2d4dd5d46d58f8331361d05): exit 0
+    fetch exit 0
+  [before the README command (after fetch)]
+    loose files in refs/remotes/proton-v2:
+      b'caf\xc3\xa9' -> ea92338cb941
+    packed-refs entries:
+      b'refs/remotes/proton-v2/cafe\xcc\x81' -> 578d65cf39ea
+    git -c core.precomposeunicode=false for-each-ref refs/remotes/proton-v2:
+      b'578d65c refs/remotes/proton-v2/cafe\xcc\x81'
+      b'ea92338 refs/remotes/proton-v2/caf\xc3\xa9'
+    ls .git/refs/remotes/proton-v2 | od -c:
+      0000000   c   a   f 303 251  \n
+      0000006
+  RUN: printf 'delete refs/remotes/proton-v2/cafe\314\201\n' | git update-ref --stdin
+    exit 0
+  [after]
+    loose files in refs/remotes/proton-v2:
+      (no such directory)
+    packed-refs entries:
+      (none)
+    git -c core.precomposeunicode=false for-each-ref refs/remotes/proton-v2:
+      (none)
+    ls .git/refs/remotes/proton-v2 | od -c:
+      (no such directory)
+    git fsck:
+      notice: No default references
+      dangling commit ea92338cb941fd04e2d4dd5d46d58f8331361d05
+      dangling commit 38800fb40fb7d5ffb7cb94afc789caed23eb720e
+      (fsck exit 0)
+
+== done

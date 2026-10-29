@@ -1,6 +1,6 @@
 # git-proton-backup Docs
 
-**Living reference. Last updated: 2026-10-16.** Update this index when a doc is added, renamed, retired, or superseded — not on a review calendar.
+**Living reference. Last updated: 2026-10-27.** Update this index when a doc is added, renamed, retired, or superseded — not on a review calendar.
 
 This repo ships two tools that share one version line; each has its own design doc.
 
@@ -12,7 +12,7 @@ This repo ships two tools that share one version line; each has its own design d
 ## Operating
 
 - [releasing.md](releasing.md) - The canonical release procedure for both tools. Follow it in order; its steps exist because skipping them has already gone wrong once.
-- [../scripts/Test-ProtonCliDrift.ps1](../scripts/Test-ProtonCliDrift.ps1) - The Proton CLI drift check `releasing.md` calls for before tagging, before publishing, and weekly between releases: the installed CLI against Proton's feed, its identity token against the helper's certified token, the feed's version against the pin, and the feed's `linux/x64` SHA-512 against the certified Linux value the script records.
+- [../scripts/Test-ProtonCliDrift.ps1](../scripts/Test-ProtonCliDrift.ps1) - The Proton CLI drift check `releasing.md` calls for before tagging, before publishing, and weekly between releases: the installed CLI against Proton's feed, its identity token against the helper's certified token, the feed's version against the pin, and the feed's `linux/x64` and `macos/arm64` SHA-512s against the values it records.
 
 ## Process And Provenance
 
@@ -22,7 +22,10 @@ This repo ships two tools that share one version line; each has its own design d
 
 - [research/remote-helper-prior-art.md](research/remote-helper-prior-art.md) - Prior-art survey with a dated verification-status block and pinned sources.
 - [research/gates/](research/gates/) - Stage gate briefs (what will be tested) and gate records (what happened). [brief-checklist.md](research/gates/brief-checklist.md) holds the standing rules every gate brief incorporates by reference.
-- [research/probes/](research/probes/) - Runnable probes against the real Proton CLI, and their pinned results.
+- [research/probes/](research/probes/) - Runnable probes against the real Proton CLI, and local probes of git, APFS and Go behaviour, with their pinned results.
+- [research/probes/macos-port/README.md](research/probes/macos-port/README.md) - The macOS port's local probes (no network, no Proton account): which file shows which finding (M12–M29, PM1–PM9), and what each file does not show.
+- [research/gates/vNEXT-macos-gate-brief.md](research/gates/vNEXT-macos-gate-brief.md) - The brief for the macOS port's one live gate, run once for the release that carries the port. Not yet run; renamed when the version is named.
+- [research/gates/vNEXT-composition-refusal-steps.md](research/gates/vNEXT-composition-refusal-steps.md) - The steps the same release's Windows and Linux gate briefs carry: an NFD create refused on each platform's own binary. Renamed with the macOS brief.
 
 ## Specs And Plans
 
@@ -30,6 +33,8 @@ Feature work is specified and planned in dated pairs under [superpowers/](superp
 
 - [superpowers/specs/2026-10-15-v2-linux-port-design.md](superpowers/specs/2026-10-15-v2-linux-port-design.md) - The Linux port of `git-remote-proton`: the findings behind it (F1–F14), the case-variant ref rule, the install and gate design, and Craig's rulings D1–D8. Approved 2026-10-16; its design record is v6.9 of the v2 design doc.
 - [superpowers/plans/2026-10-16-v2-linux-port.md](superpowers/plans/2026-10-16-v2-linux-port.md) - The 12-task implementation plan for that spec.
+- [superpowers/specs/2026-10-27-v2-macos-port-design.md](superpowers/specs/2026-10-27-v2-macos-port-design.md) - The macOS port of `git-remote-proton`: the findings behind it (M0–M29), the canonical-equivalence rule, the Mac refusals and the repair, scheduled use, the one live macOS gate, and Craig's rulings MD1–MD8 and O1–O6. Approved 2026-10-27; its design record is v6.10 of the v2 design doc.
+- [superpowers/plans/2026-10-27-v2-macos-port.md](superpowers/plans/2026-10-27-v2-macos-port.md) - The 15-task implementation plan for that spec, with its refinements R1–R6, and its execution notes, which add R7 and record every ruling made while it ran.
 
 ## Conventions
 

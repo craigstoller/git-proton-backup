@@ -44,6 +44,12 @@ forgotten for the v0.3.x releases. Follow it in order; do not skip or reorder st
    `git-remote-proton.exe.sha256`, `install.ps1`, `git-remote-proton-linux-amd64` and
    `git-remote-proton-linux-amd64.sha256`. No more, no fewer. The Linux binary is a static
    linux/amd64 build (`CGO_ENABLED=0`) cross-built on the same Windows runner.
+   There is no macOS asset, so no release has a per-release macOS gate: on a Mac the helper is
+   built from source at the release tag (README, "Install on macOS (v2)"), and no draft holds Mac
+   bytes to gate. That is the trade MD2(d) of
+   `docs/superpowers/specs/2026-10-27-v2-macos-port-design.md` ruled: a macOS asset would mean a
+   third live gate on almost every release, because a stand-in needs unchanged compiled code
+   ("When adoption may stand in for the live gate", below).
 
 5. **Two live gates run against the draft's bytes: the Windows live gate and the Linux live
    gate.** Each downloads the draft's assets and exercises its own binary
@@ -62,6 +68,20 @@ forgotten for the v0.3.x releases. Follow it in order; do not skip or reorder st
    copy (Craig's ruling, 2026-10-16). If a later gate fails or the release is abandoned after that,
    restoring the rollback copy is part of abandoning the release: pause the scheduled tasks,
    restore and verify the copy, then re-enable them.
+   The release that carries the macOS port takes a third gate once: the macOS live gate (§6 of
+   `docs/superpowers/specs/2026-10-27-v2-macos-port-design.md`; brief
+   `docs/research/gates/vNEXT-macos-gate-brief.md`, renamed when the version is named). Its place
+   follows O5. It runs last, after the Linux and Windows gates and after the draft Windows helper
+   is installed, and never at the same time as another gate, because the gates share the account's
+   baseline, the trash tally and the paused-task window; a paired PC session runs its Windows
+   side, and the draft stays unpublished until it ends. A Mac-only failure does not hold the
+   release: no macOS asset ships, so the Windows and Linux assets publish on their own gates, the
+   README keeps macOS "not yet live-gated", and the next attempt is the whole macOS gate again at
+   a later release, never a stand-in. A defect in shared code that it finds is a defect in the
+   release, under the no-retag rule below. That release's Windows and Linux gate briefs also carry
+   the steps in `docs/research/gates/vNEXT-composition-refusal-steps.md`, so each platform's own
+   binary is shown refusing a pair that differs only by Unicode normalisation (O5(d)). Once a
+   macOS gate has passed, later releases have none.
    Tags are never moved after any artifact has been built from them — if either gate finds a
    defect, the fix ships as a new tag, not a retag. The one alternative is a stand-in, for a
    release that qualifies under "When adoption may stand in for the live gate" below and only on
@@ -89,14 +109,18 @@ alone: the 0.9.0 move of 2026-10-05 went unnoticed for five days because the che
 certification plan asked for was never written down. It is written down here.
 
 **Weekly, Craig-owned:** run `scripts/Test-ProtonCliDrift.ps1` with no arguments (the installed
-helper and the `proton-drive` first on PATH). It compares four things and names which failed: the
+helper and the `proton-drive` first on PATH). It compares five things and names which failed: the
 installed CLI's bytes against the feed, the installed CLI's own identity token against the helper's
-certified token, the feed's version against the certified token's semver, and the feed's
+certified token, the feed's version against the certified token's semver, the feed's
 `linux/x64` SHA-512 for that same release against the value the script records
-(`$CertifiedLinuxX64Sha512`). The fourth leg compares the feed with a recorded value: it cannot
-see an installed Linux CLI, because nothing on Windows hashes one, so it says nothing about the CLI
-on any Linux machine. A release with no `linux/x64` entry fails that leg (Proton dropping or
-delaying Linux is drift worth a certification look). `DRIFT CHECK: MATCH` means nothing has moved.
+(`$CertifiedLinuxX64Sha512`), and the feed's `macos/arm64` SHA-512 for that same release against
+its own recorded value (`$CertifiedMacArm64Sha512`). The fourth leg compares the feed with a
+recorded value: it cannot see an installed Linux CLI, because nothing on Windows hashes one, so it
+says nothing about the CLI on any Linux machine. The fifth leg, like the fourth, compares the feed
+with a recorded value and cannot see a CLI installed on any Mac. A release with no `linux/x64`
+entry fails the fourth leg (Proton dropping or delaying Linux is drift worth a certification look),
+and a release with no `macos/arm64` entry fails the fifth. `DRIFT CHECK: MATCH` means nothing has
+moved.
 A MISMATCH between releases means Proton has moved: open a certification task in the shape of
 `docs/superpowers/plans/2026-10-10-cli-0.9.0-certification.md`. The same command is the **first
 triage step** whenever verify or a user reports an uncertified-CLI refusal.
@@ -105,30 +129,32 @@ agents cannot create scheduled tasks there), appending its output to
 `%LOCALAPPDATA%\GitProtonBackup\drift-check.log` with the script's exit code as the task's last
 result. The task is only as good as someone reading that log, which is why the check stays
 Craig-owned; the script bounds its one network call (30 s) so an unreachable feed cannot hang the
-task, and reports STOP, not MISMATCH, when the feed is reachable but unusable (a `windows/x64` or
-`linux/x64` entry whose SHA-512 is not 128 hex characters).
+task, and reports STOP, not MISMATCH, when the feed is reachable but unusable (a `windows/x64`,
+`linux/x64` or `macos/arm64` entry whose SHA-512 is not 128 hex characters).
 
 **Two expected shapes, not drift:** while a certification is in flight and the machine's CLI has
 already been swapped to the new build but the release that certifies it is not yet installed, the
-check reports the four fields `installed CLI == feed: True; installed CLI == helper's certified
+check reports the five fields `installed CLI == feed: True; installed CLI == helper's certified
 token: False; feed version == certified semver: False; feed linux/x64 == certified linux/x64:
-False`. The fourth is False because the feed's `linux/x64` entry moves with the version, until the
-certification updates `$CertifiedLinuxX64Sha512`. Once the certification commit has updated that
-constant, and while the helper that certifies the new build is still not installed, a run of the
-script carrying that commit reports `True; False; False; True`. Both are the known window the
-certification plan describes (its Task 2 step 5 swap, closed by its Task 3 step 4 install); check
-whether a certification task is open before acting on either. The full set of four is what tells
-them apart from the shapes that ARE drift, read in the same order:
+False; feed macos/arm64 == certified macos/arm64: False`. The fourth and fifth are False because
+the feed's `linux/x64` and `macos/arm64` entries move with the version, until the certification
+updates `$CertifiedLinuxX64Sha512` and `$CertifiedMacArm64Sha512`. Once the certification commit
+has updated those constants, and while the helper that certifies the new build is still not
+installed, a run of the script carrying that commit reports `True; False; False; True; True`. Both
+are the known window the certification plan describes (its Task 2 step 5 swap, closed by its
+Task 3 step 4 install); check whether a certification task is open before acting on either. The
+full set of five is what tells them apart from the shapes that ARE drift, read in the same order:
 
-- `False; True; False; False` is the not-yet-swapped machine after Proton has moved (only the feed
-  changed, and its `linux/x64` entry moved with it).
-- `False; True; True; *` is a re-cut of the same version number (same token on the machine,
-  different bytes in the feed); the fourth field says whether the Linux build was re-cut too.
-- `True; True; True; False` is a `linux/x64` entry that differs from the recorded value while
-  everything on the Windows side matches: a re-cut of the Linux build under the same version
-  number, or a release with no `linux/x64` entry. A same-token re-cut is response-worthy:
-  re-certify. The helper's token check alone would accept it, so this leg is the only thing that
-  can show it.
+- `False; True; False; False; False` is the not-yet-swapped machine after Proton has moved (only
+  the feed changed, and its `linux/x64` and `macos/arm64` entries moved with it).
+- `False; True; True; *; *` is a re-cut of the same version number (same token on the machine,
+  different bytes in the feed); the fourth and fifth fields say whether the Linux and macOS builds
+  were re-cut too.
+- `True; True; True; False; *` or `True; True; True; *; False` is a `linux/x64` or `macos/arm64`
+  entry that differs from the recorded value while everything on the Windows side matches: a re-cut
+  of that build under the same version number, or a release with no entry for it. A same-token
+  re-cut is response-worthy: re-certify. The helper's token check alone would accept it, so these
+  legs are the only thing that can show it.
 
 **Certification touch points.** Every CLI certification also runs the 17-row live contract table
 on linux/x64, in WSL with Windows interop off (`docs/research/gates/brief-checklist.md` rule 11),
@@ -142,6 +168,21 @@ script's value. Record the new value the way the first was: copy it from Proton'
 require `sha512sum` of the Linux binary the Linux gate ran to equal it; if they differ, stop, because
 Proton has re-cut the build since it was tested and recording either value would bless bytes nothing
 tested.
+
+**Certification touch points on the Mac.** Every certification also updates
+`$CertifiedMacArm64Sha512` in `scripts/Test-ProtonCliDrift.ps1` and the README's macOS CLI line, and
+adds offline checks on the Mac, with no account and networking denied (§7 of
+`docs/superpowers/specs/2026-10-27-v2-macos-port-design.md`): download the new `macos/arm64`
+build; check its SHA-512 against the feed; check its `--version` token; run it signed out through
+the helper; record the SHA-512 for the README's macOS CLI line. Record the value the way the first
+was: copy it from Proton's live feed, then require `shasum -a 512` of a fresh download of the
+feed's URL to equal it; if they differ, stop, as for Linux. The helper refuses any CLI but the one
+it was built to accept, so the signed-out run uses the release candidate that moves the pin: built
+from source in a fresh clone of that commit, in a scratch folder outside every clone and never on
+PATH, with the certification record naming its commit. It never uses `GPB_UNCERTIFIED_CLI=1`,
+which would skip the very check the run exercises. Networking is denied with `sandbox-exec`; if a
+later macOS removes it, the signed-out run is made with the Mac's networking switched off, and the
+certification record says so. There is no signed-in Mac check at certification (O4(a)).
 
 Stage 7's `--verify` command is where the scheduled form of this check belongs; until it exists,
 this section is the control.

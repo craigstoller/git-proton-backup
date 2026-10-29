@@ -3,14 +3,18 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/craigstoller/git-proton-backup/internal/gitcmd"
 	"github.com/craigstoller/git-proton-backup/internal/testcli"
+	"github.com/craigstoller/git-proton-backup/internal/testtrap"
 	"github.com/craigstoller/git-proton-backup/internal/transport"
 )
 
@@ -29,17 +33,39 @@ const (
 	testcliRoleShim = "shim"
 )
 
-// TestMain is package main's test entry point. Its ONLY job before ever
-// touching the go test framework is checking whether THIS invocation is
-// really a re-exec'd shim subprocess (see buildShimOnPath, below): if so,
-// it dispatches straight into testcli.Run using this process's own argv and
-// std streams and exits, without ever calling m.Run() — the same
-// before-flag-parsing early-exit shape cli_test.go's own TestMain uses for
-// its roles, so a shim subprocess run this way never touches -test.* flag
-// parsing at all.
+// TestMain is package main's test entry point. Before ever touching the go
+// test framework it makes two early exits. First, it checks whether
+// THIS invocation is the hermetic trap (internal/testtrap, rule 12 in
+// docs/research/gates/brief-checklist.md): a copy of this binary named
+// proton-drive and placed first on PATH, so a test that resolves the CLI
+// without a shim of its own hits the trap and never a real, signed-in
+// proton-drive further along PATH. That check comes first because the trap
+// re-executes this very binary and must exit before anything else runs.
+// Second, it checks whether THIS invocation is really a re-exec'd shim
+// subprocess (see buildShimOnPath, below): if so, it dispatches straight into
+// testcli.Run using this process's own argv and std streams and exits,
+// without ever calling m.Run() — the same before-flag-parsing early-exit shape
+// cli_test.go's own TestMain uses for its roles, so a shim subprocess run this
+// way never touches -test.* flag parsing at all.
+//
+// Only after both does the trap get installed: the early exits would otherwise
+// leak a directory per child process. GPB_LIVE_ACCOUNT=1 is the one run that
+// wants the real CLI, so it installs no trap.
 func TestMain(m *testing.M) {
+	if testtrap.Active() {
+		os.Exit(testtrap.Run(os.Stderr))
+	}
 	if os.Getenv(testcliRoleEnv) == testcliRoleShim {
 		os.Exit(testcli.Run(os.Args[1:], os.Stdout, os.Stderr))
+	}
+	trapDir := ""
+	if !liveAccount() {
+		dir, err := testtrap.Install()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "testtrap.Install:", err)
+			os.Exit(2)
+		}
+		trapDir = dir
 	}
 	// Every TestLoop_* test that reaches "list for-push" would otherwise spawn
 	// a real git for the restore-floor probe (D5(d)). Stub the seam for the whole
@@ -48,7 +74,13 @@ func TestMain(m *testing.M) {
 	// function back through realProbeRestoreFloor.
 	realProbeRestoreFloor = probeRestoreFloor
 	probeRestoreFloor = func(string) (gitcmd.ProbeResult, string) { return gitcmd.ProbeOK, "" }
-	os.Exit(m.Run())
+	code := m.Run()
+	// Explicit, because defers do not run on os.Exit. The error is ignored: a
+	// Windows file lock held by a lingering child must not fail the run.
+	if trapDir != "" {
+		os.RemoveAll(trapDir)
+	}
+	os.Exit(code)
 }
 
 // realProbeRestoreFloor holds the production probe, saved by TestMain before
@@ -62,7 +94,8 @@ var realProbeRestoreFloor func(string) (gitcmd.ProbeResult, string)
 // under test writes, maps onto a file under it via testcli.LocalPath), and
 // prepends that directory to PATH: the mechanism transport.NewCLI("")'s
 // default exe name ("proton-drive") resolves through when *transport.CLI
-// shells out.
+// shells out. It then asserts that a PATH lookup of "proton-drive" resolves to
+// that copy, and fails with both paths if it does not.
 //
 // Copying (rather than pointing PATH at os.Executable() directly) is not
 // optional: PATH lookup matches on the *basename* transport.NewCLI expects
@@ -108,6 +141,18 @@ func buildShimOnPath(t *testing.T) (treeDir string) {
 	t.Setenv(testcliRoleEnv, testcliRoleShim)
 	t.Setenv(testcli.TreeEnv, treeDir)
 	t.Setenv("PATH", shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// The F4 failure caught at its source (O6(c)): if the shim is not what a
+	// PATH lookup finds, a test would shell out to some other proton-drive,
+	// possibly a real signed-in one. os.SameFile, not a string compare, because
+	// macOS spells a temp dir both /var/... and /private/var/....
+	resolved, err := exec.LookPath("proton-drive")
+	if err != nil {
+		t.Fatalf("exec.LookPath(proton-drive) after placing the shim at %s: %v", shimExe, err)
+	}
+	if !samePath(t, resolved, shimExe) {
+		t.Fatalf("exec.LookPath(proton-drive) = %s, want the shim at %s: the shim is not what PATH resolves, "+
+			"so a hermetic test would reach another proton-drive", resolved, shimExe)
+	}
 	// Deterministic regardless of what the ambient environment happens to
 	// carry: runSetHead reads this itself (uncertifiedCLIEnv, main.go), and
 	// this test's whole point is exercising the DEFAULT allowlist refusal
@@ -289,5 +334,106 @@ func TestUpdateRevisionCreateNewRevisionStrategyUpsertsThroughTheRealShim(t *tes
 	}
 	if out != transport.Committed {
 		t.Fatalf("second UpdateRevision onto an existing target = %v, want Committed", out)
+	}
+}
+
+// --- Hermetic guards: the shim wins, and no shim means the trap (rule 12) ---
+
+// liveAccount reports whether this run is the live gate (GPB_LIVE_ACCOUNT=1),
+// the one case where TestMain installs no trap and the real CLI is wanted.
+func liveAccount() bool { return os.Getenv("GPB_LIVE_ACCOUNT") == "1" }
+
+// samePath reports whether two paths name the same file or directory, by
+// os.SameFile on their Stats: macOS spells one temp dir both /var/... and
+// /private/var/..., so a string comparison would call equal paths different.
+func samePath(t *testing.T, a, b string) bool {
+	t.Helper()
+	ai, err := os.Stat(a)
+	if err != nil {
+		t.Fatalf("stat %s: %v", a, err)
+	}
+	bi, err := os.Stat(b)
+	if err != nil {
+		t.Fatalf("stat %s: %v", b, err)
+	}
+	return os.SameFile(ai, bi)
+}
+
+// TestShimResolvesBeforeTheTrap pins the PATH order a shim test depends on:
+// after buildShimOnPath the lookup finds the shim's directory, and the trap
+// directory is still on PATH, behind it. Without the second half a missing
+// trap would pass this test for the wrong reason.
+func TestShimResolvesBeforeTheTrap(t *testing.T) {
+	if liveAccount() {
+		t.Skip("GPB_LIVE_ACCOUNT=1: no trap is installed on a live run")
+	}
+	buildShimOnPath(t)
+
+	trapDir := os.Getenv(testtrap.DirEnv)
+	if trapDir == "" {
+		t.Fatalf("%s is unset: TestMain did not install the trap", testtrap.DirEnv)
+	}
+	dirs := filepath.SplitList(os.Getenv("PATH"))
+	if len(dirs) < 2 {
+		t.Fatalf("PATH = %q, want the shim dir then the trap dir at least", os.Getenv("PATH"))
+	}
+
+	found, err := exec.LookPath("proton-drive")
+	if err != nil {
+		t.Fatalf("exec.LookPath(proton-drive) after buildShimOnPath: %v", err)
+	}
+	if !samePath(t, filepath.Dir(found), dirs[0]) {
+		t.Fatalf("exec.LookPath(proton-drive) = %s, want it inside the shim dir %s (PATH's first entry)", found, dirs[0])
+	}
+	if samePath(t, filepath.Dir(found), trapDir) {
+		t.Fatalf("exec.LookPath(proton-drive) = %s, which is the trap in %s, not the shim", found, trapDir)
+	}
+
+	behind := false
+	for _, d := range dirs[1:] {
+		if samePath(t, d, trapDir) {
+			behind = true
+			break
+		}
+	}
+	if !behind {
+		t.Fatalf("the trap dir %s is not on PATH behind the shim: PATH = %q", trapDir, os.Getenv("PATH"))
+	}
+}
+
+// TestNoShimMeansTheTrap is the other half: with no shim placed, the code
+// that builds transport.NewCLI("") reaches the trap, never a real CLI.
+// Version folds the CLI's combined output into its error (cli.go Version), so
+// the trap's message is visible in the returned error.
+func TestNoShimMeansTheTrap(t *testing.T) {
+	if liveAccount() {
+		t.Skip("GPB_LIVE_ACCOUNT=1: no trap is installed on a live run")
+	}
+	v, err := transport.NewCLI("").Version()
+	if err == nil {
+		t.Fatalf("Version() = %q with no shim placed, want an error from the trap", v)
+	}
+	if !strings.Contains(err.Error(), testtrap.Message) {
+		t.Fatalf("Version() error = %q, want it to contain the trap message %q", err.Error(), testtrap.Message)
+	}
+}
+
+// TestTrapWinsOverTheShimRoleVariable pins the order in TestMain: the trap
+// check runs ahead of the shim dispatch. With the shim role variable set and
+// no shim placed, the trap must still be the trap. Were the shim dispatch
+// first, the trap would answer as a working fake CLI and Version() would
+// succeed against a proton-drive that is not there.
+func TestTrapWinsOverTheShimRoleVariable(t *testing.T) {
+	if liveAccount() {
+		t.Skip("GPB_LIVE_ACCOUNT=1: no trap is installed on a live run")
+	}
+	t.Setenv(testcliRoleEnv, testcliRoleShim)
+	t.Setenv(testcli.TreeEnv, t.TempDir())
+	v, err := transport.NewCLI("").Version()
+	if err == nil {
+		t.Fatalf("Version() = %q: the trap answered as a shim; the Active check must come first", v)
+	}
+	if !strings.Contains(err.Error(), testtrap.Message) {
+		t.Fatalf("Version() error = %q, want it to contain the trap message %q", err.Error(), testtrap.Message)
 	}
 }

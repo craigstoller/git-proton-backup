@@ -1,0 +1,269 @@
+== environment
+  2026-10-28T07:29:48Z
+  git version 2.54.0 (Apple Git-157); GNU bash, version 3.2.57(1)-release (arm64-apple-darwin26)
+  sw_vers: 27.2
+  filesystem: an NFC-named file was created; does the NFD name open it? True
+  stored name bytes: [b'caf\xc3\xa9']
+  the README command's bytes:
+    0000000   d   e   l   e   t   e       r   e   f   s   /   r   e   m   o
+    0000020   t   e   s   /   p   r   o   t   o   n   -   v   2   /   c   a
+    0000040   f   e 314 201  \n
+    0000045
+
+== L1: refs/heads, NFC packed (A), NFD loose (C); delete NFD by exact bytes
+  ref format: files; core.precomposeunicode (set by git init): true
+  commits: A=cdeb7feb82d3 B=ea92338cb941 C=578d65cf39ea
+    update-ref --stdin (create refs/heads nfc cdeb7feb82d3f48d227dc94405676bd0f68f57c2): exit 0
+    update-ref --stdin (create refs/heads nfd 578d65cf39eab464ee3257fe5ce5557aa9c11a6c): exit 0
+  [before]
+    loose files in refs/heads:
+      b'cafe\xcc\x81' -> 578d65cf39ea
+    packed-refs entries:
+      b'refs/heads/caf\xc3\xa9' -> cdeb7feb82d3
+    git for-each-ref (repo config as git init left it):
+      b'578d65c refs/heads/caf\xc3\xa9'
+    git -c core.precomposeunicode=false for-each-ref:
+      b'578d65c refs/heads/cafe\xcc\x81'
+      b'cdeb7fe refs/heads/caf\xc3\xa9'
+    ls -la .git/refs/heads:
+      total 4
+      drwxr-xr-x 3 $USER wheel  96 Oct 28 00:29 .
+      drwxr-xr-x 4 $USER wheel 128 Oct 28 00:29 ..
+      -rw-r--r-- 1 $USER wheel  41 Oct 28 00:29 café
+    ls .git/refs/heads | od -c:
+      0000000   c   a   f   e 314 201  \n
+      0000007
+  RUN: printf 'delete refs/heads/cafe\314\201\n' | git update-ref --stdin
+    exit 0
+  [after]
+    loose files in refs/heads:
+      (none)
+    packed-refs entries:
+      b'refs/heads/caf\xc3\xa9' -> cdeb7feb82d3
+    git for-each-ref (repo config as git init left it):
+      b'cdeb7fe refs/heads/caf\xc3\xa9'
+    git -c core.precomposeunicode=false for-each-ref:
+      b'cdeb7fe refs/heads/caf\xc3\xa9'
+    ls -la .git/refs/heads:
+      total 0
+      drwxr-xr-x 2 $USER wheel  64 Oct 28 00:29 .
+      drwxr-xr-x 4 $USER wheel 128 Oct 28 00:29 ..
+    ls .git/refs/heads | od -c:
+      0000000
+    git fsck:
+      dangling commit ea92338cb941fd04e2d4dd5d46d58f8331361d05
+      dangling commit 578d65cf39eab464ee3257fe5ce5557aa9c11a6c
+      (fsck exit 0)
+
+== L2: refs/heads, NFD packed (C), NFC loose (B); delete NFD by exact bytes
+  ref format: files; core.precomposeunicode (set by git init): true
+  commits: A=cdeb7feb82d3 B=ea92338cb941 C=578d65cf39ea
+    update-ref --stdin (create refs/heads nfd 578d65cf39eab464ee3257fe5ce5557aa9c11a6c): exit 0
+fatal: cannot lock ref 'refs/heads/café': reference already exists
+    update-ref --stdin (create refs/heads nfc ea92338cb941fd04e2d4dd5d46d58f8331361d05): exit 128
+  [before]
+    loose files in refs/heads:
+      (none)
+    packed-refs entries:
+      b'refs/heads/caf\xc3\xa9' -> 578d65cf39ea
+    git for-each-ref (repo config as git init left it):
+      b'578d65c refs/heads/caf\xc3\xa9'
+    git -c core.precomposeunicode=false for-each-ref:
+      b'578d65c refs/heads/caf\xc3\xa9'
+    ls -la .git/refs/heads:
+      total 0
+      drwxr-xr-x 2 $USER wheel  64 Oct 28 00:29 .
+      drwxr-xr-x 4 $USER wheel 128 Oct 28 00:29 ..
+    ls .git/refs/heads | od -c:
+      0000000
+  RUN: printf 'delete refs/heads/cafe\314\201\n' | git update-ref --stdin
+    exit 0
+  [after]
+    loose files in refs/heads:
+      (none)
+    packed-refs entries:
+      b'refs/heads/caf\xc3\xa9' -> 578d65cf39ea
+    git for-each-ref (repo config as git init left it):
+      b'578d65c refs/heads/caf\xc3\xa9'
+    git -c core.precomposeunicode=false for-each-ref:
+      b'578d65c refs/heads/caf\xc3\xa9'
+    ls -la .git/refs/heads:
+      total 0
+      drwxr-xr-x 2 $USER wheel  64 Oct 28 00:29 .
+      drwxr-xr-x 4 $USER wheel 128 Oct 28 00:29 ..
+    ls .git/refs/heads | od -c:
+      0000000
+    git fsck:
+      dangling commit ea92338cb941fd04e2d4dd5d46d58f8331361d05
+      (fsck exit 0)
+
+== L3: refs/heads, NFC packed (A) and loose (B), NFD packed (C); delete NFD by exact bytes
+  ref format: files; core.precomposeunicode (set by git init): true
+  commits: A=cdeb7feb82d3 B=ea92338cb941 C=578d65cf39ea
+    update-ref --stdin (create refs/heads nfc cdeb7feb82d3f48d227dc94405676bd0f68f57c2): exit 0
+    update-ref --stdin (create refs/heads nfd 578d65cf39eab464ee3257fe5ce5557aa9c11a6c): exit 0
+fatal: cannot lock ref 'refs/heads/café': is at 578d65cf39eab464ee3257fe5ce5557aa9c11a6c but expected cdeb7feb82d3f48d227dc94405676bd0f68f57c2
+    update-ref --stdin (update refs/heads nfc ea92338cb941fd04e2d4dd5d46d58f8331361d05 cdeb7feb82d3f48d227dc94405676bd0f68f57c2): exit 128
+  [before]
+    loose files in refs/heads:
+      (none)
+    packed-refs entries:
+      b'refs/heads/caf\xc3\xa9' -> 578d65cf39ea
+    git for-each-ref (repo config as git init left it):
+      b'578d65c refs/heads/caf\xc3\xa9'
+    git -c core.precomposeunicode=false for-each-ref:
+      b'578d65c refs/heads/caf\xc3\xa9'
+    ls -la .git/refs/heads:
+      total 0
+      drwxr-xr-x 2 $USER wheel  64 Oct 28 00:29 .
+      drwxr-xr-x 4 $USER wheel 128 Oct 28 00:29 ..
+    ls .git/refs/heads | od -c:
+      0000000
+  RUN: printf 'delete refs/heads/cafe\314\201\n' | git update-ref --stdin
+    exit 0
+  [after]
+    loose files in refs/heads:
+      (none)
+    packed-refs entries:
+      b'refs/heads/caf\xc3\xa9' -> 578d65cf39ea
+    git for-each-ref (repo config as git init left it):
+      b'578d65c refs/heads/caf\xc3\xa9'
+    git -c core.precomposeunicode=false for-each-ref:
+      b'578d65c refs/heads/caf\xc3\xa9'
+    ls -la .git/refs/heads:
+      total 0
+      drwxr-xr-x 2 $USER wheel  64 Oct 28 00:29 .
+      drwxr-xr-x 4 $USER wheel 128 Oct 28 00:29 ..
+    ls .git/refs/heads | od -c:
+      0000000
+    git fsck:
+      dangling commit ea92338cb941fd04e2d4dd5d46d58f8331361d05
+      (fsck exit 0)
+
+== L4: refs/remotes/proton-v2, NFD packed (C), NFC loose (B); the README's command verbatim
+  ref format: files; core.precomposeunicode (set by git init): true
+  commits: A=cdeb7feb82d3 B=ea92338cb941 C=578d65cf39ea
+    update-ref --stdin (create refs/remotes/proton-v2 nfd 578d65cf39eab464ee3257fe5ce5557aa9c11a6c): exit 0
+fatal: cannot lock ref 'refs/remotes/proton-v2/café': reference already exists
+    update-ref --stdin (create refs/remotes/proton-v2 nfc ea92338cb941fd04e2d4dd5d46d58f8331361d05): exit 128
+  [before]
+    loose files in refs/remotes/proton-v2:
+      (no such directory)
+    packed-refs entries:
+      b'refs/remotes/proton-v2/caf\xc3\xa9' -> 578d65cf39ea
+    git for-each-ref (repo config as git init left it):
+      b'578d65c refs/remotes/proton-v2/caf\xc3\xa9'
+    git -c core.precomposeunicode=false for-each-ref:
+      b'578d65c refs/remotes/proton-v2/caf\xc3\xa9'
+    ls -la .git/refs/remotes/proton-v2:
+ls: cannot access '$SP/t13-probe/L4/.git/refs/remotes/proton-v2': No such file or directory
+    ls .git/refs/remotes/proton-v2 | od -c:
+ls: cannot access '$SP/t13-probe/L4/.git/refs/remotes/proton-v2': No such file or directory
+      0000000
+  RUN: printf 'delete refs/remotes/proton-v2/cafe\314\201\n' | git update-ref --stdin
+    exit 0
+  [after]
+    loose files in refs/remotes/proton-v2:
+      (no such directory)
+    packed-refs entries:
+      b'refs/remotes/proton-v2/caf\xc3\xa9' -> 578d65cf39ea
+    git for-each-ref (repo config as git init left it):
+      b'578d65c refs/remotes/proton-v2/caf\xc3\xa9'
+    git -c core.precomposeunicode=false for-each-ref:
+      b'578d65c refs/remotes/proton-v2/caf\xc3\xa9'
+    ls -la .git/refs/remotes/proton-v2:
+ls: cannot access '$SP/t13-probe/L4/.git/refs/remotes/proton-v2': No such file or directory
+    ls .git/refs/remotes/proton-v2 | od -c:
+ls: cannot access '$SP/t13-probe/L4/.git/refs/remotes/proton-v2': No such file or directory
+      0000000
+    git fsck:
+      dangling commit ea92338cb941fd04e2d4dd5d46d58f8331361d05
+      (fsck exit 0)
+
+== L5: refs/remotes/proton-v2, NFD loose (C) only, NFC packed (B); the README's command verbatim
+  ref format: files; core.precomposeunicode (set by git init): true
+  commits: A=cdeb7feb82d3 B=ea92338cb941 C=578d65cf39ea
+    update-ref --stdin (create refs/remotes/proton-v2 nfc ea92338cb941fd04e2d4dd5d46d58f8331361d05): exit 0
+    update-ref --stdin (create refs/remotes/proton-v2 nfd 578d65cf39eab464ee3257fe5ce5557aa9c11a6c): exit 0
+  [before]
+    loose files in refs/remotes/proton-v2:
+      b'cafe\xcc\x81' -> 578d65cf39ea
+    packed-refs entries:
+      b'refs/remotes/proton-v2/caf\xc3\xa9' -> ea92338cb941
+    git for-each-ref (repo config as git init left it):
+      b'578d65c refs/remotes/proton-v2/caf\xc3\xa9'
+    git -c core.precomposeunicode=false for-each-ref:
+      b'578d65c refs/remotes/proton-v2/cafe\xcc\x81'
+      b'ea92338 refs/remotes/proton-v2/caf\xc3\xa9'
+    ls -la .git/refs/remotes/proton-v2:
+      total 4
+      drwxr-xr-x 3 $USER wheel 96 Oct 28 00:29 .
+      drwxr-xr-x 3 $USER wheel 96 Oct 28 00:29 ..
+      -rw-r--r-- 1 $USER wheel 41 Oct 28 00:29 café
+    ls .git/refs/remotes/proton-v2 | od -c:
+      0000000   c   a   f   e 314 201  \n
+      0000007
+  RUN: printf 'delete refs/remotes/proton-v2/cafe\314\201\n' | git update-ref --stdin
+    exit 0
+  [after]
+    loose files in refs/remotes/proton-v2:
+      (no such directory)
+    packed-refs entries:
+      b'refs/remotes/proton-v2/caf\xc3\xa9' -> ea92338cb941
+    git for-each-ref (repo config as git init left it):
+      b'ea92338 refs/remotes/proton-v2/caf\xc3\xa9'
+    git -c core.precomposeunicode=false for-each-ref:
+      b'ea92338 refs/remotes/proton-v2/caf\xc3\xa9'
+    ls -la .git/refs/remotes/proton-v2:
+ls: cannot access '$SP/t13-probe/L5/.git/refs/remotes/proton-v2': No such file or directory
+    ls .git/refs/remotes/proton-v2 | od -c:
+ls: cannot access '$SP/t13-probe/L5/.git/refs/remotes/proton-v2': No such file or directory
+      0000000
+    git fsck:
+      dangling commit 578d65cf39eab464ee3257fe5ce5557aa9c11a6c
+      (fsck exit 0)
+
+== L6: refs/remotes/proton-v2, only NFC, loose (B); the README's command verbatim (NFD named)
+  ref format: files; core.precomposeunicode (set by git init): true
+  commits: A=cdeb7feb82d3 B=ea92338cb941 C=578d65cf39ea
+    update-ref --stdin (create refs/remotes/proton-v2 nfc ea92338cb941fd04e2d4dd5d46d58f8331361d05): exit 0
+  [before]
+    loose files in refs/remotes/proton-v2:
+      b'caf\xc3\xa9' -> ea92338cb941
+    packed-refs entries:
+      (none)
+    git for-each-ref (repo config as git init left it):
+      b'ea92338 refs/remotes/proton-v2/caf\xc3\xa9'
+    git -c core.precomposeunicode=false for-each-ref:
+      b'ea92338 refs/remotes/proton-v2/caf\xc3\xa9'
+    ls -la .git/refs/remotes/proton-v2:
+      total 4
+      drwxr-xr-x 3 $USER wheel 96 Oct 28 00:29 .
+      drwxr-xr-x 3 $USER wheel 96 Oct 28 00:29 ..
+      -rw-r--r-- 1 $USER wheel 41 Oct 28 00:29 café
+    ls .git/refs/remotes/proton-v2 | od -c:
+      0000000   c   a   f 303 251  \n
+      0000006
+  RUN: printf 'delete refs/remotes/proton-v2/cafe\314\201\n' | git update-ref --stdin
+    exit 0
+  [after]
+    loose files in refs/remotes/proton-v2:
+      (no such directory)
+    packed-refs entries:
+      (none)
+    git for-each-ref (repo config as git init left it):
+      (none)
+    git -c core.precomposeunicode=false for-each-ref:
+      (none)
+    ls -la .git/refs/remotes/proton-v2:
+ls: cannot access '$SP/t13-probe/L6/.git/refs/remotes/proton-v2': No such file or directory
+    ls .git/refs/remotes/proton-v2 | od -c:
+ls: cannot access '$SP/t13-probe/L6/.git/refs/remotes/proton-v2': No such file or directory
+      0000000
+    git fsck:
+      notice: No default references
+      dangling commit ea92338cb941fd04e2d4dd5d46d58f8331361d05
+      dangling commit 578d65cf39eab464ee3257fe5ce5557aa9c11a6c
+      (fsck exit 0)
+
+== done

@@ -1,0 +1,100 @@
+== git version 2.54.0 (Apple Git-157); 27.2
+commits: A=563a92211bb8 B=203c15ba1f0c C=f205b193be75
+  clone: warning: remote HEAD refers to nonexistent ref, unable to checkout
+  clone ref format: files
+  [after clone]
+    loose files under refs/remotes/origin:
+      (none)
+    packed-refs entries for origin:
+      0000000   5   6   3   a   9   2   2   1   1   b   b   8   7   d   d   8
+      0000020   7   b   e   2   a   a   1   d   4   2   3   a   9   b   8   3
+      0000040   0   0   d   5   3   b   8   2       r   e   f   s   /   r   e
+      0000060   m   o   t   e   s   /   o   r   i   g   i   n   /   c   a   f
+      0000100   e 314 201  \n   f   2   0   5   b   1   9   3   b   e   7   5
+      0000120   6   6   a   c   4   7   1   a   5   b   b   7   a   b   b   2
+      0000140   1   4   c   2   c   d   0   d   d   c   9   f       r   e   f
+      0000160   s   /   r   e   m   o   t   e   s   /   o   r   i   g   i   n
+      0000200   /   m   a   i   n  \n
+      0000206
+    for-each-ref, the repository's own config (core.precomposeunicode=true):
+      0000000   5   6   3   a   9   2   2       r   e   f   s   /   r   e   m
+      0000020   o   t   e   s   /   o   r   i   g   i   n   /   c   a   f   e
+      0000040 314 201  \n   f   2   0   5   b   1   9       r   e   f   s   /
+      0000060   r   e   m   o   t   e   s   /   o   r   i   g   i   n   /   m
+      0000100   a   i   n  \n
+      0000104
+    for-each-ref with -c core.precomposeunicode=false:
+      0000000   5   6   3   a   9   2   2       r   e   f   s   /   r   e   m
+      0000020   o   t   e   s   /   o   r   i   g   i   n   /   c   a   f   e
+      0000040 314 201  \n   f   2   0   5   b   1   9       r   e   f   s   /
+      0000060   r   e   m   o   t   e   s   /   o   r   i   g   i   n   /   m
+      0000100   a   i   n  \n
+      0000104
+  fetch 1 exit: 0
+  [after fetch 1 (remote NFD moved A -> B)]
+    loose files under refs/remotes/origin:
+      0000000   c   a   f   e 314 201  \n
+      0000007
+    packed-refs entries for origin:
+      0000000   5   6   3   a   9   2   2   1   1   b   b   8   7   d   d   8
+      0000020   7   b   e   2   a   a   1   d   4   2   3   a   9   b   8   3
+      0000040   0   0   d   5   3   b   8   2       r   e   f   s   /   r   e
+      0000060   m   o   t   e   s   /   o   r   i   g   i   n   /   c   a   f
+      0000100   e 314 201  \n   f   2   0   5   b   1   9   3   b   e   7   5
+      0000120   6   6   a   c   4   7   1   a   5   b   b   7   a   b   b   2
+      0000140   1   4   c   2   c   d   0   d   d   c   9   f       r   e   f
+      0000160   s   /   r   e   m   o   t   e   s   /   o   r   i   g   i   n
+      0000200   /   m   a   i   n  \n
+      0000206
+    for-each-ref, the repository's own config (core.precomposeunicode=true):
+      0000000   5   6   3   a   9   2   2       r   e   f   s   /   r   e   m
+      0000020   o   t   e   s   /   o   r   i   g   i   n   /   c   a   f   e
+      0000040 314 201  \n   2   0   3   c   1   5   b       r   e   f   s   /
+      0000060   r   e   m   o   t   e   s   /   o   r   i   g   i   n   /   c
+      0000100   a   f 303 251  \n   f   2   0   5   b   1   9       r   e   f
+      0000120   s   /   r   e   m   o   t   e   s   /   o   r   i   g   i   n
+      0000140   /   m   a   i   n  \n
+      0000146
+    for-each-ref with -c core.precomposeunicode=false:
+      0000000   2   0   3   c   1   5   b       r   e   f   s   /   r   e   m
+      0000020   o   t   e   s   /   o   r   i   g   i   n   /   c   a   f   e
+      0000040 314 201  \n   f   2   0   5   b   1   9       r   e   f   s   /
+      0000060   r   e   m   o   t   e   s   /   o   r   i   g   i   n   /   m
+      0000100   a   i   n  \n
+      0000104
+  fetch 2: error: cannot lock ref 'refs/remotes/origin/café': is at 203c15ba1f0c9aacfed7b988f144016721910158 but expected 563a92211bb87dd87be2aa1d423a9b8300d53b82
+  fetch 2 exit: 1
+  [after fetch 2 (remote NFD moved B -> C)]
+    loose files under refs/remotes/origin:
+      0000000   c   a   f   e 314 201  \n
+      0000007
+    packed-refs entries for origin:
+      0000000   5   6   3   a   9   2   2   1   1   b   b   8   7   d   d   8
+      0000020   7   b   e   2   a   a   1   d   4   2   3   a   9   b   8   3
+      0000040   0   0   d   5   3   b   8   2       r   e   f   s   /   r   e
+      0000060   m   o   t   e   s   /   o   r   i   g   i   n   /   c   a   f
+      0000100   e 314 201  \n   f   2   0   5   b   1   9   3   b   e   7   5
+      0000120   6   6   a   c   4   7   1   a   5   b   b   7   a   b   b   2
+      0000140   1   4   c   2   c   d   0   d   d   c   9   f       r   e   f
+      0000160   s   /   r   e   m   o   t   e   s   /   o   r   i   g   i   n
+      0000200   /   m   a   i   n  \n
+      0000206
+    for-each-ref, the repository's own config (core.precomposeunicode=true):
+      0000000   5   6   3   a   9   2   2       r   e   f   s   /   r   e   m
+      0000020   o   t   e   s   /   o   r   i   g   i   n   /   c   a   f   e
+      0000040 314 201  \n   2   0   3   c   1   5   b       r   e   f   s   /
+      0000060   r   e   m   o   t   e   s   /   o   r   i   g   i   n   /   c
+      0000100   a   f 303 251  \n   f   2   0   5   b   1   9       r   e   f
+      0000120   s   /   r   e   m   o   t   e   s   /   o   r   i   g   i   n
+      0000140   /   m   a   i   n  \n
+      0000146
+    for-each-ref with -c core.precomposeunicode=false:
+      0000000   2   0   3   c   1   5   b       r   e   f   s   /   r   e   m
+      0000020   o   t   e   s   /   o   r   i   g   i   n   /   c   a   f   e
+      0000040 314 201  \n   f   2   0   5   b   1   9       r   e   f   s   /
+      0000060   r   e   m   o   t   e   s   /   o   r   i   g   i   n   /   m
+      0000100   a   i   n  \n
+      0000104
+  git fsck:
+  (fsck exit 0)
+== done

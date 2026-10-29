@@ -43,14 +43,20 @@ jobs:
         # 'stable' rather than go-version-file: go.mod declares the oldest
         # supported toolchain (the floor), and CI should prove the code still
         # builds on the newest one. Building only at the floor would let a
-        # break on current Go reach main unnoticed. The third leg does build
-        # at the floor (the toolchain the release workflow uses), so a break
-        # at that end is caught too. A leg sets go-version or go-version-file,
-        # never both; the two setup-go steps below key off which one is set.
+        # break on current Go reach main unnoticed. The go-version-file leg
+        # does build at the floor (the toolchain the release workflow uses),
+        # so a break at that end is caught too. A leg sets go-version or
+        # go-version-file, never both; the two setup-go steps below key off
+        # which one is set.
+        # The macOS leg is arm64 only (the Arch step below fails if the
+        # macos-latest alias ever moves to another architecture) and has no
+        # floor twin: the floor toolchain is already tested on Linux, and what
+        # macOS adds is OS behaviour.
         include:
           - { os: windows-latest, go-version: stable }
           - { os: ubuntu-latest, go-version: stable }
           - { os: ubuntu-latest, go-version-file: go.mod }
+          - { os: macos-latest, go-version: stable }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -89,17 +95,51 @@ jobs:
             throw "gofmt: $(@($unformatted).Count) file(s) need formatting"
           }
           Write-Host 'gofmt: clean'
-      # Linux steps (bash; GitHub runs an explicit `shell: bash` as
+      # Linux and macOS steps (bash; GitHub runs an explicit `shell: bash` as
       # `bash -eo pipefail`, so any command that may fail sits in an if or a
-      # function).
-      - name: Build (Linux)
-        if: runner.os == 'Linux'
+      # function). Each step in this job is keyed on the runner OS, so a leg
+      # whose OS no step names would run only checkout and setup-go and report
+      # green; the Build, Vet, Test and gofmt steps below therefore run on
+      # every runner that is not Windows.
+      - name: Build
+        if: runner.os != 'Windows'
         shell: bash
         run: go build ./...
-      - name: Vet (Linux)
-        if: runner.os == 'Linux'
+      - name: Vet
+        if: runner.os != 'Windows'
         shell: bash
         run: go vet ./...
+      - name: Arch
+        if: runner.os == 'macOS'
+        shell: bash
+        # macOS support is arm64 only. A future move of the macos-latest alias
+        # to an x86_64 image must fail here, not quietly test darwin/amd64.
+        run: test "$(uname -m)" = arm64 || { echo "macOS leg is $(uname -m), not arm64"; exit 1; }
+      - name: Git floor (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        # The same floor and the same probe as the Linux step below: the fetch
+        # tests need git 2.45.0 or newer. The fallback here is Homebrew, with
+        # auto-update off so the install does not first update Homebrew
+        # itself. A $GITHUB_PATH entry reaches only the steps after this one,
+        # so the step also exports PATH for itself before it probes again.
+        # The log names the path taken ("probe: runner git" or "probe: brew
+        # git") and the git it ended up with (`command -v git` and `git
+        # --version`). Only the fallback path adds /opt/homebrew/bin to
+        # $GITHUB_PATH: the git the later steps run must be the git this step
+        # probed, and on the runner-git path nothing here changes PATH.
+        run: |
+          OID=0123456789abcdef0123456789abcdef01234567
+          probe() { local out; out=$(printf '%s\n' "$OID" | git rev-list --objects --missing=print --stdin 2>&1) || return 1; grep -qx "?$OID" <<<"$out"; }
+          retry() { for n in 1 2 3; do "$@" && return 0; sleep 15; done; return 1; }
+          show_git() { echo "git: $(command -v git || echo 'not on PATH')"; git --version || true; }
+          show_git
+          if probe; then echo "probe: runner git"; else
+            retry env HOMEBREW_NO_AUTO_UPDATE=1 brew install git || { echo "git floor: brew install failed"; exit 1; }
+            export PATH="/opt/homebrew/bin:$PATH"
+            show_git
+            if probe; then echo "probe: brew git"; echo /opt/homebrew/bin >> "$GITHUB_PATH"; else echo "git floor: fetch tests need git 2.45.0 or newer; runner has $(git --version) (or, implausibly, the checkout holds the probe object $OID)"; exit 1; fi
+          fi
       - name: Git floor (2.45.0) probe
         if: runner.os == 'Linux'
         shell: bash
@@ -120,15 +160,46 @@ jobs:
             git --version
             if probe; then echo "probe: PPA git"; else echo "git floor: fetch tests need git 2.45.0 or newer; runner has $(git --version) (or, implausibly, the checkout holds the probe object $OID)"; exit 1; fi
           fi
-      - name: Test (Linux)
-        if: runner.os == 'Linux'
+      - name: Test
+        if: runner.os != 'Windows'
         shell: bash
-        # Hermetic, as on Windows. The probe above has already proved the
-        # runner's git reports a missing tip as a `?`-line under
-        # `rev-list --missing=print`, the behaviour git 2.45.0 introduced and
-        # the fetch tests need.
+        # Hermetic, as on Windows. The git-floor probe above (the Linux step on
+        # Linux, the macOS step on macOS) has already proved the runner's git
+        # reports a missing tip as a `?`-line under `rev-list
+        # --missing=print`, the behaviour git 2.45.0 introduced and the fetch
+        # tests need.
         run: go test -count=1 ./...
-      - name: gofmt (Linux)
-        if: runner.os == 'Linux'
+      - name: Unicode containment (Go floor)
+        if: matrix.go-version-file
+        shell: bash
+        # Test above already runs this test, but without -v a passing test logs
+        # nothing. Run it again here, verbosely and on the floor toolchain's
+        # leg only, so that leg's log carries the test's one-line account:
+        # the toolchain's Unicode version, the pinned version, which branch ran
+        # (containment only, or containment and equal classes), and how many
+        # pinned classes merge more than one toolchain orbit. Keyed on the
+        # go-version-file leg itself, not on its OS, so a future matrix entry
+        # cannot move it.
+        run: go test -count=1 -v -run TestSimpleFoldOrbitsLieInsideGeneratedClasses ./internal/repo
+      - name: Wrapper
+        if: runner.os == 'macOS'
+        shell: bash
+        # The scheduled-push wrapper's test. It is offline (stand-in git,
+        # osascript and sleep), and it runs under /bin/bash, the bash macOS
+        # ships and the one the wrapper's own shebang names, whatever `bash`
+        # the runner puts first on PATH.
+        run: /bin/bash scripts/macos/test-gpb-v2-push.sh
+      - name: Unicode tables are current
+        if: matrix.os == 'ubuntu-latest' && matrix.go-version == 'stable'
+        shell: bash
+        # Regenerate the decomposition and case-folding tables from the
+        # committed Unicode data files (internal/repo/unicodedata/<version>/,
+        # read by `go generate`, no network) and fail if anything differs, so
+        # the committed tables cannot drift from their generator. One leg
+        # only; keyed on that leg's matrix values, not on the runner OS, so a
+        # future matrix entry cannot move it.
+        run: cd internal/repo && go generate . && git diff --exit-code && { test -z "$(git status --porcelain .)" || { git status --porcelain .; exit 1; }; }
+      - name: gofmt
+        if: runner.os != 'Windows'
         shell: bash
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }

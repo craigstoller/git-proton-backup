@@ -1,13 +1,15 @@
 <#
-    Guard that the README's Linux CLI install commands follow the code.
+    Guard that the README's Linux and macOS CLI install commands follow the code.
 
-    The README tells a Linux user to download Proton's CLI from a versioned URL and to check the
-    download against a SHA-512. Both are certification touch points (docs/releasing.md, "Between
-    releases"): the version is the semver of transport.CertifiedCLI, and the SHA-512 is the
-    constant scripts/Test-ProtonCliDrift.ps1 records for the certified linux/x64 build. A
-    certification that moves one and forgets the README would leave the README telling a Linux
-    user to install a build the helper refuses, or to verify against a hash the gate never ran.
-    These two tests make that a red build instead of a user's first-run failure.
+    The README tells a Linux user, and a Mac user, to download Proton's CLI from a versioned URL
+    and to check the download against a SHA-512. Each is a certification touch point
+    (docs/releasing.md, "Between releases"): the version is the semver of transport.CertifiedCLI,
+    and each SHA-512 is the constant scripts/Test-ProtonCliDrift.ps1 records for the certified
+    build on that platform ($CertifiedLinuxX64Sha512 for linux/x64, $CertifiedMacArm64Sha512 for
+    macos/arm64, whose download path says darwin-arm64). A certification that moves one and
+    forgets the README would leave the README telling a user to install a build the helper
+    refuses, or to verify against a hash nobody recorded. These four tests make that a red build
+    instead of a user's first-run failure.
 
     Hermetic: reads three files from the repo, runs nothing, touches no account.
 #>
@@ -28,6 +30,10 @@ BeforeAll {
     $shaMatch = [regex]::Match($drift, '\$CertifiedLinuxX64Sha512\s*=\s*''([0-9a-f]{128})''')
     if (-not $shaMatch.Success) { throw 'ReadmePins: could not read $CertifiedLinuxX64Sha512 from scripts/Test-ProtonCliDrift.ps1' }
     $script:certifiedLinuxSha512 = $shaMatch.Groups[1].Value
+
+    $macShaMatch = [regex]::Match($drift, '\$CertifiedMacArm64Sha512\s*=\s*''([0-9a-f]{128})''')
+    if (-not $macShaMatch.Success) { throw 'ReadmePins: could not read $CertifiedMacArm64Sha512 from scripts/Test-ProtonCliDrift.ps1' }
+    $script:certifiedMacSha512 = $macShaMatch.Groups[1].Value
 }
 
 Describe 'README Linux CLI pins' {
@@ -42,5 +48,21 @@ Describe 'README Linux CLI pins' {
         # `sha512sum -c` takes "<hash>  <name>" with two spaces.
         $line = "$($script:certifiedLinuxSha512)  proton-drive"
         $script:readme.Contains($line) | Should -BeTrue -Because 'README.md must contain the drift script''s $CertifiedLinuxX64Sha512, then two spaces, then proton-drive'
+    }
+}
+
+Describe 'README macOS CLI pins' {
+    # RED: both tests below were written before the README had a macOS install block, and failed
+    # on their Should -BeTrue assertions until it did. They now guard the pins.
+    It 'pins the README''s macOS CLI download to the certified version' {
+        # Proton's feed names the platform macos/arm64; its download path says darwin-arm64.
+        $url = "https://proton.me/download/drive/cli/$($script:certifiedSemver)/darwin-arm64/proton-drive"
+        $script:readme.Contains($url) | Should -BeTrue -Because "README.md must contain $url (the semver of transport.CertifiedCLI)"
+    }
+
+    It 'pins the README''s macOS CLI SHA-512 to the drift script''s certified value' {
+        # `shasum -a 512 -c` takes "<hash>  <name>" with two spaces, as `sha512sum -c` does.
+        $line = "$($script:certifiedMacSha512)  proton-drive"
+        $script:readme.Contains($line) | Should -BeTrue -Because 'README.md must contain the drift script''s $CertifiedMacArm64Sha512, then two spaces, then proton-drive'
     }
 }

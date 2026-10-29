@@ -1,0 +1,80 @@
+== L10: L8's layout (clone packs NFC=A and NFD=C; fetch writes NFC=B loose), packed first
+  commits: A=cdeb7feb82d3 B=ea92338cb941 C=578d65cf39ea
+    update-ref --stdin in remote.git (create refs/heads nfc cdeb7feb82d3f48d227dc94405676bd0f68f57c2): exit 0
+    update-ref --stdin in remote.git (create refs/heads nfd 578d65cf39eab464ee3257fe5ce5557aa9c11a6c): exit 0
+    update-ref --stdin in remote.git (update refs/heads nfc ea92338cb941fd04e2d4dd5d46d58f8331361d05 cdeb7feb82d3f48d227dc94405676bd0f68f57c2): exit 0
+    fetch exit 0
+  [before]
+    loose files in refs/remotes/proton-v2:
+      b'caf\xc3\xa9' -> ea92338cb941
+    packed-refs entries:
+      b'refs/remotes/proton-v2/cafe\xcc\x81' -> 578d65cf39ea
+      b'refs/remotes/proton-v2/caf\xc3\xa9' -> cdeb7feb82d3
+  RUN: git -c core.precomposeunicode=false pack-refs --all
+    exit 0
+  [after pack-refs]
+    loose files in refs/remotes/proton-v2:
+      (no such directory)
+    packed-refs entries:
+      b'refs/remotes/proton-v2/cafe\xcc\x81' -> 578d65cf39ea
+      b'refs/remotes/proton-v2/caf\xc3\xa9' -> ea92338cb941
+  RUN: printf 'delete refs/remotes/proton-v2/cafe\314\201\n' | git update-ref --stdin
+    exit 0
+  [after delete]
+    loose files in refs/remotes/proton-v2:
+      (no such directory)
+    packed-refs entries:
+      b'refs/remotes/proton-v2/caf\xc3\xa9' -> ea92338cb941
+
+== L11: L9's layout (clone packs NFD=C; fetch writes NFC=B loose), packed first
+  commits: A=cdeb7feb82d3 B=ea92338cb941 C=578d65cf39ea
+    update-ref --stdin in remote.git (create refs/heads nfd 578d65cf39eab464ee3257fe5ce5557aa9c11a6c): exit 0
+    update-ref --stdin in remote.git (create refs/heads nfc ea92338cb941fd04e2d4dd5d46d58f8331361d05): exit 0
+    fetch exit 0
+  [before]
+    loose files in refs/remotes/proton-v2:
+      b'caf\xc3\xa9' -> ea92338cb941
+    packed-refs entries:
+      b'refs/remotes/proton-v2/cafe\xcc\x81' -> 578d65cf39ea
+  RUN: git -c core.precomposeunicode=false pack-refs --all
+    exit 0
+  [after pack-refs]
+    loose files in refs/remotes/proton-v2:
+      (no such directory)
+    packed-refs entries:
+      b'refs/remotes/proton-v2/cafe\xcc\x81' -> 578d65cf39ea
+      b'refs/remotes/proton-v2/caf\xc3\xa9' -> ea92338cb941
+  RUN: printf 'delete refs/remotes/proton-v2/cafe\314\201\n' | git update-ref --stdin
+    exit 0
+  [after delete]
+    loose files in refs/remotes/proton-v2:
+      (no such directory)
+    packed-refs entries:
+      b'refs/remotes/proton-v2/caf\xc3\xa9' -> ea92338cb941
+
+== L12: L1's layout (NFC packed A, NFD loose C), packed first
+  commits: A=cdeb7feb82d3 B=ea92338cb941 C=578d65cf39ea
+    update-ref --stdin in L12 (create refs/heads nfc cdeb7feb82d3f48d227dc94405676bd0f68f57c2): exit 0
+    update-ref --stdin in L12 (create refs/heads nfd 578d65cf39eab464ee3257fe5ce5557aa9c11a6c): exit 0
+  [before]
+    loose files in refs/heads:
+      b'cafe\xcc\x81' -> 578d65cf39ea
+    packed-refs entries:
+      b'refs/heads/caf\xc3\xa9' -> cdeb7feb82d3
+  RUN: git -c core.precomposeunicode=false pack-refs --all
+    exit 0
+  [after pack-refs]
+    loose files in refs/heads:
+      (none)
+    packed-refs entries:
+      b'refs/heads/cafe\xcc\x81' -> 578d65cf39ea
+      b'refs/heads/caf\xc3\xa9' -> cdeb7feb82d3
+  RUN: printf 'delete refs/heads/cafe\314\201\n' | git update-ref --stdin
+    exit 0
+  [after delete]
+    loose files in refs/heads:
+      (none)
+    packed-refs entries:
+      b'refs/heads/caf\xc3\xa9' -> cdeb7feb82d3
+
+== done

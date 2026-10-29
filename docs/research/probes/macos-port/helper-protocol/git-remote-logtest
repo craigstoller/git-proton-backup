@@ -1,0 +1,18 @@
+#!/bin/bash
+# A logging stand-in remote helper: records what git sends, advertises one ref
+# (LOGTEST_SHA as refs/heads/main), and answers a fetch batch without sending
+# objects. Local only; used to see which commands git sends for fetch, clone
+# and ls-remote, and whether it sends a fetch when the objects are already local.
+log="$LOGTEST_LOG"
+echo "ARGS: $*" >> "$log"
+while IFS= read -r line; do
+  echo "IN: $line" >> "$log"
+  case "$line" in
+    capabilities) printf 'option\nfetch\n\n' ;;
+    option\ *) echo ok ;;
+    list|"list for-push") printf '%s refs/heads/main\n@refs/heads/main HEAD\n\n' "$LOGTEST_SHA" ;;
+    fetch\ *) echo "FETCH-COMMAND-RECEIVED" >> "$log" ;;
+    "") printf '\n' ;;
+  esac
+done
+echo "EOF" >> "$log"
