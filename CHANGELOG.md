@@ -23,8 +23,9 @@
   both spellings in escaped form, since they print alike. Case is now folded from tables pinned at
   Unicode 17.0.0 instead of the Go toolchain's own, so every build refuses the same names; no pair
   refused before is let through [basis: a containment test of the toolchain's case folding against
-  the pinned tables. Release builds use Go 1.22, whose tables are Unicode 15.0.0, and only CI's Go
-  1.22 leg runs the test against them; that leg has not run yet]. The cost is that some pairs no
+  the pinned tables. Release builds use Go 1.22, whose tables are Unicode 15.0.0, and CI's Go 1.22
+  leg runs the test against them; it passed on 2026-10-28, with 2974 orbit members checked]. The
+  cost is that some pairs no
   filesystem is known to confuse are refused too, such as `ᾳ` beside `αι` [inference: no
   measurement shows a Mac confusing them].
 - **git-remote-proton: a warning when a remote already holds such a pair, and refusals on a Mac.**

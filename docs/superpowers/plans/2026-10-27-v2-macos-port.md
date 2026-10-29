@@ -1504,5 +1504,12 @@ after text:
 - These coverage gaps: generator checks 1 and 3, supplementary-plane samples, an equal-class mark
   vector, an invalid byte between reordered marks, the canonical twins of two tests, and the
   remaining task-review test gaps.
-- The CI items to read on the first run: which git the macOS runner resolves, that it is arm64,
-  the wrapper's timing there, the Go 1.22 leg's containment line, and the Windows `.cmd` stubs.
+
+**The first CI run (run 40821233371, on `92d2168`, 2026-10-28) passed in all five jobs.**
+- The macOS leg ran on arm64 (`macos-26-arm64`) with the runner's own git 2.56.0, so the floor
+  probe needed no brew fallback. The wrapper test passed 7 of 7, and every package passed,
+  including the two tests at git's Mac default.
+- The Go 1.22 leg ran the containment test against toolchain Unicode 15.0.0. It checked 2974 orbit
+  members and passed; 3 pinned classes span more than one toolchain orbit, which O1(iv) accepts.
+- Windows Pester passed 221 of 221, including the 30 drift tests through the `.cmd` stubs.
+- The generated tables matched the committed data.
