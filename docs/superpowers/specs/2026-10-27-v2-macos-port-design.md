@@ -100,7 +100,7 @@ Local only, with a logging stand-in helper and scratch repositories, git 2.54.0 
 | M25 | git starts a remote helper with `GIT_DIR=.git`, from the repository's top level, for `ls-remote` or `fetch` run at that top level **or in any subfolder of it**; it leaves `GIT_DIR` unset only when no repository encloses the working directory. The helper's first argument is the remote's name for a named remote (`lt`, `origin`) and the URL itself (`logtest::x`) for an anonymous one, for `fetch` and `ls-remote` alike. | [mac] |
 | M26 | git refuses, before contacting the remote, a push that both deletes and writes one ref: `git push origin :refs/heads/main <oid>:refs/heads/main` fails with `dst ref refs/heads/main receives from more than one src`, exit 1. So a same-batch replacement of one name reaches `Push` only from a direct caller, such as a test. | [mac] |
 | M27 | `go version -m` reports `vcs.modified=true` for a build made in a clone holding one untracked file that is not ignored, and `vcs.modified=false` for one holding only ignored files (an untracked `.superpowers/` file). | [mac] |
-| M28 | **At a clone's `list`**, git has already created the new repository: the helper starts in the parent folder with the remote's name (`origin`) as its first argument and `GIT_DIR` set to the new repository's `.git`, whose format already reads `files` (default) or `reftable` (`--ref-format=reftable`). `remote.origin.url` is written, **`remote.origin.fetch` is not yet**, and the repository holds no refs. `option cloning true` comes only after `list`. | [mac] |
+| M28 | **At a clone's `list`**, git has already created the new repository: the helper starts in the parent folder with the remote's name (`origin`) as its first argument and `GIT_DIR` set to the new repository's `.git`, whose format already reads `files` (default) or `reftable` (`--ref-format=reftable`). `remote.origin.url` is written; in a plain clone **`remote.origin.fetch` is not yet**, though a clone given `-c remote.origin.fetch=<spec>` has it set at `list` (MA6) [measured during the plan's Task 8 review, 2026-10-27], and the repository holds no refs. `option cloning true` comes only after `list`. | [mac] |
 | M29 | Go's `%q` leaves a combining mark unescaped, so NFC `refs/heads/café` and NFD `refs/heads/café` print identically; `%+q` (`strconv.QuoteToASCII`) prints `"refs/heads/caf\u00e9"` and `"refs/heads/cafe\u0301"`. | [mac] |
 
 ### Facts the design rests on, read rather than measured
@@ -367,13 +367,19 @@ caseless equivalence is a Unicode definition, not a model of APFS or NTFS, so a 
 beside `αι` (equivalent under it, because Unicode folds U+0345 to `ι`) is refused though no
 measurement shows a Mac confusing them [inference]. The README's honest limits name this.
 
-**What no rule here catches: a lone NFD name.** Every check in this section compares two refs. A
-remote holding `café` only in NFD, pushed from Linux, Windows or a tool, has no pair, so it is
-pushed, scanned, cloned and fetched without a word, and a Mac user then cannot name it by typing:
-the typed NFC spelling fails with `fatal: invalid reference` (M15). That is loud, not silent, and
-corrupts nothing, so it is left to the README's honest limits, with the exact-bytes form
-(`core.precomposeunicode=false`, the name given as bytes) as the way to reach it [review: Gemini;
-my call].
+**What no rule here catches at first: a lone NFD name.** Every check in this section compares two
+refs. A remote holding `café` only in NFD, pushed from Linux, Windows or a tool, has no pair, so it
+is pushed, scanned and cloned without a word, and a Mac user then cannot name it by typing: the
+typed NFC spelling fails with `fatal: invalid reference` (M15). At git's Mac default,
+`core.precomposeunicode=true`, the branch's first incremental fetch writes a loose NFD file that git
+itself then lists precomposed, as a phantom NFC tracking ref beside the stale packed NFD one, and the
+next fetch fails in git (`cannot lock ref`). The helper refuses that next fetch first, under rule
+(2), because `LocalRefs` reads git's own view (MA4) [measured 2026-10-28, git 2.54.0:
+`docs/research/probes/macos-port/lone-nfd-default/`; the helper's half pinned by
+`TestLoop_ListAtTheMacDefaultRefusesALoneNFDBranchAfterItsFirstFetch`]. Nothing is lost (`git fsck`
+exits 0), so it is left to the README's honest limits, with a `reftable` clone as the remedy and
+the exact-bytes form (`core.precomposeunicode=false`, the name given as bytes) as the way to reach
+the name [review: Gemini; my call].
 
 **Existing pairs: what a read does (O3(d)).** As under D2, pairs already on a remote stay: pushes
 made before this release or from older helper versions, CLI or web uploads, and repaired skipped
@@ -513,8 +519,8 @@ advertised set, `gitDir` and stderr; the comparisons are pure functions beside `
   an update D2 would refuse in the current state is refused by D2, with D2's message, before this
   rule sees it, and `TestPushRenameRefusalsReachAFixedPoint`'s two-pass case keeps its result
   (interleaving the two rules pass by pass would let this rule take that case's second refusal).
-  Each outer round that continues refuses at least one update, so there are at most (updates + 1)
-  rounds, and every step is set algebra, so neither outcome nor text depends on batch order. A
+  Each outer round that continues invalidates at least one entry, possibly only a delete that part
+  3 refuses, so there are at most (entries + 1) rounds (MA5), and every step is set algebra, so neither outcome nor text depends on batch order. A
   refused update is invalid for every later check and gets exactly one message; this rule's
   refusals never enter A1's `renameTo`, so a delete is paired once, by the rule that refused its
   write.
@@ -548,8 +554,9 @@ Gemini, DeepSeek]:
 1. record both members' names and object IDs, which the warning prints;
 2. make a temporary `--ref-format=reftable` clone, which the refusal allows and APFS cannot alias;
 3. from it, delete one member **by its exact bytes** (`core.precomposeunicode=false`, the name
-   given as bytes, since a typed name precomposes, M13), or delete it from a Windows or Linux
-   client. A delete push from inside a Mac `files` clone is what this avoids: git's post-push
+   given as bytes, since a typed name precomposes, M13), or delete it from a Linux client, or, for
+   a pair that differs by normalisation alone, a Windows one (MA7) [inference: NTFS ignores case
+   and keeps normalisation; not measured]. A delete push from inside a Mac `files` clone is what this avoids: git's post-push
    delete of the deleted name's tracking ref can unlink the surviving member's loose file, which
    APFS treats as the same name, and rewind it to a stale packed value (M24) [review: Gemini].
    The Mac push rule's part 3 refuses that delete, so the mistake now fails loudly;
@@ -931,13 +938,22 @@ the approved text stated, and each is Craig's call. MA1 and MA2 accept the recom
 they were found while writing the plan (`docs/superpowers/plans/2026-10-27-v2-macos-port.md`,
 Task 0), where each one's before-and-after text was put to him. MA3 was found by the review of the
 plan's Task 13, which probed the remedy in scratch repositories; Craig chose option (c) of three on
-2026-10-28, with its before-and-after text in front of him.
+2026-10-28, with its before-and-after text in front of him. MA4 to MA9 came from the plan's final
+whole-branch review and its task reviews; on 2026-10-28 Craig accepted the recommended default for
+each ("Proceed with your recommendations"), with the before-and-after text of MA4 to MA8 in front of
+him. MA9 changes no text.
 
 | | Ruled | Not taken |
 |---|---|---|
 | MA1 | `remote.<name>.mirror` is not a fetch-destination source (§3, rule (2)): git uses it for push only [doc: `git help config`, git 2.54.0] | keep reading it, a key git never uses for fetch |
 | MA2 | the pin-moving fetch checks the files' version lines and records their SHA-256s, and the data is cross-checked by `NormalizationTest.txt` and the containment test (§3, "The inputs are committed"); Unicode publishes no checksums [2026-10-27: none in the 17.0.0 `ucd/` listing or either ReadMe] | the original "published checksums" check, which cannot be made |
-| MA3 | the stale-local-ref remedy: a bare exact-bytes delete can unlink the other spelling's loose ref on APFS (§3, "The refusal's remedies follow its cause"), so the re-clone comes first and the in-place delete runs only after `pack-refs` with precomposition off; the helper's refusal messages name only the re-clone and point to the README for the in-place route [measured 2026-10-28, git 2.54.0: after a real clone and a fetch, the bare delete rewound the other ref to a stale packed value with `git fsck` clean; packed first, only the named ref went] | the bare exact-bytes delete; (a) the re-clone alone, everywhere; (b) the pack-first delete alone |
+| MA3 | the stale-local-ref remedy: a bare exact-bytes delete can unlink the other spelling's loose ref on APFS (§3, "The refusal's remedies follow its cause"), so the re-clone comes first and the in-place delete runs only after `pack-refs` with precomposition off; the helper's refusal messages name only the re-clone and point to the README for the in-place route [measured 2026-10-28, git 2.54.0: after a real clone and a fetch, the bare delete rewound the other ref to a stale packed value while `git fsck` exited 0, listing the lost commit only as dangling (wording corrected by MA8); packed first, only the named ref went] | the bare exact-bytes delete; (a) the re-clone alone, everywhere; (b) the pack-first delete alone |
+| MA4 | a lone NFD name at git's Mac default (§3, "What no rule here catches at first"): its first incremental fetch leaves git listing a phantom NFC tracking ref, its next fetch fails in git, and the helper refuses that fetch first; `LocalRefs` keeps reading git's own view, so no code changes, and the README names the limit with a `reftable` clone as the remedy [measured 2026-10-28, git 2.54.0, `docs/research/probes/macos-port/lone-nfd-default/`] | (b) read exact bytes (`-c core.precomposeunicode=false`), which lets git fail the fetch itself; (c) refuse a lone non-NFC destination up front on a Mac `files` clone, new code and a gate step |
+| MA5 | the push rule's termination bound is (entries + 1): an outer round can continue on a part-3 delete alone (§3, the Mac push rule) | the stated (updates + 1) |
+| MA6 | M28 holds for a plain clone; a clone given `-c remote.origin.fetch=<spec>` has that key set at `list`, which is why the empty-repository checks add git's default mapping to the configured specs | M28 as a plain-clone-only statement |
+| MA7 | the repair deletes a member from a Linux client or a `reftable` clone, and from Windows only for a pair that differs by normalisation alone (§3, "Repair", step 3) [inference: NTFS ignores case and keeps normalisation; not measured] | Windows as a route for any pair |
+| MA8 | MA3's measurement reads "`git fsck` exited 0, listing the lost commit only as dangling", as its record shows (layout L8), not "clean" | the "clean" wording |
+| MA9 | a dangling symbolic local ref stays an accepted limit: every git ref enumerator skips it, so a destination written through it is unseen; the common case, a dangling `refs/remotes/<r>/HEAD` after a prune, is still caught by R6's synthesized `<p>/HEAD` (no text change in §3) | a fourth local read that walks loose refs |
 
 The plan also makes six refinements (R1–R6) under O3(d)'s licence that "a plan may refine them with
 a reason". They were put to Craig on 2026-10-27 and not objected to, so they stand as unopposed

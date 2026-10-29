@@ -1485,3 +1485,24 @@ after text:
 - §3's lone-NFD premise ("corrupts nothing"), false at git's Mac default (measured above);
 - the push rule's termination bound, "(updates + 1)": a round can continue on a part-3 delete
   alone, so the bound that holds is entries + 1.
+
+**Settled later the same day (Craig's call, 2026-10-28: "Proceed with your recommendations").**
+- The five texts are amended as shown to him, as spec amendments MA4 to MA8. The design doc's
+  v6.10 entry copies them.
+- For the lone NFD name, the helper keeps reading git's own view (MA4). Not taken: reading exact
+  bytes; refusing such a name up front.
+- The dangling symbolic local ref stays an accepted limit (MA9). Not taken: a loose-ref walk.
+- The gate brief's question defaults stand as unopposed defaults, for Craig to confirm when the
+  gate is prepared. Question 1, the version name, has no default.
+
+**Kept for later.** The final review's follow-ups, none blocking:
+- `fetch_unicode.go` should refuse a non-HTTPS redirect before the Unicode pin next moves.
+- R2's phase-5 re-check could be gated like R2's own `uncommitted` set, to save its cost.
+- R1 does not compare up-to-date tracking refs with each other; the README states the gap.
+- A directory pair of n and m branches prints n×m warning lines on every `list`; cap it.
+- A hermetic test of R1's `reftable` remedy path at `list for-push` would back gate step 5.11.
+- These coverage gaps: generator checks 1 and 3, supplementary-plane samples, an equal-class mark
+  vector, an invalid byte between reordered marks, the canonical twins of two tests, and the
+  remaining task-review test gaps.
+- The CI items to read on the first run: which git the macOS runner resolves, that it is arm64,
+  the wrapper's timing there, the Go 1.22 leg's containment line, and the Windows `.cmd` stubs.

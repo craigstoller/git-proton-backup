@@ -1277,7 +1277,7 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
     phantom NFC tracking ref beside the stale NFD one after the branch's first incremental fetch
     (measured; `docs/research/probes/macos-port/lone-nfd-default/`), and the Mac fetch check then
     refuses the next fetch as a collision (a hermetic test pins it). The README's honest limits
-    say so.*
+    say so. Craig kept the helper reading git's own view (MA4), so the code does not change.*
 - **One pinned Unicode version for both relations (O1(iv), MA2).** `caseKey` folds by a generated
   table instead of `unicode.SimpleFold`, so every build refuses the same set whichever Go compiled
   it, and `nfd` uses generated decomposition and combining-class tables from the same version,
@@ -1454,16 +1454,25 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   | O5 | all four: the Mac gate last, after the draft Windows helper, never concurrent; a Mac-only failure does not hold the release; a paired PC session runs the Windows side; the Windows and Linux gates test the composition refusal on their own binaries | any of the four left out |
   | O6 | (c) rule 12, an AGENTS.md line, and a shim-resolution check in the test code | (a) the checklist only; (b) the checklist and AGENTS.md |
 
-- **Amendments MA1–MA3 (copied from the spec).** Each corrects a fact the approved spec stated,
-  and each is Craig's call. MA1 and MA2 (2026-10-27) accept the recommended default. MA3
-  (2026-10-28) was found by the review of the plan's Task 13, which probed the remedy in scratch
-  repositories; Craig chose option (c) of three, with its before-and-after text in front of him.
+- **Amendments MA1–MA9 (copied from the spec; MA3 to MA9 byte for byte).** Each corrects a fact
+  the approved spec stated, and each is Craig's call. MA1 and MA2 (2026-10-27) accept the
+  recommended default. MA3 (2026-10-28) was found by the review of the plan's Task 13, which
+  probed the remedy in scratch repositories; Craig chose option (c) of three, with its
+  before-and-after text in front of him. MA4 to MA9 (2026-10-28) came from the plan's final
+  review and its task reviews; Craig accepted the recommended default for each ("Proceed with
+  your recommendations"). MA9 changes no spec text.
 
   | | Ruled | Not taken |
   |---|---|---|
   | MA1 | `remote.<name>.mirror` is not a fetch-destination source: git uses it for push only [doc: `git help config`, git 2.54.0] | keep reading it, a key git never uses for fetch |
   | MA2 | the pin-moving fetch checks the files' version lines and records their SHA-256s, and the data is cross-checked by `NormalizationTest.txt` and the containment test; Unicode publishes no checksums | the original "published checksums" check, which cannot be made |
-  | MA3 | the stale-local-ref remedy: a bare exact-bytes delete can unlink the other spelling's loose ref on APFS (§3, "The refusal's remedies follow its cause"), so the re-clone comes first and the in-place delete runs only after `pack-refs` with precomposition off; the helper's refusal messages name only the re-clone and point to the README for the in-place route [measured 2026-10-28, git 2.54.0: after a real clone and a fetch, the bare delete rewound the other ref to a stale packed value with `git fsck` clean; packed first, only the named ref went] | the bare exact-bytes delete; (a) the re-clone alone, everywhere; (b) the pack-first delete alone |
+  | MA3 | the stale-local-ref remedy: a bare exact-bytes delete can unlink the other spelling's loose ref on APFS (§3, "The refusal's remedies follow its cause"), so the re-clone comes first and the in-place delete runs only after `pack-refs` with precomposition off; the helper's refusal messages name only the re-clone and point to the README for the in-place route [measured 2026-10-28, git 2.54.0: after a real clone and a fetch, the bare delete rewound the other ref to a stale packed value while `git fsck` exited 0, listing the lost commit only as dangling (wording corrected by MA8); packed first, only the named ref went] | the bare exact-bytes delete; (a) the re-clone alone, everywhere; (b) the pack-first delete alone |
+  | MA4 | a lone NFD name at git's Mac default (§3, "What no rule here catches at first"): its first incremental fetch leaves git listing a phantom NFC tracking ref, its next fetch fails in git, and the helper refuses that fetch first; `LocalRefs` keeps reading git's own view, so no code changes, and the README names the limit with a `reftable` clone as the remedy [measured 2026-10-28, git 2.54.0, `docs/research/probes/macos-port/lone-nfd-default/`] | (b) read exact bytes (`-c core.precomposeunicode=false`), which lets git fail the fetch itself; (c) refuse a lone non-NFC destination up front on a Mac `files` clone, new code and a gate step |
+  | MA5 | the push rule's termination bound is (entries + 1): an outer round can continue on a part-3 delete alone (§3, the Mac push rule) | the stated (updates + 1) |
+  | MA6 | M28 holds for a plain clone; a clone given `-c remote.origin.fetch=<spec>` has that key set at `list`, which is why the empty-repository checks add git's default mapping to the configured specs | M28 as a plain-clone-only statement |
+  | MA7 | the repair deletes a member from a Linux client or a `reftable` clone, and from Windows only for a pair that differs by normalisation alone (§3, "Repair", step 3) [inference: NTFS ignores case and keeps normalisation; not measured] | Windows as a route for any pair |
+  | MA8 | MA3's measurement reads "`git fsck` exited 0, listing the lost commit only as dangling", as its record shows (layout L8), not "clean" | the "clean" wording |
+  | MA9 | a dangling symbolic local ref stays an accepted limit: every git ref enumerator skips it, so a destination written through it is unseen; the common case, a dangling `refs/remotes/<r>/HEAD` after a prune, is still caught by R6's synthesized `<p>/HEAD` (no text change in §3) | a fourth local read that walks loose refs |
 
 **v6.9, 2026-10-16 — Linux port: linux/amd64 becomes a supported platform, pushes refuse new case-variant refs, and the git-floor and distro-CLI messages change.**
 
