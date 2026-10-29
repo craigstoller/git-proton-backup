@@ -3270,7 +3270,8 @@ func TestLoop_ListTreatsAPushOnlyRemoteAsNamed(t *testing.T) {
 // An empty url clears the list before it (git help config), so a remote whose
 // first url is "" and whose second is real has a url, and git starts the
 // helper as that named remote with the second one (measured 2026-10-28, git
-// 2.54.0, with a stand-in helper). It is not anonymous: its refspecs are
+// 2.54.0, with a stand-in helper; record in
+// docs/research/probes/macos-port/remote-url-reset/). It is not anonymous: its refspecs are
 // checked at both list commands, as for TestLoop_ListTreatsAPushOnlyRemoteAsNamed,
 // and the rename-transition and PM1 states are refused.
 func TestLoop_ListTreatsAnEmptyURLThenARealOneAsNamed(t *testing.T) {

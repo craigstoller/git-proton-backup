@@ -1,0 +1,75 @@
+== c1: remote.back.url= remote.back.url=proton::/x
+-- ls-remote back
+argv: back | /x
+fatal: remote helper 'proton' aborted session
+   exit 128
+-- push back HEAD:refs/heads/main
+argv: back | /x
+fatal: remote helper 'proton' aborted session
+   exit 128
+== c2: remote.back.url=proton::/x remote.back.url=
+-- ls-remote back
+fatal: 'back' does not appear to be a git repository
+fatal: Could not read from remote repository.
+
+Please make sure you have the correct access rights
+and the repository exists.
+   exit 128
+-- push back HEAD:refs/heads/main
+fatal: 'back' does not appear to be a git repository
+fatal: Could not read from remote repository.
+
+Please make sure you have the correct access rights
+and the repository exists.
+   exit 128
+== c3: remote.back.url=proton::/x remote.back.url= remote.back.pushurl=proton::/y
+-- ls-remote back
+fatal: 'back' does not appear to be a git repository
+fatal: Could not read from remote repository.
+
+Please make sure you have the correct access rights
+and the repository exists.
+   exit 128
+-- push back HEAD:refs/heads/main
+argv: back | /y
+fatal: remote helper 'proton' aborted session
+   exit 128
+== c4: remote.back.url=proton::/x remote.back.pushurl= remote.back.pushurl=proton::/y
+-- ls-remote back
+argv: back | /x
+fatal: remote helper 'proton' aborted session
+   exit 128
+-- push back HEAD:refs/heads/main
+argv: back | /y
+fatal: remote helper 'proton' aborted session
+   exit 128
+== c5: remote.back.url=proton::/x remote.back.pushurl=proton::/y remote.back.pushurl=
+-- ls-remote back
+argv: back | /x
+fatal: remote helper 'proton' aborted session
+   exit 128
+-- push back HEAD:refs/heads/main
+argv: back | /x
+fatal: remote helper 'proton' aborted session
+   exit 128
+== c6: remote.back.url= remote.back.pushurl=proton::/y
+-- ls-remote back
+fatal: 'back' does not appear to be a git repository
+fatal: Could not read from remote repository.
+
+Please make sure you have the correct access rights
+and the repository exists.
+   exit 128
+-- push back HEAD:refs/heads/main
+argv: back | /y
+fatal: remote helper 'proton' aborted session
+   exit 128
+== c7: remote.back.url=proton::/x remote.back.url= remote.back.url=proton::/z
+-- ls-remote back
+argv: back | /z
+fatal: remote helper 'proton' aborted session
+   exit 128
+-- push back HEAD:refs/heads/main
+argv: back | /z
+fatal: remote helper 'proton' aborted session
+   exit 128

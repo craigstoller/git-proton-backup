@@ -184,3 +184,13 @@ own.
 
 **Changes made when these were committed.** None: both files are byte-for-byte copies. The
 script takes its folder as an argument and holds no path, and the log prints none.
+
+## An empty remote URL: `remote-url-reset/`
+
+Run on 2026-10-28 with git 2.54.0 in scratch repositories, during the final review's fixes.
+`urlprobe.sh` puts a stand-in `git-remote-proton` first on PATH that logs its argv and exits, then
+runs git with `remote.<name>.url` and `pushurl` lists that hold an empty value. `urlprobe.out` is its
+output. It shows git resetting a multi-valued key's list at an empty value and handing the helper
+the later value under the remote's name, which is the behaviour `internal/gitcmd/local.go` now
+follows and `TestRemoteConfigAnEmptyURLClearsTheList` and
+`TestLoop_ListTreatsAnEmptyURLThenARealOneAsNamed` pin. Scrubbed when committed: the script's scratch folder became `$SP`.
