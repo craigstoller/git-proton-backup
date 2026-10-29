@@ -44,12 +44,15 @@
     <key>StandardErrorPath</key>
     <string>/Users/YOU/Library/Logs/gpb-v2-push.myrepo.err.log</string>
 
-    <!-- Optional environment. The wrapper exports PATH from GPB_PATH, whose default is
+    <!-- Optional environment, in the commented-out block below. The wrapper exports PATH from
+         GPB_PATH, whose default is
          $HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin. Set
-         GPB_PATH here if git, git-remote-proton or proton-drive live somewhere else. Uncomment
-         PROTON_DRIVE_CACHE_DIR to give the Proton CLI, and so the helper, a cache folder of its
-         own. GPB_PUSH_TIMEOUT is the bound on each push in seconds (default 1800).
-
+         GPB_PATH if git, git-remote-proton or proton-drive live somewhere else.
+         PROTON_DRIVE_CACHE_DIR gives the Proton CLI, and so the helper, a cache folder of its
+         own. GPB_PUSH_TIMEOUT is the bound on each push in seconds (default 1800). To use the
+         block, delete the comment lines just above and below it, then delete each key you do
+         not need together with the string under it. -->
+    <!--
     <key>EnvironmentVariables</key>
     <dict>
         <key>GPB_PATH</key>

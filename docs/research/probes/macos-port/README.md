@@ -14,8 +14,9 @@ measurements listed in [the plan](../../../superpowers/plans/2026-10-27-v2-macos
 (the 2026-10-23 runs against Proton's CLI and the hermetic suite) have no files here.
 
 This is a subfolder, unlike the flat probes beside it, because the port's probes come to 34 files.
-Eight more, run on 2026-10-28 for Amendment MA3, sit in `stale-ref-remedy/`; the last section
-below covers them.
+Eight more, run on 2026-10-28 for Amendment MA3, sit in `stale-ref-remedy/`, and two more, run the
+same day for the branch's final review, in `lone-nfd-default/`; the last two sections below cover
+them.
 
 ## Reading the files
 
@@ -147,3 +148,39 @@ only, the run's scratch folder is written `$SP` (the repositories' root was `$SP
 the local account name in the `ls -la` lines is written `$USER`. Two of those lines (32 and 202)
 show the NFD file name raw, as `ls` printed it; the `od -c` lines below them give its bytes. The
 scripts take their folders as arguments and hold no path.
+
+## A lone NFD name at git's Mac default: `lone-nfd-default/`
+
+**Pinned results, run locally on 2026-10-28** for the branch's final review, on the same Mac
+(Apple git 2.54.0, macOS 27.2). Local repositories only: git's own local transport, no remote
+helper, no network, no Proton account. `probe.sh` takes one argument, a work folder it deletes
+and recreates: `/bin/bash probe.sh <work folder>`. It builds a `reftable` bare remote holding
+`main` and a branch `café` spelled only in NFD (`63 61 66 65 cc 81`), clones it by path into a
+`files` repository left at git's Mac default (`core.precomposeunicode=true`, which the log's
+listings print), then moves the NFD branch on the remote twice and fetches after each move. After
+the clone and after each fetch it prints, as `od -c`, the loose files and the packed-refs entries
+under `refs/remotes/origin`, and `git for-each-ref` there twice: with the repository's own config,
+and with `-c core.precomposeunicode=false`. No dates are fixed, so the commit IDs are the run's
+own.
+
+| Step | What `run1.log` shows |
+|---|---|
+| The clone | One tracking ref for `café`: a packed-refs entry, in NFD, at commit A. Both listings agree. |
+| Fetch 1 (the remote's NFD branch moves from A to B) | Exit 0. A loose NFD file now sits beside the packed NFD entry, which still says A. With the repository's own config, `for-each-ref` lists the NFD ref at A and an NFC `café`, which no file is named, at B. With precomposition off it lists one NFD ref, at B. |
+| Fetch 2 (B to C) | Exit 1: `cannot lock ref 'refs/remotes/origin/café': is at <B> but expected <A>`, with the name in NFD. The files and both listings are as after fetch 1. |
+| `git fsck` | Exit 0, nothing printed. |
+
+**What these files do not show.**
+
+- **The helper.** The probe never starts `git-remote-proton`. What the helper does with the same
+  layout is pinned by two hermetic tests that build it the same way:
+  `TestLocalRefsAtTheMacDefaultReportsALooseNFDNamePrecomposed` (`internal/gitcmd`) and
+  `TestLoop_ListAtTheMacDefaultRefusesALoneNFDBranchAfterItsFirstFetch`
+  (`cmd/git-remote-proton`).
+- **A checkout.** The clone prints `remote HEAD refers to nonexistent ref, unable to checkout`, so
+  it has no local branch. [inference from the script] The bare remote's `HEAD` names git's default
+  branch, and the script pushes only `main`.
+- No letter-case pair, no `reftable` clone, and no NFC branch on the remote.
+
+**Changes made when these were committed.** None: both files are byte-for-byte copies. The
+script takes its folder as an argument and holds no path, and the log prints none.

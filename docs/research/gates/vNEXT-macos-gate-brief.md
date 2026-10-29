@@ -202,6 +202,14 @@ that others depend on comes first.
     at a tag cannot be re-anchored, since the gate runs the tag's brief and tags never move; and
     step 7 deletes Part A's build, which a gate that goes on still needs. C.3's and step 1's STOPs
     (exit 3) hold the same way, for the same reasons.
+14. **A step 5 sub-step with a clone left at git's Mac default?** Default: no new live step; the
+    hermetic tests cover the helper's side
+    (`TestLoop_ListAtTheMacDefaultRefusesALoneNFDBranchAfterItsFirstFetch` and
+    `TestLocalRefsAtTheMacDefaultReportsALooseNFDNamePrecomposed`). Reason: every step 5 clone
+    sets `core.precomposeunicode=false` (`exact_bytes`), so the gate never runs under the default,
+    where git reports loose ref names precomposed; git's side of that was measured on local
+    repositories [measured 2026-10-28: `docs/research/probes/macos-port/lone-nfd-default/`], and
+    gate content is his to add.
 
 ---
 
@@ -970,10 +978,18 @@ awake_ok() {
   echo "keep-awake: pid $AWAKE_PID is not running caffeinate now: [$c]"; return 1
 }
 # strays <ERE>: for each process whose command line matches, its pid and program path only (never
-# its arguments); status 0 when one is printed, 1 when none.
+# its arguments); status 0 when one is printed, 1 when none, 2 when pgrep itself failed (exit 2 or
+# 3; the line printed says so), which no caller may read as none.
 strays() {
-  local p; p=$(/usr/bin/pgrep -f "$1" | /usr/bin/tr '\n' ',' | /usr/bin/sed 's/,$//')
-  [ -n "$p" ] || return 1
+  local out prc p
+  out=$(/usr/bin/pgrep -f "$1"); prc=$?
+  case "$prc" in
+    0) ;;
+    1) return 1 ;;
+    *) echo "strays: pgrep exited $prc, so the process list is UNKNOWN"; return 2 ;;
+  esac
+  p=$(printf '%s\n' "$out" | /usr/bin/tr '\n' ',' | /usr/bin/sed 's/,$//')
+  [ -n "$p" ] || { echo "strays: pgrep exited 0 but printed no pid, so the process list is UNKNOWN"; return 2; }
   /bin/ps -o pid=,comm= -p "$p"
 }
 cd "$G" || exit 2
@@ -2108,10 +2124,11 @@ PC, whose W.B.0 blob must equal it), `RUN STARTED: probe-a1 ...`, then
 
 - the drift script on `origin/main` holds `$CertifiedMacArm64Sha512` equal to M2's value, and the
   probe CLI's SHA-512 is that value (M2). A missing constant means plan Task 12 has not landed:
-  STOP for Craig. `BLOCKED: the download failed`, or `... not the certified build`, means the
-  certified 0.9.0 `darwin-arm64` artifact is gone or re-cut (the README warns its versioned URL
-  may stop serving once Proton moves on [README]): a new CLI needs a new pin, M2 and README quote,
-  so it is a STOP for Craig before the tag, and the brief is revised first;
+  STOP for Craig. `BLOCKED: the download failed` may mean that the certified 0.9.0 `darwin-arm64`
+  artifact is gone (the README warns its versioned URL may stop serving once Proton moves on
+  [README]), or may be a transient failure; `... not the certified build` means it was re-cut.
+  Either is a STOP for Craig before the tag; a gone or re-cut CLI needs a new pin, M2 and README
+  quote, and the brief is revised first;
 - no quarantine attribute (M2: a `curl` download carries none), and `codesign` prints Proton's
   Developer ID (M3); record it;
 - no `proton-drive` on the probe's PATH, and neither `proton-drive` nor `git-remote-proton` in
@@ -2432,7 +2449,7 @@ else
   echo yes > "$G/v010-needs-uncertified"
   echo "CLI PIN MOVED SINCE v0.10.0: YES (step 5.5 runs v0.10.0's commands alone with GPB_UNCERTIFIED_CLI=1)"
 fi
-code=$(/usr/bin/curl -sS -L -r 0-0 -o /dev/null -w '%{http_code}' https://proton.me/download/drive/cli/0.9.0/darwin-arm64/proton-drive) || code="$code (curl exit $?)"
+code=$(/usr/bin/curl -sS -L --connect-timeout 30 --max-time 900 -r 0-0 -o /dev/null -w '%{http_code}' https://proton.me/download/drive/cli/0.9.0/darwin-arm64/proton-drive) || code="$code (curl exit $?)"
 echo "the certified CLI's versioned download (M1; C.3's README line), one byte asked for: HTTP $code"
 case "$code" in 200|206) ;; *) bad "the certified CLI's versioned URL does not serve it now, so C.3's README lines would fail: a new CLI needs a new pin, M2 and README quote" ;; esac
 if [ "$fail" = 0 ]; then echo "C.2 (Mac): PASS"; exit 0; fi
@@ -2448,7 +2465,9 @@ files whose text the brief quotes (the wrapper and plist under `scripts/macos`, 
 warns that this versioned URL may stop serving once Proton moves on [README], and a lapse found
 here holds before anything is installed, where at C.3 it would come after the helper's build. Its
 `curl` reaches the network but not the account [untested: this brief was written with no network
-call to that URL].
+call to that URL]. It is bounded, `--connect-timeout 30` and `--max-time 900`, so a dead network
+cannot hang C.2. The second bound is generous because a server that ignores the range sends the
+whole binary, and a transfer cut short would be a false STOP.
 
 **A listed file, or any other failed check:** `C.2 (Mac): STOP` (exit 3), before any account write.
 It holds (Question 13): nothing is cleaned, and the PC's tasks stay paused, until Craig rules
@@ -2549,7 +2568,7 @@ echo "~/.local/bin before the gate: $(if [ -d "$HOME/.local/bin" ]; then echo pr
 echo "== README.md at the tag $TAG (main checkout): its macOS install lines"
 git -C "$MAIN" show "$TAG:README.md" > "$G/out/c3-readme-at-tag.md" || { echo "BLOCKED: no README.md at $TAG"; exit 1; }
 mkdir "$G/readme" || exit 1
-kit readme "$G/out/c3-readme-at-tag.md" "$G/readme" "$README_HELPER_SHA" "$README_CLI_SHA" || { echo "C.3: STOP for adjudication: the README's macOS install lines at the tag are not the ones this brief quotes; nothing written, nothing run, and it holds until Craig rules"; exit 3; }
+kit readme "$G/out/c3-readme-at-tag.md" "$G/readme" "$README_HELPER_SHA" "$README_CLI_SHA" || { echo "C.3: STOP for adjudication: the README's macOS install lines at the tag are not the ones this brief quotes; nothing installed, nothing run, and it holds until Craig rules"; exit 3; }
 echo "== the helper: the README's lines, run in $G"
 logged c3-helper env PATH="$HOME/sdk/go1.27.0/bin:$PATH" GOTOOLCHAIN=local /bin/bash -e "$G/readme/helper.sh"
 echo "README helper lines: exit $rc"
@@ -3131,7 +3150,12 @@ ref(s), HEAD left out)`.
   config sets `core.precomposeunicode=false` (`exact_bytes` in `lib.sh`), as M24's probe did, with
   the name written as bytes (`$NFD`, `$'cafe\xcc\x81'`), because git on a Mac precomposes its
   arguments otherwise (M13). A clone made by git gets `core.precomposeunicode=true` (M13), so each
-  step sets it back to `false` before it names a spelling by bytes.
+  step sets it back to `false` before it names a spelling by bytes. Under that default git also
+  reports loose ref names precomposed, so that after a lone NFD branch's first incremental fetch
+  it lists a phantom NFC tracking ref beside the stale NFD one [measured 2026-10-28, local
+  repositories: `docs/research/probes/macos-port/lone-nfd-default/`], and the gate's clones, all
+  set to `false`, do not exercise that setting; a sub-step at the default is Craig's call
+  (Question 14).
 - **Seeded with `main`.** Each remote of its own is seeded with a push of `main` alone first, so its
   `HEAD` names `main` and deleting a `cafe` spelling is never the `HEAD`-branch delete the helper
   refuses [code `internal/repo/push.go:192-196`].
@@ -4302,7 +4326,8 @@ kit pushtree "$G/launchd/samples.txt" "$o" "$e"; t=$?
 notex=0
 case "$t" in 0) ;; 3) notex=1 ;; *) bad "kit pushtree BLOCKED (its lines above say why)" ;; esac
 echo "== stray processes now (pid and program of each command line matching proton-drive|git-remote-proton|gpb-v2-push): none expected"
-if strays 'proton-drive|git-remote-proton|gpb-v2-push'; then bad "a stray process is running"; else echo "(none)"; fi
+strays 'proton-drive|git-remote-proton|gpb-v2-push'; st=$?
+case "$st" in 0) bad "a stray process is running" ;; 1) echo "(none)" ;; *) bad "the process list could not be read" ;; esac
 kit absentnode "$ABSENT" || bad "the missing parent exists now"
 if [ "$fail" != 0 ]; then echo "6.3: BLOCKED"; exit 1; fi
 if [ "$notex" = 1 ]; then echo "6.3: (b) NOT EXERCISED: STOP for Craig"; exit 3; fi
@@ -4417,10 +4442,12 @@ done
 if [ -d "$G/launchd" ]; then : > "$G/launchd/stop-sampler"; fi
 WP='proton-drive|git-remote-proton|gpb-v2-push|git( -C [^ ]+)? (push|fetch|clone) |[.]test( |$)|(^|/)go test( |$)'
 for k in 1 2 3 4 5 6 7 8 9 10 11 12; do
-  strays "$WP" >/dev/null || break
+  strays "$WP" >/dev/null; [ "$?" = 0 ] || break
   echo "waiting for a writer to finish (check $k of 12):"; strays "$WP"; sleep 10
 done
-if strays "$WP"; then echo "MAC WRITERS: RUNNING (wait, then run 7.0 again; trash and delete nothing meanwhile)"; exit 1; fi
+strays "$WP"; st=$?
+if [ "$st" = 0 ]; then echo "MAC WRITERS: RUNNING (wait, then run 7.0 again; trash and delete nothing meanwhile)"; exit 1; fi
+if [ "$st" != 1 ]; then echo "MAC WRITERS: UNKNOWN (the process list could not be read, above; run 7.0 again; trash and delete nothing meanwhile)"; exit 1; fi
 echo "MAC WRITERS: NONE"
 echo "HANDOFF -> PC: W.7.0"
 ```
@@ -4428,7 +4455,11 @@ echo "HANDOFF -> PC: W.7.0"
 **Pass:** `MAC WRITERS: NONE`, and W.7.0's `WINDOWS WRITERS: NONE`. Neither: wait and run 7.0
 again; nothing is trashed or deleted meanwhile. A writer is listed by pid and program only. A
 `go test` counts as one, as its test binary does: after an interrupted step 2.1, its launcher can
-still be compiling, and then start the live table.
+still be compiling, and then start the live table. Like W.7.0's `WINDOWS WRITERS: UNKNOWN`,
+`MAC WRITERS: UNKNOWN` (`pgrep` failed, so the process list could not be read) is never NONE and
+hands nothing off: run 7.0 again, and one that repeats is a STOP for Craig, with nothing trashed
+or deleted meanwhile. `pgrep` exits 2 on invalid options and 3 on an internal error [doc:
+`man pgrep`, EXIT STATUS, read 2026-10-28].
 Then Craig presses Ctrl-C in the keep-awake's window (held since C.0), and the runner checks that
 one pid: `/bin/ps -p "$(/bin/cat ~/gpbmac/gate-a1/caffeinate.pid)" -o pid=,comm=; echo "ps: exit
 $?"`. It must print only `ps: exit 1`. A line naming `/usr/bin/caffeinate` means it still runs:
@@ -5708,3 +5739,15 @@ Rejected, so not to be raised again:
 
 - B3-8 (DeepSeek): 6.0's redaction leaves one-dot names alone (`init.defaultbranch`, tested).
 - B3-9 (DeepSeek): `docs/README.md` exists; its line 28 names the steps file.
+
+Final review, 2026-10-28 (the branch's whole-branch review), on `7c9aca7`. Applied:
+
+- F-1: C.2's reachability `curl` is bounded, `--connect-timeout 30` and a generous
+  `--max-time 900`, so a server that ignores the range is not cut short into a false STOP.
+- F-2: C.3's `kit readme` STOP says nothing installed, not nothing written: by then the run
+  folder holds the README copy and `readme/`.
+- F-3: B.0 says a failed download may mean a gone artifact, or may be a transient failure.
+- F-4: the Mac `strays` returns 2 when `pgrep` fails (exit 2 or 3), where it read as none; 7.0
+  then prints `MAC WRITERS: UNKNOWN` and hands nothing off, as W.7.0 does, and 6.3 BLOCKs.
+- F-5: step 5's exact-bytes rule says the gate's clones do not exercise git's Mac default, under
+  which git reports loose ref names precomposed; Question 14.

@@ -668,11 +668,21 @@ normalisation item above describes. Letter case counts too, because default APFS
 case. They apply where git keeps each ref as a file, so that APFS can take two names for one.
 
 - **A name that exists only in NFD.** Every check compares two refs. A remote that holds `café`
-  only in NFD, pushed from Linux, Windows or a tool, has no pair, so it is pushed, fetched and
-  cloned without a word. On a Mac, typing its name gives the NFC spelling, which fails with
-  `fatal: invalid reference` (measured). That is loud and corrupts nothing. To reach the ref, give
-  git the name as bytes with precomposition off, for example `git -c core.precomposeunicode=false
-  switch "$(printf 'cafe\314\201')"`.
+  only in NFD, pushed from Linux, Windows or a tool, has no pair. A Mac `files` clone of it works,
+  and so does the first fetch after the branch moves. That fetch writes the tracking ref as a loose
+  file beside its packed entry, which keeps the old commit. Under git's Mac default,
+  `core.precomposeunicode=true`, git reads the file's name as NFC, so it then lists two tracking
+  refs: the NFD one at the old commit, and an NFC `café` at the new commit that no file is named.
+  After the branch's next move, plain git's fetch fails with `cannot lock ref` (measured
+  2026-10-28, git 2.54.0, local repositories; record in
+  [docs/research/probes/macos-port/lone-nfd-default/](docs/research/probes/macos-port/lone-nfd-default/)).
+  The helper refuses that fetch first, at `list`, with the collision refusal below; a hermetic
+  test pins this (`TestLoop_ListAtTheMacDefaultRefusesALoneNFDBranchAfterItsFirstFetch`). The
+  remedy is a `--ref-format=reftable` clone. The in-place repair below was not tested on this
+  layout. On a Mac, typing the name gives the NFC spelling, which fails with `fatal: invalid
+  reference` (measured). That is loud and corrupts nothing. To reach the ref, give git the name as
+  bytes with precomposition off, for example `git -c core.precomposeunicode=false switch
+  "$(printf 'cafe\314\201')"`.
 - **Pairs already on a remote.** A pair can be there from pushes made before this release or by an
   older helper, from a CLI or web upload, or from a repaired skipped file. The create rule cannot
   stop those, and a Mac fetch of one corrupts tracking refs silently (above). So reads are checked
@@ -767,9 +777,14 @@ case. They apply where git keeps each ref as a file, so that APFS can take two n
     (`git push --prune` is covered: git sends its deletes to the helper like any others.)
   - Another git process on the same Mac that changes refs while a push or fetch runs. The checks
     judge the local refs as they were when the helper read them.
-  - Two up-to-date refs whose custom fetch refspecs map them onto colliding names, while neither
-    tracking ref exists yet; and an up-to-date push to a ref from a source named under another
-    spelling and given as exact bytes.
+  - Two up-to-date refs whose tracking refs collide with each other. The whole-push check compares
+    each up-to-date ref's tracking ref with the other refs this repository holds, never with
+    another tracking ref the same push rewrites. So it misses a Mac `files` clone that holds both
+    members of a remote pair as local branches under their exact names: `git push --all` then
+    rewrites both tracking refs into one APFS file, and the push is not refused [inference,
+    untested]. Two up-to-date refs whose custom fetch refspecs map them onto colliding names fall
+    in the same gap. The check also misses an up-to-date push to a ref from a source named under
+    another spelling and given as exact bytes.
   - A symbolic local ref whose target does not exist. git's ref listings do not show it, so a ref
     written through it is not checked. The common case, a dangling `refs/remotes/<remote>/HEAD`
     after a prune, is still caught where it would collide: the checks count `<remote>/HEAD` as a

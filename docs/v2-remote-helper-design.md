@@ -1272,7 +1272,12 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   - *The cost.* Canonical caseless equivalence is Unicode's definition, not a model of APFS or
     NTFS, so `ᾳ` beside `αι` is refused (Unicode folds U+0345 to `ι`) though no measurement shows a
     Mac confusing them [inference]. A lone NFD name has no pair, so no two-ref rule sees it; the
-    README states it, with the exact-bytes way to reach it (M15).
+    README states it, with the exact-bytes way to reach it (M15). *Superseded in part on
+    2026-10-28: at git's Mac default, `core.precomposeunicode=true`, a `files` clone lists a
+    phantom NFC tracking ref beside the stale NFD one after the branch's first incremental fetch
+    (measured; `docs/research/probes/macos-port/lone-nfd-default/`), and the Mac fetch check then
+    refuses the next fetch as a collision (a hermetic test pins it). The README's honest limits
+    say so.*
 - **One pinned Unicode version for both relations (O1(iv), MA2).** `caseKey` folds by a generated
   table instead of `unicode.SimpleFold`, so every build refuses the same set whichever Go compiled
   it, and `nfd` uses generated decomposition and combining-class tables from the same version,

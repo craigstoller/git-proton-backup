@@ -112,9 +112,10 @@ log() {
 }
 
 # end_watchdog: ends the watchdog's whole group (the subshell and its sleep) and reaps it. TERM
-# comes first, and the watchdog's trap makes it exit quietly. Bash runs a trapped signal only when
-# its foreground sleep returns, so a TERM that arrives just before that sleep is forked would leave
-# a timer running for the whole bound; if the group has not gone in 2 s, KILL it.
+# comes first, and the watchdog's trap makes it exit quietly. Bash may run a trapped signal only
+# when its foreground sleep returns (not measured), so a TERM that arrives just before that sleep
+# is forked could leave a timer running for the whole bound; if the group has not gone in 2 s,
+# KILL it.
 end_watchdog() {
     kill -TERM -- "-$wd_pid" 2>/dev/null
     i=0
