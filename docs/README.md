@@ -1,6 +1,6 @@
 # git-proton-backup Docs
 
-**Living reference. Last updated: 2026-10-27.** Update this index when a doc is added, renamed, retired, or superseded — not on a review calendar.
+**Living reference. Last updated: 2026-10-28.** Update this index when a doc is added, renamed, retired, or superseded — not on a review calendar.
 
 This repo ships two tools that share one version line; each has its own design doc.
 
@@ -24,8 +24,8 @@ This repo ships two tools that share one version line; each has its own design d
 - [research/gates/](research/gates/) - Stage gate briefs (what will be tested) and gate records (what happened). [brief-checklist.md](research/gates/brief-checklist.md) holds the standing rules every gate brief incorporates by reference.
 - [research/probes/](research/probes/) - Runnable probes against the real Proton CLI, and local probes of git, APFS and Go behaviour, with their pinned results.
 - [research/probes/macos-port/README.md](research/probes/macos-port/README.md) - The macOS port's local probes (no network, no Proton account): which file shows which finding (M12–M29, PM1–PM9), and what each file does not show.
-- [research/gates/vNEXT-macos-gate-brief.md](research/gates/vNEXT-macos-gate-brief.md) - The brief for the macOS port's one live gate, run once for the release that carries the port. Not yet run; renamed when the version is named.
-- [research/gates/vNEXT-composition-refusal-steps.md](research/gates/vNEXT-composition-refusal-steps.md) - The steps the same release's Windows and Linux gate briefs carry: an NFD create refused on each platform's own binary. Renamed with the macOS brief.
+- [research/gates/v0.11.0-macos-gate-brief.md](research/gates/v0.11.0-macos-gate-brief.md) - The brief for the macOS port's one live gate, run once, for v0.11.0, the release that carries the port. Not yet run.
+- [research/gates/v0.11.0-composition-refusal-steps.md](research/gates/v0.11.0-composition-refusal-steps.md) - The steps the same release's Windows and Linux gate briefs carry: an NFD create refused on each platform's own binary.
 
 ## Specs And Plans
 

@@ -70,16 +70,16 @@ forgotten for the v0.3.x releases. Follow it in order; do not skip or reorder st
    restore and verify the copy, then re-enable them.
    The release that carries the macOS port takes a third gate once: the macOS live gate (§6 of
    `docs/superpowers/specs/2026-10-27-v2-macos-port-design.md`; brief
-   `docs/research/gates/vNEXT-macos-gate-brief.md`, renamed when the version is named). Its place
-   follows O5. It runs last, after the Linux and Windows gates and after the draft Windows helper
-   is installed, and never at the same time as another gate, because the gates share the account's
+   `docs/research/gates/v0.11.0-macos-gate-brief.md`; the release is v0.11.0). Its place follows
+   O5. It runs last, after the Linux and Windows gates and after the draft Windows helper is
+   installed, and never at the same time as another gate, because the gates share the account's
    baseline, the trash tally and the paused-task window; a paired PC session runs its Windows
    side, and the draft stays unpublished until it ends. A Mac-only failure does not hold the
    release: no macOS asset ships, so the Windows and Linux assets publish on their own gates, the
    README keeps macOS "not yet live-gated", and the next attempt is the whole macOS gate again at
    a later release, never a stand-in. A defect in shared code that it finds is a defect in the
    release, under the no-retag rule below. That release's Windows and Linux gate briefs also carry
-   the steps in `docs/research/gates/vNEXT-composition-refusal-steps.md`, so each platform's own
+   the steps in `docs/research/gates/v0.11.0-composition-refusal-steps.md`, so each platform's own
    binary is shown refusing a pair that differs only by Unicode normalisation (O5(d)). Once a
    macOS gate has passed, later releases have none.
    Tags are never moved after any artifact has been built from them — if either gate finds a

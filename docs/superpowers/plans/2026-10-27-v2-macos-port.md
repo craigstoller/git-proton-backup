@@ -1513,3 +1513,9 @@ after text:
   members and passed; 3 pinned classes span more than one toolchain orbit, which O1(iv) accepts.
 - Windows Pester passed 221 of 221, including the 30 drift tests through the `.cmd` stubs.
 - The generated tables matched the committed data.
+
+**Release preparation for v0.11.0 (2026-10-28, branch `worktree-release-v0.11.0`).** Craig named the
+release v0.11.0 on 2026-10-28. The two files Task 15 created under placeholder names were renamed by
+the scripted substitution the brief describes, to `docs/research/gates/v0.11.0-macos-gate-brief.md`
+and `docs/research/gates/v0.11.0-composition-refusal-steps.md`; Task 15's text above keeps the old
+names as written.
