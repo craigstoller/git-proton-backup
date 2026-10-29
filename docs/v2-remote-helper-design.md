@@ -1234,7 +1234,9 @@ Compaction and retention remain a separately approved milestone. v2 reserves not
   made during implementation; each names the commit that carries it. The evidence is the spec's
   findings M0–M29 and the plan's PM1–PM9, measured on one Apple Silicon Mac (macOS 27.2, Apple git
   2.54.0, go1.27.0) unless the spec marks another basis; the probes and their logs are in
-  `docs/research/probes/macos-port/`.
+  `docs/research/probes/macos-port/`. The port merged to `main` by PR #18 on 2026-10-28, and Craig
+  named its release v0.11.0 the same day; the macOS gate's question rulings are recorded in its
+  brief.
 - **Supported platforms.** windows/amd64 and linux/amd64 are unchanged. darwin/arm64 (MD1(a);
   Intel out of scope, MD8(a)) is built from source at a release tag (MD2(d)), with the same recipe
   as `release.yml`'s Linux build (`CGO_ENABLED=0 go build -trimpath -ldflags "-X

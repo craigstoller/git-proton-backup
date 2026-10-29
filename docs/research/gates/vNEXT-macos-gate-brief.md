@@ -1,6 +1,7 @@
 # vNEXT macOS live gate brief: the macOS port's one live gate, on Craig's MacBook Air
 
-**Status: brief, not run; one Placeholder left, the version name** (Question 1). This is a set of
+**Status: brief, not run; one Placeholder left, the version name** (Question 1, ruled v0.11.0 on
+2026-10-28; the scripted substitution and the re-anchoring run at release preparation). This is a set of
 instructions for the runners of the one live macOS
 gate that spec section 6 requires for the release that carries the macOS port
 (`docs/superpowers/specs/2026-10-27-v2-macos-port-design.md`, "The one live macOS gate (MD5(a),
@@ -139,6 +140,13 @@ adding an R7 step is Craig's decision (Question 2).
 
 Each has this brief's default, which stands unless he rules otherwise, and its reason. A question
 that others depend on comes first.
+
+**Ruled on 2026-10-28 (Craig's call: "Take your recommendations as my rulings").** Question 1: the
+release is v0.11.0; the files keep `vNEXT` until release preparation runs the scripted
+substitution and re-anchors the brief to the release commit. Questions 2 to 7 and 9 to 14: the
+default as written. Question 8: allow the notification permission when macOS asks, because the
+wrapper's banner is the only signal a failed scheduled push gives; the brief still records the
+prompt and what the run did before it.
 
 1. **The version name.** Default: none; the files stay `vNEXT` until he names the release, then are
    renamed by one scripted substitution. Reason: the root names, the tag C.3 checks out and every
