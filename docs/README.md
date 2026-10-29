@@ -25,6 +25,8 @@ This repo ships two tools that share one version line; each has its own design d
 - [research/probes/](research/probes/) - Runnable probes against the real Proton CLI, and local probes of git, APFS and Go behaviour, with their pinned results.
 - [research/probes/macos-port/README.md](research/probes/macos-port/README.md) - The macOS port's local probes (no network, no Proton account): which file shows which finding (M12–M29, PM1–PM9), and what each file does not show.
 - [research/gates/v0.11.0-macos-gate-brief.md](research/gates/v0.11.0-macos-gate-brief.md) - The brief for the macOS port's one live gate, run once, for v0.11.0, the release that carries the port. Not yet run.
+- [research/gates/v0.11.0-linux-gate-brief.md](research/gates/v0.11.0-linux-gate-brief.md) - The brief for v0.11.0's Linux live gate, written from v0.10.0's and its record; it runs first and installs the draft Windows helper. Not yet run.
+- [research/gates/v0.11.0-windows-gate-brief.md](research/gates/v0.11.0-windows-gate-brief.md) - The brief for v0.11.0's Windows live gate, written from v0.10.0's and its record; it runs second, asserts the draft helper's install, and adopts the release. Not yet run.
 - [research/gates/v0.11.0-composition-refusal-steps.md](research/gates/v0.11.0-composition-refusal-steps.md) - The steps the same release's Windows and Linux gate briefs carry: an NFD create refused on each platform's own binary.
 
 ## Specs And Plans

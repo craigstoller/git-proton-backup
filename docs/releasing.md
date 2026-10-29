@@ -52,7 +52,7 @@ forgotten for the v0.3.x releases. Follow it in order; do not skip or reorder st
    ("When adoption may stand in for the live gate", below).
 
 5. **Two live gates run against the draft's bytes: the Windows live gate and the Linux live
-   gate.** Each downloads the draft's assets and exercises its own binary
+   gate** (the release that carries the macOS port takes a third, once; below). Each downloads the draft's assets and exercises its own binary
    (`git-remote-proton.exe` for Windows, `git-remote-proton-linux-amd64` for Linux) against the
    real Proton account per its own current gate brief (see
    `docs/research/gates/brief-checklist.md` for the standing rules every gate brief incorporates).
@@ -68,6 +68,10 @@ forgotten for the v0.3.x releases. Follow it in order; do not skip or reorder st
    copy (Craig's ruling, 2026-10-16). If a later gate fails or the release is abandoned after that,
    restoring the rollback copy is part of abandoning the release: pause the scheduled tasks,
    restore and verify the copy, then re-enable them.
+   For v0.11.0 the briefs are `docs/research/gates/v0.11.0-linux-gate-brief.md` and
+   `docs/research/gates/v0.11.0-windows-gate-brief.md`, in v0.10.0's shape: the Linux gate runs
+   first, its brief installs the draft Windows helper and keeps a rollback copy, and the Windows
+   gate asserts that install (a default carried from the 2026-10-16 ruling, for Craig to confirm).
    The release that carries the macOS port takes a third gate once: the macOS live gate (§6 of
    `docs/superpowers/specs/2026-10-27-v2-macos-port-design.md`; brief
    `docs/research/gates/v0.11.0-macos-gate-brief.md`; the release is v0.11.0). Its place follows
@@ -89,8 +93,9 @@ forgotten for the v0.3.x releases. Follow it in order; do not skip or reorder st
    no-retag rule applies to it unchanged.
 
 6. **Craig publishes.** Once the gates pass, run the drift check again with `-Helper` set to the
-   draft's exe — the installed one when step 5 installed it (a pin-moving release), otherwise the
-   downloaded asset in the Windows gate's staging directory — and require `DRIFT CHECK: MATCH`
+   draft's exe — the installed one when step 5 installed it (a pin-moving release, or a release
+   whose Linux gate brief installs it, as v0.10.0's and v0.11.0's do), otherwise the downloaded
+   asset in the Windows gate's staging directory — and require `DRIFT CHECK: MATCH`
    under the same STOP rule as step 3. Then Craig — not the gate runner — publishes the draft
    release on GitHub.
 
