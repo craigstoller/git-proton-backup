@@ -92,7 +92,7 @@ are not equivalent, and the restore story is where that matters most.
 
 | | v1 — bundles | v2 — `git-remote-proton` |
 |---|---|---|
-| Platforms | Windows (PowerShell 7.4+) | Windows (amd64) and, from v0.10.0, Linux (amd64); macOS (Apple Silicon) built from source, not yet live-gated ([Install on macOS](#install-on-macos-v2)) |
+| Platforms | Windows (PowerShell 7.4+) | Windows (amd64) and, from v0.10.0, Linux (amd64); macOS (Apple Silicon) built from source, live-gated once, at v0.11.0 ([Install on macOS](#install-on-macos-v2)) |
 | Transport | Proton Drive's Windows sync app; a single bundle file lands in the synced folder | The Proton Drive CLI, invoked directly by the helper as a real git remote |
 | Remote name | `proton` | `proton-v2` |
 | Restore needs | git only, from any machine — the bundle itself is the backup, no account needed | git 2.45.0 or newer, `git-remote-proton` on PATH, and the certified Proton Drive CLI (0.9.0) signed in; on Linux, also a credential store the CLI can use ([Linux prerequisites](#install-on-linux-v2)) |
@@ -254,18 +254,20 @@ is untested.
 
 ### Install on macOS (v2)
 
-**Status: built from source; the hermetic suite runs on it in CI; not yet live-gated.** v2 runs on
+**Status: built from source; the hermetic suite runs on it in CI; live-gated once, at v0.11.0;
+later releases' Mac builds and later CLI versions on the Mac are not live-gated.** v2 runs on
 Apple Silicon Macs (`darwin/arm64`). Intel Macs are out of scope, and v1 does not run on macOS,
-because its transport is the Windows sync app. No release carries a macOS binary, so no release
+because its transport is the Windows sync app. No release carries a macOS binary, so no per-release
 gate runs Mac bytes: you build the helper yourself from a release tag. CI runs the hermetic Go
 suite on an Apple Silicon runner at Go's latest stable release, and the port's design rests on
 local probes run on one Mac
 ([docs/research/probes/macos-port/](docs/research/probes/macos-port/README.md)). The M-numbers
 below are findings in the
 [macOS port spec](docs/superpowers/specs/2026-10-27-v2-macos-port-design.md), which marks how each
-was measured. No live gate has run on a Mac yet. On a Mac the helper also refuses some fetches
-and pushes that would let the filesystem mix two refs up; read
-[Honest limits on macOS](#honest-limits-on-macos-v2) before you rely on it.
+was measured. v0.11.0 passed the port's one live gate on a Mac on 2026-10-29, with a helper built
+from its tag and Proton's certified Mac CLI ([record](docs/research/gates/v0.11.0-macos-gate.md)).
+On a Mac the helper also refuses some fetches and pushes that would let the filesystem mix two
+refs up; read [Honest limits on macOS](#honest-limits-on-macos-v2) before you rely on it.
 
 **Prerequisites.**
 
@@ -298,14 +300,16 @@ CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=$TAG" -o ~/.local/bin
 ~/.local/bin/git-remote-proton --version
 cd ..
 
-# Proton's CLI, certified version 0.9.0, macOS build (SHA-512 recorded 2026-10-27; no live gate has run it yet):
+# Proton's CLI, certified version 0.9.0, macOS build (SHA-512 recorded 2026-10-27; run by the macOS live gate 2026-10-29):
 curl -fLo proton-drive https://proton.me/download/drive/cli/0.9.0/darwin-arm64/proton-drive \
   && echo "3f4125de5e41dcc7f4e0e07e8d60737aa18f35c6ecc1ba3fce47ea97b331857eefaf88e74671135af57122d4cb5439b817ec528f8df383550ac7810aeaf0217b  proton-drive" | shasum -a 512 -c && install -m 0755 proton-drive ~/.local/bin/proton-drive
 ```
 
 `--version` must print the tag and the certified CLI token: `git-remote-proton vX.Y.Z (certified
 CLI: cli-drive@0.9.0+75612299)`. The SHA-512 is the value Proton's feed listed for this build on
-2026-10-27, and it equals `shasum -a 512` of a download of that URL made the same day. The
+2026-10-27; it equals `shasum -a 512` of a download of that URL made the same day, and the binary
+the v0.11.0 macOS live gate ran on 2026-10-29
+([record](docs/research/gates/v0.11.0-macos-gate.md)). The
 download, the check and the install are chained with `&&`, so a failed download or a failed check
 installs nothing. A failing check means you do not hold the bytes that were recorded (Proton may
 have re-cut the build, or the download is damaged), so do not install it. Proton's download page
@@ -661,10 +665,10 @@ download them; you don't need this tool, or even a Windows machine, to get your 
 
 ### Honest limits on macOS (v2)
 
-macOS is not live-gated yet ([Install on macOS](#install-on-macos-v2)). Where this section says
-*measured*, it means local repositories on one Mac with Apple's git 2.54.0, not runs through the
-helper against Proton. The checks below exist because a Mac clone mishandles a pair, as the
-normalisation item above describes. Letter case counts too, because default APFS also ignores
+macOS was live-gated once, at v0.11.0 ([Install on macOS](#install-on-macos-v2)). Where this section
+says *measured*, it still means local repositories on one Mac with Apple's git 2.54.0, not runs
+through the helper against Proton. The checks below exist because a Mac clone mishandles a pair, as
+the normalisation item above describes. Letter case counts too, because default APFS also ignores
 case. They apply where git keeps each ref as a file, so that APFS can take two names for one.
 
 - **A name that exists only in NFD.** Every check compares two refs. A remote that holds `café`
@@ -857,7 +861,8 @@ promised.
 ## Roadmap
 
 - **macOS** — `git-remote-proton` (v2) builds from source on Apple Silicon, and CI runs the
-  hermetic suite on an Apple Silicon runner. It is not yet live-gated (see [Install on
+  hermetic suite on an Apple Silicon runner. It passed its one live gate at v0.11.0; later
+  releases' Mac builds and later CLI versions on the Mac are not live-gated (see [Install on
   macOS](#install-on-macos-v2)). Ruled out for this port: a macOS release asset and Intel Macs;
   v1 stays Windows-only.
 - **Linux** — `git-remote-proton` (v2) gained Linux support in v0.10.0: CLI-direct

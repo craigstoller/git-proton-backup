@@ -12,9 +12,11 @@
   macOS (v2)" section: build the helper with Go in a fresh clone of the release tag, install
   Proton's certified `macos/arm64` CLI after checking it against its SHA-512, put both on PATH,
   and check that each resolves to one path. No release carries a macOS binary. CI now runs the
-  hermetic suite on an Apple Silicon macOS runner. macOS is not yet live-gated. For scheduled
-  backups, `scripts/macos/` has a wrapper that runs `push --all` and then `push --tags` with a
-  30-minute limit on each, and an example LaunchAgent that runs it daily, one per repository.
+  hermetic suite on an Apple Silicon macOS runner. This release passed the port's one macOS live
+  gate (`docs/research/gates/v0.11.0-macos-gate.md`); later releases' Mac builds and later CLI
+  versions on the Mac are not live-gated. For scheduled backups, `scripts/macos/` has a wrapper
+  that runs `push --all` and then `push --tags` with a 30-minute limit on each, and an example
+  LaunchAgent that runs it daily, one per repository.
 - **git-remote-proton: a push now also refuses to create a ref that differs from another only by
   Unicode normalisation, on every platform.** An example is `café` with its accent stored as one
   character (NFC) beside the same name stored as `e` plus a combining accent (NFD). The two look
