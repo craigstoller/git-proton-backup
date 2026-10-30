@@ -24,10 +24,13 @@ This repo ships two tools that share one version line; each has its own design d
 - [research/gates/](research/gates/) - Stage gate briefs (what will be tested) and gate records (what happened). [brief-checklist.md](research/gates/brief-checklist.md) holds the standing rules every gate brief incorporates by reference.
 - [research/probes/](research/probes/) - Runnable probes against the real Proton CLI, and local probes of git, APFS and Go behaviour, with their pinned results.
 - [research/probes/macos-port/README.md](research/probes/macos-port/README.md) - The macOS port's local probes (no network, no Proton account): which file shows which finding (M12–M29, PM1–PM9), and what each file does not show.
-- [research/gates/v0.11.0-macos-gate-brief.md](research/gates/v0.11.0-macos-gate-brief.md) - The brief for the macOS port's one live gate, run once, for v0.11.0, the release that carries the port. Not yet run.
-- [research/gates/v0.11.0-linux-gate-brief.md](research/gates/v0.11.0-linux-gate-brief.md) - The brief for v0.11.0's Linux live gate, written from v0.10.0's and its record; it runs first and installs the draft Windows helper. Not yet run.
-- [research/gates/v0.11.0-windows-gate-brief.md](research/gates/v0.11.0-windows-gate-brief.md) - The brief for v0.11.0's Windows live gate, written from v0.10.0's and its record; it runs second, asserts the draft helper's install, and adopts the release. Not yet run.
+- [research/gates/v0.11.0-macos-gate-brief.md](research/gates/v0.11.0-macos-gate-brief.md) - The brief for the macOS port's one live gate, run once, for v0.11.0, the release that carries the port. Run once, 2026-10-29: PASS.
+- [research/gates/v0.11.0-linux-gate-brief.md](research/gates/v0.11.0-linux-gate-brief.md) - The brief for v0.11.0's Linux live gate, written from v0.10.0's and its record; it runs first and installs the draft Windows helper. Run 2026-10-29: PASS.
+- [research/gates/v0.11.0-windows-gate-brief.md](research/gates/v0.11.0-windows-gate-brief.md) - The brief for v0.11.0's Windows live gate, written from v0.10.0's and its record; it runs second, asserts the draft helper's install, and adopts the release. Run 2026-10-29: PASS.
 - [research/gates/v0.11.0-composition-refusal-steps.md](research/gates/v0.11.0-composition-refusal-steps.md) - The steps the same release's Windows and Linux gate briefs carry: an NFD create refused on each platform's own binary.
+- [research/gates/v0.11.0-linux-gate.md](research/gates/v0.11.0-linux-gate.md) - The record of v0.11.0's Linux live gate, with its pre-tag sign-in probe and Craig's rulings on the release's three briefs. PASS, final.
+- [research/gates/v0.11.0-windows-gate.md](research/gates/v0.11.0-windows-gate.md) - The record of v0.11.0's Windows live gate and adoption, the macOS gate's PC half, and the publication digest closure. PASS, final.
+- [research/gates/v0.11.0-macos-gate.md](research/gates/v0.11.0-macos-gate.md) - The record of the macOS port's one live gate (v0.11.0): the v0.10.0 build, the sign-in probe, and steps 0 to 7 on the Mac with the PC's half. PASS, final; one measurement (M16 through v0.10.0's helper) recorded, not judged.
 
 ## Specs And Plans
 
